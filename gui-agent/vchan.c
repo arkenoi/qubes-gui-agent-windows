@@ -22,6 +22,7 @@
 #include <windows.h>
 
 #include "vchan.h"
+#include "perf.h"
 
 #include <libvchan.h>
 #include <vchan-common.h>
@@ -31,16 +32,28 @@ CRITICAL_SECTION g_VchanCriticalSection;
 
 struct libvchan *g_Vchan = NULL;
 
+BOOL VchanSendTimed(IN struct libvchan *vchan, IN const void *data, IN size_t size, IN const WCHAR *what)
+{
+    if (!g_PerfEnabled)
+        return VchanSendBuffer(vchan, data, size, what);
+
+    LONGLONG t0 = PerfNow();
+    BOOL status = VchanSendBuffer(vchan, data, size, what);
+    g_PerfSendTicks += PerfNow() - t0;
+    g_PerfSendCount++;
+    return status;
+}
+
 BOOL VchanSendMessage(IN const struct msg_hdr *header, IN int headerSize, IN const void *data, IN int dataSize, IN const WCHAR *what)
 {
     int status;
 
     LogVerbose("msg 0x%x (%s) for window 0x%x, size %d", header->type, what, header->window, header->untrusted_len);
-    status = VchanSendBuffer(g_Vchan, header, headerSize, what);
+    status = VchanSendTimed(g_Vchan, header, headerSize, what);
     if (status < 0)
         return FALSE;
 
-    status = VchanSendBuffer(g_Vchan, data, dataSize, what);
+    status = VchanSendTimed(g_Vchan, data, dataSize, what);
     if (status < 0)
         return FALSE;
 

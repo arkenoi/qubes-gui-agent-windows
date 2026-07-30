@@ -39,6 +39,7 @@
 #include "vchan-handlers.h"
 #include "util.h"
 #include "debug.h"
+#include "perf.h"
 #include "qubes-io.h"
 
 // windows-utils
@@ -1016,9 +1017,21 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
     WINDOW_DATA *nextEntry;
     ULONG status = ERROR_SUCCESS;
 
+    // Instrumentation (see perf.h). All of these collapse to zero when disabled;
+    // the only cost then is the g_PerfEnabled test inside PerfNow().
+    LONGLONG perfFrameStart = PerfNow();
+    LONGLONG perfSendBase = g_PerfSendTicks;
+    LONG perfSendCountBase = g_PerfSendCount;
+    LONGLONG perfPhase = 0, perfSendPhase = 0;
+    LONGLONG perfUpdate = 0, perfEnum = 0, perfRemove = 0, perfDamage = 0;
+    UINT perfWindows = 0;
+
     LogVerbose("start");
     if (!g_SeamlessMode)
     {
+        perfPhase = PerfNow();
+        perfSendPhase = g_PerfSendTicks;
+
         if (frame->dirty_rects_count == 0)
         {
             // normally we don't get frames with 0 dirty rects unless it's the 1st one
@@ -1036,6 +1049,12 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
             }
         }
 
+        perfDamage = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
+        PerfEmitFrame(FALSE, perfFrameStart, PerfNow() - perfFrameStart,
+            0, 0, 0, perfDamage,
+            g_PerfSendTicks - perfSendBase, g_PerfSendCount - perfSendCountBase,
+            &frame->perf, frame->dirty_rects_count, 1);
+
         LogVerbose("end (fullscreen)");
         return ERROR_SUCCESS;
     }
@@ -1043,6 +1062,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
     EnterCriticalSection(&g_csWatchedWindows);
 
     // TODO: don't enumerate all windows every time, use window hooks to monitor for changes
+
+    perfPhase = PerfNow();
+    perfSendPhase = g_PerfSendTicks;
 
     // Update state of all tracked windows. If a window is no longer eligible (destroyed, hidden...)
     // then mark it for removal but keep in the list for now, so AddAllWindows() can skip them.
@@ -1062,8 +1084,16 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         entry = nextEntry;
     }
 
+    perfUpdate = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
+    perfPhase = PerfNow();
+    perfSendPhase = g_PerfSendTicks;
+
     // Enumerate all top-level windows and all eligible ones to the list if not already there.
     AddAllWindows();
+
+    perfEnum = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
+    perfPhase = PerfNow();
+    perfSendPhase = g_PerfSendTicks;
 
     // Remove windows marked for deletion.
     entry = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
@@ -1085,12 +1115,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         entry = nextEntry;
     }
 
+    perfRemove = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
+    perfPhase = PerfNow();
+    perfSendPhase = g_PerfSendTicks;
+
     // send damage notifications
     entry = (WINDOW_DATA *)g_WatchedWindowsList.Flink;
     while (entry != (WINDOW_DATA*)&g_WatchedWindowsList)
     {
         entry = CONTAINING_RECORD(entry, WINDOW_DATA, ListEntry);
         nextEntry = (WINDOW_DATA*)entry->ListEntry.Flink;
+        perfWindows++;
 
         if (entry->IsIconic) // minimized, don't care
             goto skip;
@@ -1127,7 +1162,14 @@ skip:
     }
 
 cleanup:
+    perfDamage = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
     LeaveCriticalSection(&g_csWatchedWindows);
+
+    PerfEmitFrame(TRUE, perfFrameStart, PerfNow() - perfFrameStart,
+        perfUpdate, perfEnum, perfRemove, perfDamage,
+        g_PerfSendTicks - perfSendBase, g_PerfSendCount - perfSendCountBase,
+        &frame->perf, frame->dirty_rects_count, perfWindows);
+
     LogVerbose("end (%x)", status);
     return status;
 }
@@ -1257,7 +1299,10 @@ static ULONG WINAPI WatchForEvents(void)
         if (g_SeamlessMode)
         {
             // dump watched windows every second
-            if (GetTickCount() - dumpLastTime > 1000)
+            // (skip entirely if the output would be discarded: DumpWindows() does
+            // OpenProcess+QueryFullProcessImageName per window and takes both the
+            // watched-windows and the logger lock, once a second, at any log level)
+            if (LogGetLevel() >= LOG_LEVEL_DEBUG && GetTickCount() - dumpLastTime > 1000)
             {
                 DumpWindows();
                 dumpLastTime = GetTickCount();
@@ -1517,6 +1562,8 @@ static ULONG Init(void)
     {
         return GetLastError();
     }
+
+    PerfInit();
 
     EnableUIAccess();
     status = CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName));

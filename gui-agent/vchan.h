@@ -35,9 +35,14 @@ extern struct libvchan *g_Vchan;
 BOOL VchanInit(IN int domain, IN int port);
 BOOL VchanSendMessage(IN const struct msg_hdr* header, IN int headerSize, IN const void* data, IN int dataSize, IN const WCHAR* what);
 
+// Thin wrapper around VchanSendBuffer that accounts the time spent writing to
+// the vchan (see perf.h). Identical semantics/return value; when instrumentation
+// is disabled it's a direct tail call.
+BOOL VchanSendTimed(IN struct libvchan* vchan, IN const void* data, IN size_t size, IN const WCHAR* what);
+
 #define VCHAN_SEND_MSG(header, body, what) (\
     header.untrusted_len = sizeof(body), \
     VchanSendMessage(&(header), sizeof(header), &(body), sizeof(body), what) \
     )
 
-#define VCHAN_SEND(x, what) VchanSendBuffer(g_Vchan, &(x), sizeof(x), what)
+#define VCHAN_SEND(x, what) VchanSendTimed(g_Vchan, &(x), sizeof(x), what)

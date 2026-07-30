@@ -21,6 +21,9 @@
     <ClCompile Include="..\..\gui-agent\main.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\gui-agent\perf.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\gui-agent\resolution.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -48,6 +51,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\..\gui-agent\main.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="..\..\gui-agent\perf.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="..\..\gui-agent\resolution.h">

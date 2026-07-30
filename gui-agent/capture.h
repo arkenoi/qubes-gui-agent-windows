@@ -28,6 +28,8 @@
 
 #include <xencontrol.h>
 
+#include "perf.h"
+
 #define ALIGN(x, a)	(((x) + (a) - 1) & ~((a) - 1))
 #define	FRAMEBUFFER_PAGE_COUNT(width, height)	(ALIGN(((width)*(height)*4), PAGE_SIZE) / PAGE_SIZE)
 
@@ -43,6 +45,7 @@ typedef struct _CAPTURE_FRAME
 	UINT dirty_rects_count;
 	RECT* dirty_rects;
 	CRITICAL_SECTION lock;
+	PERF_CAPTURE perf; // instrumentation, see perf.h (inert unless enabled)
 } CAPTURE_FRAME;
 
 typedef struct _CAPTURE_CONTEXT

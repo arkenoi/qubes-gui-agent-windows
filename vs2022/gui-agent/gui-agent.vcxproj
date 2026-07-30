@@ -13,6 +13,7 @@
   <ItemGroup>
     <ClCompile Include="..\..\gui-agent\capture.c" />
     <ClCompile Include="..\..\gui-agent\main.c" />
+    <ClCompile Include="..\..\gui-agent\perf.c" />
     <ClCompile Include="..\..\gui-agent\resolution.c" />
     <ClCompile Include="..\..\gui-agent\send.c" />
     <ClCompile Include="..\..\gui-agent\util.c" />
@@ -24,6 +25,7 @@
   <ItemGroup>
     <ClInclude Include="..\..\gui-agent\capture.h" />
     <ClInclude Include="..\..\gui-agent\main.h" />
+    <ClInclude Include="..\..\gui-agent\perf.h" />
     <ClInclude Include="..\..\gui-agent\resolution.h" />
     <ClInclude Include="..\..\gui-agent\resource.h" />
     <ClInclude Include="..\..\gui-agent\send.h" />
