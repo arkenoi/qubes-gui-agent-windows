@@ -830,6 +830,8 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     entry->Handle = window;
     entry->Style = GetWindowLong(window, GWL_STYLE);
     entry->ExStyle = GetWindowLong(window, GWL_EXSTYLE);
+    // Must be set unconditionally: ZeroMemory() above leaves it at 0, which would read as
+    // "fully transparent". No-ops for non-layered windows.
     entry->IsIconic = IsIconic(window);
     entry->DeletePending = FALSE;
     GetWindowText(window, entry->Caption, ARRAYSIZE(entry->Caption)); // don't really care about errors here
@@ -840,8 +842,17 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     DWORD cloaked;
     if (SUCCEEDED(DwmGetWindowAttribute(window, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))))
     {
+        // DWM-cloaked windows are the third class of unmappable chrome (CLAUDE.md 2A-chrome):
+        // present, styled visible, drawn nowhere - e.g. windows on another virtual desktop or
+        // suspended UWP frames. Folding it into IsVisible here is what makes
+        // ShouldAcceptWindow() reject them; the hook thread watches
+        // EVENT_OBJECT_CLOAKED/UNCLOAKED and forces re-examination, since cloaking changes
+        // none of the fields the reject cache signature compares.
         if (cloaked != 0) // hidden by DWM
+        {
+            LogVerbose("0x%x: DWM-cloaked (0x%x)", window, cloaked);
             entry->IsVisible = FALSE;
+        }
     }
 
     if (window == g_StartWindow)
@@ -867,6 +878,7 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 
         // check if we're modal to some other window
         HWND owner = GetWindow(window, GW_OWNER);
+        entry->Owner = owner; // also an input of ShouldAcceptWindow(), see WINDOW_DATA
         if (owner)
         {
             BOOL ownerDisabled = GetWindowLong(owner, GWL_STYLE) & WS_DISABLED;
@@ -1083,6 +1095,8 @@ static void SampleWindowSignature(IN HWND window, OUT REJECTED_WINDOW* signature
 // TRUE if the window is known to be ineligible and nothing we can check cheaply
 // changed since it was rejected. Deliberately avoids everything that made the old
 // per-frame enumeration expensive: no window text, no DWM calls, no allocation.
+// cheapest end of that scale - nothing like the cross-process WM_GETTEXT this exists to
+// avoid.)
 static BOOL IsWindowRejected(IN HWND window)
 {
     int index = FindRejectedWindow(window);
@@ -1105,12 +1119,17 @@ static BOOL IsWindowRejected(IN HWND window)
 
     // Backstop for a lost event: everything that can make a window eligible
     // (WS_VISIBLE, size, extended styles) also changes one of these.
-    if ((DWORD)GetWindowLong(window, GWL_STYLE) != rejected->Style ||
-        (DWORD)GetWindowLong(window, GWL_EXSTYLE) != rejected->ExStyle)
+    DWORD exStyle = (DWORD)GetWindowLong(window, GWL_EXSTYLE);
+
+    if ((DWORD)GetWindowLong(window, GWL_STYLE) != rejected->Style || exStyle != rejected->ExStyle)
         return FALSE;
 
     if (!GetWindowRect(window, &rect) || !EqualRect(&rect, &rejected->Rect))
         return FALSE;
+
+    // ...with one exception: the layered alpha, which an app can change with no style
+    // change and no WinEvent at all. Checked last because it is the least likely of these
+    // to have moved, and it is the only one that costs a call beyond the ones above.
 
     return TRUE;
 }
@@ -1437,6 +1456,73 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
             return FALSE;
     }
 
+    // ---- compound-window chrome (CLAUDE.md 2A-chrome) -------------------------------
+    //
+    // Some applications - Office 2013+ is the canonical case - draw their frame shadow and
+    // glow with extra TOP-LEVEL windows arranged around the real frame instead of letting
+    // DWM do it. To the agent each of those looks like an ordinary top-level window, so it
+    // gets mapped, and the gui daemon dutifully draws a qube border around every one of
+    // them: a single Office window arrives in dom0 as five separate bordered fragments.
+    //
+    // These are never anything a user can interact with, so dropping them loses nothing.
+    // The rules below are deliberately narrow - a false positive means a real window
+    // vanishes from dom0, which is much worse than a spurious border - and they are pure
+    // reads of state GetWindowData() already collected, so they cost nothing per frame.
+
+    // NOTE: an "alpha == 0 layered window" rule was considered and DELIBERATELY REJECTED.
+    // Windows fades menus and tooltips IN from alpha 0, so sampling one at the moment it
+    // appears would reject and cache it, and SetLayeredWindowAttributes emits no WinEvent -
+    // the window would stay invisible in dom0 until the next periodic resync (up to
+    // WINDOW_RESYNC_INTERVAL_MS). Worse, applying it to an already-mapped window turns a
+    // transient fade-out into MSG_DESTROY plus a recreate, losing z-order and focus.
+    // Its only benefit was cosmetic (suppressing an empty bordered rect), and it does not
+    // even match the Office strips, which are VISIBLE shadows with alpha > 0. A missing
+    // window is far worse than a spurious border.
+
+    // Rule 2: owned, click-through, undecorated layered chrome - the Office shadow strips.
+    // Every clause is required:
+    //   WS_EX_LAYERED|WS_EX_TRANSPARENT  the strip is alpha-blended AND hit-test
+    //                                    transparent, i.e. it can never receive a click; a
+    //                                    dom0 window for it could not be interacted with
+    //                                    even in principle.
+    //   Owner != NULL                    it decorates another window of the same app. An
+    //                                    unowned top-level window is somebody's real UI
+    //                                    (splash screens, HUD overlays) and is left alone.
+    //   !WS_CAPTION                      anything with a title bar is a window the user is
+    //                                    meant to see as a window. Tested with & rather than
+    //                                    HasFlags() on purpose: WS_CAPTION is
+    //                                    WS_BORDER|WS_DLGFRAME, so this also spares a merely
+    //                                    bordered window - erring towards keeping windows.
+    //                                    Office's strips are plain WS_POPUP, no border bits.
+    //   !WS_EX_APPWINDOW                 the app explicitly asked for a taskbar button, so
+    //                                    it considers this a first-class window.
+    //   WS_EX_NOACTIVATE + WS_EX_TOOLWINDOW (BOTH)  the app declared it non-activatable
+    //                                    AND non-taskbar. Office strips carry both. Requiring
+    //                                    both on purpose: a comctl32 tooltip is owned,
+    //                                    toolwindow and can be WS_EX_TRANSPARENT, but is
+    //                                    generally NOT WS_EX_NOACTIVATE, so demanding both
+    //                                    keeps tooltips visible.
+    // Note this is strictly narrower than the pre-existing "activate windows" banner rule
+    // above, which additionally pins the class name; that one stays as is.
+    if (HasFlags(data->ExStyle, WS_EX_LAYERED | WS_EX_TRANSPARENT) &&
+        data->Owner != NULL &&
+        !(data->Style & WS_CAPTION) &&
+        !(data->ExStyle & WS_EX_APPWINDOW) &&
+        HasFlags(data->ExStyle, WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW))
+    {
+        // LogVerbose, not LogDebug: during a drag every strip emits
+        // EVENT_OBJECT_LOCATIONCHANGE, its cached signature changes (rect moved) and it
+        // is re-examined at input rate, so this would be hundreds of formatted lines a
+        // second with a cross-process class name on the hot path.
+        LogVerbose("0x%x: rejecting compound-window chrome (class '%s', owner 0x%x, style 0x%x, exstyle 0x%x)",
+            data->Handle, data->Class, data->Owner, data->Style, data->ExStyle);
+        return FALSE;
+    }
+
+    // DWM-cloaked windows are the third 2A-chrome case; they are rejected by the
+    // !data->IsVisible test at the top of this function, because GetWindowData() folds
+    // DWMWA_CLOAKED into IsVisible. No separate rule needed here.
+
     return TRUE;
 }
 
@@ -1486,6 +1572,12 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         windowData->ExStyle = data.ExStyle;
         LogDebug("0x%x exstyle changed to 0x%x", data.Handle, data.ExStyle);
     }
+
+    // Not diffed (nothing is sent to dom0 when they change), but they ARE inputs of
+    // ShouldAcceptWindow(), which is re-evaluated against windowData at the end of this
+    // function. Left stale, a window that turned into chrome - or one whose layered alpha
+    // dropped to 0 - would keep being mapped.
+    windowData->Owner = data.Owner;
 
     // caption
     if (0 != wcscmp(windowData->Caption, data.Caption))
