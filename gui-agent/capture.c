@@ -212,7 +212,10 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                 return FALSE;
             }
 
-            LogDebug("duplication recreated after %u attempt(s)", attempt + 1);
+            // INFO, not DEBUG: the guest runs LogLevel=3 by default, so at DEBUG this
+            // recovery is invisible and an operator cannot tell in-place recovery from
+            // a silent teardown. This line is the evidence that the fix worked.
+            LogInfo("duplication recreated in place after %u attempt(s) - windows kept", attempt + 1);
             return TRUE;
         }
 
