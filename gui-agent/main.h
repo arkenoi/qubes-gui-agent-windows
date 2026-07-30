@@ -58,6 +58,14 @@ typedef struct _WINDOW_DATA
 
     BOOL IsOverrideRedirect;
     HWND ModalParent; // if nonzero, this window is modal in relation to window pointed by this field
+
+    // Owner (GW_OWNER), not parent: every top-level window is parented to the desktop, but
+    // compound-window chrome (Office 2013+ shadow strips, menus, tooltips) is OWNED by the
+    // frame it decorates. Only sampled when the window is visible, which is all
+    // ShouldAcceptWindow() needs: it rejects invisible windows before looking at this.
+    HWND Owner;
+
+    // Uniform alpha of a layered window; 255 (opaque) for everything we cannot ask about.
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(
