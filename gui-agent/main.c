@@ -96,6 +96,425 @@ HWND g_SearchWindow = NULL;
 
 HANDLE g_ShutdownEvent = NULL;
 
+/*
+ * Event-driven window tracking.
+ *
+ * The watched window list used to be rebuilt by an EnumWindows() pass on every
+ * captured frame. Measured on a stock Windows 10 guest that pass took 23 ms
+ * (median, up to 177 ms) per frame and accounted for 97.5% of all frame
+ * processing time: the guest has ~70 top-level windows, only one of which is
+ * usually eligible, and every ineligible one was re-interrogated from scratch on
+ * every frame (each interrogation is a cross-process WM_GETTEXT plus an RPC to
+ * DWM).
+ *
+ * Instead a dedicated thread owns a set of WinEvent hooks and only records which
+ * window handles something happened to; the main loop interrogates just those.
+ * See PHASE2A-NOTES.md for the design rationale.
+ */
+
+// Interval of the full EnumWindows() resync that backstops the event stream (see
+// TakePendingWindows). Two seconds: a resync is cheap now that ineligible windows
+// are cached (nothing is interrogated unless it visibly changed), and it bounds
+// how long a window could stay missing from the gui daemon to something a user
+// would call a glitch rather than a hang.
+#define WINDOW_RESYNC_INTERVAL_MS 2000
+
+// Maximum number of distinct window handles queued between two drains. On
+// overflow we fall back to a full resync instead of dropping an event.
+#define PENDING_WINDOWS_MAX 256
+
+// Maximum number of remembered ineligible windows.
+#define REJECTED_WINDOWS_MAX 256
+
+// Handles the hook thread waits on besides its message queue: stop, rearm.
+#define WINDOW_EVENT_WAIT_COUNT 2
+
+// Placeholder window of a minimized UAC prompt, see GetWindowData().
+#define UAC_DUMMY_WINDOW_CLASS L"$$$Secure UAP Dummy Window Class For Interim Dialog"
+
+// Written by the hook thread, drained by the main loop.
+static CRITICAL_SECTION g_csWindowEvents;
+static HWND g_PendingWindows[PENDING_WINDOWS_MAX];
+// Event id that queued each pending window, parallel to g_PendingWindows. Needed because
+// the admit path must know WHY a window was queued: for events whose effect is visible in
+// the cheap signature (LOCATIONCHANGE/STATECHANGE/NAMECHANGE) a cached rejection is still
+// valid and the expensive interrogation can be skipped, but CLOAKED/UNCLOAKED change
+// eligibility WITHOUT touching style/rect, so those must always force re-examination.
+static DWORD g_PendingEvents[PENDING_WINDOWS_MAX];
+static UINT g_PendingWindowsCount = 0;
+static BOOL g_ResyncRequested = TRUE; // the first pass is always a full enumeration
+
+// Main loop only, guarded by nothing: read and written by the thread that drains events.
+static DWORD g_LastResyncTime = 0;
+
+static HANDLE g_WindowEventSignal = NULL; // auto-reset: window events are waiting
+static HANDLE g_WindowEventRearm = NULL;  // auto-reset: reattach to the input desktop, rearm hooks
+static HANDLE g_WindowEventStop = NULL;   // manual-reset: leave the hook thread
+static HANDLE g_WindowEventThread = NULL;
+
+// Set when the hook thread dies. Without hooks the only tracking left is the periodic
+// resync, so keep it short: at WINDOW_RESYNC_INTERVAL_MS window moves would reach dom0 at
+// 0.5 Hz, which is WORSE than the per-frame enumeration this replaced. Falling back to
+// roughly the old cadence is a regression to par, not below it.
+static volatile LONG g_WindowEventThreadDead = 0;
+#define WINDOW_RESYNC_FALLBACK_MS 150
+
+#ifndef EVENT_OBJECT_CLOAKED // Win8+ SDK
+#define EVENT_OBJECT_CLOAKED 0x8017
+#define EVENT_OBJECT_UNCLOAKED 0x8018
+#endif
+
+static const struct
+{
+    DWORD Min;
+    DWORD Max;
+} g_HookedEventRanges[] =
+{
+    { EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND }, // minimize/restore
+    { EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH }, // secure desktop etc
+    { EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE }, // create/destroy/show/hide
+    { EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_NAMECHANGE }, // state/location/name (window moves)
+    { EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED }, // DWM cloaking = invisible for us
+};
+
+// TRUE for events whose effect on eligibility is INVISIBLE to the cheap reject-cache
+// signature (pid/tid/style/exstyle/rect), so a cached rejection cannot be trusted and the
+// window must be interrogated again.
+//   - CLOAKED/UNCLOAKED: DWM cloaking is not a window style; a cloaked window keeps its
+//     rect and styles, so nothing in the signature moves.
+//   - CREATE/DESTROY/SHOW/HIDE: shell/lifecycle transitions; also update the globals
+//     (g_ShowTaskbar, g_StartVisible) that gate other windows.
+//   - NAMECHANGE: the caption is part of what is sent to dom0 and is not in the signature.
+// LOCATIONCHANGE and STATECHANGE are deliberately NOT here: both move the rect or the
+// style, so IsWindowRejected() detects them by itself, and those are exactly the events a
+// dragged window emits at input rate. Re-interrogating on them would reinstate the ~340 us
+// per-window cost that Phase 2A exists to remove.
+static BOOL WindowEventForcesReexamine(IN DWORD event)
+{
+    switch (event)
+    {
+    case EVENT_OBJECT_CREATE:
+    case EVENT_OBJECT_DESTROY:
+    case EVENT_OBJECT_SHOW:
+    case EVENT_OBJECT_HIDE:
+    case EVENT_OBJECT_NAMECHANGE:
+    case EVENT_OBJECT_CLOAKED:
+    case EVENT_OBJECT_UNCLOAKED:
+        return TRUE;
+    default:
+        return FALSE;
+    }
+}
+
+// Record that something happened to a window (or, with resync=TRUE, that the
+// whole list needs to be rebuilt). Called from the hook thread.
+static void QueueWindowEvent(IN HWND window, IN DWORD event, IN BOOL resync)
+{
+    BOOL signal = TRUE;
+
+    EnterCriticalSection(&g_csWindowEvents);
+    if (resync)
+    {
+        g_PendingWindowsCount = 0;
+        g_ResyncRequested = TRUE;
+    }
+    // NOTE: there is deliberately no "else if (g_ResyncRequested) signal = FALSE" shortcut.
+    // It looks free (a pending resync does cover every window) but it depends on an
+    // invariant DiscardWindowEvents() breaks: that function also sets g_ResyncRequested,
+    // without signalling, and only TakePendingWindows() clears it. After a
+    // seamless-off -> on transition the flag can remain set with no signal outstanding, and
+    // from then on EVERY event takes the suppressed path, so window moves silently fall
+    // back to capture rate. Signalling an auto-reset event is far cheaper than that.
+    else
+    {
+        UINT i;
+
+        for (i = 0; i < g_PendingWindowsCount; i++)
+        {
+            if (g_PendingWindows[i] == window)
+                break;
+        }
+
+        if (i < g_PendingWindowsCount)
+        {
+            // Already queued. Keep the reason that forces the most work, so a cheap
+            // LOCATIONCHANGE cannot mask a CLOAKED that arrived for the same window.
+            if (WindowEventForcesReexamine(event))
+                g_PendingEvents[i] = event;
+            signal = FALSE; // already queued and not drained yet
+        }
+        else if (g_PendingWindowsCount < PENDING_WINDOWS_MAX)
+        {
+            g_PendingEvents[g_PendingWindowsCount] = event;
+            g_PendingWindows[g_PendingWindowsCount++] = window;
+        }
+        else
+        {
+            // We can't keep up with the event rate; don't lose anything, resync.
+            g_PendingWindowsCount = 0;
+            g_ResyncRequested = TRUE;
+        }
+    }
+    LeaveCriticalSection(&g_csWindowEvents);
+
+    if (signal)
+        SetEvent(g_WindowEventSignal);
+}
+
+// Hand the queued window handles to the caller and tell it whether a full
+// enumeration is due. Called from the main loop only.
+static BOOL TakePendingWindows(OUT HWND* buffer, OUT DWORD* events, IN UINT capacity, OUT UINT* count)
+{
+    BOOL resync;
+    DWORD now;
+
+    EnterCriticalSection(&g_csWindowEvents);
+    resync = g_ResyncRequested;
+    g_ResyncRequested = FALSE;
+    *count = 0;
+    if (!resync)
+    {
+        *count = g_PendingWindowsCount < capacity ? g_PendingWindowsCount : capacity;
+        memcpy(buffer, g_PendingWindows, (*count) * sizeof(HWND));
+        memcpy(events, g_PendingEvents, (*count) * sizeof(DWORD));
+    }
+    g_PendingWindowsCount = 0;
+    LeaveCriticalSection(&g_csWindowEvents);
+
+    // Safety net: an event can be lost (the hooks are down for a moment while we
+    // reattach to a new input desktop, the system coalesces or drops events if the
+    // hook thread falls behind), and some inputs of ShouldAcceptWindow() change
+    // without any event for the affected window at all (g_ShowTaskbar,
+    // g_StartVisible). A periodic full enumeration repairs any such desync.
+    now = GetTickCount();
+    {
+        // If the hook thread died there are no events at all, so the resync IS the
+        // tracking - run it far more often so we degrade to the old behaviour rather
+        // than below it (see g_WindowEventThreadDead).
+        DWORD interval = InterlockedCompareExchange(&g_WindowEventThreadDead, 0, 0)
+            ? WINDOW_RESYNC_FALLBACK_MS : WINDOW_RESYNC_INTERVAL_MS;
+
+        if (!resync && (now - g_LastResyncTime) >= interval)
+            resync = TRUE;
+    }
+
+    if (resync)
+        g_LastResyncTime = now;
+
+    return resync;
+}
+
+// Forget everything that was queued; the caller knows the list is up to date
+// (or that it doesn't care, in fullscreen mode).
+static void DiscardWindowEvents(void)
+{
+    EnterCriticalSection(&g_csWindowEvents);
+    g_PendingWindowsCount = 0;
+    g_ResyncRequested = TRUE; // whatever we just dropped is covered by the next resync
+    LeaveCriticalSection(&g_csWindowEvents);
+}
+
+// WinEvent hook callback, runs on the hook thread.
+//
+// This must stay cheap: the same thread has to keep retrieving messages for
+// out-of-context hooks to be delivered at all, so anything slow here (a
+// cross-process GetWindowText, a DWM query, a vchan write) would stall the event
+// stream. It only ever records handles; all interrogation happens in the main loop.
+static void CALLBACK WindowEventProc(
+    IN HWINEVENTHOOK hook,
+    IN DWORD event,
+    IN HWND window,
+    IN LONG objectId,
+    IN LONG childId,
+    IN DWORD eventThread,
+    IN DWORD eventTime)
+{
+    UNREFERENCED_PARAMETER(hook);
+    UNREFERENCED_PARAMETER(eventThread);
+    UNREFERENCED_PARAMETER(eventTime);
+
+    if (!g_SeamlessMode) // the watched window list isn't used in fullscreen mode
+        return;
+
+    if (event == EVENT_SYSTEM_DESKTOPSWITCH)
+    {
+        QueueWindowEvent(NULL, 0, TRUE);
+        return;
+    }
+
+    // Only whole top-level windows are relevant. This filter is what makes the
+    // callback affordable: it drops the flood of EVENT_OBJECT_LOCATIONCHANGE for
+    // carets, the cursor and child controls.
+    if (objectId != OBJID_WINDOW || childId != CHILDID_SELF || !window)
+        return;
+
+    // EnumWindows() only offers windows parented to the desktop, track exactly the
+    // same set (this also drops message-only windows). A destroyed window can't be
+    // queried anymore, so it has to be let through unfiltered.
+    if (event != EVENT_OBJECT_DESTROY && GetAncestor(window, GA_PARENT) != GetDesktopWindow())
+        return;
+
+    QueueWindowEvent(window, event, FALSE);
+}
+
+// Owns the WinEvent hooks and pumps messages for them.
+static DWORD WINAPI WindowEventThreadProc(IN void* param)
+{
+    HWINEVENTHOOK hooks[RTL_NUMBER_OF(g_HookedEventRanges)];
+    HANDLE waitFor[WINDOW_EVENT_WAIT_COUNT];
+    BOOL exitThread = FALSE;
+    HDESK ownDesktop = NULL; // the desktop THIS thread opened, closed only by this thread
+
+    UNREFERENCED_PARAMETER(param);
+    LogDebug("start");
+
+    waitFor[0] = g_WindowEventStop;
+    waitFor[1] = g_WindowEventRearm;
+
+    while (!exitThread)
+    {
+        HDESK previousDesktop = ownDesktop;
+
+        ZeroMemory(hooks, sizeof(hooks));
+
+        // WinEvent hooks only receive events from the desktop that the thread setting
+        // them is attached to, so this thread must follow the input desktop.
+        //
+        // Deliberately NOT AttachToInputDesktop(): that helper also writes the shared
+        // globals g_DesktopWindow/g_StartWindow/g_SearchWindow, unsynchronised, and it is
+        // already called from two other threads. The reject cache now depends on
+        // g_StartWindow/g_SearchWindow (ExamineWindow refuses to cache them because
+        // interrogating them updates g_StartVisible/g_ShowTaskbar), so a torn read there
+        // would cache the real Start window as ineligible - permanently, since the entry
+        // survives every resync. It also CloseDesktop()s the process-default desktop
+        // handle, which MSDN forbids and which a third caller would double-close.
+        // Only the per-thread part is needed here.
+        ownDesktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_HOOKCONTROL);
+        if (ownDesktop)
+        {
+            if (!SetThreadDesktop(ownDesktop))
+                win_perror("SetThreadDesktop");
+        }
+        else
+        {
+            win_perror("OpenInputDesktop");
+        }
+
+        if (previousDesktop)
+            CloseDesktop(previousDesktop);
+
+        for (UINT i = 0; i < RTL_NUMBER_OF(g_HookedEventRanges); i++)
+        {
+            hooks[i] = SetWinEventHook(g_HookedEventRanges[i].Min, g_HookedEventRanges[i].Max,
+                NULL, WindowEventProc, 0, 0, WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+
+            if (!hooks[i])
+                LogWarning("SetWinEventHook(0x%x-0x%x) failed", g_HookedEventRanges[i].Min, g_HookedEventRanges[i].Max);
+        }
+
+        // Whatever happened while the hooks were down is unknown to us.
+        QueueWindowEvent(NULL, 0, TRUE);
+
+        while (TRUE)
+        {
+            // Out-of-context hook callbacks are delivered by the system while this
+            // thread retrieves messages, so this wait must be message-aware.
+            DWORD signaled = MsgWaitForMultipleObjects(WINDOW_EVENT_WAIT_COUNT, waitFor, FALSE, INFINITE, QS_ALLINPUT);
+
+            if (signaled == WAIT_OBJECT_0) // stop
+            {
+                exitThread = TRUE;
+                break;
+            }
+
+            if (signaled == WAIT_OBJECT_0 + 1) // rearm on a new desktop
+                break;
+
+            if (signaled == WAIT_OBJECT_0 + WINDOW_EVENT_WAIT_COUNT) // message(s) queued
+            {
+                MSG msg;
+
+                while (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE))
+                {
+                    if (msg.message == WM_QUIT)
+                    {
+                        exitThread = TRUE;
+                        break;
+                    }
+
+                    TranslateMessage(&msg);
+                    DispatchMessage(&msg);
+                }
+
+                if (exitThread)
+                    break;
+
+                continue;
+            }
+
+            win_perror("MsgWaitForMultipleObjects");
+            exitThread = TRUE;
+            break;
+        }
+
+        for (UINT i = 0; i < RTL_NUMBER_OF(hooks); i++)
+        {
+            if (hooks[i])
+                UnhookWinEvent(hooks[i]);
+        }
+    }
+
+    if (ownDesktop)
+        CloseDesktop(ownDesktop);
+
+    // D7: if this thread ever exits, event-driven tracking stops and window moves fall back
+    // to the 2 s resync - i.e. 0.5 Hz, WORSE than the 6.6 Hz the old per-frame enumeration
+    // achieved. Make that loud rather than a silent regression, and let the frame path fall
+    // back to a short resync so behaviour degrades to roughly the old code instead.
+    LogError("window event thread exiting - tracking falls back to periodic resync");
+    InterlockedExchange(&g_WindowEventThreadDead, 1);
+
+    LogDebug("end");
+    return ERROR_SUCCESS;
+}
+
+// Tell the hook thread to reattach to the current input desktop and rearm.
+static void RearmWindowEvents(void)
+{
+    if (g_WindowEventRearm)
+        SetEvent(g_WindowEventRearm);
+}
+
+static ULONG StartWindowEventThread(void)
+{
+    InitializeCriticalSection(&g_csWindowEvents);
+
+    g_WindowEventSignal = CreateEvent(NULL, FALSE, FALSE, NULL);
+    g_WindowEventRearm = CreateEvent(NULL, FALSE, FALSE, NULL);
+    g_WindowEventStop = CreateEvent(NULL, TRUE, FALSE, NULL);
+    if (!g_WindowEventSignal || !g_WindowEventRearm || !g_WindowEventStop)
+        return win_perror("CreateEvent");
+
+    g_WindowEventThread = CreateThread(NULL, 0, WindowEventThreadProc, NULL, 0, NULL);
+    if (!g_WindowEventThread)
+        return win_perror("CreateThread(window events)");
+
+    return ERROR_SUCCESS;
+}
+
+static void StopWindowEventThread(void)
+{
+    if (!g_WindowEventThread)
+        return;
+
+    SetEvent(g_WindowEventStop);
+    if (WAIT_OBJECT_0 != WaitForSingleObject(g_WindowEventThread, 2000))
+        LogWarning("window event thread didn't exit in time");
+
+    CloseHandle(g_WindowEventThread);
+    g_WindowEventThread = NULL;
+}
+
 #ifdef DEBUG_DUMP_WINDOWS
 // FIXME: this fails for UWP apps
 void DumpWindowBitmap(const WINDOW_DATA* data)
@@ -436,7 +855,7 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         // But, for SOME reason, *sometimes* these windows don't have the iconic flag set, and their size is 0...
         // TODO: enumerate taskbar buttons to properly detect such cases,
         // this seems to require using UI Automation interfaces.
-        if (wcscmp(entry->Class, L"$$$Secure UAP Dummy Window Class For Interim Dialog") == 0)
+        if (wcscmp(entry->Class, UAC_DUMMY_WINDOW_CLASS) == 0)
         {
             // For now we hide these windows and mark the taskbar to be shown
             // because programatically activating them doesn't seem to work.
@@ -557,50 +976,227 @@ end:
     return status;
 }
 
-// EnumWindows callback for adding all eligible top-level windows to the list.
-// watched windows critical section must be entered
-static BOOL CALLBACK AddWindowsProc(IN HWND window, IN LPARAM lParam)
+/*
+ * Cache of windows that were interrogated and found ineligible.
+ *
+ * Without it every resync would re-interrogate the ~70 windows that a Windows
+ * desktop keeps around and never shows. Entries are only trusted while nothing
+ * cheaply observable about the window changed, so a window that becomes eligible
+ * is re-admitted even if we never saw an event for it.
+ *
+ * Accessed by the main loop only, with the watched windows critical section held.
+ */
+typedef struct _REJECTED_WINDOW
 {
-    UNREFERENCED_PARAMETER(lParam);
-    ULONG status;
+    HWND  Handle;
+    DWORD ProcessId; // creator ids: guard against handle reuse
+    DWORD ThreadId;
+    DWORD Style;     // cheap change detectors, no cross-process calls involved
+    DWORD ExStyle;
+    RECT  Rect;
+} REJECTED_WINDOW;
 
-    WINDOW_DATA* data = FindWindowByHandle(window);
-    if (data) // already in the list
+static REJECTED_WINDOW g_RejectedWindows[REJECTED_WINDOWS_MAX];
+static UINT g_RejectedWindowsCount = 0;
+
+static int FindRejectedWindow(IN HWND window)
+{
+    for (UINT i = 0; i < g_RejectedWindowsCount; i++)
     {
-        LogVerbose("0x%x: end (existing)", window);
-        return TRUE; // skip to next window
+        if (g_RejectedWindows[i].Handle == window)
+            return (int)i;
     }
 
-    // window not in list, get its data and add
+    return -1;
+}
+
+static void EvictRejectedWindow(IN HWND window)
+{
+    int index = FindRejectedWindow(window);
+
+    if (index < 0)
+        return;
+
+    g_RejectedWindowsCount--;
+    g_RejectedWindows[index] = g_RejectedWindows[g_RejectedWindowsCount];
+    ZeroMemory(&g_RejectedWindows[g_RejectedWindowsCount], sizeof(REJECTED_WINDOW));
+}
+
+static void ClearRejectedWindows(void)
+{
+    ZeroMemory(g_RejectedWindows, sizeof(g_RejectedWindows));
+    g_RejectedWindowsCount = 0;
+}
+
+// Remember a window as ineligible. The caller must have evicted any previous entry.
+// The signature MUST be sampled by the caller BEFORE the window is interrogated, and
+// passed in here. Sampling it after the accept/reject decision would bake in any state
+// change that happened *during* the interrogation: if the owner calls ShowWindow() in that
+// gap we would cache the already-visible signature, and if the resulting EVENT_OBJECT_SHOW
+// is then coalesced or dropped, every later resync would compare "unchanged" and the window
+// would never be shown in dom0 again. That defeats the 2 s resync in exactly the case it
+// exists for.
+static void CacheRejectedWindow(IN HWND window, IN const REJECTED_WINDOW* signature)
+{
+    UINT index;
+    REJECTED_WINDOW* rejected;
+
+    if (g_RejectedWindowsCount < REJECTED_WINDOWS_MAX)
+    {
+        index = g_RejectedWindowsCount++;
+    }
+    else
+    {
+        // Full: reuse a slot held by a window that no longer exists. If there is
+        // none, just don't cache this one, the only cost is interrogating it again
+        // on the next resync.
+        for (index = 0; index < REJECTED_WINDOWS_MAX; index++)
+        {
+            if (!IsWindow(g_RejectedWindows[index].Handle))
+                break;
+        }
+
+        if (index == REJECTED_WINDOWS_MAX)
+        {
+            LogWarning("rejected window cache full");
+            return;
+        }
+    }
+
+    rejected = &g_RejectedWindows[index];
+    *rejected = *signature;
+    rejected->Handle = window;
+}
+
+// Sample the cheap signature used by the reject cache. Must be called BEFORE interrogating
+// the window (see CacheRejectedWindow).
+static void SampleWindowSignature(IN HWND window, OUT REJECTED_WINDOW* signature)
+{
+    ZeroMemory(signature, sizeof(*signature));
+    signature->Handle = window;
+    signature->ThreadId = GetWindowThreadProcessId(window, &signature->ProcessId);
+    signature->Style = (DWORD)GetWindowLong(window, GWL_STYLE);
+    signature->ExStyle = (DWORD)GetWindowLong(window, GWL_EXSTYLE);
+    GetWindowRect(window, &signature->Rect);
+}
+
+// TRUE if the window is known to be ineligible and nothing we can check cheaply
+// changed since it was rejected. Deliberately avoids everything that made the old
+// per-frame enumeration expensive: no window text, no DWM calls, no allocation.
+static BOOL IsWindowRejected(IN HWND window)
+{
+    int index = FindRejectedWindow(window);
+    const REJECTED_WINDOW* rejected;
+    DWORD processId = 0;
+    DWORD threadId;
+    RECT rect;
+
+    if (index < 0)
+        return FALSE;
+
+    rejected = &g_RejectedWindows[index];
+
+    // Windows recycles window handles: a handle that now belongs to a different
+    // thread or process is a different window, and the entry must not apply to it.
+    // (Both ids are 0 if the window is gone.)
+    threadId = GetWindowThreadProcessId(window, &processId);
+    if (threadId != rejected->ThreadId || processId != rejected->ProcessId)
+        return FALSE;
+
+    // Backstop for a lost event: everything that can make a window eligible
+    // (WS_VISIBLE, size, extended styles) also changes one of these.
+    if ((DWORD)GetWindowLong(window, GWL_STYLE) != rejected->Style ||
+        (DWORD)GetWindowLong(window, GWL_EXSTYLE) != rejected->ExStyle)
+        return FALSE;
+
+    if (!GetWindowRect(window, &rect) || !EqualRect(&rect, &rejected->Rect))
+        return FALSE;
+
+    return TRUE;
+}
+
+// Interrogate a window that isn't tracked yet: add it to the watched list if it
+// qualifies, otherwise remember it as ineligible.
+// Watched windows critical section must be entered.
+static ULONG ExamineWindow(IN HWND window, IN OUT UINT* interrogated)
+{
+    WINDOW_DATA* data = NULL;
+    ULONG status;
+    REJECTED_WINDOW signature;
+
+    EvictRejectedWindow(window); // whatever we knew about it is being refreshed now
+    // Sample BEFORE interrogating: see CacheRejectedWindow for why sampling afterwards can
+    // permanently hide a window that became eligible mid-interrogation.
+    SampleWindowSignature(window, &signature);
+    (*interrogated)++;
+
     status = GetWindowData(window, &data);
     if (status != ERROR_SUCCESS)
     {
-        LogVerbose("0x%x: end (error)", window);
-        return TRUE;
+        // Typically a window DWM knows nothing about, so it can't be mapped anyway.
+        LogVerbose("0x%x: GetWindowData failed (0x%x)", window, status);
+        if (data)
+            free(data);
+        CacheRejectedWindow(window, &signature);
+        return ERROR_SUCCESS;
     }
 
     if (!ShouldAcceptWindow(data))
     {
-        LogVerbose("0x%x: end (skipping)", window);
-        return TRUE;
+        // Interrogating these has a side effect on global state that AddAllWindows()
+        // recomputes from scratch (the UAC placeholder sets g_ShowTaskbar, Start sets
+        // g_StartVisible which in turn gates Search), so they must not be skipped.
+        if (window != g_StartWindow && window != g_SearchWindow &&
+            0 != wcscmp(data->Class, UAC_DUMMY_WINDOW_CLASS))
+        {
+            CacheRejectedWindow(window, &signature);
+        }
+
+        LogVerbose("0x%x: rejected", window);
+        free(data);
+        return ERROR_SUCCESS;
     }
 
-    status = AddWindow(data);
+    status = AddWindow(data); // the list takes ownership of data
     if (ERROR_SUCCESS != status)
-    {
         win_perror2(status, "AddWindow");
-        LogVerbose("0x%x: end (add failed, exiting)", window);
-        return FALSE; // stop enumeration, fatal error occurred (should probably exit process at this point)
-    }
 
-    LogVerbose("0x%x: end (new, added)", window);
+    return status;
+}
+
+typedef struct _ADD_WINDOWS_CONTEXT
+{
+    UINT Interrogated; // windows whose state was actually queried
+    ULONG Status;
+} ADD_WINDOWS_CONTEXT;
+
+// EnumWindows callback for adding all eligible top-level windows to the list.
+// watched windows critical section must be entered
+static BOOL CALLBACK AddWindowsProc(IN HWND window, IN LPARAM lParam)
+{
+    ADD_WINDOWS_CONTEXT* context = (ADD_WINDOWS_CONTEXT*)lParam;
+
+    if (FindWindowByHandle(window)) // already in the list
+        return TRUE; // skip to next window
+
+    if (IsWindowRejected(window)) // known to be ineligible, and unchanged since
+        return TRUE;
+
+    context->Status = ExamineWindow(window, &context->Interrogated);
+    if (ERROR_SUCCESS != context->Status)
+        return FALSE; // stop enumeration, fatal error occurred (should probably exit process at this point)
+
     return TRUE;
 }
 
 // Adds all top-level windows to the watched list.
+// This is the resync path: the watched list is normally maintained from window
+// events instead (see TrackWindows).
 // watched windows critical section must be entered
-static ULONG AddAllWindows(void)
+static ULONG AddAllWindows(IN OUT UINT* interrogated)
 {
+    ADD_WINDOWS_CONTEXT context = { 0 };
+
     LogVerbose("start");
 
     g_TaskbarWindow = FindWindow(L"Shell_TrayWnd", 0);
@@ -608,8 +1204,10 @@ static ULONG AddAllWindows(void)
 
     ULONG status = ERROR_SUCCESS;
     // Enum top-level windows and add all that are not filtered.
-    if (!EnumWindows(AddWindowsProc, 0))
-        status = win_perror("EnumWindows");
+    if (!EnumWindows(AddWindowsProc, (LPARAM)&context))
+        status = context.Status != ERROR_SUCCESS ? context.Status : win_perror("EnumWindows");
+
+    *interrogated += context.Interrogated;
 
     if (g_TaskbarWindow)
     {
@@ -622,6 +1220,8 @@ static ULONG AddAllWindows(void)
             LogDebug("showing taskbar");
             ShowWindow(g_TaskbarWindow, SW_SHOW);
             taskbarEntry = NULL;
+            EvictRejectedWindow(g_TaskbarWindow);
+            (*interrogated)++;
             status = GetWindowData(g_TaskbarWindow, &taskbarEntry);
             if (status != ERROR_SUCCESS)
             {
@@ -673,6 +1273,8 @@ static ULONG ResetWatch(BOOL seamlessMode)
         entry = nextEntry;
     }
 
+    ClearRejectedWindows(); // window acceptance is being decided from scratch
+
     LeaveCriticalSection(&g_csWatchedWindows);
 
     g_DesktopWindow = NULL;
@@ -681,12 +1283,17 @@ static ULONG ResetWatch(BOOL seamlessMode)
     // WatchForEvents will map the whole screen as one window.
     if (seamlessMode)
     {
+        UINT interrogated = 0;
+
         LogVerbose("seamless mode, adding all windows");
         // Add all eligible windows to watch list.
         // Since this is a switch from fullscreen, no windows were watched.
         EnterCriticalSection(&g_csWatchedWindows);
-        status = AddAllWindows();
+        status = AddAllWindows(&interrogated);
         LeaveCriticalSection(&g_csWatchedWindows);
+
+        // The list is authoritative again, restart the resync interval.
+        g_LastResyncTime = GetTickCount();
 
         if (g_TaskbarWindow)
             ShowWindow(g_TaskbarWindow, SW_HIDE);
@@ -1010,6 +1617,184 @@ end:
     return status;
 }
 
+// What one TrackWindows() pass did, for the QGAPERF instrumentation.
+typedef struct _TRACK_STATS
+{
+    LONGLONG UpdateTicks;   // refreshing already tracked windows
+    LONGLONG EnumTicks;     // admitting new windows
+    LONGLONG RemoveTicks;   // dropping windows that became ineligible
+    UINT Interrogated;      // windows whose state was actually queried
+    UINT Events;            // window events applied
+    BOOL Resync;            // this pass was a full EnumWindows() resync
+} TRACK_STATS;
+
+// Tracking work accumulated between frames (window events processed while no frame
+// was being handled). Folded into the next frame's record so the QGAPERF numbers
+// keep accounting for all of the tracking cost. Main loop only.
+static LONGLONG g_TrackedUpdateTicks = 0;
+static LONGLONG g_TrackedEnumTicks = 0;
+static LONGLONG g_TrackedRemoveTicks = 0;
+static UINT g_TrackedInterrogated = 0;
+static UINT g_TrackedEvents = 0;
+
+// One window tracking pass: apply the events collected by the hook thread (or
+// re-enumerate everything if a resync is due) and send the resulting notifications
+// to the gui daemon.
+// Watched windows critical section must be entered.
+static ULONG TrackWindows(OUT TRACK_STATS* stats)
+{
+    HWND pending[PENDING_WINDOWS_MAX];
+    DWORD pendingEvents[PENDING_WINDOWS_MAX]; // why each was queued (see WindowEventForcesReexamine)
+    UINT pendingCount = 0;
+    WINDOW_DATA* entry;
+    WINDOW_DATA* nextEntry;
+    ULONG phaseStatus = ERROR_SUCCESS;
+    // Like the code this replaces, only a failed removal is reported to the caller:
+    // failing to read or add one window must not abort processing of the frame.
+    ULONG status = ERROR_SUCCESS;
+    LONGLONG perfPhase, perfSendPhase;
+
+    ZeroMemory(stats, sizeof(*stats));
+    stats->Resync = TakePendingWindows(pending, pendingEvents, PENDING_WINDOWS_MAX, &pendingCount);
+    stats->Events = pendingCount;
+
+    // Refresh the state of tracked windows: all of them on a resync, otherwise only
+    // those an event was reported for. If a window is no longer eligible (destroyed,
+    // hidden...) then mark it for removal but keep it in the list for now, so that
+    // the next phase can skip it.
+    perfPhase = PerfNow();
+    perfSendPhase = g_PerfSendTicks;
+
+    if (stats->Resync)
+    {
+        entry = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+        while (entry != (WINDOW_DATA*)&g_WatchedWindowsList)
+        {
+            entry = CONTAINING_RECORD(entry, WINDOW_DATA, ListEntry);
+            nextEntry = (WINDOW_DATA*)entry->ListEntry.Flink;
+
+            stats->Interrogated++;
+            phaseStatus = UpdateWindowData(entry);
+            if (phaseStatus != ERROR_SUCCESS)
+            {
+                win_perror2(phaseStatus, "UpdateWindowData");
+                entry->DeletePending = TRUE;
+                // TODO: exit if there was a vchan failure and we not just failed to get window data
+            }
+
+            entry = nextEntry;
+        }
+    }
+    else
+    {
+        for (UINT i = 0; i < pendingCount; i++)
+        {
+            entry = FindWindowByHandle(pending[i]);
+            if (!entry)
+                continue; // not tracked (yet), handled below
+
+            stats->Interrogated++;
+            phaseStatus = UpdateWindowData(entry);
+            if (phaseStatus != ERROR_SUCCESS)
+            {
+                win_perror2(phaseStatus, "UpdateWindowData");
+                entry->DeletePending = TRUE;
+            }
+        }
+    }
+
+    stats->UpdateTicks = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
+    perfPhase = PerfNow();
+    perfSendPhase = g_PerfSendTicks;
+
+    // Admit windows that aren't tracked yet.
+    if (stats->Resync)
+    {
+        AddAllWindows(&stats->Interrogated);
+    }
+    else
+    {
+        for (UINT i = 0; i < pendingCount; i++)
+        {
+            if (FindWindowByHandle(pending[i])) // tracked, refreshed above
+                continue;
+
+            if (!IsWindow(pending[i])) // gone, nothing to add
+            {
+                EvictRejectedWindow(pending[i]);
+                continue;
+            }
+
+            // An event means "look at this one again" - but only actually re-interrogate
+            // when the cached rejection can no longer be trusted. Without this check an
+            // ineligible but event-noisy window (DWM helpers, tooltips, hidden Electron
+            // frames, anything dragged) re-pays the full ~340 us GetWindowText +
+            // DwmGetWindowAttribute cost on every event, at input rate, holding
+            // g_csWatchedWindows - exactly the cost Phase 2A removes, on an unbounded
+            // guest-controlled schedule.
+            if (!WindowEventForcesReexamine(pendingEvents[i]) && IsWindowRejected(pending[i]))
+                continue;
+
+            phaseStatus = ExamineWindow(pending[i], &stats->Interrogated);
+            if (phaseStatus != ERROR_SUCCESS)
+            {
+                // D8: the rest of this batch was already dequeued and would be lost.
+                QueueWindowEvent(NULL, 0, TRUE);
+                break;
+            }
+        }
+    }
+
+    stats->EnumTicks = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
+    perfPhase = PerfNow();
+    perfSendPhase = g_PerfSendTicks;
+
+    // Remove windows marked for deletion.
+    entry = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (entry != (WINDOW_DATA*)&g_WatchedWindowsList)
+    {
+        entry = CONTAINING_RECORD(entry, WINDOW_DATA, ListEntry);
+        nextEntry = (WINDOW_DATA*)entry->ListEntry.Flink;
+
+        if (entry->DeletePending)
+        {
+            ULONG removeStatus = RemoveWindow(entry);
+            if (removeStatus != ERROR_SUCCESS)
+            {
+                win_perror2(removeStatus, "RemoveWindow");
+                status = removeStatus;
+                break;
+            }
+        }
+
+        entry = nextEntry;
+    }
+
+    stats->RemoveTicks = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
+    return status;
+}
+
+// Apply pending window events outside of frame processing. This is what makes
+// window moves reach the gui daemon at input rate instead of at capture rate.
+static void ProcessWindowEvents(void)
+{
+    TRACK_STATS stats;
+    ULONG status;
+
+    EnterCriticalSection(&g_csWatchedWindows);
+    status = TrackWindows(&stats);
+    LeaveCriticalSection(&g_csWatchedWindows);
+
+    if (status != ERROR_SUCCESS)
+        win_perror2(status, "TrackWindows");
+
+    g_TrackedUpdateTicks += stats.UpdateTicks;
+    g_TrackedEnumTicks += stats.EnumTicks;
+    g_TrackedRemoveTicks += stats.RemoveTicks;
+    g_TrackedInterrogated += stats.Interrogated;
+    g_TrackedEvents += stats.Events;
+}
+
 // Called after receiving new frame.
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
 {
@@ -1024,7 +1809,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
     LONG perfSendCountBase = g_PerfSendCount;
     LONGLONG perfPhase = 0, perfSendPhase = 0;
     LONGLONG perfUpdate = 0, perfEnum = 0, perfRemove = 0, perfDamage = 0;
-    UINT perfWindows = 0;
+    LONGLONG perfTrackedOutOfFrame = 0; // tracking ticks accumulated between frames
+    UINT perfWindows = 0, perfInterrogated = 0, perfEvents = 0;
+    TRACK_STATS track;
 
     LogVerbose("start");
     if (!g_SeamlessMode)
@@ -1053,7 +1840,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         PerfEmitFrame(FALSE, perfFrameStart, PerfNow() - perfFrameStart,
             0, 0, 0, perfDamage,
             g_PerfSendTicks - perfSendBase, g_PerfSendCount - perfSendCountBase,
-            &frame->perf, frame->dirty_rects_count, 1);
+            &frame->perf, frame->dirty_rects_count, 1, 0, 0);
 
         LogVerbose("end (fullscreen)");
         return ERROR_SUCCESS;
@@ -1061,63 +1848,32 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
 
     EnterCriticalSection(&g_csWatchedWindows);
 
-    // TODO: don't enumerate all windows every time, use window hooks to monitor for changes
+    // Bring the watched window list up to date from the events the hook thread
+    // collected (or resync it wholesale, periodically). This used to be an
+    // EnumWindows() pass over every top-level window on every single frame.
+    status = TrackWindows(&track);
+
+    // Tracking done between frames belongs to this frame's accounting too, or the
+    // work would simply vanish from the QGAPERF numbers.
+    perfUpdate = track.UpdateTicks + g_TrackedUpdateTicks;
+    perfEnum = track.EnumTicks + g_TrackedEnumTicks;
+    perfRemove = track.RemoveTicks + g_TrackedRemoveTicks;
+    perfInterrogated = track.Interrogated + g_TrackedInterrogated;
+    perfEvents = track.Events + g_TrackedEvents;
+    // ...which means `tot` must include it as well. `tot` is otherwise
+    // (PerfNow() - perfFrameStart), i.e. in-frame only, so once most tracking moves
+    // BETWEEN frames (which is the whole point of the hook) upd+enu would exceed tot and
+    // analyze-perf.py would report shares >100% and a negative "unaccounted". The one
+    // number Phase 2A is judged on has to balance.
+    perfTrackedOutOfFrame = g_TrackedUpdateTicks + g_TrackedEnumTicks + g_TrackedRemoveTicks;
+    g_TrackedUpdateTicks = g_TrackedEnumTicks = g_TrackedRemoveTicks = 0;
+    g_TrackedInterrogated = g_TrackedEvents = 0;
 
     perfPhase = PerfNow();
     perfSendPhase = g_PerfSendTicks;
 
-    // Update state of all tracked windows. If a window is no longer eligible (destroyed, hidden...)
-    // then mark it for removal but keep in the list for now, so AddAllWindows() can skip them.
-    entry = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
-    while (entry != (WINDOW_DATA*)&g_WatchedWindowsList)
-    {
-        entry = CONTAINING_RECORD(entry, WINDOW_DATA, ListEntry);
-        nextEntry = (WINDOW_DATA*)entry->ListEntry.Flink;
-        status = UpdateWindowData(entry);
-        if (status != ERROR_SUCCESS)
-        {
-            win_perror2(status, "UpdateWindowData");
-            entry->DeletePending = TRUE;
-            // TODO: exit if there was a vchan failure and we not just failed to get window data
-        }
-
-        entry = nextEntry;
-    }
-
-    perfUpdate = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
-    perfPhase = PerfNow();
-    perfSendPhase = g_PerfSendTicks;
-
-    // Enumerate all top-level windows and all eligible ones to the list if not already there.
-    AddAllWindows();
-
-    perfEnum = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
-    perfPhase = PerfNow();
-    perfSendPhase = g_PerfSendTicks;
-
-    // Remove windows marked for deletion.
-    entry = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
-    while (entry != (WINDOW_DATA*)&g_WatchedWindowsList)
-    {
-        entry = CONTAINING_RECORD(entry, WINDOW_DATA, ListEntry);
-        nextEntry = (WINDOW_DATA*)entry->ListEntry.Flink;
-
-        if (entry->DeletePending)
-        {
-            status = RemoveWindow(entry);
-            if (status != ERROR_SUCCESS)
-            {
-                win_perror2(status, "RemoveWindow");
-                goto cleanup;
-            }
-        }
-
-        entry = nextEntry;
-    }
-
-    perfRemove = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
-    perfPhase = PerfNow();
-    perfSendPhase = g_PerfSendTicks;
+    if (status != ERROR_SUCCESS)
+        goto cleanup;
 
     // send damage notifications
     entry = (WINDOW_DATA *)g_WatchedWindowsList.Flink;
@@ -1165,10 +1921,12 @@ cleanup:
     perfDamage = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
     LeaveCriticalSection(&g_csWatchedWindows);
 
-    PerfEmitFrame(TRUE, perfFrameStart, PerfNow() - perfFrameStart,
+    // tot includes the tracking that happened between frames (see perfTrackedOutOfFrame),
+    // so that upd+enu+rem+dmg+snd stays <= tot and the shares remain meaningful.
+    PerfEmitFrame(TRUE, perfFrameStart, PerfNow() - perfFrameStart + perfTrackedOutOfFrame,
         perfUpdate, perfEnum, perfRemove, perfDamage,
         g_PerfSendTicks - perfSendBase, g_PerfSendCount - perfSendCountBase,
-        &frame->perf, frame->dirty_rects_count, perfWindows);
+        &frame->perf, frame->dirty_rects_count, perfWindows, perfInterrogated, perfEvents);
 
     LogVerbose("end (%x)", status);
     return status;
@@ -1178,6 +1936,8 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
 {
     LogVerbose("start");
     AttachToInputDesktop();
+    // The hook thread has its own desktop association, it must follow.
+    RearmWindowEvents();
     // Initialize capture interfaces, this also initializes framebuffer PFNs
     *capture = CaptureInitialize(newFrameEvent, captureErrorEvent);
     if (!(*capture))
@@ -1277,7 +2037,9 @@ static ULONG WINAPI WatchForEvents(void)
     watchedEvents[3] = fullScreenOffEvent;
     watchedEvents[4] = libvchan_fd_for_select(g_Vchan);
     watchedEvents[5] = captureErrorEvent;
-    eventCount = 6;
+    // Last, so that WaitForMultipleObjects prefers frames and vchan traffic to it.
+    watchedEvents[6] = g_WindowEventSignal;
+    eventCount = 7;
 
     CAPTURE_CONTEXT* capture = NULL;
 
@@ -1448,6 +2210,18 @@ static ULONG WINAPI WatchForEvents(void)
             StopFrameProcessing(&capture);
             // CaptureTeardown() is delayed until we receive confirming MSG_DESTROY for 0x0 from gui daemon
             // revoking framebuffer access before that is unsafe
+            break;
+
+        case 6: // window events collected by the hook thread
+            // Applying them here instead of only when the next frame arrives is what
+            // gets window moves to the gui daemon at input rate.
+            // Nothing is sent while the screen window is destroyed (between a capture
+            // error and the restart that follows it); the discarded events are covered
+            // by the resync that ResetWatch/DiscardWindowEvents leave pending.
+            if (g_VchanClientConnected && g_SeamlessMode && !g_LocalScreenDestroyed)
+                ProcessWindowEvents();
+            else
+                DiscardWindowEvents();
             break;
         }
 
@@ -1634,6 +2408,12 @@ static ULONG Init(void)
 
     g_MinWindowWidth = GetSystemMetrics(SM_CXMIN);
     g_MinWindowHeight = GetSystemMetrics(SM_CYMIN);
+
+    // Must be running before the main loop starts waiting on g_WindowEventSignal.
+    status = StartWindowEventThread();
+    if (ERROR_SUCCESS != status)
+        return status;
+
     return ERROR_SUCCESS;
 }
 
@@ -1651,8 +2431,12 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
     // Call the thread proc directly.
     if (ERROR_SUCCESS != WatchForEvents())
+    {
+        StopWindowEventThread();
         return win_perror("WatchForEvents");
+    }
 
+    StopWindowEventThread();
     DeleteCriticalSection(&g_VchanCriticalSection);
 
     LogInfo("exiting");

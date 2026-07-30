@@ -50,6 +50,8 @@ typedef struct _PERF_ACC
     UINT     dirty_rects;
     UINT     move_rects;
     UINT64   dirty_area;
+    UINT     interrogated;  // windows actually queried
+    UINT     events;        // window events applied
     UINT     windows;   // last value, not a sum
     BOOL     seamless;  // last value
 } PERF_ACC;
@@ -109,7 +111,7 @@ void PerfInit(void)
 
     LogInfo("QGAPERF on: freq=%I64d everyN=%u qpc_cost_ns=%I64d default=%d (sink %I64d)",
         g_PerfFreq, g_PerfEveryN, qpcCostNs, QGA_PERF_DEFAULT, sink);
-    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,sends,skip,log (times in microseconds)",
+    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,log (times in microseconds)",
         PERF_RECORD_VERSION);
 }
 
@@ -151,7 +153,9 @@ void PerfEmitFrame(
     IN LONG send_count,
     IN const PERF_CAPTURE* cap,
     IN UINT dirty_rects,
-    IN UINT window_count)
+    IN UINT window_count,
+    IN UINT interrogated,
+    IN UINT window_events)
 {
     if (!g_PerfEnabled)
         return;
@@ -178,6 +182,8 @@ void PerfEmitFrame(
     g_Acc.total += total_ticks;
     g_Acc.sends += send_count;
     g_Acc.dirty_rects += dirty_rects;
+    g_Acc.interrogated += interrogated;
+    g_Acc.events += window_events;
     g_Acc.windows = window_count;
     g_Acc.seamless = seamless;
 
@@ -189,7 +195,7 @@ void PerfEmitFrame(
     // One line, integers only, no allocation and no string building of our own.
     LogInfo("QGAPERF,v=%d,seq=%I64u,n=%u,mode=%c,dt=%I64d,acq=%I64d,wak=%I64d,mrq=%I64d,drq=%I64d,"
         L"upd=%I64d,enu=%I64d,rem=%I64d,dmg=%I64d,snd=%I64d,tot=%I64d,"
-        L"dr=%u,mr=%u,mrmax=%u,area=%I64u,win=%u,sends=%d,skip=%d,log=%I64d",
+        L"dr=%u,mr=%u,mrmax=%u,area=%I64u,win=%u,iwn=%u,wev=%u,sends=%d,skip=%d,log=%I64d",
         PERF_RECORD_VERSION,
         g_Seq,
         g_Acc.frames,
@@ -210,6 +216,8 @@ void PerfEmitFrame(
         g_MoveRectsMax,
         g_Acc.dirty_area,
         g_Acc.windows,
+        g_Acc.interrogated,
+        g_Acc.events,
         g_Acc.sends,
         InterlockedExchange(&g_SkippedFrames, 0),
         PerfUs(g_EmitTicks));

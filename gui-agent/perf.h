@@ -56,7 +56,8 @@
 #define PERF_ENV_VALUE L"QUBES_GUI_PERF"
 
 // Version of the CSV record format, bumped when fields change.
-#define PERF_RECORD_VERSION 1
+// v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
+#define PERF_RECORD_VERSION 2
 
 extern BOOL     g_PerfEnabled;  // master switch
 extern LONGLONG g_PerfFreq;     // QueryPerformanceFrequency, ticks per second
@@ -107,7 +108,9 @@ void PerfEmitFrame(
     IN LONG send_count,
     IN const PERF_CAPTURE* cap,
     IN UINT dirty_rects,
-    IN UINT window_count);
+    IN UINT window_count,
+    IN UINT interrogated,   // windows whose state was actually queried this frame
+    IN UINT window_events); // window events applied this frame
 
 // Returns 0 when instrumentation is disabled, so all the deltas computed from it are 0.
 static __forceinline LONGLONG PerfNow(void)
