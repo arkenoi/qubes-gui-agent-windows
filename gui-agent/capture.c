@@ -172,9 +172,17 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
     if (ctx->frame.texture) // never leak a frame we were holding
     {
         IDXGIOutputDuplication_ReleaseFrame(ctx->duplication);
-        ID3D11Texture2D_Release(ctx->frame.texture);
+        IDXGIResource_Release(ctx->frame.texture);
         ctx->frame.texture = NULL;
     }
+    // ReleaseFrame() can fail at UnMapDesktopSurface and leave `mapped` set, and it frees
+    // the rects only on the path it completes. The duplication object is going away, so
+    // reset the whole frame state or the replacement inherits stale flags and the next
+    // GetFrame asserts on a non-NULL texture / double-unmaps.
+    ctx->frame.mapped = FALSE;
+    free(ctx->frame.dirty_rects);
+    ctx->frame.dirty_rects = NULL;
+    ctx->frame.dirty_rects_count = 0;
     if (ctx->duplication)
     {
         IDXGIOutputDuplication_Release(ctx->duplication);
@@ -713,6 +721,20 @@ end_frame:
         status = ReleaseFrame(capture);
         if (FAILED(status))
         {
+            // ACCESS_LOST is raised here far more often than from AcquireNextFrame: by the
+            // time a desktop switch or mode change lands we are typically holding a frame,
+            // so the invalidation surfaces on release. Verified on the live guest - a
+            // desktop switch produced two ReleaseFrame 0x887A0026 failures and six window
+            // unmaps, with the acquire-side recovery never firing. Handle it identically
+            // here or the in-place recovery is unreachable in practice.
+            if (status == DXGI_ERROR_ACCESS_LOST || status == DXGI_ERROR_ACCESS_DENIED)
+            {
+                if (RecreateDuplication(capture))
+                    continue; // recovered in place, window list untouched
+
+                LogError("duplication lost on release and could not be recreated, reinitializing");
+            }
+
             LogDebug("signaling error due to failed frame release");
             SetEvent(capture->error_event);
             break;
