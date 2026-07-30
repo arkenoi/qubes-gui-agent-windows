@@ -1,0 +1,219 @@
+/*
+ * The Qubes OS Project, http://www.qubes-os.org
+ *
+ * Copyright (c) Invisible Things Lab
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU General Public License
+ * as published by the Free Software Foundation; either version 2
+ * of the License, or (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program; if not, write to the Free Software
+ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ *
+ */
+
+#include "perf.h"
+
+#include <log.h>
+#include <config.h>
+
+BOOL     g_PerfEnabled = FALSE;
+LONGLONG g_PerfFreq = 0;
+DWORD    g_PerfEveryN = 1;
+
+__declspec(thread) LONGLONG g_PerfSendTicks = 0;
+__declspec(thread) LONG     g_PerfSendCount = 0;
+
+// Accumulated over g_PerfEveryN frames. Touched only by the main loop.
+typedef struct _PERF_ACC
+{
+    UINT     frames;
+    LONGLONG dt;        // wall time covered by those frames
+    LONGLONG acquire;
+    LONGLONG wakeup;
+    LONGLONG moverect;
+    LONGLONG dirtyrect;
+    LONGLONG update;
+    LONGLONG enumerate;
+    LONGLONG remove;
+    LONGLONG damage;
+    LONGLONG send;
+    LONGLONG total;
+    LONG     sends;
+    UINT     dirty_rects;
+    UINT     move_rects;
+    UINT64   dirty_area;
+    UINT     windows;   // last value, not a sum
+    BOOL     seamless;  // last value
+} PERF_ACC;
+
+static PERF_ACC g_Acc;
+static UINT64   g_Seq = 0;              // processed frames since agent start
+static UINT     g_MoveRectsMax = 0;     // high water mark, survives into every record
+static BOOL     g_MoveRectsReported = FALSE;
+static LONGLONG g_PrevFrameQpc = 0;
+static LONGLONG g_EmitTicks = 0;        // cost of the *previous* emit, reported as "log"
+static volatile LONG g_SkippedFrames = 0;   // capture thread -> main loop
+
+void PerfInit(void)
+{
+    LARGE_INTEGER freq;
+    WCHAR moduleName[CFG_MODULE_MAX];
+    WCHAR env[8];
+    DWORD value;
+    BOOL enabled = (QGA_PERF_DEFAULT != 0);
+
+    QueryPerformanceFrequency(&freq);
+    g_PerfFreq = freq.QuadPart;
+
+    if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)))
+    {
+        if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PERF_VALUE, &value, NULL))
+            enabled = (value != 0);
+
+        if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PERF_EVERY_VALUE, &value, NULL) && value > 0)
+            g_PerfEveryN = value;
+    }
+
+    if (GetEnvironmentVariable(PERF_ENV_VALUE, env, RTL_NUMBER_OF(env)) > 0)
+        enabled = (env[0] != L'0');
+
+    g_PerfEnabled = enabled;
+
+    if (!g_PerfEnabled)
+    {
+        LogInfo("QGAPERF off");
+        return;
+    }
+
+    // Calibrate the self-cost: on a Xen HVM guest QPC may be backed by the TSC
+    // (~20-30ns) or by an emulated timer (~1us), which changes how much of the
+    // numbers below is measurement overhead. Measure instead of assuming.
+    LARGE_INTEGER a, b, t;
+    LONGLONG sink = 0;
+    QueryPerformanceCounter(&a);
+    for (int i = 0; i < 10000; i++)
+    {
+        QueryPerformanceCounter(&t);
+        sink += t.QuadPart;
+    }
+    QueryPerformanceCounter(&b);
+    LONGLONG qpcCostNs = g_PerfFreq ? ((b.QuadPart - a.QuadPart) * 1000000000LL) / g_PerfFreq / 10000LL : 0;
+
+    LogInfo("QGAPERF on: freq=%I64d everyN=%u qpc_cost_ns=%I64d default=%d (sink %I64d)",
+        g_PerfFreq, g_PerfEveryN, qpcCostNs, QGA_PERF_DEFAULT, sink);
+    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,sends,skip,log (times in microseconds)",
+        PERF_RECORD_VERSION);
+}
+
+void PerfNoteSkippedFrame(void)
+{
+    if (!g_PerfEnabled)
+        return;
+
+    InterlockedIncrement(&g_SkippedFrames);
+}
+
+void PerfNoteMoveRects(IN UINT count, IN LONG srcX, IN LONG srcY, IN const RECT* dst)
+{
+    if (!g_PerfEnabled || count == 0)
+        return;
+
+    if (count > g_MoveRectsMax)
+        g_MoveRectsMax = count;
+
+    if (!g_MoveRectsReported)
+    {
+        g_MoveRectsReported = TRUE;
+        // This is the answer to the "they seem to always be empty when testing"
+        // TODO in capture.c: if this line ever appears, move rects are usable.
+        LogInfo("QGAPERF-MOVERECTS: first non-empty GetFrameMoveRects: count=%u src=(%d,%d) dst=(%d,%d)-(%d,%d)",
+            count, srcX, srcY, dst->left, dst->top, dst->right, dst->bottom);
+    }
+}
+
+void PerfEmitFrame(
+    IN BOOL seamless,
+    IN LONGLONG frame_start_qpc,
+    IN LONGLONG total_ticks,
+    IN LONGLONG update_ticks,
+    IN LONGLONG enum_ticks,
+    IN LONGLONG remove_ticks,
+    IN LONGLONG damage_ticks,
+    IN LONGLONG send_ticks,
+    IN LONG send_count,
+    IN const PERF_CAPTURE* cap,
+    IN UINT dirty_rects,
+    IN UINT window_count)
+{
+    if (!g_PerfEnabled)
+        return;
+
+    g_Seq++;
+
+    g_Acc.frames++;
+    g_Acc.dt += g_PrevFrameQpc ? (frame_start_qpc - g_PrevFrameQpc) : 0;
+    g_PrevFrameQpc = frame_start_qpc;
+
+    g_Acc.acquire += cap->acquire_ticks;
+    g_Acc.wakeup += cap->signal_qpc ? (frame_start_qpc - cap->signal_qpc) : 0;
+    g_Acc.moverect += cap->moverect_ticks;
+    g_Acc.dirtyrect += cap->dirtyrect_ticks;
+    g_Acc.dirty_area += cap->dirty_area;
+    if (cap->move_rects_count != (UINT)-1)
+        g_Acc.move_rects += cap->move_rects_count;
+
+    g_Acc.update += update_ticks;
+    g_Acc.enumerate += enum_ticks;
+    g_Acc.remove += remove_ticks;
+    g_Acc.damage += damage_ticks;
+    g_Acc.send += send_ticks;
+    g_Acc.total += total_ticks;
+    g_Acc.sends += send_count;
+    g_Acc.dirty_rects += dirty_rects;
+    g_Acc.windows = window_count;
+    g_Acc.seamless = seamless;
+
+    if (g_Acc.frames < g_PerfEveryN)
+        return;
+
+    LONGLONG emitStart = PerfNow();
+
+    // One line, integers only, no allocation and no string building of our own.
+    LogInfo("QGAPERF,v=%d,seq=%I64u,n=%u,mode=%c,dt=%I64d,acq=%I64d,wak=%I64d,mrq=%I64d,drq=%I64d,"
+        L"upd=%I64d,enu=%I64d,rem=%I64d,dmg=%I64d,snd=%I64d,tot=%I64d,"
+        L"dr=%u,mr=%u,mrmax=%u,area=%I64u,win=%u,sends=%d,skip=%d,log=%I64d",
+        PERF_RECORD_VERSION,
+        g_Seq,
+        g_Acc.frames,
+        g_Acc.seamless ? L's' : L'f',
+        PerfUs(g_Acc.dt),
+        PerfUs(g_Acc.acquire),
+        PerfUs(g_Acc.wakeup),
+        PerfUs(g_Acc.moverect),
+        PerfUs(g_Acc.dirtyrect),
+        PerfUs(g_Acc.update),
+        PerfUs(g_Acc.enumerate),
+        PerfUs(g_Acc.remove),
+        PerfUs(g_Acc.damage),
+        PerfUs(g_Acc.send),
+        PerfUs(g_Acc.total),
+        g_Acc.dirty_rects,
+        g_Acc.move_rects,
+        g_MoveRectsMax,
+        g_Acc.dirty_area,
+        g_Acc.windows,
+        g_Acc.sends,
+        InterlockedExchange(&g_SkippedFrames, 0),
+        PerfUs(g_EmitTicks));
+
+    g_EmitTicks = PerfNow() - emitStart;
+    ZeroMemory(&g_Acc, sizeof(g_Acc));
+}

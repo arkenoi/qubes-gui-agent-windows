@@ -345,8 +345,10 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
     EnterCriticalSection(&ctx->frame.lock);
     assert(!ctx->frame.texture);
 
+    LONGLONG perf_t0 = PerfNow();
     HRESULT status = IDXGIOutputDuplication_AcquireNextFrame(ctx->duplication,
         timeout, &ctx->frame.info, &ctx->frame.texture);
+    ctx->frame.perf.acquire_ticks = PerfNow() - perf_t0;
     if (FAILED(status))
     {
         if (status != DXGI_ERROR_WAIT_TIMEOUT) // don't spam log with timeouts
@@ -401,7 +403,44 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
         assert(ctx->framebuffer == ctx->frame.rect.pBits);
     }
 
+    // Instrumentation: is GetFrameMoveRects ever non-empty? See the TODO below.
+    // MSDN mandates move rects are retrieved before dirty rects, so this must stay here.
+    // The results are only measured, never used to produce output.
+    ctx->frame.perf.move_rects_count = 0;
+    ctx->frame.perf.moverect_ticks = 0;
+    if (g_PerfEnabled)
+    {
+        DXGI_OUTDUPL_MOVE_RECT move_rects[64];
+        UINT mr_size = 0;
+        RECT no_rect = { 0, 0, 0, 0 };
+
+        perf_t0 = PerfNow();
+        HRESULT mr_status = IDXGIOutputDuplication_GetFrameMoveRects(ctx->duplication,
+            (UINT)sizeof(move_rects), move_rects, &mr_size);
+        ctx->frame.perf.moverect_ticks = PerfNow() - perf_t0;
+
+        if (SUCCEEDED(mr_status))
+        {
+            ctx->frame.perf.move_rects_count = mr_size / sizeof(DXGI_OUTDUPL_MOVE_RECT);
+            if (ctx->frame.perf.move_rects_count > 0)
+                PerfNoteMoveRects(ctx->frame.perf.move_rects_count,
+                    move_rects[0].SourcePoint.x, move_rects[0].SourcePoint.y,
+                    &move_rects[0].DestinationRect);
+        }
+        else if (mr_status == DXGI_ERROR_MORE_DATA)
+        {
+            // more than ARRAYSIZE(move_rects) move rects: report the count, don't retry
+            ctx->frame.perf.move_rects_count = mr_size / sizeof(DXGI_OUTDUPL_MOVE_RECT);
+            PerfNoteMoveRects(ctx->frame.perf.move_rects_count, 0, 0, &no_rect);
+        }
+        else
+        {
+            ctx->frame.perf.move_rects_count = (UINT)-1; // query failed
+        }
+    }
+
     // dirty rects
+    perf_t0 = PerfNow();
     UINT dr_size = 1; // initial buffer can't be empty
     RECT temp_rect;
 
@@ -429,6 +468,20 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
     }
 
     ctx->frame.dirty_rects_count = dr_size / sizeof(RECT);
+    ctx->frame.perf.dirtyrect_ticks = PerfNow() - perf_t0;
+
+    // Instrumentation: total damaged area, computed outside the timed region so
+    // it doesn't inflate the number it annotates. Capture thread only.
+    ctx->frame.perf.dirty_area = 0;
+    if (g_PerfEnabled)
+    {
+        for (UINT i = 0; i < ctx->frame.dirty_rects_count; i++)
+        {
+            ctx->frame.perf.dirty_area +=
+                (UINT64)(ctx->frame.dirty_rects[i].right - ctx->frame.dirty_rects[i].left) *
+                (UINT64)(ctx->frame.dirty_rects[i].bottom - ctx->frame.dirty_rects[i].top);
+        }
+    }
 
 #ifdef _DEBUG
     LogVerbose("%u dirty rects", ctx->frame.dirty_rects_count);
@@ -548,9 +601,13 @@ static DWORD WINAPI CaptureThread(void* param)
         }
 
         if (capture->frame.dirty_rects_count == 0)
+        {
+            PerfNoteSkippedFrame();
             goto end_frame; // framebuffer contents not changed
+        }
 
         // notify main loop that there's a new frame
+        capture->frame.perf.signal_qpc = PerfNow();
         SetEvent(capture->frame_event);
 
         // wait until main loop processes the frame
