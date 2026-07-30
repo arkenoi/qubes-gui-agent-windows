@@ -152,6 +152,69 @@ fail:
     return NULL;
 }
 
+static IDXGIOutputDuplication* GetDuplication(IN IDXGIOutput1* output, IN ID3D11Device* device, OUT UINT* width, OUT UINT* height);
+
+// Rebuild the duplication object in place after DXGI_ERROR_ACCESS_LOST/ACCESS_DENIED,
+// WITHOUT disturbing the watched window list. Returns TRUE if capture can continue.
+//
+// The mode and DesktopImageInSystemMemory can both change across the event (that is
+// often why it fired), so the desc is re-read by GetDuplication and a resolution change
+// is reported the same way the initial setup does. If the desktop is momentarily
+// unavailable - which is exactly what the secure desktop looks like - retry briefly
+// rather than giving up: the secure desktop typically lasts seconds.
+static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
+{
+    const UINT maxAttempts = 20;
+    const DWORD retryDelayMs = 250;
+    UINT width = 0, height = 0;
+
+    EnterCriticalSection(&ctx->frame.lock);
+    if (ctx->frame.texture) // never leak a frame we were holding
+    {
+        IDXGIOutputDuplication_ReleaseFrame(ctx->duplication);
+        ID3D11Texture2D_Release(ctx->frame.texture);
+        ctx->frame.texture = NULL;
+    }
+    if (ctx->duplication)
+    {
+        IDXGIOutputDuplication_Release(ctx->duplication);
+        ctx->duplication = NULL;
+    }
+    LeaveCriticalSection(&ctx->frame.lock);
+
+    for (UINT attempt = 0; attempt < maxAttempts; attempt++)
+    {
+        if (!InterlockedCompareExchange(&g_CaptureThreadEnable, FALSE, FALSE))
+            return FALSE; // asked to stop while recovering
+
+        IDXGIOutputDuplication* duplication = GetDuplication(ctx->output, ctx->device, &width, &height);
+        if (duplication)
+        {
+            EnterCriticalSection(&ctx->frame.lock);
+            ctx->duplication = duplication;
+            LeaveCriticalSection(&ctx->frame.lock);
+
+            if (width != ctx->width || height != ctx->height)
+            {
+                // The framebuffer geometry changed underneath us; the grants and the
+                // dom0-side window are sized for the old one, so a full reinit is the
+                // correct response here (unlike a plain ACCESS_LOST).
+                LogWarning("resolution changed during recovery (%ux%u -> %ux%u), reinitializing",
+                    ctx->width, ctx->height, width, height);
+                return FALSE;
+            }
+
+            LogDebug("duplication recreated after %u attempt(s)", attempt + 1);
+            return TRUE;
+        }
+
+        Sleep(retryDelayMs);
+    }
+
+    LogError("failed to recreate duplication after %u attempts", maxAttempts);
+    return FALSE;
+}
+
 static IDXGIOutputDuplication* GetDuplication(IN IDXGIOutput1* output, IN ID3D11Device* device, OUT UINT* width, OUT UINT* height)
 {
     LogVerbose("start");
@@ -591,9 +654,33 @@ static DWORD WINAPI CaptureThread(void* param)
                 continue; // no new frame available, wait for next one
             }
 
-            LogWarning("failed to get frame");
-            // this usually happens when the capture interface gets invalidated
-            // (desktop change etc)
+            // DXGI_ERROR_ACCESS_LOST (0x887A0026) is the ROUTINE "your duplication object
+            // is stale, make a new one" signal: it fires on mode changes, desktop
+            // switches, and every trip to the secure desktop (UAC / Ctrl-Alt-Del).
+            // DXGI_ERROR_ACCESS_DENIED (0x887A002B) is the secure desktop itself.
+            //
+            // Tearing everything down for these is wrong and user-visible: the main loop
+            // reinitialises and unmaps EVERY window, so the qube's windows vanish and
+            // reappear in dom0 after an entirely expected event. It also makes
+            // resolution changes (and therefore any future resize-follows-dom0-window
+            // feature) glitch by construction, since those raise ACCESS_LOST constantly.
+            //
+            // Note the log message this used to produce was itself misleading:
+            // win_perror2 renders 0x887A0026 through FormatMessage(FROM_SYSTEM), which
+            // prints the unrelated string "The keyed mutex was abandoned." There is no
+            // keyed mutex involved - see instrumentation/ACCESS-LOST-BUG.md.
+            if (status == DXGI_ERROR_ACCESS_LOST || status == DXGI_ERROR_ACCESS_DENIED)
+            {
+                if (RecreateDuplication(capture))
+                    continue; // recovered in place, window list untouched
+
+                LogError("duplication lost and could not be recreated, reinitializing");
+            }
+            else
+            {
+                LogWarning("failed to get frame");
+            }
+
             InterlockedExchange(&g_CaptureThreadEnable, FALSE);
             // notify main loop, it'll reinitialize everything
             SetEvent(capture->error_event);
