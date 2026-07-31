@@ -157,6 +157,25 @@ static HANDLE g_WindowEventThread = NULL;
 // 0.5 Hz, which is WORSE than the per-frame enumeration this replaced. Falling back to
 // roughly the old cadence is a regression to par, not below it.
 static volatile LONG g_WindowEventThreadDead = 0;
+
+// Window currently being dragged/resized interactively, or NULL. Damage for it is
+// SUPPRESSED until the drag ends, then the whole window is repainted once.
+//
+// Why: dom0 repaints a window only when we send damage for it, but it reads the pixels from
+// the shared framebuffer AT THAT WINDOW'S CURRENT RECT, live and asynchronously. During a
+// drag the rect changes continuously while the guest is still painting, so every damage
+// message makes dom0 re-read a region that is mid-repaint at a shifting position - the
+// content visibly slides around inside the frame ("wobble"). Sending configure on the frame
+// path instead of at input rate was tried and measured: frame rate rose to 23 fps with
+// configure frame-synced and the wobble remained, so message timing was not the cause.
+// Not sending damage at all during the drag means dom0 simply does not re-read: the content
+// stays as last painted (stable, briefly stale) and snaps correct on release.
+static volatile LONG_PTR g_MoveSizeWindow = 0;
+
+// Set to the window whose drag just ended; the frame path repaints it fully once and
+// clears this. A tracked window is not re-examined by ExamineWindow(), so queueing an
+// event alone would refresh its geometry but never repaint its pixels.
+static volatile LONG_PTR g_MoveSizeRepaint = 0;
 #define WINDOW_RESYNC_FALLBACK_MS 150
 
 #ifndef EVENT_OBJECT_CLOAKED // Win8+ SDK
@@ -170,6 +189,7 @@ static const struct
     DWORD Max;
 } g_HookedEventRanges[] =
 {
+    { EVENT_SYSTEM_MOVESIZESTART, EVENT_SYSTEM_MOVESIZEEND }, // interactive drag/resize
     { EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND }, // minimize/restore
     { EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH }, // secure desktop etc
     { EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE }, // create/destroy/show/hide
@@ -354,6 +374,22 @@ static void CALLBACK WindowEventProc(
     if (event == EVENT_SYSTEM_DESKTOPSWITCH)
     {
         QueueWindowEvent(NULL, 0, TRUE);
+        return;
+    }
+
+    if (event == EVENT_SYSTEM_MOVESIZESTART)
+    {
+        InterlockedExchangePointer((PVOID volatile*)&g_MoveSizeWindow, (PVOID)window);
+        return;
+    }
+
+    if (event == EVENT_SYSTEM_MOVESIZEEND)
+    {
+        InterlockedExchangePointer((PVOID volatile*)&g_MoveSizeWindow, NULL);
+        InterlockedExchangePointer((PVOID volatile*)&g_MoveSizeRepaint, (PVOID)window);
+        // Wake the loop: the drag is over, so geometry and a full repaint should go out now
+        // rather than waiting for the next frame.
+        QueueWindowEvent(window, EVENT_OBJECT_SHOW, FALSE);
         return;
     }
 
@@ -2018,6 +2054,22 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         RECT windowRect = { entry->X, entry->Y, entry->X + entry->Width, entry->Y + entry->Height };
         RECT changedArea; // intersection of damage rect with window rect
 
+        // A drag just ended for this window: everything we suppressed during the drag is
+        // still stale in dom0, so repaint the whole thing once instead of relying on
+        // whatever dirty rects happen to be in this frame.
+        if ((HWND)InterlockedCompareExchangePointer(
+                (PVOID volatile*)&g_MoveSizeRepaint, NULL, NULL) == entry->Handle)
+        {
+            InterlockedExchangePointer((PVOID volatile*)&g_MoveSizeRepaint, NULL);
+            if (entry->Width > 0 && entry->Height > 0)
+            {
+                ULONG repaint = SendWindowDamageEvent(entry->Handle, 0, 0,
+                    entry->Width, entry->Height);
+                if (ERROR_SUCCESS != repaint)
+                    win_perror2(repaint, "SendWindowDamageEvent(movesize-end)");
+            }
+        }
+
         // skip windows that aren't in the changed area
         for (UINT i = 0; i < frame->dirty_rects_count; i++)
         {
@@ -2028,6 +2080,12 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
                     frame->dirty_rects[i].left, frame->dirty_rects[i].top,
                     frame->dirty_rects[i].right - frame->dirty_rects[i].left, frame->dirty_rects[i].bottom - frame->dirty_rects[i].top,
                     changedArea.left, changedArea.top, changedArea.right - changedArea.left, changedArea.bottom - changedArea.top);
+
+                // Suppressed while this window is being dragged/resized - see
+                // g_MoveSizeWindow. The full repaint happens on MOVESIZEEND.
+                if ((HWND)InterlockedCompareExchangePointer(
+                        (PVOID volatile*)&g_MoveSizeWindow, NULL, NULL) == entry->Handle)
+                    continue;
 
                 status = SendWindowDamageEvent(entry->Handle,
                     changedArea.left - entry->X, // window-relative coords
