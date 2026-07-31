@@ -467,20 +467,20 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 
         if (replyToMessages && data != NULL)
         {
-            // ACK to the gui daemon so it won't stop sending MSG_CONFIGURE. Sent under
-            // g_csWatchedWindows so window removal (UNMAP/DESTROY, also under this lock)
-            // cannot interleave: an ACK for a just-destroyed window would hit the
-            // daemon's "msg without CREATE" exit(1). For the same reason no ACK at all
-            // for untracked windows. ovr always reflects the agent's own classification -
-            // echoing the daemon's value made the flag flap against our own CONFIGUREs.
-            ULONG ackStatus;
-            if (IsZoomed(window))
-                ackStatus = SendWindowConfigure(window,
-                    data->X, data->Y, data->Width, data->Height, data->IsOverrideRedirect);
-            else
-                ackStatus = SendWindowConfigure(window,
-                    configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height,
-                    data->IsOverrideRedirect);
+            // ACK to the gui daemon so it won't stop sending MSG_CONFIGURE. It MUST
+            // byte-echo the daemon's own values: the daemon recognizes the echo and
+            // no-ops it. ACKing anything else (tried: the agent's actual geometry for
+            // maximized windows) is processed as a real configure request - the daemon
+            // moveresizes its X window, the resulting ConfigureNotify emits a fresh
+            // MSG_CONFIGURE, and the pair spins at vchan speed. (The daemon ignores the
+            // override_redirect field of agent configures - xside.c:2105 - so echoing
+            // it is safe.) Sent under g_csWatchedWindows so window removal
+            // (UNMAP/DESTROY, also under this lock) cannot interleave: an ACK for a
+            // just-destroyed window would hit the daemon's "msg without CREATE"
+            // exit(1). For the same reason no ACK at all for untracked windows.
+            ULONG ackStatus = SendWindowConfigure(window,
+                configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height,
+                configureMsg.override_redirect);
             LeaveCriticalSection(&g_csWatchedWindows);
             return ackStatus;
         }
