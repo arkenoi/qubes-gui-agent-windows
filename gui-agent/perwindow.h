@@ -44,6 +44,14 @@ BOOL PwIsAttached(IN const WINDOW_DATA* entry);
 // call for non-attached windows. Call before the entry is freed.
 void PwDetachWindow(IN OUT WINDOW_DATA* entry);
 
+// FALSE if PrintWindow cannot produce correct pixels for this window (ULW-style or
+// colorkeyed layered windows) - such windows must stay on the legacy screen-slice path.
+BOOL PwWindowEligible(IN const WINDOW_DATA* entry);
+
+// Detach an attached window at runtime and force the daemon to release its stale image
+// via an unmap/map cycle, dropping the window to the legacy path.
+void PwForceLegacy(IN OUT WINDOW_DATA* entry);
+
 // Size changed: rebuild buffer/capture/grant and re-send MSG_WINDOW_DUMP. Call after
 // SendWindowConfigure for the new size.
 ULONG PwResizeWindow(IN OUT WINDOW_DATA* entry);

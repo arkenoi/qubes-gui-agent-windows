@@ -186,6 +186,8 @@ ULONG SendWindowDestroy(IN HWND window)
         return ERROR_SUCCESS;
 
     LogDebug("0x%x", window);
+    if (g_ProtoTrace)
+        LogInfo("QGAPROTO,msg=DESTROY,hwnd=0x%x", (uint32_t)(ULONG_PTR)window);
     header.type = MSG_DESTROY;
 #pragma warning(suppress:4311)
     header.window = (uint32_t)window;
@@ -411,40 +413,59 @@ cleanup:
 
 ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN int height)
 {
-    if (g_ProtoTrace)
-    {
-        // Wobble is a desync between the geometry dom0 believes and where the window actually
-        // is in the live shared framebuffer. Record both at the instant damage goes out: `a*`
-        // is the origin this damage was registered against (what dom0 will add back), `l*` is
-        // where the window really is right now. A non-zero delta during motion IS the wobble,
-        // measured with no cross-VM capture skew.
-        RECT live;
-        if (window && GetRealWindowRect(window, &live) == ERROR_SUCCESS)
-        {
-            // Now also called from the WGC capture thread: the list walk must hold the
-            // lock (lock order: watched-windows OUTER, vchan INNER, same as the frame
-            // path; the vchan CS is not held yet at this point).
-            EnterCriticalSection(&g_csWatchedWindows);
-            WINDOW_DATA* wd = FindWindowByHandle(window);
-            int ax = wd ? wd->X : 0, ay = wd ? wd->Y : 0;
-            LeaveCriticalSection(&g_csWatchedWindows);
-            LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d,ax=%d,ay=%d,lx=%d,ly=%d",
-                (uint32_t)(ULONG_PTR)window, x, y, width, height,
-                ax, ay, live.left, live.top);
-        }
-        else
-        {
-            LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d",
-                (uint32_t)(ULONG_PTR)window, x, y, width, height);
-        }
-    }
-
     struct msg_shmimage shmMsg;
     struct msg_hdr header;
     BOOL status;
+    BOOL tracked = FALSE;
 
     if (!g_VchanClientConnected)
         return ERROR_SUCCESS;
+
+    // Per-window damage may come from the capture thread, which races RemoveWindow on the
+    // frame thread: MSG_SHMIMAGE landing after RemoveWindow's MSG_DESTROY makes gui-daemon
+    // exit(1) ("msg without CREATE"), killing the whole qube's GUI. RemoveWindow runs
+    // entirely under g_csWatchedWindows, so hold it across the send (lock order:
+    // watched-windows OUTER, vchan INNER, same as the frame path): either this damage is
+    // fully on the wire before UNMAP/DESTROY (the daemon drops damage for unmapped
+    // windows), or the entry is already gone and it is dropped here.
+    if (window)
+    {
+        EnterCriticalSection(&g_csWatchedWindows);
+        WINDOW_DATA* wd = FindWindowByHandle(window);
+        if (!wd)
+        {
+            LeaveCriticalSection(&g_csWatchedWindows);
+            LogVerbose("0x%x: dropping damage for removed window", window);
+            return ERROR_SUCCESS;
+        }
+        tracked = TRUE;
+
+        if (g_ProtoTrace)
+        {
+            // Wobble is a desync between the geometry dom0 believes and where the window
+            // actually is in the live shared framebuffer. Record both at the instant damage
+            // goes out: `a*` is the origin this damage was registered against (what dom0
+            // will add back), `l*` is where the window really is right now. A non-zero
+            // delta during motion IS the wobble, measured with no cross-VM capture skew.
+            RECT live;
+            if (GetRealWindowRect(window, &live) == ERROR_SUCCESS)
+            {
+                LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d,ax=%d,ay=%d,lx=%d,ly=%d",
+                    (uint32_t)(ULONG_PTR)window, x, y, width, height,
+                    wd->X, wd->Y, live.left, live.top);
+            }
+            else
+            {
+                LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d",
+                    (uint32_t)(ULONG_PTR)window, x, y, width, height);
+            }
+        }
+    }
+    else if (g_ProtoTrace)
+    {
+        LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d",
+            (uint32_t)(ULONG_PTR)window, x, y, width, height);
+    }
 
     LogVerbose("0x%x: (%d,%d)-(%d,%d) %dx%d", window, x, y, x + width, y + height, width, height);
     header.type = MSG_SHMIMAGE;
@@ -460,10 +481,14 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
     if (!g_VchanClientConnected)
     {
         LeaveCriticalSection(&g_VchanCriticalSection);
+        if (tracked)
+            LeaveCriticalSection(&g_csWatchedWindows);
         return ERROR_SUCCESS;
     }
     status = VCHAN_SEND_MSG(header, shmMsg, L"MSG_SHMIMAGE");
     LeaveCriticalSection(&g_VchanCriticalSection);
+    if (tracked)
+        LeaveCriticalSection(&g_csWatchedWindows);
 
     return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
 }

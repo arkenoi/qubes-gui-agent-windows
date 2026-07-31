@@ -906,6 +906,33 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         }
     }
 
+    // A maximized window's DWM frame rect can exceed the screen (invisible resize borders,
+    // or the window having been nudged by a dom0-initiated move). Reporting that oversize
+    // rect makes the dom0 WM constrain the daemon's X window, the daemon echo the
+    // constrained size back, and HandleConfigure fight the guest - an endless CONFIGURE
+    // ping-pong with a full per-window grant rebuild on every flip. Clamp what we report
+    // (and grant) to the visible screen; the per-window capture crop already skips the
+    // off-screen frame margin.
+    if ((entry->Style & WS_MAXIMIZE) && entry->IsVisible &&
+        g_HostScreenWidth > 0 && g_HostScreenHeight > 0)
+    {
+        int x2 = entry->X + (int)entry->Width;
+        int y2 = entry->Y + (int)entry->Height;
+        if (x2 > (int)g_HostScreenWidth)
+            x2 = (int)g_HostScreenWidth;
+        if (y2 > (int)g_HostScreenHeight)
+            y2 = (int)g_HostScreenHeight;
+        if (entry->X < 0)
+            entry->X = 0;
+        if (entry->Y < 0)
+            entry->Y = 0;
+        if (x2 > entry->X && y2 > entry->Y)
+        {
+            entry->Width = (DWORD)(x2 - entry->X);
+            entry->Height = (DWORD)(y2 - entry->Y);
+        }
+    }
+
     entry->IsOverrideRedirect = IsPopup(entry);
 
     return ERROR_SUCCESS;
@@ -991,6 +1018,30 @@ end:
     return status;
 }
 
+// Send MSG_CONFIGURE for a tracked window with its current geometry, unless it would be
+// byte-identical to the last one sent (drag processing produced bursts of 4+ duplicates).
+static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
+{
+    if (entry->CfgSentValid &&
+        entry->LastCfgX == entry->X && entry->LastCfgY == entry->Y &&
+        entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
+        entry->LastCfgOvr == entry->IsOverrideRedirect)
+        return ERROR_SUCCESS;
+
+    ULONG status = SendWindowConfigure(entry->Handle, entry->X, entry->Y,
+        entry->Width, entry->Height, entry->IsOverrideRedirect);
+    if (status == ERROR_SUCCESS)
+    {
+        entry->CfgSentValid = TRUE;
+        entry->LastCfgX = entry->X;
+        entry->LastCfgY = entry->Y;
+        entry->LastCfgW = (int)entry->Width;
+        entry->LastCfgH = (int)entry->Height;
+        entry->LastCfgOvr = entry->IsOverrideRedirect;
+    }
+    return status;
+}
+
 // Remove window from the list and free memory.
 // Watched windows list critical section must be entered.
 ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
@@ -1016,21 +1067,18 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
 
     if (g_VchanClientConnected)
     {
+        // The entry is already off the list: even if a send fails (vchan going down),
+        // still attempt DESTROY and free the entry. Bailing out here used to leak the
+        // entry AND leave the daemon tracking a window we would never message again.
         status = SendWindowUnmap(entry->Handle);
         if (ERROR_SUCCESS != status)
-        {
             win_perror2(status, "SendWindowUnmap");
-            goto end;
-        }
 
         if (entry->Handle) // never destroy screen "window"
         {
             status = SendWindowDestroy(entry->Handle);
             if (ERROR_SUCCESS != status)
-            {
                 win_perror2(status, "SendWindowDestroy");
-                goto end;
-            }
         }
     }
 
@@ -1708,6 +1756,18 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     {
         windowData->ExStyle = data.ExStyle;
         LogDebug("0x%x exstyle changed to 0x%x", data.Handle, data.ExStyle);
+
+        // Windows can BECOME layered after attach (Edge sets WS_EX_LAYERED +
+        // UpdateLayeredWindow on its first-run overlay only after showing it).
+        // PrintWindow returns premultiplied source pixels for ULW surfaces - a 30%-alpha
+        // dimming backdrop captures as near-black - so such a window must drop to the
+        // legacy screen-slice path, which carries the DWM-blended result.
+        if (PwIsAttached(windowData) && !PwWindowEligible(windowData))
+        {
+            LogInfo("0x%x: became PrintWindow-ineligible (layered), dropping to legacy path",
+                windowData->Handle);
+            PwForceLegacy(windowData);
+        }
     }
 
     // Not diffed (nothing is sent to dom0 when they change), but they ARE inputs of
@@ -1805,8 +1865,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
 
         if (coordsChanged)
         {
-            status = SendWindowConfigure(windowData->Handle,
-                windowData->X, windowData->Y, windowData->Width, windowData->Height, windowData->IsOverrideRedirect);
+            status = SendWindowConfigureIfChanged(windowData);
             if (status != ERROR_SUCCESS)
                 goto end;
         }
@@ -1816,8 +1875,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // configure first, then popup state
         if (coordsChanged)
         {
-            status = SendWindowConfigure(windowData->Handle,
-                windowData->X, windowData->Y, windowData->Width, windowData->Height, windowData->IsOverrideRedirect);
+            status = SendWindowConfigureIfChanged(windowData);
             if (status != ERROR_SUCCESS)
                 goto end;
         }
@@ -2391,7 +2449,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
             }
 
             RECT fresh;
-            if (damagedNow && GetRealWindowRect(entry->Handle, &fresh) == ERROR_SUCCESS)
+            // Maximized windows do not drag; skip the refresh so the raw (unclamped)
+            // DWM rect cannot leak out here and restart the dom0 CONFIGURE ping-pong.
+            if (damagedNow && !(entry->Style & WS_MAXIMIZE) &&
+                GetRealWindowRect(entry->Handle, &fresh) == ERROR_SUCCESS)
             {
                 int freshW = fresh.right - fresh.left, freshH = fresh.bottom - fresh.top;
                 if ((fresh.left != entry->X || fresh.top != entry->Y ||
@@ -2402,8 +2463,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
                     entry->Y = fresh.top;
                     entry->Width = freshW;
                     entry->Height = freshH;
-                    SendWindowConfigure(entry->Handle, entry->X, entry->Y,
-                        entry->Width, entry->Height, entry->IsOverrideRedirect);
+                    SendWindowConfigureIfChanged(entry);
                 }
             }
         }

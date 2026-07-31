@@ -89,6 +89,16 @@ typedef struct _WINDOW_DATA
     // dump claiming more pixels than the granted pages makes gui-daemon exit(1).
     ULONG PwWidth;
     ULONG PwHeight;
+
+    // Last MSG_CONFIGURE sent for this window: byte-identical repeats are suppressed
+    // (bursts of 4+ duplicates were measured during drags), and geometry the daemon
+    // itself just dictated is recorded here so it is not echoed back at it.
+    BOOL CfgSentValid;
+    int LastCfgX;
+    int LastCfgY;
+    int LastCfgW;
+    int LastCfgH;
+    BOOL LastCfgOvr;
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(

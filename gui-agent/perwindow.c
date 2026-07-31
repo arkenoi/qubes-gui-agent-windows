@@ -195,6 +195,28 @@ void PwRevokeTick(void)
     LeaveCriticalSection(&g_PwPendingLock);
 }
 
+// Whether PrintWindow can produce correct pixels for this window. UpdateLayeredWindow
+// (ULW) surfaces have no GDI-paintable content: PrintWindow returns the premultiplied
+// source bits, which renders translucent regions as garbage (a dimming backdrop comes out
+// near-black). GetLayeredWindowAttributes FAILING on a layered window is the ULW
+// discriminator; colorkeyed windows are equally uncapturable (the key color would show as
+// opaque). Plain SetLayeredWindowAttributes alpha windows paint via WM_PAINT and capture
+// fine (menus fading in were validated on the per-window path) - keep those attached.
+BOOL PwWindowEligible(IN const WINDOW_DATA* entry)
+{
+    if (!(entry->ExStyle & WS_EX_LAYERED))
+        return TRUE;
+
+    COLORREF key;
+    BYTE alpha;
+    DWORD lwFlags;
+    if (!GetLayeredWindowAttributes(entry->Handle, &key, &alpha, &lwFlags))
+        return FALSE; // ULW-style layered window
+    if (lwFlags & LWA_COLORKEY)
+        return FALSE;
+    return TRUE;
+}
+
 ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
 {
     if (!g_PwOn)
@@ -209,6 +231,12 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
         return ERROR_SUCCESS;
     if (entry->Width == 0 || entry->Height == 0)
         return ERROR_INVALID_PARAMETER;
+    if (!PwWindowEligible(entry))
+    {
+        LogInfo("0x%x: layered (ULW/colorkey) window - staying on legacy path",
+                entry->Handle);
+        return ERROR_NOT_SUPPORTED;
+    }
 
     ULONG status;
     const size_t imageBytes = (size_t)entry->Width * entry->Height * 4;
@@ -293,6 +321,8 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->PwDumpSent)
         return;
+    LogInfo("0x%x: per-window buffer %ux%u detached", entry->Handle,
+            entry->PwWidth, entry->PwHeight);
     WcRemoveWindow(entry->Handle);
     PwQueueRevoke(entry->PwGrantHandle, entry->PwGrantRefs, entry->PwBuffer);
     entry->PwBuffer = NULL;
@@ -302,6 +332,22 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwWidth = 0;
     entry->PwHeight = 0;
     entry->PwDumpSent = FALSE;
+}
+
+// Drop an attached window back to the legacy screen-slice path at runtime. The daemon
+// keeps compositing from the detached (stale, pinned) buffer until something makes it
+// release the image; force that with an unmap/map cycle (no re-dump: we are no longer
+// attached), after which the queued revoke succeeds on a tick.
+void PwForceLegacy(IN OUT WINDOW_DATA* entry)
+{
+    if (!entry->PwDumpSent)
+        return;
+    PwDetachWindow(entry);
+    if (entry->IsVisible || entry->IsIconic)
+    {
+        if (SendWindowUnmap(entry->Handle) == ERROR_SUCCESS)
+            (void)SendWindowMap(entry);
+    }
 }
 
 ULONG PwResizeWindow(IN OUT WINDOW_DATA* entry)

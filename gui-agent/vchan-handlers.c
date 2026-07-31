@@ -397,6 +397,17 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
             {
                 LogVerbose("0x%x is minimized, ignoring", window);
             }
+            else if (IsZoomed(window))
+            {
+                // A maximized window is anchored by the guest WM: applying dom0 geometry
+                // via SetWindowPos either bounces (the window snaps back) or drags the
+                // maximized frame off its anchor - both feed an endless CONFIGURE
+                // ping-pong with the dom0 WM, rebuilding the per-window grant on every
+                // flip. Ignore the request; the ACK below re-syncs the daemon to the
+                // geometry the guest actually has.
+                LogDebug("0x%x is maximized, ignoring dom0 configure %dx%d",
+                    window, configureMsg.width, configureMsg.height);
+            }
             else
             {
                 if (data->X == configureMsg.x && data->Y == configureMsg.y)
@@ -433,6 +444,15 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                         data->Width = configureMsg.width;
                         data->Height = configureMsg.height;
                     }
+
+                    // The daemon knows this geometry (it dictated it); record it as
+                    // last-sent so the tracking pass does not echo it back.
+                    data->CfgSentValid = TRUE;
+                    data->LastCfgX = data->X;
+                    data->LastCfgY = data->Y;
+                    data->LastCfgW = (int)data->Width;
+                    data->LastCfgH = (int)data->Height;
+                    data->LastCfgOvr = data->IsOverrideRedirect;
                 }
                 else
                 {
@@ -444,7 +464,28 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
         {
             LogWarning("window 0x%x not tracked", window);
         }
+
+        if (replyToMessages && data != NULL)
+        {
+            // ACK to the gui daemon so it won't stop sending MSG_CONFIGURE. Sent under
+            // g_csWatchedWindows so window removal (UNMAP/DESTROY, also under this lock)
+            // cannot interleave: an ACK for a just-destroyed window would hit the
+            // daemon's "msg without CREATE" exit(1). For the same reason no ACK at all
+            // for untracked windows. ovr always reflects the agent's own classification -
+            // echoing the daemon's value made the flag flap against our own CONFIGUREs.
+            ULONG ackStatus;
+            if (IsZoomed(window))
+                ackStatus = SendWindowConfigure(window,
+                    data->X, data->Y, data->Width, data->Height, data->IsOverrideRedirect);
+            else
+                ackStatus = SendWindowConfigure(window,
+                    configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height,
+                    data->IsOverrideRedirect);
+            LeaveCriticalSection(&g_csWatchedWindows);
+            return ackStatus;
+        }
         LeaveCriticalSection(&g_csWatchedWindows);
+        return ERROR_SUCCESS;
     }
     else
     {
@@ -471,9 +512,9 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
         }
     }
 
+    // Screen (window 0) ACK: the screen window is never destroyed, no ordering hazard.
     if (replyToMessages)
     {
-        // send ACK to gui daemon so it won't stop sending MSG_CONFIGURE
         return SendWindowConfigure(window,
             configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height, configureMsg.override_redirect);
     }
