@@ -2085,7 +2085,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         entry = zSorted[zi];
         perfWindows++;
 
-        if (entry->IsIconic) // minimized, don't care
+        // A window that is minimized or hidden occludes nothing. Letting one contribute to
+        // the covered region below would permanently suppress damage for whatever is beneath
+        // it - a window going partially blank for no visible reason.
+        if (entry->IsIconic || !entry->IsVisible)
             continue;
 
         // INVARIANT: the origin used to convert damage to window-relative coordinates must
