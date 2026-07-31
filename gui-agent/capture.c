@@ -192,9 +192,21 @@ static void AttachCaptureThreadToInputDesktop(void)
         return;
     }
 
-    if (previous)
-        CloseDesktop(previous);
+    // Do NOT CloseDesktop() the handle we previously installed.
+    //
+    // Closing it on a cold boot leaves the MAIN thread's desktop invalid: EnumWindows then
+    // returns ERROR_INVALID_HANDLE on every resync, no window is ever added to the watched
+    // list, and the qube renders nothing in dom0. Bisected to this change - the build
+    // immediately before it reports 0 failures, this one reports 8.
+    //
+    // It does not reproduce when the agent is restarted in a live session, because that
+    // re-establishes a valid desktop, which is why every check in the suite missed it.
+    //
+    // Leaking one desktop handle per recovery is the correct trade: recoveries are rare, the
+    // handle is released when the process exits, and MSDN warns against closing a desktop
+    // that may still be in use by another thread of the process.
     previous = desktop;
+    (void)previous;
 }
 
 static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
