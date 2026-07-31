@@ -25,6 +25,7 @@
 #include <config.h>
 
 BOOL     g_PerfEnabled = FALSE;
+BOOL     g_ProtoTrace  = FALSE;
 LONGLONG g_PerfFreq = 0;
 DWORD    g_PerfEveryN = 1;
 
@@ -88,6 +89,19 @@ void PerfInit(void)
         enabled = (env[0] != L'0');
 
     g_PerfEnabled = enabled;
+
+    // Protocol trace is independent of the perf switch: it is about correctness, not cost.
+    {
+        BOOL proto = FALSE;
+        DWORD pv = 0;
+        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
+            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PROTO_VALUE, &pv, NULL))
+            proto = (pv != 0);
+        if (GetEnvironmentVariable(PROTO_ENV_VALUE, env, RTL_NUMBER_OF(env)) > 0)
+            proto = (env[0] != L'0');
+        g_ProtoTrace = proto;
+        LogInfo("QGAPROTO %s", g_ProtoTrace ? "on" : "off");
+    }
 
     if (!g_PerfEnabled)
     {

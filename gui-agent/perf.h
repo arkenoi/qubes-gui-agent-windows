@@ -54,12 +54,22 @@
 
 // Environment override (wins over the registry): QUBES_GUI_PERF=0|1
 #define PERF_ENV_VALUE L"QUBES_GUI_PERF"
+#define PROTO_ENV_VALUE L"QUBES_GUI_PROTO"
+#define REG_CONFIG_PROTO_VALUE L"ProtoTrace"
 
 // Version of the CSV record format, bumped when fields change.
 // v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
 #define PERF_RECORD_VERSION 2
 
 extern BOOL     g_PerfEnabled;  // master switch
+
+// Protocol trace: records what the agent actually TELLS THE DAEMON, as opposed to what the
+// guest state implies it should. Every acceptance failure so far came from checking guest
+// state or agent intent and inferring the wire content - e.g. concluding menus were sent
+// override_redirect from their WS_POPUP style, while dom0 drew a decoration on them. The
+// only ground truth for a protocol defect is the field that went out.
+// Off by default; registry DWORD "ProtoTrace" or env QUBES_GUI_PROTO=1.
+extern BOOL     g_ProtoTrace;
 extern LONGLONG g_PerfFreq;     // QueryPerformanceFrequency, ticks per second
 extern DWORD    g_PerfEveryN;   // emit one line per this many processed frames
 

@@ -26,6 +26,7 @@
 
 #include "common.h"
 #include "send.h"
+#include "perf.h"
 #include "main.h"
 #include "vchan.h"
 
@@ -144,6 +145,13 @@ ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)
     createMsg.parent = UINT32_MAX; // ignored by daemon
     createMsg.override_redirect = windowData ? windowData->IsOverrideRedirect : FALSE;
     LogDebug("(%d,%d) %ux%u", createMsg.x, createMsg.y, createMsg.width, createMsg.height);
+
+    if (g_ProtoTrace)
+        LogInfo("QGAPROTO,msg=CREATE,hwnd=0x%x,x=%d,y=%d,w=%u,h=%u,ovr=%d,style=0x%08x,ex=0x%08x",
+            windowData ? (uint32_t)(ULONG_PTR)windowData->Handle : 0,
+            createMsg.x, createMsg.y, createMsg.width, createMsg.height,
+            createMsg.override_redirect,
+            windowData ? windowData->Style : 0, windowData ? windowData->ExStyle : 0);
 
     EnterCriticalSection(&g_VchanCriticalSection);
     if (!VCHAN_SEND_MSG(header, createMsg, L"MSG_CREATE"))
@@ -313,6 +321,14 @@ ULONG SendWindowMap(IN const WINDOW_DATA *windowData OPTIONAL)
     else
         mapMsg.override_redirect = 0;
 
+    if (g_ProtoTrace)
+        LogInfo("QGAPROTO,msg=MAP,hwnd=0x%x,ovr=%d,transient=0x%x,style=0x%08x,ex=0x%08x,vis=%d,w=%u,h=%u",
+            windowData ? (uint32_t)(ULONG_PTR)windowData->Handle : 0,
+            mapMsg.override_redirect, mapMsg.transient_for,
+            windowData ? windowData->Style : 0, windowData ? windowData->ExStyle : 0,
+            windowData ? windowData->IsVisible : 0,
+            windowData ? windowData->Width : 0, windowData ? windowData->Height : 0);
+
     EnterCriticalSection(&g_VchanCriticalSection);
     if (!VCHAN_SEND_MSG(header, mapMsg, L"MSG_MAP"))
     {
@@ -358,6 +374,10 @@ ULONG SendWindowConfigure(HANDLE window, int x, int y, int width, int height, BO
 
     header.type = MSG_CONFIGURE;
 
+    if (g_ProtoTrace)
+        LogInfo("QGAPROTO,msg=CONFIGURE,hwnd=0x%x,x=%d,y=%d,w=%d,h=%d,ovr=%d",
+            (uint32_t)(ULONG_PTR)window, x, y, width, height, popup);
+
     configureMsg.x = x;
     configureMsg.y = y;
     configureMsg.width = width;
@@ -385,6 +405,10 @@ cleanup:
 
 ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN int height)
 {
+    if (g_ProtoTrace)
+        LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d",
+            (uint32_t)(ULONG_PTR)window, x, y, width, height);
+
     struct msg_shmimage shmMsg;
     struct msg_hdr header;
     BOOL status;
