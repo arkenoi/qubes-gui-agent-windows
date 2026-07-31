@@ -162,6 +162,41 @@ static IDXGIOutputDuplication* GetDuplication(IN IDXGIOutput1* output, IN ID3D11
 // is reported the same way the initial setup does. If the desktop is momentarily
 // unavailable - which is exactly what the secure desktop looks like - retry briefly
 // rather than giving up: the secure desktop typically lasts seconds.
+// Re-attach THIS thread to the current input desktop.
+//
+// DuplicateOutput() returns E_ACCESSDENIED (0x80070005) when the calling thread is not on the
+// input desktop, which is exactly the state a desktop switch leaves the capture thread in -
+// and a desktop switch is one of the main things that invalidates the duplication in the
+// first place. Without this, every retry in RecreateDuplication() fails for the whole retry
+// window, recovery gives up, and the caller falls back to the full teardown that unmaps every
+// window - the precise outcome the in-place recovery exists to avoid.
+//
+// Deliberately NOT AttachToInputDesktop(): that helper also writes the shared globals
+// g_DesktopWindow/g_StartWindow/g_SearchWindow unsynchronised and CloseDesktop()s the
+// process-default desktop handle, which MSDN forbids and which a further caller would
+// double-close. See the same reasoning at the hook thread in main.c. Only the per-thread part
+// is wanted here, and only this thread's own handle is ever closed.
+static void AttachCaptureThreadToInputDesktop(void)
+{
+    static HDESK previous = NULL; // only ever a handle THIS function opened
+
+    HDESK desktop = OpenInputDesktop(0, FALSE, GENERIC_ALL);
+    if (!desktop)
+        return; // not fatal: the retry loop will try again
+
+    if (!SetThreadDesktop(desktop))
+    {
+        // fails if the thread owns windows or hooks; the capture thread owns neither, but
+        // never leak the handle if it ever does
+        CloseDesktop(desktop);
+        return;
+    }
+
+    if (previous)
+        CloseDesktop(previous);
+    previous = desktop;
+}
+
 static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
 {
     const UINT maxAttempts = 20;
@@ -194,6 +229,11 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
     {
         if (!InterlockedCompareExchange(&g_CaptureThreadEnable, FALSE, FALSE))
             return FALSE; // asked to stop while recovering
+
+        // A desktop switch both invalidates the duplication AND leaves this thread on the
+        // old desktop, so re-attach before every attempt, not once before the loop: the
+        // switch may still be in progress on the first try.
+        AttachCaptureThreadToInputDesktop();
 
         IDXGIOutputDuplication* duplication = GetDuplication(ctx->output, ctx->device, &width, &height);
         if (duplication)
