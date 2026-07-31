@@ -273,6 +273,8 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwPageCount = pageCount;
     entry->PwGrantRefs = refs;
     entry->PwGrantHandle = shared;
+    entry->PwWidth = entry->Width;
+    entry->PwHeight = entry->Height;
     entry->PwDumpSent = TRUE;
     LogDebug("0x%x: per-window buffer %ux%u (%lu pages) attached",
              entry->Handle, entry->Width, entry->Height, pageCount);
@@ -289,6 +291,8 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwPageCount = 0;
     entry->PwGrantRefs = NULL;
     entry->PwGrantHandle = NULL;
+    entry->PwWidth = 0;
+    entry->PwHeight = 0;
     entry->PwDumpSent = FALSE;
 }
 
@@ -299,13 +303,31 @@ ULONG PwResizeWindow(IN OUT WINDOW_DATA* entry)
     // Old grant to the pending list; the daemon releases its mapping when it processes
     // the new MSG_WINDOW_DUMP below, after which revocation succeeds on a tick/ACK.
     PwDetachWindow(entry);
-    return PwAttachWindow(entry);
+    ULONG status = PwAttachWindow(entry);
+    if (status != ERROR_SUCCESS)
+    {
+        // The daemon still composites this window from the DETACHED (stale, pinned)
+        // buffer until something makes it release the image. Force that now with an
+        // unmap/map cycle (no re-dump: we are no longer attached), dropping the window
+        // to the legacy screen path; the queued revoke then succeeds on a tick.
+        LogWarning("0x%x: re-attach failed (0x%x), forcing daemon release via unmap/map",
+                   entry->Handle, status);
+        if (entry->IsVisible || entry->IsIconic)
+        {
+            if (SendWindowUnmap(entry->Handle) == ERROR_SUCCESS)
+                (void)SendWindowMap(entry);
+        }
+    }
+    return status;
 }
 
 ULONG PwRemapWindow(IN const WINDOW_DATA* entry)
 {
     if (!entry->PwDumpSent)
         return ERROR_NOT_SUPPORTED;
-    return SendWindowDump(entry->Handle, entry->Width, entry->Height,
+    // MUST be the geometry the buffer was granted for, never the live entry dims: a
+    // dump claiming width*height*4 > granted pages makes gui-daemon exit(1) (daemon
+    // xside.c img_data_size check), taking down the whole qube's GUI.
+    return SendWindowDump(entry->Handle, entry->PwWidth, entry->PwHeight,
                           entry->PwPageCount, entry->PwGrantRefs);
 }

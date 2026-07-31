@@ -421,8 +421,13 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
         RECT live;
         if (window && GetRealWindowRect(window, &live) == ERROR_SUCCESS)
         {
+            // Now also called from the WGC capture thread: the list walk must hold the
+            // lock (lock order: watched-windows OUTER, vchan INNER, same as the frame
+            // path; the vchan CS is not held yet at this point).
+            EnterCriticalSection(&g_csWatchedWindows);
             WINDOW_DATA* wd = FindWindowByHandle(window);
             int ax = wd ? wd->X : 0, ay = wd ? wd->Y : 0;
+            LeaveCriticalSection(&g_csWatchedWindows);
             LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d,ax=%d,ay=%d,lx=%d,ly=%d",
                 (uint32_t)(ULONG_PTR)window, x, y, width, height,
                 ax, ay, live.left, live.top);
@@ -450,6 +455,13 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
     shmMsg.width = width;
     shmMsg.height = height;
     EnterCriticalSection(&g_VchanCriticalSection);
+    // Re-check under the lock: the teardown path closes/frees the vchan under this CS,
+    // and the first check above races it from the capture thread.
+    if (!g_VchanClientConnected)
+    {
+        LeaveCriticalSection(&g_VchanCriticalSection);
+        return ERROR_SUCCESS;
+    }
     status = VCHAN_SEND_MSG(header, shmMsg, L"MSG_SHMIMAGE");
     LeaveCriticalSection(&g_VchanCriticalSection);
 

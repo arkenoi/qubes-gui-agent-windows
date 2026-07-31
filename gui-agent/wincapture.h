@@ -43,6 +43,10 @@ ULONG WcAddWindow(HWND hwnd, int width, int height, int cropX, int cropY, void* 
 // Stop capturing hwnd. After return the module no longer touches the buffer.
 void WcRemoveWindow(HWND hwnd);
 
+// TRUE if the channel for hwnd died (exception during capture) or does not exist.
+// The owner should detach and fall back to the legacy path.
+BOOL WcIsDead(HWND hwnd);
+
 // Synchronously render the window's current content into the buffer via
 // PrintWindow(PW_RENDERFULLCONTENT) so the daemon has real pixels before the first WGC
 // frame arrives. Window-relative crop applied as in WcAddWindow.

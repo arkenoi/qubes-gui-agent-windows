@@ -83,6 +83,12 @@ typedef struct _WINDOW_DATA
     ULONG* PwGrantRefs;
     void* PwGrantHandle;   // sharedAddress from XcGnttabPermitForeignAccess2
     BOOL PwDumpSent;
+    // Geometry the CURRENT buffer/dump was built for. The live Width/Height can move
+    // ahead of it (tracking, dom0-initiated resize); any divergence triggers a rebuild
+    // in UpdateWindowData, and remap re-announces THESE dims, never the live ones - a
+    // dump claiming more pixels than the granted pages makes gui-daemon exit(1).
+    ULONG PwWidth;
+    ULONG PwHeight;
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(

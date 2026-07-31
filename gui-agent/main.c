@@ -37,6 +37,7 @@
 #include "resolution.h"
 #include "send.h"
 #include "perwindow.h"
+#include "wincapture.h"
 #include "vchan-handlers.h"
 #include "util.h"
 #include "debug.h"
@@ -1745,6 +1746,16 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             status = SendWindowFlags(windowData->Handle, 0, WINDOW_FLAG_MINIMIZE); // unset minimize
             if (status != ERROR_SUCCESS)
                 goto end;
+            // A window added while minimized never got a per-window buffer (attach is
+            // gated on !IsIconic); attach now that it has real content. Failure just
+            // leaves it on the legacy path.
+            if (PwEnabled() && !PwIsAttached(windowData) && windowData->IsVisible &&
+                windowData->Width > 0 && windowData->Height > 0)
+            {
+                if (PwAttachWindow(windowData) == ERROR_SUCCESS)
+                    (void)SendWindowDamageEvent(windowData->Handle, 0, 0,
+                        windowData->Width, windowData->Height);
+            }
         }
         windowData->IsIconic = FALSE;
     }
@@ -1752,8 +1763,6 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     // coords
     BOOL coordsChanged = (windowData->X != data.X || windowData->Y != data.Y ||
         windowData->Width != data.Width || windowData->Height != data.Height);
-    BOOL sizeChanged = (windowData->Width != data.Width ||
-        windowData->Height != data.Height);
 
     if (coordsChanged)
     {
@@ -1821,10 +1830,15 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         }
     }
 
-    // Size change invalidates the per-window buffer: rebuild it (new buffer + grant +
-    // WINDOW_DUMP for the new geometry) and repaint. Failure just drops the window
-    // back to the legacy path; not an error.
-    if (sizeChanged && PwIsAttached(windowData))
+    // The per-window buffer is size-bound: whenever the live size diverges from the
+    // geometry the buffer was granted for, rebuild (new buffer + grant + WINDOW_DUMP)
+    // and repaint. Comparing against PwWidth/PwHeight instead of this pass's delta also
+    // catches dom0-initiated resizes, where HandleConfigure pre-writes Width/Height and
+    // a plain sizeChanged never fires. Failure inside PwResizeWindow already forces the
+    // daemon back to the legacy path via unmap/map.
+    if (PwIsAttached(windowData) &&
+        (windowData->PwWidth != windowData->Width ||
+         windowData->PwHeight != windowData->Height))
     {
         if (PwResizeWindow(windowData) == ERROR_SUCCESS)
         {
@@ -2028,6 +2042,31 @@ static ULONG TrackWindows(OUT TRACK_STATS* stats)
 static void ProcessWindowEvents(void)
 {
     PwRevokeTick();
+
+    // Reap dead capture channels: a WGC session that threw (window gone mid-poll,
+    // device loss) stops delivering silently. Detach and force the daemon back to the
+    // screen path with an unmap/map so the window updates again instead of freezing.
+    if (PwEnabled())
+    {
+        EnterCriticalSection(&g_csWatchedWindows);
+        LIST_ENTRY* pwe = g_WatchedWindowsList.Flink;
+        while (pwe != &g_WatchedWindowsList)
+        {
+            WINDOW_DATA* wd = CONTAINING_RECORD(pwe, WINDOW_DATA, ListEntry);
+            pwe = pwe->Flink;
+            if (PwIsAttached(wd) && WcIsDead(wd->Handle))
+            {
+                LogWarning("0x%x: capture channel died, reverting to legacy path", wd->Handle);
+                PwDetachWindow(wd);
+                if (wd->IsVisible || wd->IsIconic)
+                {
+                    if (SendWindowUnmap(wd->Handle) == ERROR_SUCCESS)
+                        (void)SendWindowMap(wd);
+                }
+            }
+        }
+        LeaveCriticalSection(&g_csWatchedWindows);
+    }
 
     TRACK_STATS stats;
     ULONG status;
@@ -2825,6 +2864,11 @@ static ULONG WINAPI WatchForEvents(void)
     }
 
     LogDebug("main loop finished");
+
+    // Join the WGC capture thread BEFORE tearing the vchan down: its damage callback
+    // sends on the vchan, and closing/freeing g_Vchan (or deleting the CS later in
+    // WinMain) with that thread alive is a use-after-free.
+    PwShutdown();
 
     EnterCriticalSection(&g_VchanCriticalSection);
     if (g_VchanClientConnected)

@@ -265,11 +265,14 @@ ULONG WcAddWindow(HWND hwnd, int width, int height, int cropX, int cropY, void* 
         c->height = height;
         c->cropX = cropX;
         c->cropY = cropY;
+        // The live window rect can lag the tracked size mid-resize; size the pool to
+        // cover BOTH so a transient mismatch skips frames (ContentSize check below)
+        // instead of failing the attach. The next tracking pass rebuilds cleanly.
         c->capW = wr.right - wr.left;
         c->capH = wr.bottom - wr.top;
+        if (c->capW < cropX + width) c->capW = cropX + width;
+        if (c->capH < cropY + height) c->capH = cropY + height;
         c->buffer = (BYTE*)buffer;
-        if (c->cropX + width > c->capW || c->cropY + height > c->capH)
-            return ERROR_INVALID_PARAMETER; // crop must fit inside the captured rect
 
         auto item = ItemForWindow(hwnd);
         c->pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -303,6 +306,22 @@ ULONG WcAddWindow(HWND hwnd, int width, int height, int cropX, int cropY, void* 
     {
         return ERROR_UNIDENTIFIED_ERROR;
     }
+}
+
+BOOL WcIsDead(HWND hwnd)
+{
+    if (!g_eng)
+        return TRUE;
+    BOOL dead = TRUE;
+    AcquireSRWLockShared(&g_eng->lock);
+    for (auto& ch : g_eng->channels)
+        if (ch->hwnd == hwnd)
+        {
+            dead = ch->dead ? TRUE : FALSE;
+            break;
+        }
+    ReleaseSRWLockShared(&g_eng->lock);
+    return dead;
 }
 
 void WcRemoveWindow(HWND hwnd)
