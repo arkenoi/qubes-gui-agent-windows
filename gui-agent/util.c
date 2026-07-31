@@ -298,13 +298,30 @@ ULONG AttachToInputDesktop(void)
     }
 #endif
 
-    // Close old handle to prevent object leaks.
     oldDesktop = GetThreadDesktop(GetCurrentThreadId());
+
+    // Diagnostic for the intermittent cold-boot failure: EnumWindows starts returning
+    // ERROR_INVALID_HANDLE on the main thread on roughly one boot in three, after which no
+    // window is ever added to the watched list. Two callers race here at startup
+    // (StartFrameProcessing, ResolutionChangeThread), so record WHICH thread attached to WHICH
+    // desktop and whether it won, to correlate against the first EnumWindows failure.
+    {
+        WCHAR before[128] = L"?", after[128] = L"?";
+        DWORD needed = 0;
+        if (oldDesktop)
+            GetUserObjectInformation(oldDesktop, UOI_NAME, before, sizeof(before), &needed);
+        GetUserObjectInformation(desktop, UOI_NAME, after, sizeof(after), &needed);
+        LogInfo("QGADESK,tid=%lu,from=%s,to=%s,oldh=0x%p,newh=0x%p",
+            GetCurrentThreadId(), before, after, oldDesktop, desktop);
+    }
+
     if (!SetThreadDesktop(desktop))
     {
         status = win_perror("SetThreadDesktop");
+        LogInfo("QGADESK,tid=%lu,SetThreadDesktop=FAILED", GetCurrentThreadId());
         goto cleanup;
     }
+    LogInfo("QGADESK,tid=%lu,SetThreadDesktop=ok", GetCurrentThreadId());
 
     g_DesktopWindow = GetDesktopWindow();
     // TODO: enum windows and compare EXEs in case there's some other apps with the same title

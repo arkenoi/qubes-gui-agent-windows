@@ -1248,7 +1248,27 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
     ULONG status = ERROR_SUCCESS;
     // Enum top-level windows and add all that are not filtered.
     if (!EnumWindows(AddWindowsProc, (LPARAM)&context))
+    {
         status = context.Status != ERROR_SUCCESS ? context.Status : win_perror("EnumWindows");
+        // Correlate the failure with this thread's desktop (see QGADESK in util.c): the
+        // question is whether the desktop we are on is the input desktop, a stale one, or a
+        // handle that has been closed underneath us.
+        {
+            WCHAR name[128] = L"?";
+            DWORD needed = 0;
+            HDESK cur = GetThreadDesktop(GetCurrentThreadId());
+            BOOL got = cur ? GetUserObjectInformation(cur, UOI_NAME, name, sizeof(name), &needed) : FALSE;
+            HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+            WCHAR iname[128] = L"?";
+            if (input)
+            {
+                GetUserObjectInformation(input, UOI_NAME, iname, sizeof(iname), &needed);
+                CloseDesktop(input);
+            }
+            LogInfo("QGADESK,event=enumfail,tid=%lu,threadDesktop=%s(ok=%d,h=0x%p),inputDesktop=%s",
+                GetCurrentThreadId(), name, got, cur, iname);
+        }
+    }
 
     *interrogated += context.Interrogated;
 
