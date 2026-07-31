@@ -1944,6 +1944,37 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
         entry = (WINDOW_DATA*)entry->ListEntry.Flink;
     }
 
+    // Clipping now applies only to override-redirect popups, so the ordering is only needed
+    // when one is on screen - which is a second or two at a time. Paying a full EnumWindows
+    // on every frame for a case that is almost never active cost roughly 4x the Phase 2A
+    // drag figure. Skip it, and report the order as unknown so nothing clips.
+    BOOL anyPopup = FALSE;
+    WINDOW_DATA* scan = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (scan != (WINDOW_DATA*)&g_WatchedWindowsList)
+    {
+        scan = CONTAINING_RECORD(scan, WINDOW_DATA, ListEntry);
+        if (scan->IsOverrideRedirect && scan->IsVisible)
+        {
+            anyPopup = TRUE;
+            break;
+        }
+        scan = (WINDOW_DATA*)scan->ListEntry.Flink;
+    }
+    if (!anyPopup)
+    {
+        // still hand back the window list, just without a trustworthy order
+        UINT n = 0;
+        WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+        while (e != (WINDOW_DATA*)&g_WatchedWindowsList && n < capacity)
+        {
+            e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+            sorted[n++] = e;
+            e = (WINDOW_DATA*)e->ListEntry.Flink;
+        }
+        g_ZOrderValid = FALSE;
+        return n;
+    }
+
     int next = 0;
     // EnumWindows can fail (observed: ERROR_INVALID_HANDLE). If it does, every ZOrder stays
     // INT_MAX, the sort below is arbitrary, and clipping against an arbitrary order is far
@@ -2141,8 +2172,24 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         // The origin must also stay equal to the one last announced in MSG_CONFIGURE, so when
         // the position has moved, announce the new one first and then convert against it.
         {
+            // Only worth refreshing if this window is actually damaged this frame: the helper
+            // does DwmGetWindowAttribute + GetMonitorInfo + EnumDisplaySettings, and paying it
+            // for every watched window every frame is most of the drag regression.
+            RECT probe = { entry->X, entry->Y,
+                           entry->X + (int)entry->Width, entry->Y + (int)entry->Height };
+            RECT hit;
+            BOOL damagedNow = FALSE;
+            for (UINT di = 0; di < frame->dirty_rects_count; di++)
+            {
+                if (IntersectRect(&hit, &frame->dirty_rects[di], &probe))
+                {
+                    damagedNow = TRUE;
+                    break;
+                }
+            }
+
             RECT fresh;
-            if (GetRealWindowRect(entry->Handle, &fresh) == ERROR_SUCCESS)
+            if (damagedNow && GetRealWindowRect(entry->Handle, &fresh) == ERROR_SUCCESS)
             {
                 int freshW = fresh.right - fresh.left, freshH = fresh.bottom - fresh.top;
                 if ((fresh.left != entry->X || fresh.top != entry->Y ||
