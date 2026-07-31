@@ -217,9 +217,9 @@ ULONG WcProbeSupport(void)
     if (FAILED(hr))
         return (ULONG)hr;
 
-    ABI::Windows::Graphics::Capture::IGraphicsCaptureSessionStatics2* st = nullptr;
+    ABI::Windows::Graphics::Capture::IGraphicsCaptureSessionStatics* st = nullptr;
     hr = RoGetActivationFactory(cls,
-        __uuidof(ABI::Windows::Graphics::Capture::IGraphicsCaptureSessionStatics2),
+        __uuidof(ABI::Windows::Graphics::Capture::IGraphicsCaptureSessionStatics),
         (void**)&st);
     WindowsDeleteString(cls);
     if (FAILED(hr))
