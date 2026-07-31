@@ -1914,6 +1914,14 @@ static void ProcessWindowEvents(void)
 // Called after receiving new frame.
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
 {
+    // Menus/tooltips are override-redirect windows. They are mapped like any other window,
+    // but dom0 screenshot tooling enumerates only managed windows, so whether their repaints
+    // (e.g. hover highlight) actually reach the daemon cannot be checked from outside. Count
+    // them here instead. Logged only when non-zero, so this is silent unless a popup is
+    // actually being damaged, and at DEBUG which is the guest's default level.
+    ULONG perfPopupDamage = 0;
+    HWND  perfPopupWindow = NULL;
+
     WINDOW_DATA *entry;
     WINDOW_DATA *nextEntry;
     ULONG status = ERROR_SUCCESS;
@@ -2023,6 +2031,12 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
                     frame->dirty_rects[i].right - frame->dirty_rects[i].left, frame->dirty_rects[i].bottom - frame->dirty_rects[i].top,
                     changedArea.left, changedArea.top, changedArea.right - changedArea.left, changedArea.bottom - changedArea.top);
 
+                if (entry->IsOverrideRedirect)
+                {
+                    perfPopupDamage++;
+                    perfPopupWindow = entry->Handle;
+                }
+
                 status = SendWindowDamageEvent(entry->Handle,
                     changedArea.left - entry->X, // window-relative, same origin as MSG_CONFIGURE
                     changedArea.top - entry->Y,
@@ -2050,6 +2064,10 @@ cleanup:
         perfUpdate, perfEnum, perfRemove, perfDamage,
         g_PerfSendTicks - perfSendBase, g_PerfSendCount - perfSendCountBase,
         &frame->perf, frame->dirty_rects_count, perfWindows, perfInterrogated, perfEvents);
+
+    if (perfPopupDamage > 0)
+        LogDebug("popup damage: %u message(s) this frame, last window 0x%x",
+            perfPopupDamage, perfPopupWindow);
 
     LogVerbose("end (%x)", status);
     return status;
