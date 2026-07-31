@@ -80,10 +80,13 @@ void PwInit(void)
         return;
     }
 
-    if (!WcIsSupported())
     {
-        LogWarning("per-window capture unavailable: Windows.Graphics.Capture not supported");
-        return;
+        ULONG probe = WcProbeSupport();
+        if (probe != 0)
+        {
+            LogWarning("per-window capture unavailable: WGC probe failed 0x%x", probe);
+            return;
+        }
     }
 
     DWORD status = XcOpen(PwXcLogger, &g_PwXc);

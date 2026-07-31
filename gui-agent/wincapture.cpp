@@ -199,17 +199,30 @@ DWORD WINAPI CaptureThread(LPVOID param)
 
 extern "C" {
 
-BOOL WcIsSupported(void)
+ULONG WcProbeSupport(void)
 {
+    HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
+        return (ULONG)hr;
     try
     {
-        EnsureApartment();
-        return GraphicsCaptureSession::IsSupported() ? TRUE : FALSE;
+        if (!GraphicsCaptureSession::IsSupported())
+            return ERROR_NOT_SUPPORTED;
+        return 0;
+    }
+    catch (hresult_error const& ex)
+    {
+        return (ULONG)ex.code().value;
     }
     catch (...)
     {
-        return FALSE;
+        return ERROR_UNIDENTIFIED_ERROR;
     }
+}
+
+BOOL WcIsSupported(void)
+{
+    return WcProbeSupport() == 0 ? TRUE : FALSE;
 }
 
 ULONG WcInit(WC_DAMAGE_CALLBACK callback)

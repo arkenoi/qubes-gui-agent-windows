@@ -32,6 +32,10 @@ void WcShutdown(void);
 // TRUE if Windows.Graphics.Capture is available on this OS.
 BOOL WcIsSupported(void);
 
+// 0 if WGC is usable; otherwise the failing HRESULT/status (for logging: WHY it is
+// unavailable - apartment init, activation factory, IsSupported() itself).
+ULONG WcProbeSupport(void);
+
 // Begin capturing hwnd into 'buffer' (caller-allocated, width*height*4 bytes,
 // page-aligned). cropX/cropY: offset of the visible bounding rect (what the daemon was
 // told about via MSG_CONFIGURE) inside the OS window rect that WGC captures - DWM
