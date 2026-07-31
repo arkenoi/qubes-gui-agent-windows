@@ -825,6 +825,10 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 
     entry->X = rect.left;
     entry->Y = rect.top;
+    // Seed the frame registration so a window seen for the first time converts its damage
+    // against a sane origin; ProcessNewFrame re-snapshots it every frame thereafter.
+    entry->FrameX = entry->X;
+    entry->FrameY = entry->Y;
     entry->Width = rect.right - rect.left;
     entry->Height = rect.bottom - rect.top;
     entry->Handle = window;
@@ -1962,6 +1966,20 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
 
     EnterCriticalSection(&g_csWatchedWindows);
 
+    // Snapshot each window's position BEFORE tracking updates it: the dirty rects in this
+    // frame were captured while the windows were still where they are right now, so this is
+    // the registration the damage must be converted against. See WINDOW_DATA::FrameX.
+    {
+        WINDOW_DATA* snap = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+        while (snap != (WINDOW_DATA*)&g_WatchedWindowsList)
+        {
+            snap = CONTAINING_RECORD(snap, WINDOW_DATA, ListEntry);
+            snap->FrameX = snap->X;
+            snap->FrameY = snap->Y;
+            snap = (WINDOW_DATA*)snap->ListEntry.Flink;
+        }
+    }
+
     // Bring the watched window list up to date from the events the hook thread
     // collected (or resync it wholesale, periodically). This used to be an
     // EnumWindows() pass over every top-level window on every single frame.
@@ -2000,7 +2018,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         if (entry->IsIconic) // minimized, don't care
             goto skip;
 
-        RECT windowRect = { entry->X, entry->Y, entry->X + entry->Width, entry->Y + entry->Height };
+        // Intersect against the position the window had WHEN THIS FRAME WAS CAPTURED, not
+        // where it is now, and convert with the same origin below. Mixing the two is what
+        // mis-registers damage during a drag.
+        RECT windowRect = { entry->FrameX, entry->FrameY,
+                            entry->FrameX + (int)entry->Width, entry->FrameY + (int)entry->Height };
         RECT changedArea; // intersection of damage rect with window rect
 
         // skip windows that aren't in the changed area
@@ -2015,8 +2037,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
                     changedArea.left, changedArea.top, changedArea.right - changedArea.left, changedArea.bottom - changedArea.top);
 
                 status = SendWindowDamageEvent(entry->Handle,
-                    changedArea.left - entry->X, // window-relative coords
-                    changedArea.top - entry->Y,
+                    changedArea.left - entry->FrameX, // window-relative, as of THIS frame
+                    changedArea.top - entry->FrameY,
                     changedArea.right - changedArea.left, // size
                     changedArea.bottom - changedArea.top);
 
