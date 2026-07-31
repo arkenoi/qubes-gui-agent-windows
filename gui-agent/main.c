@@ -1232,6 +1232,46 @@ static BOOL CALLBACK AddWindowsProc(IN HWND window, IN LPARAM lParam)
     return TRUE;
 }
 
+
+// Follow the input desktop if it changes under us.
+//
+// The agent can start while Winlogon is still the input desktop (the logon screen). It then
+// attaches to Winlogon correctly - and stays there after autologon switches the input desktop
+// to Default. EnumWindows on Winlogon cannot see the user's windows, so nothing is ever added
+// to the watched list and the qube renders nothing in dom0 until the agent is restarted.
+//
+// Measured on a failing cold boot:
+//   QGADESK,from=Default,to=Winlogon,SetThreadDesktop=ok
+//   QGADESK,event=enumfail,threadDesktop=Winlogon,inputDesktop=Default   (x12, every resync)
+//
+// Intermittent because it is a race against autologon, and cleared by an agent restart because
+// that re-attaches to whatever is current - which is why every check that restarted the agent
+// in a live session missed it.
+static void EnsureOnInputDesktop(void)
+{
+    WCHAR mine[128] = L"", input[128] = L"";
+    DWORD needed = 0;
+
+    HDESK cur = GetThreadDesktop(GetCurrentThreadId());
+    HDESK in = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    if (!in)
+        return; // cannot tell; try again on the next resync
+
+    if (cur)
+        GetUserObjectInformation(cur, UOI_NAME, mine, sizeof(mine), &needed);
+    GetUserObjectInformation(in, UOI_NAME, input, sizeof(input), &needed);
+    CloseDesktop(in);
+
+    if (mine[0] && input[0] && 0 == wcscmp(mine, input))
+        return; // already there
+
+    LogInfo("input desktop changed: '%s' -> '%s', re-attaching", mine, input);
+    AttachToInputDesktop();
+    // The window hooks only receive events from the desktop the setting thread is attached to,
+    // so they have to follow as well or tracking stays dead on the new desktop.
+    RearmWindowEvents();
+}
+
 // Adds all top-level windows to the watched list.
 // This is the resync path: the watched list is normally maintained from window
 // events instead (see TrackWindows).
@@ -1241,6 +1281,8 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
     ADD_WINDOWS_CONTEXT context = { 0 };
 
     LogVerbose("start");
+
+    EnsureOnInputDesktop();
 
     g_TaskbarWindow = FindWindow(L"Shell_TrayWnd", 0);
     g_ShowTaskbar = FALSE;
