@@ -36,6 +36,7 @@
 #include "vchan.h"
 #include "resolution.h"
 #include "send.h"
+#include "perwindow.h"
 #include "vchan-handlers.h"
 #include "util.h"
 #include "debug.h"
@@ -785,7 +786,20 @@ ULONG ToggleMap(IN const WINDOW_DATA* entry)
     if (status != ERROR_SUCCESS)
         return status;
 
-    return SendWindowMap(entry);
+    status = SendWindowMap(entry);
+    if (status != ERROR_SUCCESS)
+        return status;
+
+    // The daemon released its mapping of the per-window buffer on MSG_UNMAP; the
+    // grants are still valid, so re-announce them and repaint.
+    if (PwIsAttached(entry))
+    {
+        status = PwRemapWindow(entry);
+        if (status == ERROR_SUCCESS)
+            status = SendWindowDamageEvent(entry->Handle, 0, 0,
+                entry->Width, entry->Height);
+    }
+    return status;
 }
 
 // fills WINDOW_DATA if successful
@@ -914,6 +928,15 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             goto end;
         }
 
+        // Per-window framebuffer: announce the window's own buffer BEFORE mapping so
+        // the daemon never composites this window from the screen slice. On failure
+        // the window simply stays on the legacy path.
+        if (PwEnabled() && entry->IsVisible && !entry->IsIconic &&
+            entry->Width > 0 && entry->Height > 0)
+        {
+            (void)PwAttachWindow(entry);
+        }
+
         // map (show) the window if it's visible OR minimized
         if (entry->IsIconic || entry->IsVisible)
         {
@@ -971,6 +994,11 @@ end:
 // Watched windows list critical section must be entered.
 ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
 {
+    // Stop per-window capture and queue its grant for revocation before any protocol
+    // messages: the daemon releases its mapping on UNMAP/DESTROY below, after which
+    // the queued revoke succeeds on a tick.
+    PwDetachWindow(entry);
+
     ULONG status = ERROR_INVALID_PARAMETER;
 
     LogVerbose("start");
@@ -1724,6 +1752,8 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     // coords
     BOOL coordsChanged = (windowData->X != data.X || windowData->Y != data.Y ||
         windowData->Width != data.Width || windowData->Height != data.Height);
+    BOOL sizeChanged = (windowData->Width != data.Width ||
+        windowData->Height != data.Height);
 
     if (coordsChanged)
     {
@@ -1788,6 +1818,25 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             status = ToggleMap(windowData);
             if (status != ERROR_SUCCESS)
                 goto end;
+        }
+    }
+
+    // Size change invalidates the per-window buffer: rebuild it (new buffer + grant +
+    // WINDOW_DUMP for the new geometry) and repaint. Failure just drops the window
+    // back to the legacy path; not an error.
+    if (sizeChanged && PwIsAttached(windowData))
+    {
+        if (PwResizeWindow(windowData) == ERROR_SUCCESS)
+        {
+            ULONG damageStatus = SendWindowDamageEvent(windowData->Handle, 0, 0,
+                windowData->Width, windowData->Height);
+            if (damageStatus != ERROR_SUCCESS)
+                win_perror2(damageStatus, "SendWindowDamageEvent(resize)");
+        }
+        else
+        {
+            LogDebug("0x%x: per-window rebuild failed, window on legacy path",
+                windowData->Handle);
         }
     }
 
@@ -1978,6 +2027,8 @@ static ULONG TrackWindows(OUT TRACK_STATS* stats)
 // window moves reach the gui daemon at input rate instead of at capture rate.
 static void ProcessWindowEvents(void)
 {
+    PwRevokeTick();
+
     TRACK_STATS stats;
     ULONG status;
 
@@ -2233,6 +2284,20 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         // it - a window going partially blank for no visible reason.
         if (entry->IsIconic || !entry->IsVisible)
             continue;
+
+        // Windows with their own per-window buffer get content AND damage from the WGC
+        // engine; the composited screen carries nothing for them, and slicing it is
+        // exactly the artifact source this build removes. They still claim their area
+        // (override-redirect only, same rule as below) so LEGACY-path windows beneath
+        // them are clipped as before.
+        if (PwIsAttached(entry))
+        {
+            SetRectRgn(rgnWindow, entry->X, entry->Y,
+                entry->X + (int)entry->Width, entry->Y + (int)entry->Height);
+            if (g_ZOrderValid && entry->IsOverrideRedirect)
+                CombineRgn(rgnCovered, rgnCovered, rgnWindow, RGN_OR);
+            continue;
+        }
 
         // INVARIANT: the origin used to convert damage to window-relative coordinates must
         // be the same origin most recently sent in MSG_CONFIGURE, because that is what the
@@ -2868,6 +2933,7 @@ static ULONG Init(void)
     }
 
     PerfInit();
+    PwInit();
 
     EnableUIAccess();
     status = CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName));

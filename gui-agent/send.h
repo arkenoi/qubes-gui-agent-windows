@@ -49,6 +49,11 @@
 #define UrgencyHint      256  // urgency
 
 ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs);
+
+// Per-window MSG_WINDOW_DUMP: announce a window's own framebuffer (grant refs) to the
+// daemon. window==0 is the whole-screen dump (SendScreenGrants).
+ULONG SendWindowDump(IN HWND window, IN ULONG width, IN ULONG height,
+    IN size_t numGrants, IN const ULONG* refs);
 ULONG SendWindowCreate(IN const WINDOW_DATA *windowData);
 ULONG SendWindowDestroy(IN HWND window);
 ULONG SendWindowFlags(IN HWND window, IN uint32_t flagsToSet, IN uint32_t flagsToUnset);

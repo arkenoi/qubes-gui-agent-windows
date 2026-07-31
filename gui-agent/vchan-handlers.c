@@ -26,6 +26,7 @@
 #include "vchan.h"
 #include "vchan-handlers.h"
 #include "send.h"
+#include "perwindow.h"
 #include "xorg-keymap.h"
 #include "resolution.h"
 
@@ -61,6 +62,7 @@ DWORD HandleVersion(void)
         return ERROR_UNIDENTIFIED_ERROR;
     }
     LogDebug("gui daemon version: 0x%x", guidVersion);
+    PwSetDaemonVersion(guidVersion);
     return ERROR_SUCCESS;
 }
 
@@ -598,6 +600,12 @@ DWORD HandleServerData(BOOL replyToMessages, OUT BOOL* screenDestroyed)
         break;
     case MSG_DESTROY:
         status = HandleDestroy((HWND)header.window, screenDestroyed);
+        break;
+    case MSG_WINDOW_DUMP_ACK:
+        // no body; the daemon has processed a WINDOW_DUMP, so superseded grants for
+        // that window can now be revoked
+        PwRevokeTick();
+        status = ERROR_SUCCESS;
         break;
 #pragma warning(pop)
     default:

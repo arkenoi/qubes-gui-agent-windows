@@ -38,13 +38,14 @@
 
 static_assert(sizeof(ULONG) == sizeof(uint32_t), "ULONG has a different size than uint32_t");
 
-ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs)
+ULONG SendWindowDump(IN HWND window, IN ULONG width, IN ULONG height,
+    IN size_t numGrants, IN const ULONG* refs)
 {
     ULONG status = ERROR_INVALID_PARAMETER;
     struct msg_hdr header;
     struct msg_window_dump_hdr dumpHdr;
 
-    LogVerbose("start");
+    LogVerbose("start, window 0x%x %ux%u", window, width, height);
 
     if (refs == NULL)
     {
@@ -59,7 +60,7 @@ ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs)
     }
 
     header.type = MSG_WINDOW_DUMP;
-    header.window = 0; // screen
+    header.window = (uint32_t)(uintptr_t)window; // 0 == whole screen
     size_t untrusted_len = sizeof(dumpHdr) + numGrants * sizeof(ULONG);
     assert(untrusted_len < UINT32_MAX);
     header.untrusted_len = (uint32_t)untrusted_len;
@@ -74,8 +75,8 @@ ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs)
 
     dumpHdr.type = WINDOW_DUMP_TYPE_GRANT_REFS;
     dumpHdr.bpp = 32;
-    dumpHdr.width = g_ScreenWidth;
-    dumpHdr.height = g_ScreenHeight;
+    dumpHdr.width = width;
+    dumpHdr.height = height;
 
     if (!VCHAN_SEND(dumpHdr, L"dumpHdr"))
     {
@@ -95,6 +96,11 @@ end:
     LogVerbose("end (%x)", status);
 
     return status;
+}
+
+ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs)
+{
+    return SendWindowDump(NULL, g_ScreenWidth, g_ScreenHeight, numGrants, refs);
 }
 
 ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)

@@ -75,6 +75,14 @@ typedef struct _WINDOW_DATA
     HWND Owner;
 
     // Uniform alpha of a layered window; 255 (opaque) for everything we cannot ask about.
+
+    // Per-window capture state (perwindow.c). All zero while the window is on the
+    // legacy screen-slice path; PwDumpSent is the "attached" flag.
+    void* PwBuffer;        // page-aligned BGRA framebuffer granted to the gui domain
+    ULONG PwPageCount;
+    ULONG* PwGrantRefs;
+    void* PwGrantHandle;   // sharedAddress from XcGnttabPermitForeignAccess2
+    BOOL PwDumpSent;
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(
