@@ -72,11 +72,23 @@ void AttachThreadToInputDesktop()
     }
 }
 
-// PrintWindow the window into a fresh DIB, diff the cropped region against the
-// caller buffer, copy changed rows, report the changed row band. Returns FALSE only
-// if PrintWindow itself failed.
-bool CaptureAndDiff(Engine& e, Channel& c)
+// One pending damage report, produced under the engine lock and fired AFTER it is
+// released (the callback re-enters agent locks that the frame thread holds while
+// calling WcMarkDirty - firing it under the engine lock is a lock-order inversion that
+// deadlocks the whole frame pipeline).
+struct DamageOut
 {
+    HWND hwnd;
+    int w, y0, y1;
+};
+
+// PrintWindow the window into a fresh DIB, diff the cropped region against the
+// caller buffer, copy changed rows. If content changed, *out receives the row band and
+// the function does NOT call the callback (the caller fires it after unlocking).
+// Returns FALSE only if PrintWindow itself failed.
+bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
+{
+    (void)e;
     RECT wr;
     if (!GetWindowRect(c.hwnd, &wr))
         return false;
@@ -126,8 +138,13 @@ bool CaptureAndDiff(Engine& e, Channel& c)
     DeleteObject(bmp);
     DeleteDC(memdc);
 
-    if (ok && y0 >= 0 && e.callback)
-        e.callback(c.hwnd, 0, y0, c.width, y1 - y0 + 1);
+    if (ok && y0 >= 0 && out)
+    {
+        out->hwnd = c.hwnd;
+        out->w = c.width;
+        out->y0 = y0;
+        out->y1 = y1;
+    }
     return ok ? true : false;
 }
 
@@ -135,9 +152,11 @@ DWORD WINAPI CaptureThread(LPVOID param)
 {
     Engine& e = *(Engine*)param;
     AttachThreadToInputDesktop();
+    std::vector<DamageOut> fired;
     while (!e.quit.load())
     {
         bool didWork = false;
+        fired.clear();
         AcquireSRWLockShared(&e.lock);
         const size_t n = e.channels.size();
 
@@ -165,9 +184,12 @@ DWORD WINAPI CaptureThread(LPVOID param)
             if (c.dead || !c.dirty.exchange(false))
                 continue;
             didWork = true;
-            if (CaptureAndDiff(e, c))
+            DamageOut dmg{ nullptr, 0, 0, 0 };
+            if (CaptureAndDiff(e, c, &dmg))
             {
                 c.failures = 0;
+                if (dmg.hwnd)
+                    fired.push_back(dmg);
             }
             else if (++c.failures >= DEAD_AFTER_FAILURES)
             {
@@ -181,6 +203,14 @@ DWORD WINAPI CaptureThread(LPVOID param)
             }
         }
         ReleaseSRWLockShared(&e.lock);
+
+        // Fire callbacks with NO engine lock held: the callback path takes agent locks
+        // (g_csWatchedWindows) that the frame thread holds while calling WcMarkDirty,
+        // so calling back under e.lock would invert the order and deadlock.
+        if (e.callback)
+            for (auto& d : fired)
+                e.callback(d.hwnd, 0, d.y0, d.w, d.y1 - d.y0 + 1);
+
         Sleep(didWork ? 2 : 8);
     }
     return 0;
@@ -304,10 +334,13 @@ ULONG WcPrefill(HWND hwnd)
             c = ch.get();
             break;
         }
-    // capture synchronously on the calling thread (same proven GDI path)
+    // capture synchronously on the calling thread (same proven GDI path); pass no
+    // DamageOut - the caller sends a full-window damage after the dump, and firing the
+    // callback here (under the shared lock, on the frame thread) risks the same
+    // lock-order inversion the async path avoids.
     ULONG status = ERROR_NOT_FOUND;
     if (c)
-        status = CaptureAndDiff(*g_eng, *c) ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+        status = CaptureAndDiff(*g_eng, *c, NULL) ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
     ReleaseSRWLockShared(&g_eng->lock);
     return status;
 }
