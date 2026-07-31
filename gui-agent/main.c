@@ -2229,10 +2229,24 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
             }
         }
 
-        // Whatever this window occupies is now claimed: lower windows must not receive it,
-        // whether or not this window was itself damaged this frame. Only when the stacking
-        // order is actually known - see CollectZOrder.
-        if (g_ZOrderValid)
+        // Claim this window's area so lower windows do not receive its pixels - but ONLY for
+        // override-redirect popups (menus, tooltips).
+        //
+        // Clipping against general z-order was tried and is wrong. The agent never tells the
+        // daemon about stacking, so dom0's order and the guest's routinely disagree; when they
+        // do, the region withheld from a window is exactly the region dom0 has on top, and it
+        // renders as a stale band. Measured directly: with a Notepad focused above chromerepro
+        // in the guest while dom0 drew chromerepro on top, chromerepro showed a stale vertical
+        // band, which disappeared the instant the guest's stacking was made to agree.
+        //
+        // Popups are the safe case and the one that actually matters: a menu is on top in both
+        // the guest and in dom0 by construction, so withholding its area from the window below
+        // can never expose a stale region - and that bleed is what corrupts a menu's host
+        // window on hover.
+        //
+        // Fixing the general case needs the daemon to learn z-order: a protocol change,
+        // Phase 3, not something to smuggle in here.
+        if (g_ZOrderValid && entry->IsOverrideRedirect)
             CombineRgn(rgnCovered, rgnCovered, rgnWindow, RGN_OR);
     }
 
