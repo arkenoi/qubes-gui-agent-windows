@@ -247,21 +247,6 @@ static void QueueWindowEvent(IN HWND window, IN DWORD event, IN BOOL resync)
         {
             g_PendingEvents[g_PendingWindowsCount] = event;
             g_PendingWindows[g_PendingWindowsCount++] = window;
-
-            // Only wake the main loop for events that need attention BEFORE the next frame
-            // (a window appearing, disappearing, being cloaked or renamed). Pure geometry
-            // events - LOCATIONCHANGE/STATECHANGE, i.e. a drag - are deliberately NOT
-            // signalled: they ride the next frame instead.
-            //
-            // Why: dom0 paints a window by reading the shared framebuffer AT THAT WINDOW'S
-            // CURRENT RECT. Sending MSG_CONFIGURE at input rate (~60 Hz) while the
-            // framebuffer only refreshes at capture rate means dom0 samples the OLD contents
-            // at the NEW position, and the content visibly slides around inside the frame
-            // while dragging. Emitting geometry on the frame path keeps the position and the
-            // pixels consistent with each other - which is what the shipped agent does as a
-            // side effect of updating everything per frame, and why it wobbles less.
-            if (!WindowEventForcesReexamine(event))
-                signal = FALSE;
         }
         else
         {
