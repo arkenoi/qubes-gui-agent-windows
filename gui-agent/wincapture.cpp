@@ -13,6 +13,7 @@
 #include <d3d11.h>
 #include <dxgi1_2.h>
 #include <inspectable.h>
+#include <roapi.h>
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
@@ -67,6 +68,17 @@ struct Engine
 };
 
 Engine* g_eng = nullptr;
+
+// The agent's threads never initialize a WinRT/COM apartment (wgcprobe did it in
+// main(), which is why the probe worked and the agent's IsSupported() threw). Make
+// every C-API entry point idempotently ensure one; RPC_E_CHANGED_MODE means the thread
+// already has an (STA) apartment, which WinRT statics are fine with.
+void EnsureApartment()
+{
+    HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
+    if (FAILED(hr) && hr != RPC_E_CHANGED_MODE && hr != S_FALSE)
+        throw hresult_error(hr);
+}
 
 bool MakeD3D(Engine& e)
 {
@@ -191,6 +203,7 @@ BOOL WcIsSupported(void)
 {
     try
     {
+        EnsureApartment();
         return GraphicsCaptureSession::IsSupported() ? TRUE : FALSE;
     }
     catch (...)
@@ -205,6 +218,7 @@ ULONG WcInit(WC_DAMAGE_CALLBACK callback)
         return ERROR_ALREADY_INITIALIZED;
     try
     {
+        EnsureApartment();
         auto e = std::make_unique<Engine>();
         e->callback = callback;
         if (!MakeD3D(*e))
@@ -256,6 +270,7 @@ ULONG WcAddWindow(HWND hwnd, int width, int height, int cropX, int cropY, void* 
         return ERROR_INVALID_PARAMETER;
     try
     {
+        EnsureApartment();
         RECT wr;
         if (!GetWindowRect(hwnd, &wr))
             return GetLastError();
