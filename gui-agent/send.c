@@ -406,8 +406,27 @@ cleanup:
 ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN int height)
 {
     if (g_ProtoTrace)
-        LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d",
-            (uint32_t)(ULONG_PTR)window, x, y, width, height);
+    {
+        // Wobble is a desync between the geometry dom0 believes and where the window actually
+        // is in the live shared framebuffer. Record both at the instant damage goes out: `a*`
+        // is the origin this damage was registered against (what dom0 will add back), `l*` is
+        // where the window really is right now. A non-zero delta during motion IS the wobble,
+        // measured with no cross-VM capture skew.
+        RECT live;
+        if (window && GetRealWindowRect(window, &live) == ERROR_SUCCESS)
+        {
+            WINDOW_DATA* wd = FindWindowByHandle(window);
+            int ax = wd ? wd->X : 0, ay = wd ? wd->Y : 0;
+            LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d,ax=%d,ay=%d,lx=%d,ly=%d",
+                (uint32_t)(ULONG_PTR)window, x, y, width, height,
+                ax, ay, live.left, live.top);
+        }
+        else
+        {
+            LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d",
+                (uint32_t)(ULONG_PTR)window, x, y, width, height);
+        }
+    }
 
     struct msg_shmimage shmMsg;
     struct msg_hdr header;
