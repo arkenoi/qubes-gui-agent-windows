@@ -1284,6 +1284,48 @@ static ULONG WINAPI WatchForEvents(void)
             if (g_VchanClientConnected)
             {
                 assert(capture);
+
+                // The duplication was recreated in place after a loss and the framebuffer
+                // was re-granted, so the daemon is still mapping the old pages. Republish
+                // the refs BEFORE sending any damage for this frame: damage that refers to
+                // pages the daemon has not mapped yet would be painted from stale memory.
+                if (capture->grants_changed)
+                {
+                    capture->grants_changed = FALSE;
+                    ULONG grantStatus = SendScreenGrants(
+                        FRAMEBUFFER_PAGE_COUNT(g_ScreenWidth, g_ScreenHeight),
+                        capture->grant_refs);
+                    if (grantStatus != ERROR_SUCCESS)
+                        win_perror2(grantStatus, "SendScreenGrants (after recreate)");
+                    else
+                        LogInfo("framebuffer re-granted after duplication recovery, MSG_WINDOW_DUMP re-sent");
+
+                    // Everything the daemon holds came from the old framebuffer, so repaint
+                    // all of it rather than waiting for each window to happen to be damaged
+                    // again - an idle window would otherwise stay frozen indefinitely.
+                    if (g_SeamlessMode)
+                    {
+                        EnterCriticalSection(&g_csWatchedWindows);
+                        WINDOW_DATA* repaint = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+                        while (repaint != (WINDOW_DATA*)&g_WatchedWindowsList)
+                        {
+                            repaint = CONTAINING_RECORD(repaint, WINDOW_DATA, ListEntry);
+                            if (repaint->IsVisible && !repaint->IsIconic &&
+                                repaint->Width > 0 && repaint->Height > 0)
+                            {
+                                SendWindowDamageEvent(repaint->Handle, 0, 0,
+                                    repaint->Width, repaint->Height);
+                            }
+                            repaint = (WINDOW_DATA*)repaint->ListEntry.Flink;
+                        }
+                        LeaveCriticalSection(&g_csWatchedWindows);
+                    }
+                    else
+                    {
+                        SendWindowDamageEvent(NULL, 0, 0, g_ScreenWidth, g_ScreenHeight);
+                    }
+                }
+
                 ProcessNewFrame(&capture->frame);
             }
 

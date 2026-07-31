@@ -59,6 +59,10 @@ typedef struct _CAPTURE_CONTEXT
 	// this gets initialized when the first frame is acquired
 	void* framebuffer; // framebuffer address
 	ULONG* grant_refs; // xen grant refs for shared framebuffer pages
+	// Set when grant_refs have been re-established for a NEW duplication (see
+	// RecreateDuplication). The frame loop must re-send MSG_WINDOW_DUMP, or the daemon keeps
+	// reading the pages of the duplication that was torn down.
+	BOOL grants_changed;
 	HANDLE frame_event; // capture thread -> main loop: new frame
 	HANDLE ready_event; // main loop -> capture thread: frame processed
 	HANDLE error_event; // capture thread -> main loop: capture error
