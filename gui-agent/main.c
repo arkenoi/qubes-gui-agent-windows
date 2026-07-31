@@ -1284,6 +1284,28 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
 
     EnsureOnInputDesktop();
 
+    // Keep dom0's stacking in step with the guest's by re-mapping whatever is foreground.
+    //
+    // dom0 and the guest are otherwise free to disagree about z-order, and when they do, the
+    // window dom0 draws on top receives the pixels of whatever covers it in the guest's
+    // composited framebuffer - text sliced away mid-drag, see OVERLAP-IN-MOTION.md. The agent
+    // has no stacking message, but if the daemon raises a window on MSG_MAP then re-mapping
+    // the foreground window is enough, and costs one message per focus change.
+    {
+        static HWND lastForeground = NULL;
+        HWND fg = GetForegroundWindow();
+        if (fg && fg != lastForeground)
+        {
+            WINDOW_DATA* fgData = FindWindowByHandle(fg);
+            if (fgData && fgData->IsVisible && !fgData->IsIconic)
+            {
+                lastForeground = fg;
+                LogInfo("foreground -> 0x%x, re-mapping to raise it in dom0", fg);
+                SendWindowMap(fgData);
+            }
+        }
+    }
+
     g_TaskbarWindow = FindWindow(L"Shell_TrayWnd", 0);
     g_ShowTaskbar = FALSE;
 
