@@ -1912,6 +1912,63 @@ static void ProcessWindowEvents(void)
 }
 
 // Called after receiving new frame.
+
+// Assign each watched window its position in the guest z-order (0 = topmost).
+//
+// The desktop framebuffer holds the COMPOSITED desktop, so a dirty rect in screen coordinates
+// covers whatever is visible there - which belongs to the TOPMOST window over that area, not
+// to every window whose rectangle contains it. Without an ordering there is no way to tell
+// which window a given pixel actually belongs to.
+//
+// This is a bare EnumWindows: it touches no window properties, so it costs a fraction of the
+// per-frame enumeration Phase 2A removed (which called GetWindowLong/GetWindowRect per window).
+static BOOL CALLBACK ZOrderProc(HWND window, LPARAM lParam)
+{
+    int* next = (int*)lParam;
+    WINDOW_DATA* entry = FindWindowByHandle(window);
+    if (entry)
+        entry->ZOrder = (*next)++;
+    return TRUE;
+}
+
+// Order the watched list topmost-first into `sorted`, returning how many were placed.
+static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
+{
+    WINDOW_DATA* entry = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (entry != (WINDOW_DATA*)&g_WatchedWindowsList)
+    {
+        entry = CONTAINING_RECORD(entry, WINDOW_DATA, ListEntry);
+        entry->ZOrder = INT_MAX; // not seen by EnumWindows => treat as bottom
+        entry = (WINDOW_DATA*)entry->ListEntry.Flink;
+    }
+
+    int next = 0;
+    EnumWindows(ZOrderProc, (LPARAM)&next);
+
+    UINT count = 0;
+    entry = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (entry != (WINDOW_DATA*)&g_WatchedWindowsList && count < capacity)
+    {
+        entry = CONTAINING_RECORD(entry, WINDOW_DATA, ListEntry);
+        sorted[count++] = entry;
+        entry = (WINDOW_DATA*)entry->ListEntry.Flink;
+    }
+
+    // insertion sort: the list is small (single digits) and nearly ordered in practice
+    for (UINT i = 1; i < count; i++)
+    {
+        WINDOW_DATA* key = sorted[i];
+        int j = (int)i - 1;
+        while (j >= 0 && sorted[j]->ZOrder > key->ZOrder)
+        {
+            sorted[j + 1] = sorted[j];
+            j--;
+        }
+        sorted[j + 1] = key;
+    }
+    return count;
+}
+
 static HWND g_LastPopupDamageWindow = NULL;
 
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
@@ -1929,8 +1986,15 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
     HWND  perfPopupWindow = NULL;
 
     WINDOW_DATA *entry;
-    WINDOW_DATA *nextEntry;
     ULONG status = ERROR_SUCCESS;
+
+    // Damage clipping state. Regions are reused across the whole frame rather than created
+    // per window, so this costs four GDI objects per frame regardless of window count.
+    WINDOW_DATA* zSorted[64];
+    UINT zCount = 0;
+    HRGN rgnCovered = NULL, rgnWindow = NULL, rgnVisible = NULL, rgnDirty = NULL, rgnDamage = NULL;
+    RGNDATA* rgnData = NULL;
+    DWORD rgnDataSize = 0;
 
     // Instrumentation (see perf.h). All of these collapse to zero when disabled;
     // the only cost then is the g_PerfEnabled test inside PerfNow().
@@ -1978,6 +2042,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
 
     EnterCriticalSection(&g_csWatchedWindows);
 
+    // Created here, not at the top: the fullscreen path returns before ever reaching the
+    // damage loop and would leak these every frame.
+    rgnCovered = CreateRectRgn(0, 0, 0, 0);
+    rgnWindow  = CreateRectRgn(0, 0, 0, 0);
+    rgnVisible = CreateRectRgn(0, 0, 0, 0);
+    rgnDirty   = CreateRectRgn(0, 0, 0, 0);
+    rgnDamage  = CreateRectRgn(0, 0, 0, 0);
+
     // Bring the watched window list up to date from the events the hook thread
     // collected (or resync it wholesale, periodically). This used to be an
     // EnumWindows() pass over every top-level window on every single frame.
@@ -2005,16 +2077,16 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
     if (status != ERROR_SUCCESS)
         goto cleanup;
 
-    // send damage notifications
-    entry = (WINDOW_DATA *)g_WatchedWindowsList.Flink;
-    while (entry != (WINDOW_DATA*)&g_WatchedWindowsList)
+    // send damage notifications, TOPMOST FIRST so each window can be clipped against the
+    // area already claimed by the windows above it
+    zCount = CollectZOrder(zSorted, RTL_NUMBER_OF(zSorted));
+    for (UINT zi = 0; zi < zCount; zi++)
     {
-        entry = CONTAINING_RECORD(entry, WINDOW_DATA, ListEntry);
-        nextEntry = (WINDOW_DATA*)entry->ListEntry.Flink;
+        entry = zSorted[zi];
         perfWindows++;
 
         if (entry->IsIconic) // minimized, don't care
-            goto skip;
+            continue;
 
         // INVARIANT: the origin used to convert damage to window-relative coordinates must
         // be the same origin most recently sent in MSG_CONFIGURE, because that is what the
@@ -2025,6 +2097,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         RECT windowRect = { entry->X, entry->Y,
                             entry->X + (int)entry->Width, entry->Y + (int)entry->Height };
         RECT changedArea; // intersection of damage rect with window rect
+
+        // Region of this window NOT covered by anything stacked above it. The framebuffer is
+        // the composited desktop, so the pixels under a higher window belong to that window,
+        // not to this one; sending them here makes the daemon paint the upper window's content
+        // into this window's pixmap. That is what corrupts a menu's host window on hover and
+        // what leaves debris when one window is dragged across another.
+        SetRectRgn(rgnWindow, windowRect.left, windowRect.top, windowRect.right, windowRect.bottom);
+        CombineRgn(rgnVisible, rgnWindow, rgnCovered, RGN_DIFF);
 
         // skip windows that aren't in the changed area
         for (UINT i = 0; i < frame->dirty_rects_count; i++)
@@ -2037,27 +2117,55 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
                     frame->dirty_rects[i].right - frame->dirty_rects[i].left, frame->dirty_rects[i].bottom - frame->dirty_rects[i].top,
                     changedArea.left, changedArea.top, changedArea.right - changedArea.left, changedArea.bottom - changedArea.top);
 
-                if (entry->IsOverrideRedirect)
+                SetRectRgn(rgnDirty, changedArea.left, changedArea.top,
+                    changedArea.right, changedArea.bottom);
+                if (CombineRgn(rgnDamage, rgnVisible, rgnDirty, RGN_AND) == NULLREGION)
+                    continue; // entirely hidden behind a higher window
+
+                // The visible part can be several disjoint rectangles (an L shape when a
+                // window is partly overlapped), so send each rather than their bounding box -
+                // the bounding box would re-introduce the covered area.
+                DWORD needed = GetRegionData(rgnDamage, 0, NULL);
+                if (needed == 0)
+                    continue;
+                if (needed > rgnDataSize)
                 {
-                    perfPopupDamage++;
-                    perfPopupWindow = entry->Handle;
+                    RGNDATA* grown = (RGNDATA*)realloc(rgnData, needed);
+                    if (!grown)
+                        continue; // out of memory: drop this rect rather than send it wrong
+                    rgnData = grown;
+                    rgnDataSize = needed;
                 }
+                if (GetRegionData(rgnDamage, rgnDataSize, rgnData) == 0)
+                    continue;
 
-                status = SendWindowDamageEvent(entry->Handle,
-                    changedArea.left - entry->X, // window-relative, same origin as MSG_CONFIGURE
-                    changedArea.top - entry->Y,
-                    changedArea.right - changedArea.left, // size
-                    changedArea.bottom - changedArea.top);
-
-                if (ERROR_SUCCESS != status)
+                const RECT* parts = (const RECT*)rgnData->Buffer;
+                for (DWORD p = 0; p < rgnData->rdh.nCount; p++)
                 {
-                    win_perror2(status, "SendWindowDamageEvent");
-                    goto cleanup;
+                    if (entry->IsOverrideRedirect)
+                    {
+                        perfPopupDamage++;
+                        perfPopupWindow = entry->Handle;
+                    }
+
+                    status = SendWindowDamageEvent(entry->Handle,
+                        parts[p].left - entry->X, // window-relative, same origin as MSG_CONFIGURE
+                        parts[p].top - entry->Y,
+                        parts[p].right - parts[p].left, // size
+                        parts[p].bottom - parts[p].top);
+
+                    if (ERROR_SUCCESS != status)
+                    {
+                        win_perror2(status, "SendWindowDamageEvent");
+                        goto cleanup;
+                    }
                 }
             }
         }
-skip:
-        entry = nextEntry;
+
+        // Whatever this window occupies is now claimed: lower windows must not receive it,
+        // whether or not this window was itself damaged this frame.
+        CombineRgn(rgnCovered, rgnCovered, rgnWindow, RGN_OR);
     }
 
 cleanup:
@@ -2076,6 +2184,13 @@ cleanup:
     // as the menu is open - unacceptable noise in a package meant to be installed as-is. One
     // line per popup still answers the question this counter exists for (do override-redirect
     // windows receive damage at all), and the message says so rather than implying a total.
+    if (rgnCovered) DeleteObject(rgnCovered);
+    if (rgnWindow)  DeleteObject(rgnWindow);
+    if (rgnVisible) DeleteObject(rgnVisible);
+    if (rgnDirty)   DeleteObject(rgnDirty);
+    if (rgnDamage)  DeleteObject(rgnDamage);
+    free(rgnData);
+
     if (perfPopupDamage > 0 && perfPopupWindow != g_LastPopupDamageWindow)
     {
         g_LastPopupDamageWindow = perfPopupWindow;

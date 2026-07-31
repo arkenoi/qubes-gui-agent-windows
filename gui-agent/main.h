@@ -63,6 +63,9 @@ typedef struct _WINDOW_DATA
     LIST_ENTRY ListEntry;
 
     BOOL IsOverrideRedirect;
+    // Position in the guest's z-order, 0 = topmost. Recomputed per frame; used to clip damage
+    // so a window never receives the pixels of a window stacked above it.
+    int ZOrder;
     HWND ModalParent; // if nonzero, this window is modal in relation to window pointed by this field
 
     // Owner (GW_OWNER), not parent: every top-level window is parented to the desktop, but
