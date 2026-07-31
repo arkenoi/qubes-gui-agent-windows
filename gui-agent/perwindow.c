@@ -81,12 +81,13 @@ void PwInit(void)
     }
 
     {
+        // ADVISORY ONLY: under the agent's SYSTEM-in-session-1 token, IsSupported()
+        // activation fails with 0x8007000E even where real capture may work. The
+        // authoritative test is the first actual CreateForWindow in WcAddWindow, which
+        // falls back per-window on failure.
         ULONG probe = WcProbeSupport();
         if (probe != 0)
-        {
-            LogWarning("per-window capture unavailable: WGC probe failed 0x%x", probe);
-            return;
-        }
+            LogWarning("WGC support probe failed 0x%x - proceeding, real attach decides", probe);
     }
 
     DWORD status = XcOpen(PwXcLogger, &g_PwXc);
