@@ -223,6 +223,21 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
         IDXGIOutputDuplication_Release(ctx->duplication);
         ctx->duplication = NULL;
     }
+
+    // Drop the framebuffer grant too. The desktop surface belongs to the duplication we are
+    // discarding; the replacement may map somewhere else entirely. GetFrame only maps and
+    // grants when grant_refs is NULL, so leaving it set means the agent never looks at the
+    // new surface and the daemon reads the old pages forever - windows stay mapped and
+    // correctly positioned, but their contents freeze at the moment of the loss.
+    if (ctx->xc && ctx->grant_refs)
+    {
+        ULONG revokeStatus = XcGnttabRevokeForeignAccess(ctx->xc, ctx->framebuffer);
+        if (revokeStatus != ERROR_SUCCESS)
+            win_perror2(revokeStatus, "XcGnttabRevokeForeignAccess (recreate)");
+        free(ctx->grant_refs);
+        ctx->grant_refs = NULL;
+        ctx->framebuffer = NULL;
+    }
     LeaveCriticalSection(&ctx->frame.lock);
 
     for (UINT attempt = 0; attempt < maxAttempts; attempt++)
@@ -515,6 +530,9 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
         }
 
         assert(ctx->framebuffer == ctx->frame.rect.pBits);
+
+        // Tell the frame loop to re-send MSG_WINDOW_DUMP with these refs.
+        ctx->grants_changed = TRUE;
     }
 
     // Instrumentation: is GetFrameMoveRects ever non-empty? See the TODO below.
