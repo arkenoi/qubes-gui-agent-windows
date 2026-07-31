@@ -61,7 +61,7 @@ DWORD HandleVersion(void)
         LogError("VchanReceiveBuffer failed");
         return ERROR_UNIDENTIFIED_ERROR;
     }
-    LogDebug("gui daemon version: 0x%x", guidVersion);
+    LogInfo("gui daemon version: 0x%x", guidVersion);
     PwSetDaemonVersion(guidVersion);
     return ERROR_SUCCESS;
 }

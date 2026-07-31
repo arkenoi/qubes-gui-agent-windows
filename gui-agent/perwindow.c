@@ -200,7 +200,11 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     if (!g_PwOn)
         return ERROR_NOT_SUPPORTED;
     if (g_PwDaemonVersion < QUBES_GUID_MIN_MSG_WINDOW_DUMP_ACK)
+    {
+        LogInfo("0x%x: attach skipped, daemon version 0x%x < 0x%x",
+                entry->Handle, g_PwDaemonVersion, QUBES_GUID_MIN_MSG_WINDOW_DUMP_ACK);
         return ERROR_NOT_SUPPORTED;
+    }
     if (entry->PwDumpSent)
         return ERROR_SUCCESS;
     if (entry->Width == 0 || entry->Height == 0)
@@ -250,7 +254,7 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
                          cropX, cropY, buffer);
     if (status != ERROR_SUCCESS)
     {
-        LogDebug("WcAddWindow(0x%x) failed 0x%x - staying on legacy path",
+        LogInfo("WcAddWindow(0x%x) failed 0x%x - staying on legacy path",
                  entry->Handle, status);
         PwQueueRevoke(shared, refs, buffer);
         PwRevokeTick(); // nothing maps it yet; usually succeeds immediately
@@ -280,7 +284,7 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwWidth = entry->Width;
     entry->PwHeight = entry->Height;
     entry->PwDumpSent = TRUE;
-    LogDebug("0x%x: per-window buffer %ux%u (%lu pages) attached",
+    LogInfo("0x%x: per-window buffer %ux%u (%lu pages) attached",
              entry->Handle, entry->Width, entry->Height, pageCount);
     return ERROR_SUCCESS;
 }
