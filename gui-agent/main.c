@@ -2098,6 +2098,41 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
                             entry->X + (int)entry->Width, entry->Y + (int)entry->Height };
         RECT changedArea; // intersection of damage rect with window rect
 
+        // Re-read the window's position immediately before registering damage against it.
+        //
+        // dom0 copies out of the LIVE shared framebuffer when it processes the message, not
+        // out of a snapshot taken when the frame was captured. So the content it will read
+        // sits at the window's CURRENT position, and registering damage against the position
+        // TrackWindows() saw earlier in this frame mis-registers it by however far the window
+        // has moved since - measured at p95=22px, max=38px during a drag, which is the
+        // "contents wobble within the frame" the user reports.
+        //
+        // The origin must also stay equal to the one last announced in MSG_CONFIGURE, so when
+        // the position has moved, announce the new one first and then convert against it.
+        {
+            RECT fresh;
+            if (GetRealWindowRect(entry->Handle, &fresh) == ERROR_SUCCESS)
+            {
+                int freshW = fresh.right - fresh.left, freshH = fresh.bottom - fresh.top;
+                if ((fresh.left != entry->X || fresh.top != entry->Y ||
+                     freshW != (int)entry->Width || freshH != (int)entry->Height) &&
+                    freshW > 0 && freshH > 0)
+                {
+                    entry->X = fresh.left;
+                    entry->Y = fresh.top;
+                    entry->Width = freshW;
+                    entry->Height = freshH;
+                    SendWindowConfigure(entry->Handle, entry->X, entry->Y,
+                        entry->Width, entry->Height, entry->IsOverrideRedirect);
+                }
+            }
+        }
+
+        windowRect.left = entry->X;
+        windowRect.top = entry->Y;
+        windowRect.right = entry->X + (int)entry->Width;
+        windowRect.bottom = entry->Y + (int)entry->Height;
+
         // Region of this window NOT covered by anything stacked above it. The framebuffer is
         // the composited desktop, so the pixels under a higher window belong to that window,
         // not to this one; sending them here makes the daemon paint the upper window's content
