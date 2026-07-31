@@ -1912,6 +1912,8 @@ static void ProcessWindowEvents(void)
 }
 
 // Called after receiving new frame.
+static HWND g_LastPopupDamageWindow = NULL;
+
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
 {
     // Menus/tooltips are override-redirect windows. They are mapped like any other window,
@@ -2069,9 +2071,22 @@ cleanup:
         g_PerfSendTicks - perfSendBase, g_PerfSendCount - perfSendCountBase,
         &frame->perf, frame->dirty_rects_count, perfWindows, perfInterrogated, perfEvents);
 
-    if (perfPopupDamage > 0)
-        LogInfo("popup damage: %u message(s) this frame, last window 0x%x",
-            perfPopupDamage, perfPopupWindow);
+    // Only the FIRST damage frame for a given popup is logged. A menu is damaged on every
+    // hover repaint, so logging each frame emits ~40 lines/second at capture rate for as long
+    // as the menu is open - unacceptable noise in a package meant to be installed as-is. One
+    // line per popup still answers the question this counter exists for (do override-redirect
+    // windows receive damage at all), and the message says so rather than implying a total.
+    if (perfPopupDamage > 0 && perfPopupWindow != g_LastPopupDamageWindow)
+    {
+        g_LastPopupDamageWindow = perfPopupWindow;
+        LogInfo("popup damage: override-redirect window 0x%x is receiving damage (%u message(s) this frame; logged once per popup)",
+            perfPopupWindow, perfPopupDamage);
+    }
+    else if (perfPopupDamage == 0 && perfPopupWindow == NULL)
+    {
+        // no popup damaged this frame; allow the next popup to log again
+        g_LastPopupDamageWindow = NULL;
+    }
 
     LogVerbose("end (%x)", status);
     return status;
