@@ -531,8 +531,12 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
 
         assert(ctx->framebuffer == ctx->frame.rect.pBits);
 
-        // Tell the frame loop to re-send MSG_WINDOW_DUMP with these refs.
-        ctx->grants_changed = TRUE;
+        // Tell the frame loop to re-send MSG_WINDOW_DUMP with these refs - but only if this
+        // is a RE-grant. StartFrameProcessing already sends the refs for the first grant, so
+        // flagging that one too would send a duplicate dump and force a redundant full-screen
+        // repaint on every startup, logged as if a recovery had happened.
+        ctx->grants_changed = ctx->granted_once;
+        ctx->granted_once = TRUE;
     }
 
     // Instrumentation: is GetFrameMoveRects ever non-empty? See the TODO below.

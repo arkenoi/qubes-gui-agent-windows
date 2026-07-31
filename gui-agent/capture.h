@@ -66,6 +66,7 @@ typedef struct _CAPTURE_CONTEXT
 	// RecreateDuplication). The frame loop must re-send MSG_WINDOW_DUMP, or the daemon keeps
 	// reading the pages of the duplication that was torn down.
 	BOOL grants_changed;
+	BOOL granted_once; // distinguishes the first grant from a re-grant after recovery
 	HANDLE frame_event; // capture thread -> main loop: new frame
 	HANDLE ready_event; // main loop -> capture thread: frame processed
 	HANDLE error_event; // capture thread -> main loop: capture error
