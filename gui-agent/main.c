@@ -1917,8 +1917,12 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
     // Menus/tooltips are override-redirect windows. They are mapped like any other window,
     // but dom0 screenshot tooling enumerates only managed windows, so whether their repaints
     // (e.g. hover highlight) actually reach the daemon cannot be checked from outside. Count
-    // them here instead. Logged only when non-zero, so this is silent unless a popup is
-    // actually being damaged, and at DEBUG which is the guest's default level.
+    // them here instead. Emitted only when non-zero, so it is silent unless a popup is
+    // actually being damaged - a menu is open for a second or two at a time.
+    // INFO, not DEBUG: LogDebug does not appear at the guest's default LogLevel=3, which is
+    // the same trap that made the ACCESS_LOST recovery look like a no-op (see
+    // instrumentation/ACCESS-LOST-VERIFIED.md). A diagnostic invisible at the level the
+    // guest actually runs at is worse than none: it reads as a confirmed zero.
     ULONG perfPopupDamage = 0;
     HWND  perfPopupWindow = NULL;
 
@@ -2066,7 +2070,7 @@ cleanup:
         &frame->perf, frame->dirty_rects_count, perfWindows, perfInterrogated, perfEvents);
 
     if (perfPopupDamage > 0)
-        LogDebug("popup damage: %u message(s) this frame, last window 0x%x",
+        LogInfo("popup damage: %u message(s) this frame, last window 0x%x",
             perfPopupDamage, perfPopupWindow);
 
     LogVerbose("end (%x)", status);
