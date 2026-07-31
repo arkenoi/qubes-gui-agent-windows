@@ -247,6 +247,21 @@ static void QueueWindowEvent(IN HWND window, IN DWORD event, IN BOOL resync)
         {
             g_PendingEvents[g_PendingWindowsCount] = event;
             g_PendingWindows[g_PendingWindowsCount++] = window;
+
+            // Only wake the main loop for events that need attention BEFORE the next frame
+            // (a window appearing, disappearing, being cloaked or renamed). Pure geometry
+            // events - LOCATIONCHANGE/STATECHANGE, i.e. a drag - are deliberately NOT
+            // signalled: they ride the next frame instead.
+            //
+            // Why: dom0 paints a window by reading the shared framebuffer AT THAT WINDOW'S
+            // CURRENT RECT. Sending MSG_CONFIGURE at input rate (~60 Hz) while the
+            // framebuffer only refreshes at capture rate means dom0 samples the OLD contents
+            // at the NEW position, and the content visibly slides around inside the frame
+            // while dragging. Emitting geometry on the frame path keeps the position and the
+            // pixels consistent with each other - which is what the shipped agent does as a
+            // side effect of updating everything per frame, and why it wobbles less.
+            if (!WindowEventForcesReexamine(event))
+                signal = FALSE;
         }
         else
         {
@@ -920,6 +935,28 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             {
                 win_perror2(status, "SendWindowMap");
                 goto end;
+            }
+
+            // Force a full repaint of the window we just mapped.
+            //
+            // Damage is attributed to windows the agent already knows about. A window can
+            // easily be painted by Windows BEFORE we learn it exists - the old code hid this
+            // because AddAllWindows() enumerated live on the frame path, so anything that
+            // existed at that instant was known before damage was attributed; with
+            // event-driven tracking the CREATE/SHOW event can still be in flight when the
+            // frame carrying that window's paint is processed, and the damage is dropped.
+            // A menu is the worst case: it paints once and then generates no further damage,
+            // so it stays BLANK in dom0 until something else happens to dirty it (hovering
+            // an entry redraws it - which is exactly the reported symptom, and why keyboard
+            // navigation does not show it).
+            // This also narrows the same race in the shipped agent, where it is rarer but
+            // demonstrably present.
+            if (entry->IsVisible && entry->Width > 0 && entry->Height > 0)
+            {
+                ULONG damageStatus = SendWindowDamageEvent(entry->Handle, 0, 0,
+                    entry->Width, entry->Height);
+                if (ERROR_SUCCESS != damageStatus)
+                    win_perror2(damageStatus, "SendWindowDamageEvent(initial)");
             }
 
             if (entry->IsIconic)
