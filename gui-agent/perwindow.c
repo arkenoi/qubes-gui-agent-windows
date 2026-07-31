@@ -15,6 +15,7 @@
 #include <log.h>
 #include <config.h>
 #include <xencontrol.h>
+#pragma warning(disable:4200) // nonstandard extension used: zero-sized array (flexible array member)
 #include <qubes-gui-protocol.h>
 
 #define REG_CONFIG_PERWINDOW_VALUE L"PerWindowCapture"
