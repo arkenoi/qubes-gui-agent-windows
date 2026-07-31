@@ -1922,6 +1922,8 @@ static void ProcessWindowEvents(void)
 //
 // This is a bare EnumWindows: it touches no window properties, so it costs a fraction of the
 // per-frame enumeration Phase 2A removed (which called GetWindowLong/GetWindowRect per window).
+static BOOL g_ZOrderValid = FALSE;
+
 static BOOL CALLBACK ZOrderProc(HWND window, LPARAM lParam)
 {
     int* next = (int*)lParam;
@@ -1943,7 +1945,22 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
     }
 
     int next = 0;
-    EnumWindows(ZOrderProc, (LPARAM)&next);
+    // EnumWindows can fail (observed: ERROR_INVALID_HANDLE). If it does, every ZOrder stays
+    // INT_MAX, the sort below is arbitrary, and clipping against an arbitrary order is far
+    // worse than not clipping: if the desktop window (which spans the whole screen) sorts
+    // first it claims everything as covered and NOTHING else receives damage - the entire
+    // qube renders stale. Failure must degrade to "do not clip", never to "clip wrongly".
+    g_ZOrderValid = EnumWindows(ZOrderProc, (LPARAM)&next) ? TRUE : FALSE;
+    if (!g_ZOrderValid)
+    {
+        static DWORD lastComplaint = 0;
+        DWORD now = GetTickCount();
+        if (now - lastComplaint > 5000)
+        {
+            lastComplaint = now;
+            win_perror("EnumWindows (z-order); damage clipping disabled for now");
+        }
+    }
 
     UINT count = 0;
     entry = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
@@ -1952,6 +1969,17 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
         entry = CONTAINING_RECORD(entry, WINDOW_DATA, ListEntry);
         sorted[count++] = entry;
         entry = (WINDOW_DATA*)entry->ListEntry.Flink;
+    }
+
+    // Any window EnumWindows did not report has an unknown position, so the whole ordering
+    // is untrustworthy - treat it the same as an outright failure.
+    for (UINT i = 0; i < count; i++)
+    {
+        if (sorted[i]->ZOrder == INT_MAX)
+        {
+            g_ZOrderValid = FALSE;
+            break;
+        }
     }
 
     // insertion sort: the list is small (single digits) and nearly ordered in practice
@@ -2202,8 +2230,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         }
 
         // Whatever this window occupies is now claimed: lower windows must not receive it,
-        // whether or not this window was itself damaged this frame.
-        CombineRgn(rgnCovered, rgnCovered, rgnWindow, RGN_OR);
+        // whether or not this window was itself damaged this frame. Only when the stacking
+        // order is actually known - see CollectZOrder.
+        if (g_ZOrderValid)
+            CombineRgn(rgnCovered, rgnCovered, rgnWindow, RGN_OR);
     }
 
 cleanup:
