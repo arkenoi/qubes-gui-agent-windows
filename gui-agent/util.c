@@ -313,9 +313,27 @@ ULONG AttachToInputDesktop(void)
     LogDebug("desktop: 0x%x, start: 0x%x, search: 0x%x", g_DesktopWindow, g_StartWindow, g_SearchWindow);
 
 cleanup:
-    if (oldDesktop)
-        if (!CloseDesktop(oldDesktop))
-            win_perror("CloseDesktop(previous)");
+    // DO NOT CloseDesktop(oldDesktop).
+    //
+    // oldDesktop comes from GetThreadDesktop(), and MSDN is explicit: "You do not need to close
+    // the handle returned by GetThreadDesktop." That handle belongs to the PROCESS, not to this
+    // caller - every thread on the same desktop shares it. Closing it invalidates the desktop
+    // for the others, and the very next USER32 call on those threads fails with
+    // ERROR_INVALID_HANDLE.
+    //
+    // This function has two callers that race during startup: StartFrameProcessing() on the
+    // main thread, and ResolutionChangeThread(), which fires as the display initialises on a
+    // cold boot. Whichever closed second destroyed the other's desktop, after which
+    // EnumWindows() failed with 0x80070006 on every resync, no window was ever added to the
+    // watched list, and the qube rendered nothing in dom0 until the agent was restarted.
+    //
+    // That matches the observed signature exactly: intermittent (it is a race), only on a cold
+    // boot (both callers run close together there), and cleared by an agent restart.
+    //
+    // Nothing leaks by not closing it: the handle is the process's own thread-desktop handle,
+    // not one this function opened. The handle this function DID open (`desktop`) is
+    // deliberately kept, because it is now the thread's desktop.
+    (void)oldDesktop;
     return status;
 }
 
