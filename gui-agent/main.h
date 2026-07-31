@@ -59,8 +59,6 @@ typedef struct _WINDOW_DATA
     // window-relative coordinates with the freshly-updated X/Y mis-registers the damage by
     // however far the window moved in between - which dom0 renders as the content sliding
     // inside the frame while dragging. Snapshotted before TrackWindows(), used for damage.
-    int FrameX;
-    int FrameY;
 
     LIST_ENTRY ListEntry;
 
