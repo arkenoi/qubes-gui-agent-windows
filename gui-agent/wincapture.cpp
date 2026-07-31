@@ -14,6 +14,8 @@
 #include <dxgi1_2.h>
 #include <inspectable.h>
 #include <roapi.h>
+#include <winstring.h>
+#include <windows.graphics.capture.h> // raw ABI, for the exception-free support probe
 
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
@@ -199,25 +201,36 @@ DWORD WINAPI CaptureThread(LPVOID param)
 
 extern "C" {
 
+// Raw-ABI probe: no C++/WinRT projection, no exceptions - returns the genuine HRESULT
+// of whichever stage fails (RoInitialize / factory activation / IsSupported).
 ULONG WcProbeSupport(void)
 {
     HRESULT hr = RoInitialize(RO_INIT_MULTITHREADED);
     if (FAILED(hr) && hr != RPC_E_CHANGED_MODE)
         return (ULONG)hr;
-    try
-    {
-        if (!GraphicsCaptureSession::IsSupported())
-            return ERROR_NOT_SUPPORTED;
-        return 0;
-    }
-    catch (hresult_error const& ex)
-    {
-        return (ULONG)ex.code().value;
-    }
-    catch (...)
-    {
-        return ERROR_UNIDENTIFIED_ERROR;
-    }
+
+    HSTRING cls = nullptr;
+    hr = WindowsCreateString(
+        RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureSession,
+        (UINT32)wcslen(RuntimeClass_Windows_Graphics_Capture_GraphicsCaptureSession),
+        &cls);
+    if (FAILED(hr))
+        return (ULONG)hr;
+
+    ABI::Windows::Graphics::Capture::IGraphicsCaptureSessionStatics2* st = nullptr;
+    hr = RoGetActivationFactory(cls,
+        __uuidof(ABI::Windows::Graphics::Capture::IGraphicsCaptureSessionStatics2),
+        (void**)&st);
+    WindowsDeleteString(cls);
+    if (FAILED(hr))
+        return (ULONG)hr;
+
+    boolean ok = 0;
+    hr = st->IsSupported(&ok);
+    st->Release();
+    if (FAILED(hr))
+        return (ULONG)hr;
+    return ok ? 0 : ERROR_NOT_SUPPORTED;
 }
 
 BOOL WcIsSupported(void)
