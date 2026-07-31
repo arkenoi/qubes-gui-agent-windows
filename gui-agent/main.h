@@ -81,6 +81,10 @@ BOOL ShouldAcceptWindow(
     IN const WINDOW_DATA* data
     );
 
+// Visible window rect as managed by DWM (GetWindowRect includes invisible resize grips), DPI
+// adjusted. This is the geometry announced to the daemon, so dom0's frame hugs the window.
+ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect);
+
 WINDOW_DATA *FindWindowByHandle(
     IN HWND window
     );
