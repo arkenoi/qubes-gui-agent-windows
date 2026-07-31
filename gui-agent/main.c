@@ -2331,6 +2331,20 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         // them are clipped as before.
         if (PwIsAttached(entry))
         {
+            // Screen dirty rects are the change TRIGGER for the per-window engine:
+            // if anything on screen changed where this window is, ask the engine to
+            // recapture it (content itself comes from PrintWindow, never the screen).
+            RECT pwRect = { entry->X, entry->Y,
+                            entry->X + (int)entry->Width, entry->Y + (int)entry->Height };
+            RECT pwHit;
+            for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
+            {
+                if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
+                {
+                    WcMarkDirty(entry->Handle);
+                    break;
+                }
+            }
             SetRectRgn(rgnWindow, entry->X, entry->Y,
                 entry->X + (int)entry->Width, entry->Y + (int)entry->Height);
             if (g_ZOrderValid && entry->IsOverrideRedirect)

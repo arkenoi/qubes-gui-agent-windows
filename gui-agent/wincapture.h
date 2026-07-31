@@ -51,6 +51,10 @@ void WcRemoveWindow(HWND hwnd);
 // The owner should detach and fall back to the legacy path.
 BOOL WcIsDead(HWND hwnd);
 
+// Request a capture of hwnd soon (called from the frame path when screen dirty rects
+// intersect the window). Cheap; coalesces.
+void WcMarkDirty(HWND hwnd);
+
 // Synchronously render the window's current content into the buffer via
 // PrintWindow(PW_RENDERFULLCONTENT) so the daemon has real pixels before the first WGC
 // frame arrives. Window-relative crop applied as in WcAddWindow.
