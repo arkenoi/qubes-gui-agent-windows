@@ -108,6 +108,16 @@ typedef struct _WINDOW_DATA
     BOOL DaemonMaxValid;
     DWORD DaemonMaxW;
     DWORD DaemonMaxH;
+
+    // Slice-fed per-window buffer: content is copied from the composited DDA screen
+    // framebuffer (agent-side slice) instead of PrintWindow. Used for windows PrintWindow
+    // cannot capture (ULW / WS_EX_NOREDIRECTIONBITMAP overlays). Content stays
+    // window-relative, so dom0 renders it correctly wherever it places the window - unlike
+    // the daemon-side legacy slice, which sources by the DAEMON's window position and
+    // misregisters as soon as dom0 moves the window (e.g. force_on_screen pushing a
+    // fullscreen overlay below its panel).
+    BOOL PwSliceFed;
+    BOOL PwSliceNeedsFull; // one full-window copy pending (fresh attach/remap)
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(

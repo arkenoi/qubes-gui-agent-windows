@@ -240,12 +240,10 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
         return ERROR_SUCCESS;
     if (entry->Width == 0 || entry->Height == 0)
         return ERROR_INVALID_PARAMETER;
-    if (!PwWindowEligible(entry))
-    {
-        LogInfo("0x%x: layered (ULW/colorkey) window - staying on legacy path",
-                entry->Handle);
-        return ERROR_NOT_SUPPORTED;
-    }
+
+    // Windows PrintWindow cannot capture still get their own buffer, fed from the
+    // composited screen framebuffer by the frame loop (see PwSliceFed in main.h).
+    const BOOL sliceFed = !PwWindowEligible(entry);
 
     ULONG status;
     const size_t imageBytes = (size_t)entry->Width * entry->Height * 4;
@@ -275,40 +273,44 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
         return status;
     }
 
-    // Crop: WGC captures the OS window rect; the daemon knows the DWM visible bounding
-    // rect (entry->X/Y/W/H). The offset between them is what we skip in each frame.
-    RECT wr;
-    int cropX = 0, cropY = 0;
-    if (GetWindowRect(entry->Handle, &wr))
+    if (!sliceFed)
     {
-        cropX = entry->X - wr.left;
-        cropY = entry->Y - wr.top;
-        if (cropX < 0) cropX = 0;
-        if (cropY < 0) cropY = 0;
-    }
+        // Crop: WGC captures the OS window rect; the daemon knows the DWM visible bounding
+        // rect (entry->X/Y/W/H). The offset between them is what we skip in each frame.
+        RECT wr;
+        int cropX = 0, cropY = 0;
+        if (GetWindowRect(entry->Handle, &wr))
+        {
+            cropX = entry->X - wr.left;
+            cropY = entry->Y - wr.top;
+            if (cropX < 0) cropX = 0;
+            if (cropY < 0) cropY = 0;
+        }
 
-    status = WcAddWindow(entry->Handle, (int)entry->Width, (int)entry->Height,
-                         cropX, cropY, buffer);
-    if (status != ERROR_SUCCESS)
-    {
-        LogInfo("WcAddWindow(0x%x) failed 0x%x - staying on legacy path",
-                 entry->Handle, status);
-        PwQueueRevoke(shared, refs, buffer);
-        PwRevokeTick(); // nothing maps it yet; usually succeeds immediately
-        return status;
-    }
+        status = WcAddWindow(entry->Handle, (int)entry->Width, (int)entry->Height,
+                             cropX, cropY, buffer);
+        if (status != ERROR_SUCCESS)
+        {
+            LogInfo("WcAddWindow(0x%x) failed 0x%x - staying on legacy path",
+                     entry->Handle, status);
+            PwQueueRevoke(shared, refs, buffer);
+            PwRevokeTick(); // nothing maps it yet; usually succeeds immediately
+            return status;
+        }
 
-    // Real pixels before the first WGC frame; failure just means a black window until
-    // the first frame, so it is logged and ignored.
-    if (WcPrefill(entry->Handle) != ERROR_SUCCESS)
-        LogDebug("WcPrefill(0x%x) failed", entry->Handle);
+        // Real pixels before the first WGC frame; failure just means a black window until
+        // the first frame, so it is logged and ignored.
+        if (WcPrefill(entry->Handle) != ERROR_SUCCESS)
+            LogDebug("WcPrefill(0x%x) failed", entry->Handle);
+    }
 
     status = SendWindowDump(entry->Handle, entry->Width, entry->Height,
                             pageCount, refs);
     if (status != ERROR_SUCCESS)
     {
         win_perror2(status, "SendWindowDump");
-        WcRemoveWindow(entry->Handle);
+        if (!sliceFed)
+            WcRemoveWindow(entry->Handle);
         PwQueueRevoke(shared, refs, buffer);
         PwRevokeTick();
         return status;
@@ -321,8 +323,11 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwWidth = entry->Width;
     entry->PwHeight = entry->Height;
     entry->PwDumpSent = TRUE;
-    LogInfo("0x%x: per-window buffer %ux%u (%lu pages) attached",
-             entry->Handle, entry->Width, entry->Height, pageCount);
+    entry->PwSliceFed = sliceFed;
+    entry->PwSliceNeedsFull = sliceFed; // first frame does one full-window copy
+    LogInfo("0x%x: per-window buffer %ux%u (%lu pages) attached%s",
+             entry->Handle, entry->Width, entry->Height, pageCount,
+             sliceFed ? " (slice-fed)" : "");
     return ERROR_SUCCESS;
 }
 
@@ -330,9 +335,10 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->PwDumpSent)
         return;
-    LogInfo("0x%x: per-window buffer %ux%u detached", entry->Handle,
-            entry->PwWidth, entry->PwHeight);
-    WcRemoveWindow(entry->Handle);
+    LogInfo("0x%x: per-window buffer %ux%u detached%s", entry->Handle,
+            entry->PwWidth, entry->PwHeight, entry->PwSliceFed ? " (slice-fed)" : "");
+    if (!entry->PwSliceFed)
+        WcRemoveWindow(entry->Handle);
     PwQueueRevoke(entry->PwGrantHandle, entry->PwGrantRefs, entry->PwBuffer);
     entry->PwBuffer = NULL;
     entry->PwPageCount = 0;
@@ -341,6 +347,8 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwWidth = 0;
     entry->PwHeight = 0;
     entry->PwDumpSent = FALSE;
+    entry->PwSliceFed = FALSE;
+    entry->PwSliceNeedsFull = FALSE;
 }
 
 // Drop an attached window back to the legacy screen-slice path at runtime. The daemon

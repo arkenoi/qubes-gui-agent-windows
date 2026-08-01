@@ -1773,13 +1773,17 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // Windows can BECOME layered after attach (Edge sets WS_EX_LAYERED +
         // UpdateLayeredWindow on its first-run overlay only after showing it).
         // PrintWindow returns premultiplied source pixels for ULW surfaces - a 30%-alpha
-        // dimming backdrop captures as near-black - so such a window must drop to the
-        // legacy screen-slice path, which carries the DWM-blended result.
-        if (PwIsAttached(windowData) && !PwWindowEligible(windowData))
+        // dimming backdrop captures as near-black - so rebuild the attachment: the
+        // re-attach comes back slice-fed (content copied from the composited screen),
+        // which stays window-relative and renders correctly wherever dom0 places the
+        // window. PwResizeWindow already implements detach+reattach with the
+        // daemon-release fallback.
+        if (PwIsAttached(windowData) && !windowData->PwSliceFed &&
+            !PwWindowEligible(windowData))
         {
-            LogInfo("0x%x: became PrintWindow-ineligible (layered), dropping to legacy path",
+            LogInfo("0x%x: became PrintWindow-ineligible (layered), rebuilding slice-fed",
                 windowData->Handle);
-            PwForceLegacy(windowData);
+            (void)PwResizeWindow(windowData);
         }
     }
 
@@ -2125,7 +2129,7 @@ static void ProcessWindowEvents(void)
         {
             WINDOW_DATA* wd = CONTAINING_RECORD(pwe, WINDOW_DATA, ListEntry);
             pwe = pwe->Flink;
-            if (PwIsAttached(wd) && WcIsDead(wd->Handle))
+            if (PwIsAttached(wd) && !wd->PwSliceFed && WcIsDead(wd->Handle))
             {
                 LogWarning("0x%x: capture channel died, reverting to legacy path", wd->Handle);
                 PwDetachWindow(wd);
@@ -2275,6 +2279,48 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
 
 static HWND g_LastPopupDamageWindow = NULL;
 
+// Copy `area` (screen coords) of the mapped desktop frame into a slice-fed window's
+// per-window buffer and send the matching window-relative damage. Clips to the screen,
+// the window rect, and the granted buffer geometry; silently skips when the frame is
+// not mapped (content then arrives with the next mapped frame).
+static void PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRAME* frame,
+                                 IN const RECT* area)
+{
+    if (!frame->mapped || !frame->rect.pBits || !entry->PwBuffer)
+        return;
+
+    RECT screenR = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
+    RECT winR = { entry->X, entry->Y,
+                  entry->X + (int)entry->PwWidth, entry->Y + (int)entry->PwHeight };
+    RECT r;
+    if (!IntersectRect(&r, area, &winR))
+        return;
+    if (!IntersectRect(&r, &r, &screenR))
+        return;
+
+    int relX = r.left - entry->X;
+    int relY = r.top - entry->Y;
+    int w = r.right - r.left;
+    int h = r.bottom - r.top;
+    if (relX < 0 || relY < 0 || w <= 0 || h <= 0)
+        return;
+    if ((ULONG)(relX + w) > entry->PwWidth || (ULONG)(relY + h) > entry->PwHeight)
+        return; // buffer geometry changed underneath; next full copy repaints
+
+    const BYTE* src = (const BYTE*)frame->rect.pBits +
+        (size_t)r.top * frame->rect.Pitch + (size_t)r.left * 4;
+    BYTE* dst = (BYTE*)entry->PwBuffer +
+        ((size_t)relY * entry->PwWidth + (size_t)relX) * 4;
+    for (int row = 0; row < h; row++)
+    {
+        memcpy(dst, src, (size_t)w * 4);
+        src += frame->rect.Pitch;
+        dst += (size_t)entry->PwWidth * 4;
+    }
+
+    (void)SendWindowDamageEvent(entry->Handle, relX, relY, w, h);
+}
+
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
 {
     // Menus/tooltips are override-redirect windows. They are mapped like any other window,
@@ -2402,18 +2448,40 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
         // them are clipped as before.
         if (PwIsAttached(entry))
         {
-            // Screen dirty rects are the change TRIGGER for the per-window engine:
-            // if anything on screen changed where this window is, ask the engine to
-            // recapture it (content itself comes from PrintWindow, never the screen).
             RECT pwRect = { entry->X, entry->Y,
                             entry->X + (int)entry->Width, entry->Y + (int)entry->Height };
             RECT pwHit;
-            for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
+            if (entry->PwSliceFed)
             {
-                if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
+                // Agent-side slice: copy the changed region of the composited screen
+                // into the window's own buffer. Content becomes window-relative, so
+                // dom0 renders it correctly wherever it places the window - the
+                // daemon-side legacy slice misregisters as soon as dom0 repositions
+                // the window (force_on_screen on a fullscreen overlay, measured 31px).
+                if (entry->PwSliceNeedsFull)
                 {
-                    WcMarkDirty(entry->Handle);
-                    break;
+                    entry->PwSliceNeedsFull = FALSE;
+                    PwSliceCopyAndDamage(entry, frame, &pwRect);
+                }
+                else
+                {
+                    for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
+                        if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
+                            PwSliceCopyAndDamage(entry, frame, &pwHit);
+                }
+            }
+            else
+            {
+                // Screen dirty rects are the change TRIGGER for the per-window engine:
+                // if anything on screen changed where this window is, ask the engine to
+                // recapture it (content itself comes from PrintWindow, never the screen).
+                for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
+                {
+                    if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
+                    {
+                        WcMarkDirty(entry->Handle);
+                        break;
+                    }
                 }
             }
             SetRectRgn(rgnWindow, entry->X, entry->Y,
