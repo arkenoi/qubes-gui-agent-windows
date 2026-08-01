@@ -1084,6 +1084,7 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             win_perror2(status, "SendWindowCreate");
             goto end;
         }
+        entry->CreateSent = TRUE;
 
         // Per-window framebuffer: announce the window's own buffer BEFORE mapping so
         // the daemon never composites this window from the screen slice. On failure
@@ -1196,9 +1197,12 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
     if (entry->Handle == g_StartWindow)
         g_StartVisible = FALSE;
 
-    // Synthesized windows were never announced: sending UNMAP/DESTROY for an hwnd the
-    // daemon has no CREATE for is the documented daemon-killer (see send.c).
-    if (entry->Synthesized)
+    // Never announced (synthesized, or announce failed): the daemon has no CREATE for
+    // this hwnd, and UNMAP/DESTROY naming it is the documented daemon-killer (send.c).
+    // This gate must be on CreateSent, not on Synthesized: materialization clears
+    // Synthesized and then relies on removal to re-add the window through the normal
+    // path, so the removal itself must still be silent.
+    if (!entry->CreateSent)
     {
         SynthDeactivate(entry);
         free(entry);

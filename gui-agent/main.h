@@ -126,6 +126,11 @@ typedef struct _WINDOW_DATA
     // and the owner's capture masks that region so it cannot overwrite it. Result:
     // menus/tooltips/bubbles appear inside their window, with no floating bordered
     // rectangles in dom0.
+    // TRUE once MSG_CREATE has been sent for this window. The daemon exit(1)s on any
+    // message naming a window it has no CREATE for, so UNMAP/DESTROY at teardown must
+    // be gated on this - a window that was synthesized (or whose announce failed) must
+    // die silently.
+    BOOL CreateSent;
     BOOL Synthesized;      // this window is composited into SynthOwner, never announced
     HWND SynthOwner;       // owner hwnd at synthesis time
     UINT SynthChildCount;  // (owners) number of active synthesized children
