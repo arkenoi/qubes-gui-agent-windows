@@ -89,6 +89,13 @@ struct DamageOut
 bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
 {
     (void)e;
+    // PrintWindow round-trips synchronously into the target app with no timeout: a hung
+    // app would park this thread inside the engine lock, and anything then waiting for
+    // the lock exclusively (window removal, running under g_csWatchedWindows) would
+    // freeze the whole agent behind it. Skip hung windows as a transient condition; the
+    // periodic sweep re-marks them dirty, so they catch up when they recover.
+    if (IsHungAppWindow(c.hwnd))
+        return true;
     RECT wr;
     if (!GetWindowRect(c.hwnd, &wr))
         return false;

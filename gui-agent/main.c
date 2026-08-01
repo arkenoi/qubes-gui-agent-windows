@@ -1740,6 +1740,17 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         goto end;
     }
 
+    // While maximized, cap the reported size at what the dom0 WM last said it can
+    // display (recorded by HandleConfigure); the per-window dump then matches the dom0
+    // window exactly instead of overflowing it by the height of dom0's decorations.
+    if ((data.Style & WS_MAXIMIZE) && windowData->DaemonMaxValid)
+    {
+        if (data.Width > windowData->DaemonMaxW)
+            data.Width = windowData->DaemonMaxW;
+        if (data.Height > windowData->DaemonMaxH)
+            data.Height = windowData->DaemonMaxH;
+    }
+
     if (windowData->IsVisible != data.IsVisible)
     {
         windowData->IsVisible = data.IsVisible;

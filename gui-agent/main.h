@@ -100,6 +100,14 @@ typedef struct _WINDOW_DATA
     int LastCfgW;
     int LastCfgH;
     BOOL LastCfgOvr;
+
+    // Size the dom0 WM settled on for this window while maximized (from the daemon's
+    // MSG_CONFIGURE): its decorations eat into the screen, so it can display slightly
+    // less than the guest work area. While maximized, the reported/granted geometry is
+    // capped to this so the dump matches the dom0 window exactly (no cut-off band).
+    BOOL DaemonMaxValid;
+    DWORD DaemonMaxW;
+    DWORD DaemonMaxH;
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(

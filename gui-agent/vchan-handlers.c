@@ -407,6 +407,14 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                 // geometry the guest actually has.
                 LogDebug("0x%x is maximized, ignoring dom0 configure %dx%d",
                     window, configureMsg.width, configureMsg.height);
+                // ...but remember the size the dom0 WM can actually display, so the
+                // tracking pass reports/grants exactly that (see DaemonMax* in main.h).
+                if (configureMsg.width > 0 && configureMsg.height > 0)
+                {
+                    data->DaemonMaxValid = TRUE;
+                    data->DaemonMaxW = configureMsg.width;
+                    data->DaemonMaxH = configureMsg.height;
+                }
             }
             else
             {
