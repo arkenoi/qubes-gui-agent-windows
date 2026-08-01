@@ -398,7 +398,17 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
         // survives every resync. It also CloseDesktop()s the process-default desktop
         // handle, which MSDN forbids and which a third caller would double-close.
         // Only the per-thread part is needed here.
-        ownDesktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_HOOKCONTROL);
+        //
+        // DESKTOP_CREATEWINDOW: this thread also owns the work-area broadcast listener
+        // (WorkAreaCreateListener below), and CreateWindowEx on a thread whose desktop
+        // handle lacks that right fails with ERROR_ACCESS_DENIED - the hooks worked
+        // without it, the listener never could. If the wide open is denied (a desktop
+        // that refuses window creation), fall back to the narrow mask so the hooks -
+        // the critical function of this thread - still come up.
+        ownDesktop = OpenInputDesktop(0, FALSE,
+            DESKTOP_READOBJECTS | DESKTOP_HOOKCONTROL | DESKTOP_CREATEWINDOW);
+        if (!ownDesktop)
+            ownDesktop = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS | DESKTOP_HOOKCONTROL);
         if (ownDesktop)
         {
             if (!SetThreadDesktop(ownDesktop))
@@ -475,6 +485,13 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
             if (hooks[i])
                 UnhookWinEvent(hooks[i]);
         }
+
+        // The listener must go before the next SetThreadDesktop: a thread that owns a
+        // window on its current desktop cannot switch desktops, and the window would be
+        // stale on the old desktop anyway (broadcasts are per-desktop). Recreated after
+        // re-attach at the top of the loop; this bottom-of-loop site also runs on every
+        // thread-exit path (exitThread breaks out of the inner loop only).
+        WorkAreaDestroyListener();
     }
 
     if (ownDesktop)
@@ -2520,6 +2537,11 @@ static void ProcessWindowEvents(void)
     status = TrackWindows(&stats);
     LeaveCriticalSection(&g_csWatchedWindows);
 
+    // Work-area drift check (event path; the frame path in WatchForEvents has the
+    // matching call). Self-rate-limited inside, and must run outside
+    // g_csWatchedWindows: a re-assert does cross-process window calls.
+    WorkAreaEnsureApplied();
+
     if (status != ERROR_SUCCESS)
         win_perror2(status, "TrackWindows");
 
@@ -3369,6 +3391,14 @@ static ULONG WINAPI WatchForEvents(void)
                 }
 
                 ProcessNewFrame(&capture->frame, (const BYTE*)capture->framebuffer);
+
+                // Work-area drift check (frame path; ProcessWindowEvents has the
+                // matching call). Here, not inside ProcessNewFrame: no locks are held
+                // and the check stays out of the frame's perf accounting. Together the
+                // two call sites make the check fire as long as frames OR window events
+                // flow, whichever drains the tracking tick - including after hook-thread
+                // death, when only frames arrive.
+                WorkAreaEnsureApplied();
             }
 
             if (capture)
@@ -3696,6 +3726,12 @@ static ULONG Init(void)
 
     g_MinWindowWidth = GetSystemMetrics(SM_CXMIN);
     g_MinWindowHeight = GetSystemMetrics(SM_CYMIN);
+
+    // The window-event thread creates the work-area broadcast listener, whose wndproc
+    // takes g_WaLock; that lock must exist before the thread does (an early
+    // WM_DISPLAYCHANGE or Explorer SPI_SETWORKAREA broadcast would otherwise enter an
+    // uninitialized CRITICAL_SECTION). CreateThread orders this write for the new thread.
+    WorkAreaLockInit();
 
     // Must be running before the main loop starts waiting on g_WindowEventSignal.
     status = StartWindowEventThread();

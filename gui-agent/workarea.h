@@ -17,7 +17,15 @@
 #pragma once
 #include <windows.h>
 
-// Start the qubesdb watch thread (idempotent, safe before vchan connect).
+// Initialize the module lock only. MUST run before any thread that can execute
+// WaWndProc exists, i.e. before the window-event thread is started (the broadcast
+// listener's re-assert path takes the lock). Idempotent, but only against callers on
+// the same thread - it is meant for single-threaded startup (Init()).
+void WorkAreaLockInit(void);
+
+// Full init: start the qubesdb watch thread and allow applies (idempotent, safe
+// before vchan connect). Until this runs, WorkAreaApply/WorkAreaReassert/
+// WorkAreaEnsureApplied are no-ops.
 void WorkAreaInit(void);
 
 // Recompute the target work area from the best available source and apply it
@@ -28,8 +36,22 @@ void WorkAreaApply(void);
 void WorkAreaReassert(void);
 
 // Create the hidden top-level window that receives WM_SETTINGCHANGE/WM_DISPLAYCHANGE
-// broadcasts. Must be called on a thread that pumps messages (the window-event thread).
+// broadcasts. Must be called on a thread that pumps messages (the window-event thread)
+// AND whose desktop handle was opened with DESKTOP_CREATEWINDOW, after
+// WorkAreaLockInit. Idempotent per thread (replaces a leftover listener).
 void WorkAreaCreateListener(void);
+
+// Destroy the listener. Must be called on the thread that created it, and before that
+// thread re-attaches to another desktop (SetThreadDesktop fails while the thread owns
+// windows on its current desktop).
+void WorkAreaDestroyListener(void);
+
+// Drift check: re-assert if SPI_GETWORKAREA no longer matches the last applied rect
+// (an asynchronous Explorer overwrite the broadcast listener missed). Rate-limited
+// internally; called from the main loop's frame and window-event paths, so it fires
+// as long as either flows - a fully idle desktop is covered only by the listener.
+// Takes no locks across SPI/window calls.
+void WorkAreaEnsureApplied(void);
 
 // Record a dom0-provided work area + frame extents (qubesdb or MSG_WORKAREA).
 void WorkAreaSetDom0(int x, int y, int w, int h, int fl, int fr, int ft, int fb);

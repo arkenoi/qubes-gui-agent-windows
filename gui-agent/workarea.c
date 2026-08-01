@@ -14,8 +14,12 @@
 
 #define QDB_WORKAREA_PATH "/qubes-workarea"
 
+// Minimum spacing of the WorkAreaEnsureApplied drift compare.
+#define WA_DRIFT_CHECK_MS 2000
+
 static CRITICAL_SECTION g_WaLock;
-static BOOL g_WaInitDone = FALSE;
+static BOOL g_WaLockInit = FALSE; // g_WaLock initialized (see WorkAreaLockInit)
+static BOOL g_WaInitDone = FALSE; // full init: sources may be read, apply is allowed
 
 // dom0-provided values (qubesdb watcher or MSG_WORKAREA); dom0 root coordinates
 static BOOL g_WaDom0Valid = FALSE;
@@ -28,6 +32,10 @@ static int g_WaInferX = -1;
 static int g_WaInferY = -1;
 
 static RECT g_WaLastApplied;   // zero until first successful apply
+
+// Broadcast-listener window. Created, destroyed and used ONLY on the window-event
+// thread (window handles are thread-affine for DestroyWindow), so no lock.
+static HWND g_WaListener = NULL;
 
 static BOOL WaRectSane(const RECT* r)
 {
@@ -103,6 +111,12 @@ static BOOL WaCompute(OUT RECT* out)
 static BOOL CALLBACK WaRefitProc(HWND hwnd, LPARAM lparam)
 {
     UNREFERENCED_PARAMETER(lparam);
+    // SetWindowPlacement round-trips synchronously into the target app with no
+    // timeout; on the window-event thread (WaWndProc caller) a hung app would stall
+    // hook delivery for the duration. Skip hung windows - they re-lay-out from the
+    // current work area on their own once they recover.
+    if (IsHungAppWindow(hwnd))
+        return TRUE;
     if (IsWindowVisible(hwnd) && IsZoomed(hwnd) && !IsIconic(hwnd))
     {
         WINDOWPLACEMENT wp = { sizeof(wp) };
@@ -119,6 +133,13 @@ static BOOL CALLBACK WaRefitProc(HWND hwnd, LPARAM lparam)
 // something else overwrote the work area.
 void WorkAreaReassert(void)
 {
+    // Callable from the broadcast listener, which exists before WorkAreaInit runs
+    // (the window-event thread starts in Init(), WorkAreaInit only at vchan connect):
+    // until then there is no target to re-assert, so this must be a no-op. g_WaLock
+    // itself is safe earlier than that (WorkAreaLockInit precedes the thread).
+    if (!g_WaInitDone)
+        return;
+
     EnterCriticalSection(&g_WaLock);
     SetRectEmpty(&g_WaLastApplied);
     LeaveCriticalSection(&g_WaLock);
@@ -275,6 +296,50 @@ static LRESULT CALLBACK WaWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     return DefWindowProc(hwnd, msg, wp, lp);
 }
 
+// Drift check for the tracking paths: if the OS work area no longer matches what we
+// last applied (Explorer recomputed it and the broadcast listener missed it or is
+// down), re-assert. Self-rate-limited to one SPI_GETWORKAREA read per
+// WA_DRIFT_CHECK_MS regardless of which caller gets there, so it works no matter
+// which path drains the tracking tick. Both call sites (frame path and event path in
+// main.c) run on the main-loop thread with no agent locks held; the check only takes
+// g_WaLock for a struct copy and releases it before any SPI/window call.
+//
+// Coverage: fires as long as frames or window events arrive - including after
+// hook-thread death (frames still flow). NOT covered: a fully idle desktop (no
+// frames, no events); only the broadcast listener catches an overwrite there.
+void WorkAreaEnsureApplied(void)
+{
+    static DWORD lastCheck; // main-loop thread only (both call sites)
+
+    if (!g_WaInitDone)
+        return;
+
+    DWORD now = GetTickCount();
+    if (now - lastCheck < WA_DRIFT_CHECK_MS)
+        return;
+    lastCheck = now;
+
+    RECT applied;
+    EnterCriticalSection(&g_WaLock);
+    applied = g_WaLastApplied;
+    LeaveCriticalSection(&g_WaLock);
+
+    if (IsRectEmpty(&applied))
+        return; // never applied anything - nothing to defend
+
+    RECT current;
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &current, 0))
+        return;
+
+    if (EqualRect(&current, &applied))
+        return;
+
+    LogInfo("work area drifted: OS has (%d,%d)-(%d,%d), ours was (%d,%d)-(%d,%d); re-asserting",
+        current.left, current.top, current.right, current.bottom,
+        applied.left, applied.top, applied.right, applied.bottom);
+    WorkAreaReassert();
+}
+
 void WorkAreaCreateListener(void)
 {
     static const WCHAR cls[] = L"QubesGuiAgentWorkArea";
@@ -282,6 +347,19 @@ void WorkAreaCreateListener(void)
     wc.lpfnWndProc = WaWndProc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.lpszClassName = cls;
+
+    // Never let WaWndProc become reachable with g_WaLock uninitialized (its
+    // re-assert path enters it). Init() calls WorkAreaLockInit before starting the
+    // window-event thread, so this cannot trigger; it guards future reordering.
+    if (!g_WaLockInit)
+    {
+        LogError("workarea lock not initialized - listener not created (call WorkAreaLockInit first)");
+        return;
+    }
+
+    if (g_WaListener) // rearm without an intervening destroy: replace, don't leak
+        WorkAreaDestroyListener();
+
     if (!RegisterClassEx(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
     {
         win_perror("RegisterClassEx(workarea listener)");
@@ -292,16 +370,43 @@ void WorkAreaCreateListener(void)
     HWND h = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, cls, L"", WS_POPUP,
                             0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
     if (!h)
+    {
         win_perror("CreateWindowEx(workarea listener)");
-    else
-        LogDebug("work-area listener window %p created", h);
+        return;
+    }
+    g_WaListener = h;
+    LogDebug("work-area listener window %p created", h);
+}
+
+void WorkAreaDestroyListener(void)
+{
+    if (!g_WaListener)
+        return;
+    if (!DestroyWindow(g_WaListener))
+    {
+        // Loud on purpose: the thread would still own a window, so every subsequent
+        // SetThreadDesktop rearm fails and window tracking silently degrades to the
+        // periodic resync. Should be unreachable (same-thread destroy of a valid
+        // window); clearing the handle anyway keeps create/destroy re-runnable.
+        LogError("DestroyWindow(workarea listener %p) FAILED - window-event thread may no longer be able to switch desktops", g_WaListener);
+        win_perror("DestroyWindow(workarea listener)");
+    }
+    g_WaListener = NULL;
+}
+
+void WorkAreaLockInit(void)
+{
+    if (g_WaLockInit)
+        return;
+    InitializeCriticalSection(&g_WaLock);
+    g_WaLockInit = TRUE;
 }
 
 void WorkAreaInit(void)
 {
     if (g_WaInitDone)
         return;
-    InitializeCriticalSection(&g_WaLock);
+    WorkAreaLockInit(); // no-op when Init() already ran it (the normal path)
     g_WaInitDone = TRUE;
     HANDLE t = CreateThread(NULL, 0, WaWatchThread, NULL, 0, NULL);
     if (t)
