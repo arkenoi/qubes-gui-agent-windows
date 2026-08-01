@@ -1035,19 +1035,34 @@ static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerO
     }
     else if (entry->ProcessId != 0)
     {
-        int bestZ = INT_MAX;
-        for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
-             e != &g_WatchedWindowsList; e = e->Flink)
+        // Prefer the foreground window: keytips and flyouts belong to the focused
+        // window, and with two overlapping windows of the same process the topmost-
+        // containing pick below can attach the popup to the wrong sibling.
+        HWND fgHandle = GetForegroundWindow();
+        if (fgHandle)
         {
-            WINDOW_DATA* cand = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
-            if (cand->ProcessId != entry->ProcessId || cand->IsOverrideRedirect)
-                continue;
-            if (!SynthOwnerQualifies(cand, entry))
-                continue;
-            if (cand->ZOrder < bestZ)
+            WINDOW_DATA* fg = FindWindowByHandle(fgHandle);
+            if (fg && fg->ProcessId == entry->ProcessId && !fg->IsOverrideRedirect &&
+                SynthOwnerQualifies(fg, entry))
+                owner = fg;
+        }
+
+        if (!owner)
+        {
+            int bestZ = INT_MAX;
+            for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
+                 e != &g_WatchedWindowsList; e = e->Flink)
             {
-                bestZ = cand->ZOrder;
-                owner = cand;
+                WINDOW_DATA* cand = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+                if (cand->ProcessId != entry->ProcessId || cand->IsOverrideRedirect)
+                    continue;
+                if (!SynthOwnerQualifies(cand, entry))
+                    continue;
+                if (cand->ZOrder < bestZ)
+                {
+                    bestZ = cand->ZOrder;
+                    owner = cand;
+                }
             }
         }
         if (!owner)
@@ -1139,6 +1154,21 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             SynthActivate(entry, synthOwner);
             return ERROR_SUCCESS;
         }
+    }
+
+    // Sub-floor popups (Win11 Alt-nav keytip badges, ~40x46) are acceptable ONLY as
+    // synthesized content: announced, each becomes an individually bordered dom0
+    // window slice-fed with whatever pixels sit behind it. When synthesis cannot
+    // represent one (outside every owner's granted buffer), drop it silently - not
+    // appearing beats appearing wrong. Materialization funnels back through this
+    // path, so a synthesized badge that drifts out of its owner is dropped here too.
+    if (entry->IsOverrideRedirect &&
+        (entry->Width < g_MinWindowWidth || entry->Height < g_MinWindowHeight))
+    {
+        LogDebug("0x%x: sub-floor popup %ux%u with no synth owner, dropping silently",
+            entry->Handle, entry->Width, entry->Height);
+        entry->DeletePending = TRUE;
+        return ERROR_SUCCESS;
     }
 
     // send window creation info to gui daemon
