@@ -204,6 +204,17 @@ void PwRevokeTick(void)
 // fine (menus fading in were validated on the per-window path) - keep those attached.
 BOOL PwWindowEligible(IN const WINDOW_DATA* entry)
 {
+    // Override-redirect windows (menus, tooltips, bubbles, splash overlays) are slice-fed
+    // as a class. They are topmost by nature, so the composited screen region IS their
+    // correct content - and PrintWindow is unreliable for them from the agent's
+    // SYSTEM/session-1 context: Edge's "Restore pages" bubble captures fine from a
+    // user-context probe but comes back blank in the agent (the WGC lesson again:
+    // user-context probes do not predict SYSTEM-context behavior). A blank capture
+    // row-diffs as "no change" against the blank prefill, so the failure mode is a
+    // permanently black window with a healthy-looking channel.
+    if (entry->IsOverrideRedirect)
+        return FALSE;
+
     // No GDI redirection surface AT ALL (DirectComposition-only content): PrintWindow
     // has nothing to read regardless of layering. Edge's true first-run takeover window
     // is created with this bit from birth.

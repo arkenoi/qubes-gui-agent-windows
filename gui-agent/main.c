@@ -1851,6 +1851,11 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         windowData->Y = data.Y;
         windowData->Width = data.Width;
         windowData->Height = data.Height;
+
+        // A slice-fed window that moved now overlaps a different screen region; its
+        // buffer still holds the old region's pixels. Schedule a full re-copy.
+        if (windowData->PwSliceFed)
+            windowData->PwSliceNeedsFull = TRUE;
     }
 
     BOOL oldPopupState = windowData->IsOverrideRedirect;
