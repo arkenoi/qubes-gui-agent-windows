@@ -72,6 +72,12 @@ BOOL g_LocalScreenDestroyed = FALSE;
 
 // used to determine whether our window in fullscreen mode should be borderless
 // (when resolution is smaller than host's)
+// Live desktop image (the granted DDA framebuffer) and its pitch, refreshed every
+// frame. Valid for the life of the duplication - the daemon reads it continuously -
+// so paths outside the frame loop (composite synthesis activation) can sample it too.
+static const BYTE* g_FbBits = NULL;
+static int g_FbPitch = 0;
+
 DWORD g_HostScreenWidth = 0;
 DWORD g_HostScreenHeight = 0;
 
@@ -951,6 +957,8 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 
 #define SYNTH_OVERHANG_MAX 4   // px a popup may stick out and still be synthesized
 
+static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child);
+
 // Does this window qualify to be composited into its owner instead of becoming its
 // own dom0 window? Deliberately strict: only override-redirect windows (menus,
 // tooltips, bubbles - never real dialogs) whose owner is itself a PrintWindow-fed
@@ -1019,6 +1027,9 @@ static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
     entry->SynthOwner = owner->Handle;
     owner->SynthChildCount++;
     SynthUpdateMask(owner);
+    // Paint it NOW: a menu paints once, before it is tracked, and a static screen
+    // produces no further frames - waiting for damage would leave it invisible.
+    PwPatchSynthRect(owner, entry);
     LogInfo("QGAPROTO,msg=SYNTH,hwnd=0x%x,owner=0x%x,x=%d,y=%d,w=%u,h=%u",
         (uint32_t)(ULONG_PTR)entry->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
         entry->X, entry->Y, entry->Width, entry->Height);
@@ -2547,50 +2558,67 @@ static void PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRA
 // desktop image and report the damage. The owner's capture masks these rects (see
 // SynthUpdateMask), so nothing overwrites them afterwards. Called per frame for
 // owners with children; `area` limits work to the region that actually changed.
-static void PwPatchSynthChildren(IN OUT WINDOW_DATA* owner, IN const CAPTURE_FRAME* frame,
-                                 IN const BYTE* fb, IN const RECT* area)
+// Copy one synthesized child's region (optionally limited to `area`) out of the live
+// desktop image into the owner's buffer and report it as owner damage.
+static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA* c,
+                                     IN const RECT* area)
 {
-    if (!fb || frame->rect.Pitch <= 0 || !owner->PwBuffer)
+    if (!g_FbBits || g_FbPitch <= 0 || !owner->PwBuffer)
         return;
 
+    RECT childR = { c->X, c->Y, c->X + (int)c->Width, c->Y + (int)c->Height };
+    RECT ownerR = { owner->X, owner->Y,
+                    owner->X + (int)owner->PwWidth, owner->Y + (int)owner->PwHeight };
+    RECT screenR = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
+    RECT r;
+    if (!IntersectRect(&r, &childR, &ownerR) || !IntersectRect(&r, &r, &screenR))
+        return;
+    if (area && !IntersectRect(&r, &r, area))
+        return;
+
+    int relX = r.left - owner->X, relY = r.top - owner->Y;
+    int w = r.right - r.left, h = r.bottom - r.top;
+    if (relX < 0 || relY < 0 || w <= 0 || h <= 0)
+        return;
+    if ((ULONG)(relX + w) > owner->PwWidth || (ULONG)(relY + h) > owner->PwHeight)
+        return;
+
+    const BYTE* src = g_FbBits + (size_t)r.top * g_FbPitch + (size_t)r.left * 4;
+    BYTE* dst = (BYTE*)owner->PwBuffer +
+        ((size_t)relY * owner->PwWidth + (size_t)relX) * 4;
+    for (int row = 0; row < h; row++)
+    {
+        memcpy(dst, src, (size_t)w * 4);
+        src += g_FbPitch;
+        dst += (size_t)owner->PwWidth * 4;
+    }
+    (void)SendWindowDamageEvent(owner->Handle, relX, relY, w, h);
+}
+
+static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child)
+{
+    PwPatchSynthChildClipped(owner, child, NULL);
+}
+
+static void PwPatchSynthChildren(IN OUT WINDOW_DATA* owner, IN const RECT* area)
+{
     for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
     {
         WINDOW_DATA* c = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
-        if (!c->Synthesized || c->SynthOwner != owner->Handle)
-            continue;
-
-        RECT childR = { c->X, c->Y, c->X + (int)c->Width, c->Y + (int)c->Height };
-        RECT ownerR = { owner->X, owner->Y,
-                        owner->X + (int)owner->PwWidth, owner->Y + (int)owner->PwHeight };
-        RECT screenR = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
-        RECT r;
-        if (!IntersectRect(&r, &childR, &ownerR) || !IntersectRect(&r, &r, &screenR))
-            continue;
-        if (area && !IntersectRect(&r, &r, area))
-            continue;
-
-        int relX = r.left - owner->X, relY = r.top - owner->Y;
-        int w = r.right - r.left, h = r.bottom - r.top;
-        if (relX < 0 || relY < 0 || w <= 0 || h <= 0)
-            continue;
-        if ((ULONG)(relX + w) > owner->PwWidth || (ULONG)(relY + h) > owner->PwHeight)
-            continue;
-
-        const BYTE* src = fb + (size_t)r.top * frame->rect.Pitch + (size_t)r.left * 4;
-        BYTE* dst = (BYTE*)owner->PwBuffer +
-            ((size_t)relY * owner->PwWidth + (size_t)relX) * 4;
-        for (int row = 0; row < h; row++)
-        {
-            memcpy(dst, src, (size_t)w * 4);
-            src += frame->rect.Pitch;
-            dst += (size_t)owner->PwWidth * 4;
-        }
-        (void)SendWindowDamageEvent(owner->Handle, relX, relY, w, h);
+        if (c->Synthesized && c->SynthOwner == owner->Handle)
+            PwPatchSynthChildClipped(owner, c, area);
     }
 }
 
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer)
 {
+    // Publish the live desktop image for paths outside this loop (synthesis).
+    if (framebuffer && frame->rect.Pitch > 0)
+    {
+        g_FbBits = framebuffer;
+        g_FbPitch = frame->rect.Pitch;
+    }
+
     // Menus/tooltips are override-redirect windows. They are mapped like any other window,
     // but dom0 screenshot tooling enumerates only managed windows, so whether their repaints
     // (e.g. hover highlight) actually reach the daemon cannot be checked from outside. Count
@@ -2771,7 +2799,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 {
                     for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
                         if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
-                            PwPatchSynthChildren(entry, frame, framebuffer, &pwHit);
+                            PwPatchSynthChildren(entry, &pwHit);
                 }
             }
             SetRectRgn(rgnWindow, entry->X, entry->Y,
