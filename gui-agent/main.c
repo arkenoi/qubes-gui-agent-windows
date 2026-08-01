@@ -424,6 +424,10 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
         // Whatever happened while the hooks were down is unknown to us.
         QueueWindowEvent(NULL, 0, TRUE);
 
+        // This thread pumps messages, so it owns the work-area broadcast listener
+        // (WM_SETTINGCHANGE/WM_DISPLAYCHANGE re-assert; see workarea.h).
+        WorkAreaCreateListener();
+
         while (TRUE)
         {
             // Out-of-context hook callbacks are delivered by the system while this

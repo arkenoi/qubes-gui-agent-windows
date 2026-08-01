@@ -24,6 +24,13 @@ void WorkAreaInit(void);
 // (SPI_SETWORKAREA + re-fit of maximized windows) if it changed.
 void WorkAreaApply(void);
 
+// Re-apply the current target even if it did not change (something overwrote it).
+void WorkAreaReassert(void);
+
+// Create the hidden top-level window that receives WM_SETTINGCHANGE/WM_DISPLAYCHANGE
+// broadcasts. Must be called on a thread that pumps messages (the window-event thread).
+void WorkAreaCreateListener(void);
+
 // Record a dom0-provided work area + frame extents (qubesdb or MSG_WORKAREA).
 void WorkAreaSetDom0(int x, int y, int w, int h, int fl, int fr, int ft, int fb);
 

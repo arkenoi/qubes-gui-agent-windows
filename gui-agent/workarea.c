@@ -115,6 +115,16 @@ static BOOL CALLBACK WaRefitProc(HWND hwnd, LPARAM lparam)
     return TRUE;
 }
 
+// Re-apply the current target regardless of the "unchanged" shortcut: used when
+// something else overwrote the work area.
+void WorkAreaReassert(void)
+{
+    EnterCriticalSection(&g_WaLock);
+    SetRectEmpty(&g_WaLastApplied);
+    LeaveCriticalSection(&g_WaLock);
+    WorkAreaApply();
+}
+
 void WorkAreaApply(void)
 {
     if (!g_WaInitDone)
@@ -236,6 +246,55 @@ static DWORD WINAPI WaWatchThread(PVOID param)
         LogDebug("qubesdb connection lost, retrying");
         Sleep(30000);
     }
+}
+
+// Broadcast listener: Windows notifies work-area/display changes with
+// WM_SETTINGCHANGE(SPI_SETWORKAREA) and WM_DISPLAYCHANGE, which are sent to top-level
+// windows only (a message-only window would never see them). Explorer recomputes the
+// work area from its own taskbar geometry on those events and overwrites ours, so this
+// is exactly where to re-assert - no polling, no timer.
+static LRESULT CALLBACK WaWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg)
+    {
+    case WM_SETTINGCHANGE:
+        if (wp == SPI_SETWORKAREA)
+        {
+            // Our own SPI_SETWORKAREA does not broadcast (see WorkAreaApply), so any
+            // such notification is somebody else changing it: re-assert ours.
+            LogDebug("WM_SETTINGCHANGE(SPI_SETWORKAREA): re-asserting");
+            WorkAreaReassert();
+        }
+        return 0;
+    case WM_DISPLAYCHANGE:
+        LogDebug("WM_DISPLAYCHANGE %ux%u: re-asserting work area",
+            (UINT)LOWORD(lp), (UINT)HIWORD(lp));
+        WorkAreaReassert();
+        return 0;
+    }
+    return DefWindowProc(hwnd, msg, wp, lp);
+}
+
+void WorkAreaCreateListener(void)
+{
+    static const WCHAR cls[] = L"QubesGuiAgentWorkArea";
+    WNDCLASSEX wc = { sizeof(wc) };
+    wc.lpfnWndProc = WaWndProc;
+    wc.hInstance = GetModuleHandle(NULL);
+    wc.lpszClassName = cls;
+    if (!RegisterClassEx(&wc) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+    {
+        win_perror("RegisterClassEx(workarea listener)");
+        return;
+    }
+    // Top-level (broadcasts skip HWND_MESSAGE windows) but never shown, so the agent's
+    // own tracking rejects it: ShouldAcceptWindow drops invisible windows.
+    HWND h = CreateWindowEx(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, cls, L"", WS_POPUP,
+                            0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
+    if (!h)
+        win_perror("CreateWindowEx(workarea listener)");
+    else
+        LogDebug("work-area listener window 0x%x created", (uint32_t)(ULONG_PTR)h);
 }
 
 void WorkAreaInit(void)
