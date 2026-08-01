@@ -424,6 +424,13 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
         UINT flags = SWP_ASYNCWINDOWPOS | SWP_NOZORDER;
         EnterCriticalSection(&g_csWatchedWindows);
         WINDOW_DATA* data = FindWindowByHandle(window);
+        if (data && data->Synthesized)
+        {
+            // The daemon cannot legitimately reference a synthesized window (never
+            // announced); treat it as untracked so no ACK is sent back.
+            LogWarning("configure for synthesized window 0x%x, ignoring", window);
+            data = NULL;
+        }
 
         if (data != NULL)
         {

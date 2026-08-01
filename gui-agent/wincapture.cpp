@@ -47,6 +47,13 @@ struct Channel
     std::atomic<bool> dirty{ true }; // capture requested (starts dirty: initial fill)
     int failures = 0;
     bool dead = false;
+    // Buffer-relative regions this channel must NOT write: they are owned by
+    // synthesized child windows and are patched in from the composited desktop by
+    // the frame loop (see PwPatchSynthChildren in main.c). Without the mask, each
+    // capture would row-diff the patched pixels against PrintWindow's owner-only
+    // content and overwrite them every pass - the popup would flicker.
+    RECT mask[WC_MAX_MASK] = {};
+    int maskCount = 0;
 };
 
 struct Engine
@@ -132,9 +139,39 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
             const BYTE* srow = (const BYTE*)bits +
                 (size_t)(y + c.cropY) * capW * 4 + (size_t)c.cropX * 4;
             BYTE* drow = c.buffer + (size_t)y * rowBytes;
-            if (memcmp(drow, srow, rowBytes) != 0)
+
+            // Masked rows are compared/copied in the segments between the masked
+            // column ranges, so synthesized-child pixels survive untouched.
+            int segStart = 0;
+            bool rowChanged = false;
+            for (int seg = 0; seg <= c.maskCount; seg++)
             {
-                memcpy(drow, srow, rowBytes);
+                int segEnd = c.width;
+                int nextStart = c.width;
+                if (seg < c.maskCount)
+                {
+                    const RECT& m = c.mask[seg];
+                    if (y < m.top || y >= m.bottom)
+                        continue; // mask does not cover this row: no split here
+                    segEnd = m.left < segStart ? segStart : (m.left > c.width ? c.width : m.left);
+                    nextStart = m.right < segStart ? segStart : (m.right > c.width ? c.width : m.right);
+                }
+                if (segEnd > segStart)
+                {
+                    size_t off = (size_t)segStart * 4;
+                    size_t len = (size_t)(segEnd - segStart) * 4;
+                    if (memcmp(drow + off, srow + off, len) != 0)
+                    {
+                        memcpy(drow + off, srow + off, len);
+                        rowChanged = true;
+                    }
+                }
+                segStart = nextStart > segStart ? nextStart : segStart;
+                if (segStart >= c.width)
+                    break;
+            }
+            if (rowChanged)
+            {
                 if (y0 < 0)
                     y0 = y;
                 y1 = y;
@@ -296,6 +333,25 @@ void WcRemoveWindow(HWND hwnd)
             break;
         }
     }
+    ReleaseSRWLockExclusive(&g_eng->lock);
+}
+
+void WcSetMask(HWND hwnd, const RECT* rects, int count)
+{
+    if (!g_eng)
+        return;
+    if (count > WC_MAX_MASK)
+        count = WC_MAX_MASK;
+    AcquireSRWLockExclusive(&g_eng->lock);
+    for (auto& ch : g_eng->channels)
+        if (ch->hwnd == hwnd)
+        {
+            for (int i = 0; i < count; i++)
+                ch->mask[i] = rects[i];
+            ch->maskCount = count;
+            ch->dirty.store(true); // re-capture so unmasked areas refresh promptly
+            break;
+        }
     ReleaseSRWLockExclusive(&g_eng->lock);
 }
 

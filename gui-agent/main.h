@@ -118,6 +118,17 @@ typedef struct _WINDOW_DATA
     // fullscreen overlay below its panel).
     BOOL PwSliceFed;
     BOOL PwSliceNeedsFull; // one full-window copy pending (fresh attach/remap)
+
+    // Composite synthesis (CLAUDE.md 2A-chrome, taken further): an override-redirect
+    // window fully contained in its owner's rect is NOT announced to dom0 at all -
+    // no CREATE/MAP/CONFIGURE/DAMAGE/UNMAP/DESTROY ever names it. Instead the frame
+    // loop patches its region from the composited desktop into the OWNER's buffer,
+    // and the owner's capture masks that region so it cannot overwrite it. Result:
+    // menus/tooltips/bubbles appear inside their window, with no floating bordered
+    // rectangles in dom0.
+    BOOL Synthesized;      // this window is composited into SynthOwner, never announced
+    HWND SynthOwner;       // owner hwnd at synthesis time
+    UINT SynthChildCount;  // (owners) number of active synthesized children
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(

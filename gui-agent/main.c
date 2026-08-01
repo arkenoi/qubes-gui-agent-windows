@@ -784,6 +784,9 @@ BOOL IsPopup(IN const WINDOW_DATA* entry)
 
 ULONG ToggleMap(IN const WINDOW_DATA* entry)
 {
+    if (entry->Synthesized)
+        return ERROR_SUCCESS; // never announced; see main.h
+
     ULONG status = SendWindowUnmap(entry->Handle);
     if (status != ERROR_SUCCESS)
         return status;
@@ -943,11 +946,123 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 
 // watched window critical section must be entered
 // also sends creation notifications to gui daemon
+// --- composite synthesis (see WINDOW_DATA.Synthesized in main.h) ---------------
+// Watched-windows CS must be held for all of these.
+
+#define SYNTH_OVERHANG_MAX 4   // px a popup may stick out and still be synthesized
+
+// Does this window qualify to be composited into its owner instead of becoming its
+// own dom0 window? Deliberately strict: only override-redirect windows (menus,
+// tooltips, bubbles - never real dialogs) whose owner is itself a PrintWindow-fed
+// per-window window, and which are (almost) inside the owner's announced rect.
+static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerOut)
+{
+    if (!entry->IsOverrideRedirect || !entry->Owner || entry->IsIconic || !entry->IsVisible)
+        return FALSE;
+    if (entry->Width == 0 || entry->Height == 0)
+        return FALSE;
+
+    WINDOW_DATA* owner = FindWindowByHandle(entry->Owner);
+    if (!owner || owner->Synthesized || owner->DeletePending)
+        return FALSE;
+    // The owner must have its own buffer AND be PrintWindow-fed: a slice-fed owner
+    // already carries the composited child pixels, and a legacy owner has no buffer
+    // to patch into.
+    if (!PwIsAttached(owner) || owner->PwSliceFed)
+        return FALSE;
+    if (owner->SynthChildCount >= WC_MAX_MASK)
+        return FALSE;
+
+    // containment against the geometry the owner's BUFFER was granted for
+    int oL = owner->X, oT = owner->Y;
+    int oR = oL + (int)owner->PwWidth, oB = oT + (int)owner->PwHeight;
+    int cL = entry->X, cT = entry->Y;
+    int cR = cL + (int)entry->Width, cB = cT + (int)entry->Height;
+    if (cL < oL - SYNTH_OVERHANG_MAX || cT < oT - SYNTH_OVERHANG_MAX ||
+        cR > oR + SYNTH_OVERHANG_MAX || cB > oB + SYNTH_OVERHANG_MAX)
+        return FALSE;
+
+    if (ownerOut)
+        *ownerOut = owner;
+    return TRUE;
+}
+
+// Push the current synthesized-child rects of `owner` to its capture channel, so the
+// owner's PrintWindow pass leaves those pixels alone (the frame loop owns them).
+static void SynthUpdateMask(IN const WINDOW_DATA* owner)
+{
+    RECT mask[WC_MAX_MASK];
+    int n = 0;
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
+         e != &g_WatchedWindowsList && n < WC_MAX_MASK; e = e->Flink)
+    {
+        const WINDOW_DATA* c = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (!c->Synthesized || c->SynthOwner != owner->Handle)
+            continue;
+        RECT r = { c->X - owner->X, c->Y - owner->Y,
+                   c->X - owner->X + (int)c->Width, c->Y - owner->Y + (int)c->Height };
+        if (r.left < 0) r.left = 0;
+        if (r.top < 0) r.top = 0;
+        if (r.right > (int)owner->PwWidth) r.right = (int)owner->PwWidth;
+        if (r.bottom > (int)owner->PwHeight) r.bottom = (int)owner->PwHeight;
+        if (r.right > r.left && r.bottom > r.top)
+            mask[n++] = r;
+    }
+    WcSetMask(owner->Handle, mask, n);
+}
+
+// Mark a window synthesized (no protocol traffic from here on) and account it on
+// the owner. The caller must not have announced it yet.
+static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
+{
+    entry->Synthesized = TRUE;
+    entry->SynthOwner = owner->Handle;
+    owner->SynthChildCount++;
+    SynthUpdateMask(owner);
+    LogInfo("QGAPROTO,msg=SYNTH,hwnd=0x%x,owner=0x%x,x=%d,y=%d,w=%u,h=%u",
+        (uint32_t)(ULONG_PTR)entry->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
+        entry->X, entry->Y, entry->Width, entry->Height);
+}
+
+// Stop synthesizing (window gone, or it no longer qualifies). Does NOT announce the
+// window; the caller decides whether to materialize it.
+static void SynthDeactivate(IN OUT WINDOW_DATA* entry)
+{
+    if (!entry->Synthesized)
+        return;
+    entry->Synthesized = FALSE;
+    WINDOW_DATA* owner = FindWindowByHandle(entry->SynthOwner);
+    entry->SynthOwner = NULL;
+    if (owner && owner->SynthChildCount > 0)
+    {
+        owner->SynthChildCount--;
+        SynthUpdateMask(owner);
+        // The owner's capture skipped those pixels while the child lived; force a
+        // fresh capture so the owner's own content reappears there.
+        if (PwIsAttached(owner) && !owner->PwSliceFed)
+        {
+            WcMarkDirty(owner->Handle);
+            (void)SendWindowDamageEvent(owner->Handle, 0, 0, owner->PwWidth, owner->PwHeight);
+        }
+    }
+}
+
 ULONG AddWindow(IN WINDOW_DATA* entry)
 {
     ULONG status = ERROR_SUCCESS;
     LogVerbose("start, handle 0x%x, visible %d, iconic %d", entry->Handle, entry->IsVisible, entry->IsIconic);
     InsertTailList(&g_WatchedWindowsList, &entry->ListEntry);
+
+    // Composite synthesis: an owner-contained popup is never announced to dom0 - it
+    // is painted into its owner's buffer by the frame loop instead (main.h).
+    {
+        WINDOW_DATA* synthOwner = NULL;
+        if (PwEnabled() && SynthQualifies(entry, &synthOwner))
+        {
+            SynthActivate(entry, synthOwner);
+            return ERROR_SUCCESS;
+        }
+    }
 
     // send window creation info to gui daemon
     if (g_VchanClientConnected)
@@ -1025,6 +1140,8 @@ end:
 // byte-identical to the last one sent (drag processing produced bursts of 4+ duplicates).
 static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
 {
+    if (entry->Synthesized)
+        return ERROR_SUCCESS; // never announced; see main.h
     if (entry->CfgSentValid &&
         entry->LastCfgX == entry->X && entry->LastCfgY == entry->Y &&
         entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
@@ -1067,6 +1184,34 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
 
     if (entry->Handle == g_StartWindow)
         g_StartVisible = FALSE;
+
+    // Synthesized windows were never announced: sending UNMAP/DESTROY for an hwnd the
+    // daemon has no CREATE for is the documented daemon-killer (see send.c).
+    if (entry->Synthesized)
+    {
+        SynthDeactivate(entry);
+        free(entry);
+        status = ERROR_SUCCESS;
+        goto end;
+    }
+
+    // Children composited into this window lose their host; drop their synthesis so
+    // the next tracking pass re-examines (and announces) them normally.
+    if (entry->SynthChildCount > 0)
+    {
+        for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; )
+        {
+            WINDOW_DATA* c = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+            e = e->Flink;
+            if (c->Synthesized && c->SynthOwner == entry->Handle)
+            {
+                c->Synthesized = FALSE;
+                c->SynthOwner = NULL;
+                c->DeletePending = TRUE; // re-examined from scratch by TrackWindows
+            }
+        }
+        entry->SynthChildCount = 0;
+    }
 
     if (g_VchanClientConnected)
     {
@@ -1377,7 +1522,7 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
         if (fg && fg != lastForeground)
         {
             WINDOW_DATA* fgData = FindWindowByHandle(fg);
-            if (fgData && fgData->IsVisible && !fgData->IsIconic)
+            if (fgData && fgData->IsVisible && !fgData->IsIconic && !fgData->Synthesized)
             {
                 lastForeground = fg;
                 LogInfo("foreground -> 0x%x, re-mapping to raise it in dom0", fg);
@@ -1741,6 +1886,51 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         goto end;
     }
 
+    // Synthesized windows produce NO protocol traffic. Refresh local geometry (the
+    // frame loop paints them from it), keep the owner's capture mask in step, and
+    // materialize them as real windows if they stop qualifying (moved out of the
+    // owner, owner changed) - materialization happens by dropping synthesis here and
+    // letting the standard re-examination path announce them.
+    if (windowData->Synthesized)
+    {
+        BOOL geomChanged = (windowData->X != data.X || windowData->Y != data.Y ||
+            windowData->Width != data.Width || windowData->Height != data.Height);
+        windowData->X = data.X;
+        windowData->Y = data.Y;
+        windowData->Width = data.Width;
+        windowData->Height = data.Height;
+        windowData->Style = data.Style;
+        windowData->ExStyle = data.ExStyle;
+        windowData->Owner = data.Owner;
+        windowData->IsIconic = data.IsIconic;
+        windowData->IsVisible = data.IsVisible;
+        windowData->IsOverrideRedirect = data.IsOverrideRedirect;
+
+        if (!data.IsVisible || !ShouldAcceptWindow(windowData))
+        {
+            windowData->DeletePending = TRUE; // silent removal via RemoveWindow
+            status = ERROR_SUCCESS;
+            goto end;
+        }
+
+        WINDOW_DATA* owner = NULL;
+        if (!SynthQualifies(windowData, &owner))
+        {
+            LogInfo("0x%x: no longer owner-contained, materializing as a dom0 window",
+                windowData->Handle);
+            SynthDeactivate(windowData);
+            // Re-announce from scratch: drop it from the list and let the next
+            // tracking pass add it through the normal path (CREATE/attach/MAP).
+            windowData->DeletePending = TRUE;
+        }
+        else if (geomChanged)
+        {
+            SynthUpdateMask(owner);
+        }
+        status = ERROR_SUCCESS;
+        goto end;
+    }
+
     // While maximized, cap the reported size at what the dom0 WM last said it can
     // display (recorded by HandleConfigure); the per-window dump then matches the dom0
     // window exactly instead of overflowing it by the height of dom0's decorations.
@@ -1933,6 +2123,28 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             LogDebug("0x%x: per-window rebuild failed, window on legacy path",
                 windowData->Handle);
         }
+    }
+
+    // Owner-side: keep the capture mask aligned after the owner moved/resized, and
+    // re-check that its synthesized children are still contained.
+    if (windowData->SynthChildCount > 0)
+    {
+        for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; )
+        {
+            WINDOW_DATA* c = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+            e = e->Flink;
+            if (!c->Synthesized || c->SynthOwner != windowData->Handle)
+                continue;
+            WINDOW_DATA* stillOwner = NULL;
+            if (!SynthQualifies(c, &stillOwner))
+            {
+                LogInfo("0x%x: owner geometry changed, materializing child", c->Handle);
+                SynthDeactivate(c);
+                c->DeletePending = TRUE;
+            }
+        }
+        if (windowData->SynthChildCount > 0)
+            SynthUpdateMask(windowData);
     }
 
     // TODO: should we care about style changes? some of them affect Z-order (topmost etc)
@@ -2331,6 +2543,52 @@ static void PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRA
     (void)SendWindowDamageEvent(entry->Handle, relX, relY, w, h);
 }
 
+// Paint this owner's synthesized children into its buffer from the composited
+// desktop image and report the damage. The owner's capture masks these rects (see
+// SynthUpdateMask), so nothing overwrites them afterwards. Called per frame for
+// owners with children; `area` limits work to the region that actually changed.
+static void PwPatchSynthChildren(IN OUT WINDOW_DATA* owner, IN const CAPTURE_FRAME* frame,
+                                 IN const BYTE* fb, IN const RECT* area)
+{
+    if (!fb || frame->rect.Pitch <= 0 || !owner->PwBuffer)
+        return;
+
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
+    {
+        WINDOW_DATA* c = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (!c->Synthesized || c->SynthOwner != owner->Handle)
+            continue;
+
+        RECT childR = { c->X, c->Y, c->X + (int)c->Width, c->Y + (int)c->Height };
+        RECT ownerR = { owner->X, owner->Y,
+                        owner->X + (int)owner->PwWidth, owner->Y + (int)owner->PwHeight };
+        RECT screenR = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
+        RECT r;
+        if (!IntersectRect(&r, &childR, &ownerR) || !IntersectRect(&r, &r, &screenR))
+            continue;
+        if (area && !IntersectRect(&r, &r, area))
+            continue;
+
+        int relX = r.left - owner->X, relY = r.top - owner->Y;
+        int w = r.right - r.left, h = r.bottom - r.top;
+        if (relX < 0 || relY < 0 || w <= 0 || h <= 0)
+            continue;
+        if ((ULONG)(relX + w) > owner->PwWidth || (ULONG)(relY + h) > owner->PwHeight)
+            continue;
+
+        const BYTE* src = fb + (size_t)r.top * frame->rect.Pitch + (size_t)r.left * 4;
+        BYTE* dst = (BYTE*)owner->PwBuffer +
+            ((size_t)relY * owner->PwWidth + (size_t)relX) * 4;
+        for (int row = 0; row < h; row++)
+        {
+            memcpy(dst, src, (size_t)w * 4);
+            src += frame->rect.Pitch;
+            dst += (size_t)owner->PwWidth * 4;
+        }
+        (void)SendWindowDamageEvent(owner->Handle, relX, relY, w, h);
+    }
+}
+
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer)
 {
     // Menus/tooltips are override-redirect windows. They are mapped like any other window,
@@ -2451,6 +2709,18 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         if (entry->IsIconic || !entry->IsVisible)
             continue;
 
+        // Synthesized windows have no dom0 window: never send anything for them. They
+        // still claim their area so LEGACY windows below are clipped as before; their
+        // pixels reach dom0 through the owner's buffer (PwPatchSynthChildren).
+        if (entry->Synthesized)
+        {
+            SetRectRgn(rgnWindow, entry->X, entry->Y,
+                entry->X + (int)entry->Width, entry->Y + (int)entry->Height);
+            if (g_ZOrderValid)
+                CombineRgn(rgnCovered, rgnCovered, rgnWindow, RGN_OR);
+            continue;
+        }
+
         // Windows with their own per-window buffer get content AND damage from the WGC
         // engine; the composited screen carries nothing for them, and slicing it is
         // exactly the artifact source this build removes. They still claim their area
@@ -2492,6 +2762,16 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         WcMarkDirty(entry->Handle);
                         break;
                     }
+                }
+
+                // Composited children live in the masked regions of this buffer and
+                // are fed from the screen image (PrintWindow does not render owned
+                // popups). Repaint whatever part of them changed this frame.
+                if (entry->SynthChildCount > 0)
+                {
+                    for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
+                        if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
+                            PwPatchSynthChildren(entry, frame, framebuffer, &pwHit);
                 }
             }
             SetRectRgn(rgnWindow, entry->X, entry->Y,
@@ -2874,6 +3154,7 @@ static ULONG WINAPI WatchForEvents(void)
                         while (repaint != (WINDOW_DATA*)&g_WatchedWindowsList)
                         {
                             repaint = CONTAINING_RECORD(repaint, WINDOW_DATA, ListEntry);
+                            if (repaint->Synthesized) continue;
                             if (repaint->IsVisible && !repaint->IsIconic &&
                                 repaint->Width > 0 && repaint->Height > 0)
                             {

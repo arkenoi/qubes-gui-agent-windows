@@ -55,6 +55,14 @@ BOOL WcIsDead(HWND hwnd);
 // intersect the window). Cheap; coalesces.
 void WcMarkDirty(HWND hwnd);
 
+// Maximum masked regions per window (synthesized children composited by the frame
+// loop; see WcSetMask).
+#define WC_MAX_MASK 8
+
+// Set the buffer-relative regions this window's capture must not write, because a
+// synthesized child owns those pixels. Replaces any previous mask; count 0 clears.
+void WcSetMask(HWND hwnd, const RECT* rects, int count);
+
 // Synchronously render the window's current content into the buffer via
 // PrintWindow(PW_RENDERFULLCONTENT) so the daemon has real pixels before the first WGC
 // frame arrives. Window-relative crop applied as in WcAddWindow.

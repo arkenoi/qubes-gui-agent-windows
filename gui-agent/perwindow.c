@@ -241,6 +241,8 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
 {
     if (!g_PwOn)
         return ERROR_NOT_SUPPORTED;
+    if (entry->Synthesized)
+        return ERROR_NOT_SUPPORTED; // composited into its owner; a dump would name an unknown hwnd
     if (g_PwDaemonVersion < QUBES_GUID_MIN_MSG_WINDOW_DUMP_ACK)
     {
         LogInfo("0x%x: attach skipped, daemon version 0x%x < 0x%x",
