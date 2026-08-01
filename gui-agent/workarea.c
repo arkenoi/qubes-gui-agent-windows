@@ -294,7 +294,7 @@ void WorkAreaCreateListener(void)
     if (!h)
         win_perror("CreateWindowEx(workarea listener)");
     else
-        LogDebug("work-area listener window 0x%x created", (uint32_t)(ULONG_PTR)h);
+        LogDebug("work-area listener window %p created", h);
 }
 
 void WorkAreaInit(void)
