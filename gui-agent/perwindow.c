@@ -204,6 +204,15 @@ void PwRevokeTick(void)
 // fine (menus fading in were validated on the per-window path) - keep those attached.
 BOOL PwWindowEligible(IN const WINDOW_DATA* entry)
 {
+    // No GDI redirection surface AT ALL (DirectComposition-only content): PrintWindow
+    // has nothing to read regardless of layering. Edge's true first-run takeover window
+    // is created with this bit from birth.
+#ifndef WS_EX_NOREDIRECTIONBITMAP
+#define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
+#endif
+    if (entry->ExStyle & WS_EX_NOREDIRECTIONBITMAP)
+        return FALSE;
+
     if (!(entry->ExStyle & WS_EX_LAYERED))
         return TRUE;
 
