@@ -1853,7 +1853,18 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     }
 
     // too small?
-    if (data->Width < g_MinWindowWidth || data->Height < g_MinWindowHeight)
+    // The SM_CXMIN/CYMIN floor models a NORMAL window's decoration minimum; popups have
+    // no such minimum. Win11 Alt-nav keytip badges (Xaml_WindowedPopupClass, ~40x46) sit
+    // partly OUTSIDE their owner's granted buffer, so unless announced they can only ever
+    // be partially visible through a synthesized sibling's patch region (win11-idd-test,
+    // FINDINGS 2026-08-01). Announce small override-redirect popups; keep a token floor
+    // against 1-px artifacts.
+    if (data->IsOverrideRedirect)
+    {
+        if (data->Width < 4 || data->Height < 4)
+            return FALSE;
+    }
+    else if (data->Width < g_MinWindowWidth || data->Height < g_MinWindowHeight)
         return FALSE;
 
     // Ignore child windows, they are confined to parent's client area and can't be top-level.
