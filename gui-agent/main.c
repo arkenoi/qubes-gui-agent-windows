@@ -960,7 +960,15 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 // --- composite synthesis (see WINDOW_DATA.Synthesized in main.h) ---------------
 // Watched-windows CS must be held for all of these.
 
-#define SYNTH_OVERHANG_MAX 4   // px a popup may stick out and still be synthesized
+// px a popup may stick out of the owner's granted buffer and still be synthesized.
+// Win11 XAML popups (menus/flyouts) align to the owner's OUTER window rect while the
+// buffer starts at the DWM visual frame: measured 5 px overhang at 96 DPI
+// (win11-idd-test, Notepad File menu WR left 258 vs DWM frame 263), and the invisible
+// resize border grows with DPI. 12 covers that with headroom; Alt-nav keytip badges
+// (~20+ px outside) stay excluded on purpose. Both consumers clip/clamp: the frame
+// loop's patch intersects with the buffer rect, the capture mask clamps to channel
+// width, so a larger overhang only ever crops shadow-margin pixels.
+#define SYNTH_OVERHANG_MAX 12
 
 static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child);
 
