@@ -493,6 +493,13 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
     if (!g_VchanClientConnected)
         return ERROR_SUCCESS;
 
+    // Screen-window damage after StopFrameProcessing sent MSG_DESTROY for window 0 (a
+    // frame event can already be pending when the capture error is processed) is the
+    // same daemon-killer as the per-window case. All window-0 damage is sent from the
+    // main thread, which also sets this flag, so a plain check is race-free.
+    if (!window && g_LocalScreenDestroyed)
+        return ERROR_SUCCESS;
+
     LogVerbose("0x%x: (%d,%d)-(%d,%d) %dx%d", window, x, y, x + width, y + height, width, height);
     header.type = MSG_SHMIMAGE;
 #pragma warning(suppress:4311)

@@ -28,6 +28,7 @@ extern BOOL g_UseDirtyBits;
 extern BOOL g_SeamlessMode;
 extern DWORD g_ScreenHeight;
 extern DWORD g_ScreenWidth;
+extern BOOL g_LocalScreenDestroyed;
 extern DWORD g_HostScreenWidth;
 extern DWORD g_HostScreenHeight;
 extern BOOL g_VchanClientConnected;

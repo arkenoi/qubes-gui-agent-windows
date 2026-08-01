@@ -916,20 +916,22 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     if ((entry->Style & WS_MAXIMIZE) && entry->IsVisible &&
         g_HostScreenWidth > 0 && g_HostScreenHeight > 0)
     {
+        int cx = entry->X < 0 ? 0 : entry->X;
+        int cy = entry->Y < 0 ? 0 : entry->Y;
         int x2 = entry->X + (int)entry->Width;
         int y2 = entry->Y + (int)entry->Height;
         if (x2 > (int)g_HostScreenWidth)
             x2 = (int)g_HostScreenWidth;
         if (y2 > (int)g_HostScreenHeight)
             y2 = (int)g_HostScreenHeight;
-        if (entry->X < 0)
-            entry->X = 0;
-        if (entry->Y < 0)
-            entry->Y = 0;
-        if (x2 > entry->X && y2 > entry->Y)
+        // All-or-nothing: a window entirely off-screen keeps its raw geometry rather
+        // than getting a half-applied clamp.
+        if (x2 > cx && y2 > cy)
         {
-            entry->Width = (DWORD)(x2 - entry->X);
-            entry->Height = (DWORD)(y2 - entry->Y);
+            entry->X = cx;
+            entry->Y = cy;
+            entry->Width = (DWORD)(x2 - cx);
+            entry->Height = (DWORD)(y2 - cy);
         }
     }
 
