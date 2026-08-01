@@ -910,6 +910,7 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         // check if we're modal to some other window
         HWND owner = GetWindow(window, GW_OWNER);
         entry->Owner = owner; // also an input of ShouldAcceptWindow(), see WINDOW_DATA
+        GetWindowThreadProcessId(window, &entry->ProcessId); // see WINDOW_DATA.ProcessId
         if (owner)
         {
             BOOL ownerDisabled = GetWindowLong(owner, GWL_STYLE) & WS_DISABLED;
@@ -963,26 +964,19 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 
 static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child);
 
-// Does this window qualify to be composited into its owner instead of becoming its
-// own dom0 window? Deliberately strict: only override-redirect windows (menus,
-// tooltips, bubbles - never real dialogs) whose owner is itself a PrintWindow-fed
-// per-window window, and which are (almost) inside the owner's announced rect.
-static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerOut)
+// Owner-candidacy checks shared by the GW_OWNER path and the same-process fallback:
+// the owner must be an announceable window with its own PrintWindow-fed buffer (a
+// slice-fed owner already carries the composited child pixels, and a legacy owner
+// has no buffer to patch into), with mask capacity left, whose GRANTED geometry
+// contains the popup (almost - SYNTH_OVERHANG_MAX).
+static BOOL SynthOwnerQualifies(IN const WINDOW_DATA* owner, IN const WINDOW_DATA* entry)
 {
-    if (!entry->IsOverrideRedirect || !entry->Owner || entry->IsIconic || !entry->IsVisible)
+    if (!owner || owner == entry || owner->Synthesized || owner->DeletePending)
         return FALSE;
-    if (entry->Width == 0 || entry->Height == 0)
-        return FALSE;
-
-    WINDOW_DATA* owner = FindWindowByHandle(entry->Owner);
-    if (!owner || owner->Synthesized || owner->DeletePending)
-        return FALSE;
-    // The owner must have its own buffer AND be PrintWindow-fed: a slice-fed owner
-    // already carries the composited child pixels, and a legacy owner has no buffer
-    // to patch into.
     if (!PwIsAttached(owner) || owner->PwSliceFed)
         return FALSE;
-    if (owner->SynthChildCount >= WC_MAX_MASK)
+    // An entry already accounted on this owner does not consume a NEW mask slot.
+    if (owner->SynthChildCount >= WC_MAX_MASK && entry->SynthOwner != owner->Handle)
         return FALSE;
 
     // containment against the geometry the owner's BUFFER was granted for
@@ -992,6 +986,66 @@ static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerO
     int cR = cL + (int)entry->Width, cB = cT + (int)entry->Height;
     if (cL < oL - SYNTH_OVERHANG_MAX || cT < oT - SYNTH_OVERHANG_MAX ||
         cR > oR + SYNTH_OVERHANG_MAX || cB > oB + SYNTH_OVERHANG_MAX)
+        return FALSE;
+
+    return TRUE;
+}
+
+// Does this window qualify to be composited into an owner instead of becoming its
+// own dom0 window? Deliberately strict: only override-redirect windows (menus,
+// tooltips, bubbles - never real dialogs), and only into a qualifying owner:
+//   1. its GW_OWNER, when that is a window we track (the Win10 / Office chrome case);
+//   2. otherwise - no GW_OWNER at all, or GW_OWNER pointing at an untracked helper
+//      window - the TOPMOST window of the same process whose granted buffer contains
+//      the popup. Win11 XAML windowed popups (Xaml_WindowedPopupClass "PopupHost":
+//      teaching bubbles, WinUI menus/flyouts/context menus) are exactly this shape;
+//      geometric strictness is the guard against over-matching, and a popup that
+//      leaves the containment materializes via the normal re-check.
+// A window that is ALREADY synthesized re-qualifies only against its recorded owner:
+// hopping owners mid-life would desync the mask/child accounting.
+static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerOut)
+{
+    if (!entry->IsOverrideRedirect || entry->IsIconic || !entry->IsVisible)
+        return FALSE;
+    if (entry->Width == 0 || entry->Height == 0)
+        return FALSE;
+
+    WINDOW_DATA* owner = NULL;
+
+    if (entry->Synthesized)
+    {
+        owner = FindWindowByHandle(entry->SynthOwner);
+        if (!SynthOwnerQualifies(owner, entry))
+            return FALSE;
+    }
+    else if (entry->Owner && (owner = FindWindowByHandle(entry->Owner)) != NULL)
+    {
+        // GW_OWNER known and tracked: honor it exclusively. A menu owned by window A
+        // must never be synthesized into an overlapping window B of the same app.
+        if (!SynthOwnerQualifies(owner, entry))
+            return FALSE;
+    }
+    else if (entry->ProcessId != 0)
+    {
+        int bestZ = INT_MAX;
+        for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
+             e != &g_WatchedWindowsList; e = e->Flink)
+        {
+            WINDOW_DATA* cand = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+            if (cand->ProcessId != entry->ProcessId || cand->IsOverrideRedirect)
+                continue;
+            if (!SynthOwnerQualifies(cand, entry))
+                continue;
+            if (cand->ZOrder < bestZ)
+            {
+                bestZ = cand->ZOrder;
+                owner = cand;
+            }
+        }
+        if (!owner)
+            return FALSE;
+    }
+    else
         return FALSE;
 
     if (ownerOut)
@@ -1921,6 +1975,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         windowData->Style = data.Style;
         windowData->ExStyle = data.ExStyle;
         windowData->Owner = data.Owner;
+        windowData->ProcessId = data.ProcessId;
         windowData->IsIconic = data.IsIconic;
         windowData->IsVisible = data.IsVisible;
         windowData->IsOverrideRedirect = data.IsOverrideRedirect;

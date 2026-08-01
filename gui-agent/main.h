@@ -74,6 +74,11 @@ typedef struct _WINDOW_DATA
     // frame it decorates. Only sampled when the window is visible, which is all
     // ShouldAcceptWindow() needs: it rejects invisible windows before looking at this.
     HWND Owner;
+    // Creator process. Win11 XAML windowed popups (Xaml_WindowedPopupClass "PopupHost":
+    // teaching bubbles, WinUI menus/flyouts) carry no usable GW_OWNER link to the window
+    // they belong to, so synthesis falls back to "topmost same-process window whose
+    // granted buffer contains the popup" - which needs this. Sampled with Owner.
+    DWORD ProcessId;
 
     // Uniform alpha of a layered window; 255 (opaque) for everything we cannot ask about.
 
