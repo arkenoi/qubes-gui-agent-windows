@@ -2668,7 +2668,11 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
                                      IN const RECT* area)
 {
     if (!g_FbBits || g_FbPitch <= 0 || !owner->PwBuffer)
+    {
+        LogWarning("synth paint 0x%x: no source (fb=%p pitch=%d buf=%p)",
+            c->Handle, g_FbBits, g_FbPitch, owner->PwBuffer);
         return;
+    }
 
     RECT childR = { c->X, c->Y, c->X + (int)c->Width, c->Y + (int)c->Height };
     RECT ownerR = { owner->X, owner->Y,
@@ -2676,7 +2680,12 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
     RECT screenR = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
     RECT r;
     if (!IntersectRect(&r, &childR, &ownerR) || !IntersectRect(&r, &r, &screenR))
+    {
+        LogWarning("synth paint 0x%x: child (%d,%d)-(%d,%d) outside owner (%d,%d)-(%d,%d)",
+            c->Handle, childR.left, childR.top, childR.right, childR.bottom,
+            ownerR.left, ownerR.top, ownerR.right, ownerR.bottom);
         return;
+    }
     if (area && !IntersectRect(&r, &r, area))
         return;
 
@@ -2685,7 +2694,15 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
     if (relX < 0 || relY < 0 || w <= 0 || h <= 0)
         return;
     if ((ULONG)(relX + w) > owner->PwWidth || (ULONG)(relY + h) > owner->PwHeight)
+    {
+        LogWarning("synth paint 0x%x: rel (%d,%d) %dx%d exceeds owner buffer %ux%u",
+            c->Handle, relX, relY, w, h, owner->PwWidth, owner->PwHeight);
         return;
+    }
+
+    LogInfo("QGAPROTO,msg=SYNTHPAINT,hwnd=0x%x,owner=0x%x,rx=%d,ry=%d,w=%d,h=%d",
+        (uint32_t)(ULONG_PTR)c->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
+        relX, relY, w, h);
 
     const BYTE* src = g_FbBits + (size_t)r.top * g_FbPitch + (size_t)r.left * 4;
     BYTE* dst = (BYTE*)owner->PwBuffer +
