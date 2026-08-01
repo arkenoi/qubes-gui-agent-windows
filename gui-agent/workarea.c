@@ -16,6 +16,8 @@
 
 // Minimum spacing of the WorkAreaEnsureApplied drift compare.
 #define WA_DRIFT_CHECK_MS 2000
+// Minimum gap between broadcast-driven re-asserts; see WorkAreaReassert.
+#define WA_REASSERT_MIN_MS 1000
 
 static CRITICAL_SECTION g_WaLock;
 static BOOL g_WaLockInit = FALSE; // g_WaLock initialized (see WorkAreaLockInit)
@@ -138,6 +140,22 @@ void WorkAreaReassert(void)
     // until then there is no target to re-assert, so this must be a no-op. g_WaLock
     // itself is safe earlier than that (WorkAreaLockInit precedes the thread).
     if (!g_WaInitDone)
+        return;
+
+    // Debounce. Explorer answers our SPI_SETWORKAREA by recomputing from its own
+    // taskbar geometry and setting the work area back, and THAT broadcasts
+    // WM_SETTINGCHANGE(SPI_SETWORKAREA) to us - so an unconditional re-assert per
+    // broadcast becomes a ping-pong (measured on the clean install: 1018 applies in
+    // 85 s, ~12/s, each running EnumWindows + cross-process SetWindowPlacement).
+    // Fighting at input rate wins nothing that fighting at 1 Hz does not: a genuine
+    // overwrite that outlives the debounce is still caught here on the next
+    // broadcast, and WorkAreaEnsureApplied's 2 s drift check is the backstop if no
+    // further broadcast arrives. Loss is bounded to <=1 s of a stale work area,
+    // which no user-visible layout depends on.
+    static volatile LONG lastReassert; // interlocked: listener + main-loop threads
+    DWORD now = GetTickCount();
+    LONG prev = InterlockedExchange(&lastReassert, (LONG)now);
+    if (prev != 0 && (DWORD)(now - (DWORD)prev) < WA_REASSERT_MIN_MS)
         return;
 
     EnterCriticalSection(&g_WaLock);
