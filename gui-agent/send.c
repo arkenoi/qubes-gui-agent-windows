@@ -103,6 +103,45 @@ ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs)
     return SendWindowDump(NULL, g_ScreenWidth, g_ScreenHeight, numGrants, refs);
 }
 
+// --- recently-destroyed window ring -------------------------------------------------
+// Guarded by g_VchanCriticalSection. SendWindowDestroy marks the hwnd inside the same
+// lock hold that emits MSG_DESTROY; SendWindowDamageEvent checks it inside the hold that
+// would emit MSG_SHMIMAGE. Damage-after-destroy (which makes gui-daemon exit(1) with
+// "msg without CREATE", killing the whole qube's GUI) is thereby excluded by
+// linearization on the vchan lock alone. The capture thread must NOT take
+// g_csWatchedWindows for this: the main thread dispatches inbound messages while HOLDING
+// the vchan lock (main.c WatchForEvents) and its handlers take the watched-windows lock
+// inside it, so taking the two locks in the opposite order on the capture thread would
+// be an ABBA deadlock.
+// The ring only needs to cover in-flight capture callbacks: WcRemoveWindow stops new
+// captures synchronously before MSG_DESTROY is sent, so at most one already-collected
+// callback batch per window can still fire. Entries are cleared when an hwnd is reused
+// for a new CREATE.
+#define DESTROYED_RING_SIZE 64
+static HWND g_DestroyedRing[DESTROYED_RING_SIZE];
+static ULONG g_DestroyedRingNext;
+
+static void MarkWindowDestroyedLocked(IN HWND window)
+{
+    g_DestroyedRing[g_DestroyedRingNext % DESTROYED_RING_SIZE] = window;
+    g_DestroyedRingNext++;
+}
+
+static BOOL WasWindowDestroyedLocked(IN HWND window)
+{
+    for (int i = 0; i < DESTROYED_RING_SIZE; i++)
+        if (g_DestroyedRing[i] == window)
+            return TRUE;
+    return FALSE;
+}
+
+static void ClearWindowDestroyedLocked(IN HWND window)
+{
+    for (int i = 0; i < DESTROYED_RING_SIZE; i++)
+        if (g_DestroyedRing[i] == window)
+            g_DestroyedRing[i] = NULL;
+}
+
 ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)
 {
     WINDOWINFO wi;
@@ -160,6 +199,9 @@ ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)
             windowData ? windowData->Style : 0, windowData ? windowData->ExStyle : 0);
 
     EnterCriticalSection(&g_VchanCriticalSection);
+    // The OS can reuse a destroyed hwnd: a fresh CREATE re-legitimizes it for damage.
+    if (windowData)
+        ClearWindowDestroyedLocked(windowData->Handle);
     if (!VCHAN_SEND_MSG(header, createMsg, L"MSG_CREATE"))
     {
         LeaveCriticalSection(&g_VchanCriticalSection);
@@ -194,6 +236,9 @@ ULONG SendWindowDestroy(IN HWND window)
     header.untrusted_len = 0;
     EnterCriticalSection(&g_VchanCriticalSection);
     status = VCHAN_SEND(header, L"MSG_DESTROY");
+    // In the same lock hold as the send: from here on, damage for this hwnd is dropped
+    // (see the destroyed-ring comment above SendWindowDamageEvent).
+    MarkWindowDestroyedLocked(window);
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
@@ -413,59 +458,40 @@ cleanup:
 
 ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN int height)
 {
+    if (g_ProtoTrace)
+    {
+        // Wobble is a desync between the geometry dom0 believes and where the window actually
+        // is in the live shared framebuffer. Record both at the instant damage goes out: `a*`
+        // is the origin this damage was registered against (what dom0 will add back), `l*` is
+        // where the window really is right now. A non-zero delta during motion IS the wobble,
+        // measured with no cross-VM capture skew.
+        RECT live;
+        if (window && GetRealWindowRect(window, &live) == ERROR_SUCCESS)
+        {
+            // Also called from the capture thread: the list walk must hold the lock, and
+            // it must be RELEASED before the vchan lock is taken below (the main thread
+            // holds the vchan lock while taking this one - see ring comment above).
+            EnterCriticalSection(&g_csWatchedWindows);
+            WINDOW_DATA* wd = FindWindowByHandle(window);
+            int ax = wd ? wd->X : 0, ay = wd ? wd->Y : 0;
+            LeaveCriticalSection(&g_csWatchedWindows);
+            LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d,ax=%d,ay=%d,lx=%d,ly=%d",
+                (uint32_t)(ULONG_PTR)window, x, y, width, height,
+                ax, ay, live.left, live.top);
+        }
+        else
+        {
+            LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d",
+                (uint32_t)(ULONG_PTR)window, x, y, width, height);
+        }
+    }
+
     struct msg_shmimage shmMsg;
     struct msg_hdr header;
     BOOL status;
-    BOOL tracked = FALSE;
 
     if (!g_VchanClientConnected)
         return ERROR_SUCCESS;
-
-    // Per-window damage may come from the capture thread, which races RemoveWindow on the
-    // frame thread: MSG_SHMIMAGE landing after RemoveWindow's MSG_DESTROY makes gui-daemon
-    // exit(1) ("msg without CREATE"), killing the whole qube's GUI. RemoveWindow runs
-    // entirely under g_csWatchedWindows, so hold it across the send (lock order:
-    // watched-windows OUTER, vchan INNER, same as the frame path): either this damage is
-    // fully on the wire before UNMAP/DESTROY (the daemon drops damage for unmapped
-    // windows), or the entry is already gone and it is dropped here.
-    if (window)
-    {
-        EnterCriticalSection(&g_csWatchedWindows);
-        WINDOW_DATA* wd = FindWindowByHandle(window);
-        if (!wd)
-        {
-            LeaveCriticalSection(&g_csWatchedWindows);
-            LogVerbose("0x%x: dropping damage for removed window", window);
-            return ERROR_SUCCESS;
-        }
-        tracked = TRUE;
-
-        if (g_ProtoTrace)
-        {
-            // Wobble is a desync between the geometry dom0 believes and where the window
-            // actually is in the live shared framebuffer. Record both at the instant damage
-            // goes out: `a*` is the origin this damage was registered against (what dom0
-            // will add back), `l*` is where the window really is right now. A non-zero
-            // delta during motion IS the wobble, measured with no cross-VM capture skew.
-            RECT live;
-            if (GetRealWindowRect(window, &live) == ERROR_SUCCESS)
-            {
-                LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d,ax=%d,ay=%d,lx=%d,ly=%d",
-                    (uint32_t)(ULONG_PTR)window, x, y, width, height,
-                    wd->X, wd->Y, live.left, live.top);
-            }
-            else
-            {
-                LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d",
-                    (uint32_t)(ULONG_PTR)window, x, y, width, height);
-            }
-        }
-    }
-    else if (g_ProtoTrace)
-    {
-        LogInfo("QGAPROTO,msg=DAMAGE,hwnd=0x%x,rx=%d,ry=%d,w=%d,h=%d",
-            (uint32_t)(ULONG_PTR)window, x, y, width, height);
-    }
 
     LogVerbose("0x%x: (%d,%d)-(%d,%d) %dx%d", window, x, y, x + width, y + height, width, height);
     header.type = MSG_SHMIMAGE;
@@ -481,14 +507,16 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
     if (!g_VchanClientConnected)
     {
         LeaveCriticalSection(&g_VchanCriticalSection);
-        if (tracked)
-            LeaveCriticalSection(&g_csWatchedWindows);
+        return ERROR_SUCCESS;
+    }
+    if (window && WasWindowDestroyedLocked(window))
+    {
+        LeaveCriticalSection(&g_VchanCriticalSection);
+        LogVerbose("0x%x: dropping damage for destroyed window", window);
         return ERROR_SUCCESS;
     }
     status = VCHAN_SEND_MSG(header, shmMsg, L"MSG_SHMIMAGE");
     LeaveCriticalSection(&g_VchanCriticalSection);
-    if (tracked)
-        LeaveCriticalSection(&g_csWatchedWindows);
 
     return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
 }
