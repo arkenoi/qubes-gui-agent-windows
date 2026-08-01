@@ -1854,11 +1854,12 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 
     // too small?
     // The SM_CXMIN/CYMIN floor models a NORMAL window's decoration minimum; popups have
-    // no such minimum. Win11 Alt-nav keytip badges (Xaml_WindowedPopupClass, ~40x46) sit
-    // partly OUTSIDE their owner's granted buffer, so unless announced they can only ever
-    // be partially visible through a synthesized sibling's patch region (win11-idd-test,
-    // FINDINGS 2026-08-01). Announce small override-redirect popups; keep a token floor
-    // against 1-px artifacts.
+    // no such minimum. Win11 Alt-nav keytip badges (Xaml_WindowedPopupClass, ~40x46) are
+    // real UI that the floor would swallow, so popups get a token floor here.
+    // KNOWN GAP (see BOOTSTRAP-win11.md): a sub-floor popup that fails synthesis is still
+    // announced, and dom0 borders each one - 12 red-bordered badges around an Alt menu.
+    // Intended follow-up: announce sub-floor popups ONLY when they synthesize; drop them
+    // silently otherwise.
     if (data->IsOverrideRedirect)
     {
         if (data->Width < 4 || data->Height < 4)
@@ -1866,6 +1867,27 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     }
     else if (data->Width < g_MinWindowWidth || data->Height < g_MinWindowHeight)
         return FALSE;
+
+    // Win11 shell drag/snap overlays: click-through, uncapturable, full-bleed.
+    // Measured on win11-idd-test (FINDINGS 2026-08-01): dragging a window by its guest
+    // title bar raises XamlExplorerHostIslandWindow (explorer.exe) 2560x360 at the top of
+    // the screen with ex-style TOPMOST|TRANSPARENT|TOOLWINDOW|LAYERED|NOREDIRECTIONBITMAP.
+    // WS_EX_NOREDIRECTIONBITMAP means it has no redirection surface, so PrintWindow cannot
+    // capture it and the agent falls back to slice-feeding the COMPOSITED DESKTOP - which
+    // dom0 then renders as a huge phantom window full of wallpaper for as long as the drag
+    // lasts. Snap layouts are meaningless in seamless mode anyway (dom0's WM owns
+    // placement), and WS_EX_TRANSPARENT means the user could never click it.
+    // Narrow on purpose: all three of click-through + uncapturable + toolwindow must hold,
+    // so ordinary DirectComposition app windows (NOREDIRECTIONBITMAP alone, e.g. the XAML
+    // popups this build synthesizes) are untouched.
+    if ((data->ExStyle & WS_EX_TRANSPARENT) &&
+        (data->ExStyle & WS_EX_NOREDIRECTIONBITMAP) &&
+        (data->ExStyle & WS_EX_TOOLWINDOW))
+    {
+        LogDebug("0x%x: click-through uncapturable shell overlay (%s), rejecting",
+            data->Handle, data->Class);
+        return FALSE;
+    }
 
     // Ignore child windows, they are confined to parent's client area and can't be top-level.
     if (data->Style & WS_CHILD)
