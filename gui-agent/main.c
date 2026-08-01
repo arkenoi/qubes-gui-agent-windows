@@ -958,6 +958,14 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             goto end;
         }
 
+        // A guest-maximized window must be maximized dom0-side too: a decorated
+        // 3440-wide client cannot sit at x=0 (the WM frame eats the space), so the
+        // window lands at x=5 and pokes past full-width overlays - the "double border".
+        // WINDOW_FLAG_FULLSCREEN is converted by the daemon to a WM maximize unless
+        // dom0 explicitly allows real fullscreen (allow_fullscreen).
+        if (entry->Style & WS_MAXIMIZE)
+            (void)SendWindowFlags(entry->Handle, WINDOW_FLAG_FULLSCREEN, 0);
+
         // Per-window framebuffer: announce the window's own buffer BEFORE mapping so
         // the daemon never composites this window from the screen slice. On failure
         // the window simply stays on the legacy path.
@@ -1761,8 +1769,15 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
 
     if (windowData->Style != data.Style)
     {
+        BOOL wasMax = (windowData->Style & WS_MAXIMIZE) != 0;
+        BOOL isMax = (data.Style & WS_MAXIMIZE) != 0;
         windowData->Style = data.Style;
         LogDebug("0x%x style changed to 0x%x", data.Handle, data.Style);
+        // Follow guest maximize state dom0-side (see AddWindow for why).
+        if (wasMax != isMax)
+            (void)SendWindowFlags(windowData->Handle,
+                isMax ? WINDOW_FLAG_FULLSCREEN : 0,
+                isMax ? 0 : WINDOW_FLAG_FULLSCREEN);
     }
 
     if (windowData->ExStyle != data.ExStyle)
