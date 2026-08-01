@@ -16,8 +16,12 @@
 
 // Minimum spacing of the WorkAreaEnsureApplied drift compare.
 #define WA_DRIFT_CHECK_MS 2000
-// Minimum gap between broadcast-driven re-asserts; see WorkAreaReassert.
+// Minimum gap between broadcast-driven re-asserts; see WorkAreaReassertThrottled.
 #define WA_REASSERT_MIN_MS 1000
+// Consecutive failed corrections before the drift check backs off, and the slow rate
+// it falls back to; see WorkAreaEnsureApplied.
+#define WA_LOST_FIGHT_TRIES 5
+#define WA_DRIFT_BACKOFF_MS 30000
 
 static CRITICAL_SECTION g_WaLock;
 static BOOL g_WaLockInit = FALSE; // g_WaLock initialized (see WorkAreaLockInit)
@@ -142,26 +146,45 @@ void WorkAreaReassert(void)
     if (!g_WaInitDone)
         return;
 
-    // Debounce. Explorer answers our SPI_SETWORKAREA by recomputing from its own
-    // taskbar geometry and setting the work area back, and THAT broadcasts
-    // WM_SETTINGCHANGE(SPI_SETWORKAREA) to us - so an unconditional re-assert per
-    // broadcast becomes a ping-pong (measured on the clean install: 1018 applies in
-    // 85 s, ~12/s, each running EnumWindows + cross-process SetWindowPlacement).
-    // Fighting at input rate wins nothing that fighting at 1 Hz does not: a genuine
-    // overwrite that outlives the debounce is still caught here on the next
-    // broadcast, and WorkAreaEnsureApplied's 2 s drift check is the backstop if no
-    // further broadcast arrives. Loss is bounded to <=1 s of a stale work area,
-    // which no user-visible layout depends on.
-    static volatile LONG lastReassert; // interlocked: listener + main-loop threads
-    DWORD now = GetTickCount();
-    LONG prev = InterlockedExchange(&lastReassert, (LONG)now);
-    if (prev != 0 && (DWORD)(now - (DWORD)prev) < WA_REASSERT_MIN_MS)
-        return;
-
     EnterCriticalSection(&g_WaLock);
     SetRectEmpty(&g_WaLastApplied);
     LeaveCriticalSection(&g_WaLock);
     WorkAreaApply();
+}
+
+// Rate-limited entry point for the WM_SETTINGCHANGE(SPI_SETWORKAREA) listener ONLY.
+//
+// Explorer answers our SPI_SETWORKAREA by recomputing the work area from its own
+// taskbar geometry and setting it back, and that set broadcasts SPI_SETWORKAREA to
+// us - so re-asserting once per broadcast is a ping-pong. Measured on the clean
+// install of a459f0e: 1018 applies in 85 s (~12/s), each running EnumWindows plus
+// synchronous cross-process SetWindowPlacement ON THE WINDOW-EVENT THREAD, which is
+// also the hook-delivery thread.
+//
+// The gate leaves the deadline UNTOUCHED when it suppresses: a suppressed call must
+// not push the window forward, or a sustained external broadcast train (taskbar
+// auto-hide, any app using SPIF_SENDCHANGE) would starve re-asserts indefinitely
+// instead of merely rate-limiting them. Only WM_SETTINGCHANGE is gated;
+// WM_DISPLAYCHANGE and the drift check call WorkAreaReassert directly, because those
+// are already self-limited and are the paths that must not be throttled.
+static void WorkAreaReassertThrottled(void)
+{
+    static volatile LONG nextAllowed; // ticks; 0 = never fired
+    if (!g_WaInitDone)
+        return;
+
+    DWORD now = GetTickCount();
+    LONG seen = InterlockedCompareExchange(&nextAllowed, 0, 0);
+    if (seen != 0 && (LONG)(now - (DWORD)seen) < 0)
+        return; // still inside the window - deadline deliberately left as is
+
+    LONG deadline = (LONG)(now + WA_REASSERT_MIN_MS);
+    if (deadline == 0)
+        deadline = 1; // keep 0 meaning "never fired"
+    if (InterlockedCompareExchange(&nextAllowed, deadline, seen) != seen)
+        return; // another thread just claimed this slot; no retry, no spin
+
+    WorkAreaReassert();
 }
 
 void WorkAreaApply(void)
@@ -302,7 +325,7 @@ static LRESULT CALLBACK WaWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             // Our own SPI_SETWORKAREA does not broadcast (see WorkAreaApply), so any
             // such notification is somebody else changing it: re-assert ours.
             LogDebug("WM_SETTINGCHANGE(SPI_SETWORKAREA): re-asserting");
-            WorkAreaReassert();
+            WorkAreaReassertThrottled();
         }
         return 0;
     case WM_DISPLAYCHANGE:
@@ -332,8 +355,21 @@ void WorkAreaEnsureApplied(void)
     if (!g_WaInitDone)
         return;
 
+    // Backoff for a work area we cannot win. If something (Explorer recomputing from
+    // its own taskbar geometry) reverts our value every single time, correcting it
+    // every WA_DRIFT_CHECK_MS forever is a permanent low-rate fight: an EnumWindows +
+    // cross-process SetWindowPlacement sweep every 2 s for the life of the qube, with
+    // maximized windows re-fitted and then abandoned each cycle. After
+    // WA_LOST_FIGHT_TRIES consecutive corrections that did not stick, drop to
+    // WA_DRIFT_BACKOFF_MS and say so once; any check that finds our value intact
+    // resets both. Correctness is unchanged - we still re-assert, just not at a rate
+    // that buys nothing.
+    static unsigned lostInARow;
+    static BOOL backoffLogged;
+    DWORD interval = (lostInARow >= WA_LOST_FIGHT_TRIES) ? WA_DRIFT_BACKOFF_MS : WA_DRIFT_CHECK_MS;
+
     DWORD now = GetTickCount();
-    if (now - lastCheck < WA_DRIFT_CHECK_MS)
+    if (now - lastCheck < interval)
         return;
     lastCheck = now;
 
@@ -350,11 +386,27 @@ void WorkAreaEnsureApplied(void)
         return;
 
     if (EqualRect(&current, &applied))
+    {
+        lostInARow = 0; // our value held: the fight, if there was one, is over
+        backoffLogged = FALSE;
         return;
+    }
 
-    LogInfo("work area drifted: OS has (%d,%d)-(%d,%d), ours was (%d,%d)-(%d,%d); re-asserting",
-        current.left, current.top, current.right, current.bottom,
-        applied.left, applied.top, applied.right, applied.bottom);
+    lostInARow++;
+    if (lostInARow >= WA_LOST_FIGHT_TRIES && !backoffLogged)
+    {
+        backoffLogged = TRUE;
+        LogWarning("work area reverted %u checks in a row (OS insists on (%d,%d)-(%d,%d)); "
+            "backing off re-assert to %u ms",
+            lostInARow, current.left, current.top, current.right, current.bottom,
+            (unsigned)WA_DRIFT_BACKOFF_MS);
+    }
+    else if (!backoffLogged)
+    {
+        LogInfo("work area drifted: OS has (%d,%d)-(%d,%d), ours was (%d,%d)-(%d,%d); re-asserting",
+            current.left, current.top, current.right, current.bottom,
+            applied.left, applied.top, applied.right, applied.bottom);
+    }
     WorkAreaReassert();
 }
 
