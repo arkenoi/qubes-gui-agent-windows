@@ -25,6 +25,7 @@
 #include "common.h"
 #include "main.h"
 #include "resolution.h"
+#include "workarea.h"
 #include "send.h"
 #include "util.h"
 
@@ -182,6 +183,8 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height)
         // save last-set resolution to use on next startup
         CfgWriteDword(NULL, REG_CONFIG_FULLSCREEN_WIDTH_VALUE, g_ScreenWidth, NULL);
         CfgWriteDword(NULL, REG_CONFIG_FULLSCREEN_HEIGHT_VALUE, g_ScreenHeight, NULL);
+        // resolution changed: recompute the guest work area against the new screen
+        WorkAreaApply();
     }
 
     return status;

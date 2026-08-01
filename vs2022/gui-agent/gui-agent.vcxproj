@@ -18,6 +18,7 @@
     <ClCompile Include="..\..\gui-agent\send.c" />
     <ClCompile Include="..\..\gui-agent\util.c" />
     <ClCompile Include="..\..\gui-agent\vchan-handlers.c" />
+    <ClCompile Include="..\..\gui-agent\workarea.c" />
     <ClCompile Include="..\..\gui-agent\vchan.c" />
     <ClCompile Include="..\..\gui-agent\debug.c" />
     <ClCompile Include="..\..\gui-agent\xorg-keymap.c" />
@@ -41,6 +42,7 @@
     <ClInclude Include="..\..\gui-agent\send.h" />
     <ClInclude Include="..\..\gui-agent\util.h" />
     <ClInclude Include="..\..\gui-agent\vchan-handlers.h" />
+    <ClInclude Include="..\..\gui-agent\workarea.h" />
     <ClInclude Include="..\..\gui-agent\vchan.h" />
     <ClInclude Include="..\..\gui-agent\debug.h" />
     <ClInclude Include="..\..\gui-agent\xorg-keymap.h" />

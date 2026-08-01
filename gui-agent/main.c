@@ -37,6 +37,7 @@
 #include "resolution.h"
 #include "send.h"
 #include "perwindow.h"
+#include "workarea.h"
 #include "wincapture.h"
 #include "vchan-handlers.h"
 #include "util.h"
@@ -2949,6 +2950,11 @@ static ULONG WINAPI WatchForEvents(void)
                     exitLoop = TRUE;
                     break;
                 }
+
+                // Screen geometry is final here; sync the guest work area to dom0's
+                // usable workspace (config/qubesdb/inference - see workarea.h).
+                WorkAreaInit();
+                WorkAreaApply();
 
                 status = StartFrameProcessing(newFrameEvent, captureErrorEvent, &capture);
                 if (ERROR_SUCCESS != status)

@@ -33,6 +33,8 @@
 #define REG_CONFIG_SEAMLESS_VALUE   L"SeamlessMode"
 #define REG_CONFIG_FULLSCREEN_WIDTH_VALUE   L"FullscreenWidth"
 #define REG_CONFIG_FULLSCREEN_HEIGHT_VALUE  L"FullscreenHeight"
+// guest work area override "x,y,w,h" (see gui-agent/workarea.h)
+#define REG_CONFIG_WORKAREA_VALUE           L"WorkArea"
 
 // path to the gui agent, launched by the watchdog service
 #define REG_CONFIG_AGENT_PATH_VALUE  L"GuiAgentPath"

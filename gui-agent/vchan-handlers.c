@@ -33,6 +33,40 @@
 #include <config.h>
 #include <log.h>
 
+#include "workarea.h"
+
+// Protocol 1.9 proposal (DESIGN-workarea-propagation.md): daemon-sent work area.
+// Defined locally until the vendored qubes-gui-protocol.h carries it; a daemon
+// that never sends it costs nothing (the case is simply never dispatched).
+#ifndef MSG_WORKAREA
+#define QGA_MSG_WORKAREA 150
+struct qga_msg_workarea
+{
+    uint32_t x, y, width, height;
+    uint32_t frame_left, frame_right, frame_top, frame_bottom;
+};
+#else
+#define QGA_MSG_WORKAREA MSG_WORKAREA
+#define qga_msg_workarea msg_workarea
+#endif
+
+static DWORD HandleWorkarea(void)
+{
+    struct qga_msg_workarea m;
+    if (!VchanReceiveBuffer(g_Vchan, &m, sizeof(m), L"msg_workarea"))
+    {
+        LogError("VchanReceiveBuffer failed");
+        return ERROR_UNIDENTIFIED_ERROR;
+    }
+    LogInfo("dom0 workarea (%u,%u) %ux%u frame %u/%u/%u/%u",
+        m.x, m.y, m.width, m.height,
+        m.frame_left, m.frame_right, m.frame_top, m.frame_bottom);
+    WorkAreaSetDom0((int)m.x, (int)m.y, (int)m.width, (int)m.height,
+        (int)m.frame_left, (int)m.frame_right, (int)m.frame_top, (int)m.frame_bottom);
+    WorkAreaApply();
+    return ERROR_SUCCESS;
+}
+
 // tell helper service to simulate ctrl-alt-del
 static void SignalSASEvent(void)
 {
@@ -453,6 +487,10 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                         data->Height = configureMsg.height;
                     }
 
+                    // Inference sample for the work-area sync: a daemon-dictated
+                    // origin reveals the dom0 panel + frame margins.
+                    WorkAreaNoteDaemonOrigin(configureMsg.x, configureMsg.y);
+
                     // The daemon knows this geometry (it dictated it); record it as
                     // last-sent so the tracking pass does not echo it back.
                     data->CfgSentValid = TRUE;
@@ -655,6 +693,9 @@ DWORD HandleServerData(BOOL replyToMessages, OUT BOOL* screenDestroyed)
         // that window can now be revoked
         PwRevokeTick();
         status = ERROR_SUCCESS;
+        break;
+    case QGA_MSG_WORKAREA:
+        status = HandleWorkarea();
         break;
 #pragma warning(pop)
     default:
