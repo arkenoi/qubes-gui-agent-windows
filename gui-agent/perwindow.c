@@ -338,6 +338,13 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwDumpSent = TRUE;
     entry->PwSliceFed = sliceFed;
     entry->PwSliceNeedsFull = sliceFed; // first frame does one full-window copy
+    // Fresh channel: no mask has been pushed to it yet, and no move state carries
+    // over from a previous buffer (a resize rebuild lands here mid-drag).
+    entry->SynthMaskLastCount = 0;
+    entry->PwFrameXYValid = FALSE;
+    entry->PwSettleDue = FALSE;
+    entry->PwLastMoveTick = 0;
+    entry->PwLastMoveCapTick = 0;
     LogInfo("0x%x: per-window buffer %ux%u (%lu pages) attached%s",
              entry->Handle, entry->Width, entry->Height, pageCount,
              sliceFed ? L" (slice-fed)" : L"");
@@ -362,6 +369,12 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwDumpSent = FALSE;
     entry->PwSliceFed = FALSE;
     entry->PwSliceNeedsFull = FALSE;
+    // The channel (and the mask it held) is gone; move state dies with it.
+    entry->SynthMaskLastCount = 0;
+    entry->PwFrameXYValid = FALSE;
+    entry->PwSettleDue = FALSE;
+    entry->PwLastMoveTick = 0;
+    entry->PwLastMoveCapTick = 0;
 }
 
 // Drop an attached window back to the legacy screen-slice path at runtime. The daemon

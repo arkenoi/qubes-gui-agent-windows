@@ -1084,7 +1084,13 @@ static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerO
 
 // Push the current synthesized-child rects of `owner` to its capture channel, so the
 // owner's PrintWindow pass leaves those pixels alone (the frame loop owns them).
-static void SynthUpdateMask(IN const WINDOW_DATA* owner)
+// No-ops when the computed mask is byte-identical to the last one pushed: WcSetMask
+// takes the engine lock exclusively AND forces a full recapture (wincapture.cpp), so
+// a redundant push is a pure loss. The memo is written before WcSetMask, which
+// silently no-ops when no channel exists; that is safe because PwAttachWindow is the
+// only channel-creation path and it clears the memo.
+C_ASSERT(RTL_NUMBER_OF(((WINDOW_DATA*)0)->SynthMaskLast) == WC_MAX_MASK);
+static void SynthUpdateMask(IN OUT WINDOW_DATA* owner)
 {
     RECT mask[WC_MAX_MASK];
     int n = 0;
@@ -1103,7 +1109,36 @@ static void SynthUpdateMask(IN const WINDOW_DATA* owner)
         if (r.right > r.left && r.bottom > r.top)
             mask[n++] = r;
     }
+
+    if (n == owner->SynthMaskLastCount &&
+        memcmp(mask, owner->SynthMaskLast, (size_t)n * sizeof(RECT)) == 0)
+        return; // the channel already has exactly this mask
+
+    owner->SynthMaskLastCount = n;
+    memcpy(owner->SynthMaskLast, mask, (size_t)n * sizeof(RECT));
+    LogDebug("QGADRAG,ev=maskpush,hwnd=0x%x,n=%d",
+        (uint32_t)(ULONG_PTR)owner->Handle, n);
     WcSetMask(owner->Handle, mask, n);
+}
+
+// Flush the mask updates the geometry paths deferred (SynthMaskPending, main.h) -
+// called by TrackWindows exactly once per tracking pass, AFTER all interrogations of
+// the pass completed: every window's X/Y then comes from the same consistent
+// snapshot, so a pure joint owner+child move computes a mask identical to the memo
+// and pushes nothing. Computing at the call sites instead pushed a mixed-state mask
+// plus its restore - two forced recaptures per pass, at input rate during a
+// menu-over-drag. Watched windows critical section must be entered.
+static void SynthFlushMasks(void)
+{
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
+         e != &g_WatchedWindowsList; e = e->Flink)
+    {
+        WINDOW_DATA* w = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (!w->SynthMaskPending)
+            continue;
+        w->SynthMaskPending = FALSE;
+        SynthUpdateMask(w);
+    }
 }
 
 // Mark a window synthesized (no protocol traffic from here on) and account it on
@@ -2077,7 +2112,11 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         }
         else if (geomChanged)
         {
-            SynthUpdateMask(owner);
+            // Do NOT compute the mask here: the owner may be interrogated later in
+            // this same pass (a joint move updates the two positions separately), so
+            // a push now would publish a mixed-state mask and force a recapture, at
+            // input rate during a drag. TrackWindows flushes once per pass.
+            owner->SynthMaskPending = TRUE;
         }
         status = ERROR_SUCCESS;
         goto end;
@@ -2278,7 +2317,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     }
 
     // Owner-side: keep the capture mask aligned after the owner moved/resized, and
-    // re-check that its synthesized children are still contained.
+    // re-check that its synthesized children are still contained. The mask itself is
+    // pushed once per tracking pass (SynthFlushMasks) - the children may not have
+    // been interrogated yet in this pass, and a mixed-state push forces a recapture.
     if (windowData->SynthChildCount > 0)
     {
         for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; )
@@ -2296,7 +2337,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             }
         }
         if (windowData->SynthChildCount > 0)
-            SynthUpdateMask(windowData);
+            windowData->SynthMaskPending = TRUE;
     }
 
     // TODO: should we care about style changes? some of them affect Z-order (topmost etc)
@@ -2478,6 +2519,10 @@ static ULONG TrackWindows(OUT TRACK_STATS* stats)
         entry = nextEntry;
     }
 
+    // Every interrogation of this pass is done (and removals settled): push the
+    // capture-mask updates they deferred, at most one per owner (SynthFlushMasks).
+    SynthFlushMasks();
+
     stats->RemoveTicks = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
     return status;
 }
@@ -2648,6 +2693,19 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
 }
 
 static HWND g_LastPopupDamageWindow = NULL;
+
+// While a PrintWindow-fed window is moving, refresh its content at most this often.
+// Covers content that genuinely changes mid-drag (video, progress bars); the engine's
+// 250 ms round-robin sweep (wincapture.cpp) independently bounds staleness for
+// everything else. Do not lower this to "every frame" - that IS the 17 ms/frame drag
+// regression (instrumentation/qwtfull-w10/bench-qwtfull-w10.md).
+#define PW_MOVE_RECAPTURE_MS 150
+
+// Motion counts as over only after this much quiet. Mid-drag frames occasionally
+// apply no LOCATIONCHANGE (~5% of drag frames in the bench data), and treating a
+// single still frame as the end of the drag would fire a full-cost settle recapture
+// right back into the motion.
+#define PW_MOVE_SETTLE_MS 150
 
 // Copy `area` (screen coords) of the mapped desktop frame into a slice-fed window's
 // per-window buffer and send the matching window-relative damage. Clips to the screen,
@@ -2941,12 +2999,77 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // Screen dirty rects are the change TRIGGER for the per-window engine:
                 // if anything on screen changed where this window is, ask the engine to
                 // recapture it (content itself comes from PrintWindow, never the screen).
-                for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
+                //
+                // EXCEPT while the window is MOVING. A dragged window dirties its whole
+                // screen extent every frame, but a pure position change does not alter
+                // the window's OWN content: the PrintWindow buffer is position-
+                // invariant, dom0 repositions it from MSG_CONFIGURE alone (and repaints
+                // exposures from its stored image), so the row-diff of such a recapture
+                // is empty and nothing is sent. The recapture is pure waste - ~15-18 ms
+                // of PrintWindow per frame on a WARP guest - and tracking
+                // interrogations running concurrently with it stall for ~8 ms each,
+                // which is the measured 17 ms/frame drag regression (instrumentation/
+                // qwtfull-w10/bench-qwtfull-w10.md). The window counts as moving from
+                // the frame its position changed until PW_MOVE_SETTLE_MS pass with no
+                // further change - a single frame without movement is NOT the end of a
+                // drag (~5% of drag frames apply no LOCATIONCHANGE). While moving, the
+                // trigger is skipped and content refreshes at most once per
+                // PW_MOVE_RECAPTURE_MS; when motion ends, one recapture fires
+                // UNCONDITIONALLY, because the final repaint at the new position may
+                // not intersect that frame's dirty rects. A same-frame RESIZE has
+                // already rebuilt the channel (PwResizeWindow -> fresh channel starts
+                // dirty + synchronous prefill + PwFrameXYValid reset), so nothing is
+                // lost there. Slice-fed windows never reach this branch: their content
+                // comes from the composited screen and IS position-dependent
+                // (PwSliceNeedsFull on move stays required).
+                DWORD pwNow = GetTickCount();
+                if (entry->PwFrameXYValid &&
+                    (entry->X != entry->PwFrameX || entry->Y != entry->PwFrameY))
                 {
-                    if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
+                    entry->PwLastMoveTick = pwNow;
+                    entry->PwSettleDue = TRUE;
+                }
+                entry->PwFrameX = entry->X;
+                entry->PwFrameY = entry->Y;
+                entry->PwFrameXYValid = TRUE;
+
+                if (entry->PwSettleDue &&
+                    pwNow - entry->PwLastMoveTick < PW_MOVE_SETTLE_MS)
+                {
+                    // Moving. A stale PwLastMoveCapTick makes the throttled refresh
+                    // fire on the FIRST moving frame, so one-shot programmatic moves
+                    // still capture immediately, as before.
+                    if (pwNow - entry->PwLastMoveCapTick >= PW_MOVE_RECAPTURE_MS)
                     {
+                        entry->PwLastMoveCapTick = pwNow;
+                        LogDebug("QGADRAG,ev=refresh,hwnd=0x%x",
+                            (uint32_t)(ULONG_PTR)entry->Handle);
                         WcMarkDirty(entry->Handle);
-                        break;
+                    }
+                    else
+                    {
+                        LogDebug("QGADRAG,ev=suppress,hwnd=0x%x",
+                            (uint32_t)(ULONG_PTR)entry->Handle);
+                    }
+                }
+                else if (entry->PwSettleDue)
+                {
+                    // Quiet for PW_MOVE_SETTLE_MS: motion is over. Recapture once,
+                    // regardless of where this frame's damage landed.
+                    entry->PwSettleDue = FALSE;
+                    LogDebug("QGADRAG,ev=settle,hwnd=0x%x",
+                        (uint32_t)(ULONG_PTR)entry->Handle);
+                    WcMarkDirty(entry->Handle);
+                }
+                else
+                {
+                    for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
+                    {
+                        if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
+                        {
+                            WcMarkDirty(entry->Handle);
+                            break;
+                        }
                     }
                 }
 

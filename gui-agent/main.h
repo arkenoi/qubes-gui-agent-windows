@@ -124,6 +124,23 @@ typedef struct _WINDOW_DATA
     BOOL PwSliceFed;
     BOOL PwSliceNeedsFull; // one full-window copy pending (fresh attach/remap)
 
+    // Move-only drag fast path (ProcessNewFrame, PrintWindow-fed branch): a pure
+    // position change does not alter the window's own content - the per-window buffer
+    // is position-invariant and dom0 repositions it from MSG_CONFIGURE alone - so the
+    // screen-dirty-rect recapture trigger is suppressed while the window is moving.
+    // PwFrameX/Y is the position the previous processed frame saw; PwLastMoveTick is
+    // when a position change was last observed (motion counts as over only after
+    // PW_MOVE_SETTLE_MS of quiet - single frames with no applied LOCATIONCHANGE
+    // happen mid-drag); PwSettleDue arms one unconditional recapture for when motion
+    // ends; PwLastMoveCapTick rate-limits mid-motion content refreshes. All accessed
+    // under g_csWatchedWindows; all reset on channel attach/detach.
+    BOOL PwFrameXYValid;
+    int PwFrameX;
+    int PwFrameY;
+    BOOL PwSettleDue;
+    DWORD PwLastMoveTick;
+    DWORD PwLastMoveCapTick;
+
     // Composite synthesis (CLAUDE.md 2A-chrome, taken further): an override-redirect
     // window fully contained in its owner's rect is NOT announced to dom0 at all -
     // no CREATE/MAP/CONFIGURE/DAMAGE/UNMAP/DESTROY ever names it. Instead the frame
@@ -140,6 +157,23 @@ typedef struct _WINDOW_DATA
     HWND SynthOwner;       // owner hwnd at synthesis time
     UINT SynthChildCount;  // (owners) number of active synthesized children
     DWORD SynthLastFullPatch; // (owners) GetTickCount() of the last full-rect child re-copy
+    // Deferred capture-mask update (owners): the geometry-change paths never push the
+    // mask directly - owner and child positions are refreshed by SEPARATE
+    // UpdateWindowData interrogations, so a mid-pass push publishes a mixed-state
+    // (fresh owner + stale child, or vice versa) mask and the later interrogation
+    // pushes again to restore it, each push forcing a full recapture. They set this
+    // flag instead, and TrackWindows flushes ONCE per tracking pass after all
+    // interrogations completed (SynthFlushMasks), when every position is from the
+    // same consistent snapshot.
+    BOOL SynthMaskPending;
+    // Last mask pushed to this owner's capture channel (SynthUpdateMask): WcSetMask
+    // takes the engine lock EXCLUSIVELY (stalls behind an in-flight PrintWindow) and
+    // forces a full recapture, so a byte-identical mask is never re-pushed. Rect
+    // order is stable across passes because g_WatchedWindowsList is insertion-ordered
+    // (InsertTailList only, never reordered in place). Zeroed at entry creation
+    // (ZeroMemory) and on channel attach/detach - a fresh channel has no mask.
+    int SynthMaskLastCount;
+    RECT SynthMaskLast[8]; // == WC_MAX_MASK; C_ASSERTed in main.c
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(
