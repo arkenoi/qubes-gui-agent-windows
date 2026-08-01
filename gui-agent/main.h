@@ -139,6 +139,7 @@ typedef struct _WINDOW_DATA
     BOOL Synthesized;      // this window is composited into SynthOwner, never announced
     HWND SynthOwner;       // owner hwnd at synthesis time
     UINT SynthChildCount;  // (owners) number of active synthesized children
+    DWORD SynthLastFullPatch; // (owners) GetTickCount() of the last full-rect child re-copy
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(

@@ -970,6 +970,12 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 // width, so a larger overhang only ever crops shadow-margin pixels.
 #define SYNTH_OVERHANG_MAX 12
 
+// Interval of the periodic full re-copy of synthesized children in the frame loop.
+// The dirty-rect-driven patch can catch a popup MID-DRAW, and once the popup goes
+// quiet no further damage forces a second pass; this bounds how long such a
+// half-drawn composite can persist in dom0.
+#define SYNTH_FULL_PATCH_MS 200
+
 static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child);
 
 // Owner-candidacy checks shared by the GW_OWNER path and the same-process fallback:
@@ -1111,6 +1117,7 @@ static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
     // Paint it NOW: a menu paints once, before it is tracked, and a static screen
     // produces no further frames - waiting for damage would leave it invisible.
     PwPatchSynthRect(owner, entry);
+    owner->SynthLastFullPatch = GetTickCount();
     LogInfo("QGAPROTO,msg=SYNTH,hwnd=0x%x,owner=0x%x,x=%d,y=%d,w=%u,h=%u",
         (uint32_t)(ULONG_PTR)entry->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
         entry->X, entry->Y, entry->Width, entry->Height);
@@ -2951,6 +2958,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
                         if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
                             PwPatchSynthChildren(entry, &pwHit);
+
+                    // A patch above (or the one at SynthActivate) can copy a child
+                    // MID-DRAW; if no later dirty rect intersects it, the half-drawn
+                    // pixels persist in dom0. Re-copy every child's FULL rect
+                    // periodically, regardless of where this frame's damage landed.
+                    DWORD synthNow = GetTickCount();
+                    if (synthNow - entry->SynthLastFullPatch >= SYNTH_FULL_PATCH_MS)
+                    {
+                        entry->SynthLastFullPatch = synthNow;
+                        PwPatchSynthChildren(entry, NULL);
+                    }
                 }
             }
             SetRectRgn(rgnWindow, entry->X, entry->Y,
