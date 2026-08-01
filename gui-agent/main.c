@@ -2284,9 +2284,13 @@ static HWND g_LastPopupDamageWindow = NULL;
 // the window rect, and the granted buffer geometry; silently skips when the frame is
 // not mapped (content then arrives with the next mapped frame).
 static void PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRAME* frame,
-                                 IN const RECT* area)
+                                 IN const BYTE* fb, IN const RECT* area)
 {
-    if (!frame->mapped || !frame->rect.pBits || !entry->PwBuffer)
+    // fb is the persistently-granted desktop image (ctx->framebuffer): its address is
+    // constant for the life of the duplication and the daemon reads it live, so it is
+    // always current here - do NOT gate on frame->mapped, which is only TRUE on the
+    // very first frame (MapDesktopSurface runs once, for the pointer to grant).
+    if (!fb || frame->rect.Pitch <= 0 || !entry->PwBuffer)
         return;
 
     RECT screenR = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
@@ -2307,7 +2311,7 @@ static void PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRA
     if ((ULONG)(relX + w) > entry->PwWidth || (ULONG)(relY + h) > entry->PwHeight)
         return; // buffer geometry changed underneath; next full copy repaints
 
-    const BYTE* src = (const BYTE*)frame->rect.pBits +
+    const BYTE* src = fb +
         (size_t)r.top * frame->rect.Pitch + (size_t)r.left * 4;
     BYTE* dst = (BYTE*)entry->PwBuffer +
         ((size_t)relY * entry->PwWidth + (size_t)relX) * 4;
@@ -2321,7 +2325,7 @@ static void PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRA
     (void)SendWindowDamageEvent(entry->Handle, relX, relY, w, h);
 }
 
-static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
+static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer)
 {
     // Menus/tooltips are override-redirect windows. They are mapped like any other window,
     // but dom0 screenshot tooling enumerates only managed windows, so whether their repaints
@@ -2461,13 +2465,13 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame)
                 if (entry->PwSliceNeedsFull)
                 {
                     entry->PwSliceNeedsFull = FALSE;
-                    PwSliceCopyAndDamage(entry, frame, &pwRect);
+                    PwSliceCopyAndDamage(entry, frame, framebuffer, &pwRect);
                 }
                 else
                 {
                     for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
                         if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
-                            PwSliceCopyAndDamage(entry, frame, &pwHit);
+                            PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit);
                 }
             }
             else
@@ -2880,7 +2884,7 @@ static ULONG WINAPI WatchForEvents(void)
                     }
                 }
 
-                ProcessNewFrame(&capture->frame);
+                ProcessNewFrame(&capture->frame, (const BYTE*)capture->framebuffer);
             }
 
             if (capture)

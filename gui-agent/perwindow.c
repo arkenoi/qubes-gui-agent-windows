@@ -327,7 +327,7 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwSliceNeedsFull = sliceFed; // first frame does one full-window copy
     LogInfo("0x%x: per-window buffer %ux%u (%lu pages) attached%s",
              entry->Handle, entry->Width, entry->Height, pageCount,
-             sliceFed ? " (slice-fed)" : "");
+             sliceFed ? L" (slice-fed)" : L"");
     return ERROR_SUCCESS;
 }
 
@@ -336,7 +336,7 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
     if (!entry->PwDumpSent)
         return;
     LogInfo("0x%x: per-window buffer %ux%u detached%s", entry->Handle,
-            entry->PwWidth, entry->PwHeight, entry->PwSliceFed ? " (slice-fed)" : "");
+            entry->PwWidth, entry->PwHeight, entry->PwSliceFed ? L" (slice-fed)" : L"");
     if (!entry->PwSliceFed)
         WcRemoveWindow(entry->Handle);
     PwQueueRevoke(entry->PwGrantHandle, entry->PwGrantRefs, entry->PwBuffer);
