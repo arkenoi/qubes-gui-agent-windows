@@ -136,8 +136,11 @@ void WorkAreaApply(void)
         EqualRect(&current, &target))
         return; // OS already agrees
 
-    if (!SystemParametersInfoW(SPI_SETWORKAREA, 0, &target,
-                               SPIF_UPDATEINIFILE | SPIF_SENDCHANGE))
+    // NO SPIF_SENDCHANGE: the broadcast makes Explorer recompute the work area from
+    // its own taskbar geometry and immediately overwrite ours (verified in-guest -
+    // with flags the value reverts, without them it sticks). Maximized windows are
+    // re-fitted explicitly below instead of relying on the WM_SETTINGCHANGE fanout.
+    if (!SystemParametersInfoW(SPI_SETWORKAREA, 0, &target, 0))
     {
         win_perror("SPI_SETWORKAREA");
         return;
