@@ -78,6 +78,16 @@ BOOL g_LocalScreenDestroyed = FALSE;
 static const BYTE* g_FbBits = NULL;
 static int g_FbPitch = 0;
 
+// Number of windows currently synthesized into an owner (sum of every owner's
+// SynthChildCount). Maintained at the three sites that write WINDOW_DATA.Synthesized:
+// SynthActivate (+1), SynthDeactivate (-1) and the owner-death loop in RemoveWindow
+// (-1 per orphaned child). Read by the main loop to decide whether its wait needs a
+// timeout at all: while this is 0 the loop waits INFINITE exactly as before, so an
+// idle guest with no popup open gets ZERO extra wakeups. A missed decrement would
+// mean waking 5x/s forever, a missed increment would mean the blank-menu bug stays -
+// hence the single-writer discipline (main thread, watched-windows CS held).
+static UINT g_SynthActiveChildren = 0;
+
 DWORD g_HostScreenWidth = 0;
 DWORD g_HostScreenHeight = 0;
 
@@ -993,6 +1003,15 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 // half-drawn composite can persist in dom0.
 #define SYNTH_FULL_PATCH_MS 200
 
+// Delay of the FIRST full re-copy after a child is synthesized. SynthActivate paints
+// the child immediately, but a popup is tracked from its CREATE/SHOW event, which can
+// beat the popup's own first paint - so that copy may capture an unpainted (or
+// half-painted) window. Retry once, quickly, instead of waiting a full
+// SYNTH_FULL_PATCH_MS: 50 ms is ~3 refreshes at 60 Hz, comfortably past a menu's first
+// paint, and costs at most ONE extra wakeup per popup shown.
+// (must stay < SYNTH_FULL_PATCH_MS: SynthActivate back-dates by the difference)
+#define SYNTH_FIRST_PATCH_MS 50
+
 static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child);
 
 // Owner-candidacy checks shared by the GW_OWNER path and the same-process fallback:
@@ -1165,11 +1184,19 @@ static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
     entry->Synthesized = TRUE;
     entry->SynthOwner = owner->Handle;
     owner->SynthChildCount++;
+    g_SynthActiveChildren++;
     SynthUpdateMask(owner);
     // Paint it NOW: a menu paints once, before it is tracked, and a static screen
     // produces no further frames - waiting for damage would leave it invisible.
     PwPatchSynthRect(owner, entry);
-    owner->SynthLastFullPatch = GetTickCount();
+    // ...but that copy can land BEFORE the popup has drawn anything: the window is
+    // created, then painted, and we are tracking it from a CREATE/SHOW event that can
+    // easily beat the paint. Back-date the stamp so the next full re-copy is due after
+    // SYNTH_FIRST_PATCH_MS instead of a whole SYNTH_FULL_PATCH_MS - a cheap early retry
+    // that both the frame path and the new timeout path honour, since both compare the
+    // same stamp. Wrap-safe: DWORD subtraction is modular, and the consumers only ever
+    // evaluate (now - stamp).
+    owner->SynthLastFullPatch = GetTickCount() - (SYNTH_FULL_PATCH_MS - SYNTH_FIRST_PATCH_MS);
     LogInfo("QGAPROTO,msg=SYNTH,hwnd=0x%x,owner=0x%x,x=%d,y=%d,w=%u,h=%u",
         (uint32_t)(ULONG_PTR)entry->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
         entry->X, entry->Y, entry->Width, entry->Height);
@@ -1182,6 +1209,8 @@ static void SynthDeactivate(IN OUT WINDOW_DATA* entry)
     if (!entry->Synthesized)
         return;
     entry->Synthesized = FALSE;
+    if (g_SynthActiveChildren > 0)
+        g_SynthActiveChildren--;
     WINDOW_DATA* owner = FindWindowByHandle(entry->SynthOwner);
     entry->SynthOwner = NULL;
     if (owner && owner->SynthChildCount > 0)
@@ -1376,6 +1405,8 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
             if (c->Synthesized && c->SynthOwner == entry->Handle)
             {
                 c->Synthesized = FALSE;
+                if (g_SynthActiveChildren > 0)
+                    g_SynthActiveChildren--; // third and last writer, see the global
                 c->SynthOwner = NULL;
                 c->DeletePending = TRUE; // re-examined from scratch by TrackWindows
             }
@@ -2848,6 +2879,95 @@ static void PwPatchSynthChildren(IN OUT WINDOW_DATA* owner, IN const RECT* area)
     }
 }
 
+/*
+ * Time-driven twin of the periodic full re-copy in ProcessNewFrame.
+ *
+ * The in-frame copy only ever runs when a DDA frame arrives, so on a STATIC screen it
+ * never runs at all - which is precisely the reported "menu is a blank rectangle until
+ * you move the mouse into it" defect: the popup is copied once at SynthActivate (often
+ * before it painted), then nothing on screen changes, so no frame arrives, so the heal
+ * pass that exists for exactly this case never fires. These two helpers give the main
+ * loop's wait a deadline instead, so the heal pass runs on time regardless of frames.
+ *
+ * Both are main-thread only (the loop, and the tracking paths that mutate synthesis).
+ */
+
+// How long the main loop may block before the next full re-copy is due. INFINITE - i.e.
+// the pre-existing behaviour, no extra wakeups whatsoever - unless at least one child is
+// currently synthesized. Cheap enough for the loop's hot path: one integer test when
+// nothing is synthesized, and a walk of the (few dozen entry) window list only while a
+// popup is actually open.
+static DWORD SynthNextPatchTimeout(void)
+{
+    if (g_SynthActiveChildren == 0)
+        return INFINITE;
+
+    DWORD now = GetTickCount();
+    DWORD wait = INFINITE;
+
+    EnterCriticalSection(&g_csWatchedWindows);
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
+    {
+        const WINDOW_DATA* owner = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (owner->SynthChildCount == 0)
+            continue;
+        // Unsigned (modular) arithmetic throughout: correct across the GetTickCount wrap
+        // and for the deliberately back-dated stamp SynthActivate writes.
+        DWORD elapsed = now - owner->SynthLastFullPatch;
+        DWORD remaining = (elapsed >= (DWORD)SYNTH_FULL_PATCH_MS)
+            ? 0u : ((DWORD)SYNTH_FULL_PATCH_MS - elapsed);
+        if (remaining < wait)
+            wait = remaining;
+    }
+    LeaveCriticalSection(&g_csWatchedWindows);
+
+    return wait;
+}
+
+// Run the due full re-copies. Called only on WAIT_TIMEOUT, so no frame is being
+// processed and no other lock is held. Locking mirrors the in-frame path exactly
+// (g_csWatchedWindows only): PwPatchSynthChildren -> PwPatchSynthChildClipped does a
+// memcpy plus SendWindowDamageEvent (vchan CS), and touches no capture-engine lock -
+// WcSetMask/WcMarkDirty, the calls that take the WGC engine lock exclusively, are not
+// on this path. So the lock order is the established watched-windows -> vchan one and
+// no inversion is introduced.
+//
+// `capture` is the live capture context (may be NULL between a capture error and the
+// restart). g_FbBits is published by the frame loop and stays valid for the life of the
+// duplication; comparing it against capture->framebuffer - which RecreateDuplication
+// clears under its own lock before dropping the duplication, and GetFrame re-sets only
+// after re-granting - is what keeps this path off a surface that is being torn down.
+static void SynthPeriodicPatch(IN const CAPTURE_CONTEXT* capture)
+{
+    if (g_SynthActiveChildren == 0)
+        return;
+
+    // No live desktop image => nothing to copy from. Stamps are still refreshed below so
+    // the loop returns to a SYNTH_FULL_PATCH_MS cadence instead of spinning on a
+    // permanently-due deadline (an in-place duplication recovery can take seconds).
+    BOOL sourceValid = (g_FbBits != NULL && g_FbPitch > 0 &&
+                        capture != NULL && capture->framebuffer != NULL &&
+                        (const BYTE*)capture->framebuffer == g_FbBits &&
+                        g_VchanClientConnected && g_SeamlessMode && !g_LocalScreenDestroyed);
+
+    DWORD now = GetTickCount();
+
+    EnterCriticalSection(&g_csWatchedWindows);
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
+    {
+        WINDOW_DATA* owner = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (owner->SynthChildCount == 0)
+            continue;
+        if ((DWORD)(now - owner->SynthLastFullPatch) < (DWORD)SYNTH_FULL_PATCH_MS)
+            continue;
+
+        owner->SynthLastFullPatch = now;
+        if (sourceValid)
+            PwPatchSynthChildren(owner, NULL);
+    }
+    LeaveCriticalSection(&g_csWatchedWindows);
+}
+
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer)
 {
     // Publish the live desktop image for paths outside this loop (synthesis).
@@ -3357,6 +3477,14 @@ ULONG StopFrameProcessing(IN OUT CAPTURE_CONTEXT** capture)
 
     CaptureStop(*capture);
 
+    // The desktop surface g_FbBits points at belongs to the duplication that is going
+    // away (CaptureTeardown unmaps and revokes it once the daemon confirms). Un-publish
+    // it here so no out-of-frame consumer - SynthActivate's immediate paint, or the
+    // periodic re-copy on the loop's timeout - samples a surface with no owner. The next
+    // ProcessNewFrame republishes it.
+    g_FbBits = NULL;
+    g_FbPitch = 0;
+
     ULONG status = SendWindowUnmap(NULL);
     if (ERROR_SUCCESS != status)
         return win_perror2(status, "SendWindowUnmap(screen)");
@@ -3429,7 +3557,24 @@ static ULONG WINAPI WatchForEvents(void)
         vchanIoInProgress = TRUE;
 
         // Wait for events.
-        signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, INFINITE);
+        //
+        // The wait is bounded ONLY while at least one popup is synthesized into an
+        // owner's buffer, and then only until that owner's next full re-copy is due
+        // (SynthNextPatchTimeout). With nothing synthesized this is INFINITE, exactly as
+        // before: an idle guest with no menu open gets zero extra wakeups.
+        signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE,
+            SynthNextPatchTimeout());
+
+        if (signaledEvent == WAIT_TIMEOUT)
+        {
+            // Nothing to dispatch - the deadline of the periodic synthesized-child
+            // re-copy expired. This is the whole point of the timeout: on a static
+            // screen no frame arrives, so ProcessNewFrame's copy of this pass (which
+            // exists to heal a child captured mid-draw) would otherwise never run.
+            SynthPeriodicPatch(capture);
+            continue;
+        }
+
         if (signaledEvent >= MAXIMUM_WAIT_OBJECTS)
         {
             status = win_perror("WaitForMultipleObjects");
