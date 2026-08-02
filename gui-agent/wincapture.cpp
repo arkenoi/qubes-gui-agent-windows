@@ -161,6 +161,37 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
     int y0 = -1, y1 = -1;
     if (ok)
     {
+        // The row walk below is a single left-to-right sweep and only works if the mask
+        // rects are ordered by left edge: it copies [segStart, mask[seg].left) and then
+        // jumps segStart to mask[seg].right. The agent supplies them in
+        // watched-window-list order (SynthUpdateMask walks that list), which is
+        // DISCOVERY order, not x order (that list is only ever InsertTailList'd). With
+        // two synthesized children on one owner sharing rows - up to WC_MAX_MASK are
+        // admitted, see SynthOwnerQualifies - and the LEFT one discovered second, the
+        // first step copies [0, right-child.left), which spans the left child's columns,
+        // so every capture overwrites that child's patched pixels with PrintWindow's
+        // owner-only content. PrintWindow does not render owned popups, so the child
+        // reads as a blank rectangle until real damage makes the frame loop re-patch it.
+        // Sorting a COPY makes the sweep correct for any input order; overlapping and
+        // contained rects stay absorbed by the segEnd/nextStart clamps below. The
+        // channel's own array must not be sorted in place: captures hold the engine lock
+        // only SHARED, so two of them (the capture thread and WcPrefill on the frame
+        // thread) can run at once and would be writing it concurrently.
+        RECT mask[WC_MAX_MASK] = {};
+        for (int i = 0; i < c.maskCount; i++)
+            mask[i] = c.mask[i];
+        for (int i = 1; i < c.maskCount; i++) // insertion sort, at most WC_MAX_MASK entries
+        {
+            const RECT key = mask[i];
+            int j = i - 1;
+            while (j >= 0 && mask[j].left > key.left)
+            {
+                mask[j + 1] = mask[j];
+                j--;
+            }
+            mask[j + 1] = key;
+        }
+
         const size_t rowBytes = (size_t)c.width * 4;
         for (int y = 0; y < c.height; y++)
         {
@@ -178,7 +209,7 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
                 int nextStart = c.width;
                 if (seg < c.maskCount)
                 {
-                    const RECT& m = c.mask[seg];
+                    const RECT& m = mask[seg];
                     if (y < m.top || y >= m.bottom)
                         continue; // mask does not cover this row: no split here
                     segEnd = m.left < segStart ? segStart : (m.left > c.width ? c.width : m.left);
