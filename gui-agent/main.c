@@ -141,6 +141,9 @@ HANDLE g_ShutdownEvent = NULL;
 // Placeholder window of a minimized UAC prompt, see GetWindowData().
 #define UAC_DUMMY_WINDOW_CLASS L"$$$Secure UAP Dummy Window Class For Interim Dialog"
 
+// Frame shadow strips Office draws around its own windows, see ShouldAcceptWindow().
+#define MSO_BORDER_EFFECT_CLASS L"MSO_BORDEREFFECT_WINDOW_CLASS"
+
 // Written by the hook thread, drained by the main loop.
 static CRITICAL_SECTION g_csWindowEvents;
 static HWND g_PendingWindows[PENDING_WINDOWS_MAX];
@@ -2063,6 +2066,38 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         // second with a cross-process class name on the hot path.
         LogVerbose("0x%x: rejecting compound-window chrome (class '%s', owner 0x%x, style 0x%x, exstyle 0x%x)",
             data->Handle, data->Class, data->Owner, data->Style, data->ExStyle);
+        return FALSE;
+    }
+
+    // Rule 3: Office's shadow strips, by class. Office gives them a dedicated window class,
+    // MSO_BORDEREFFECT_WINDOW_CLASS - measured on a real Microsoft 365 install (FINDINGS
+    // 2026-08-02): four 8 px strips of that class ringing Word's first-run sign-in dialog,
+    // owned by that DIALOG rather than by the main OpusApp frame. An exact discriminator
+    // where rule 2's style heuristic is not: on the build this rule was written against,
+    // the strips passed every rule above and were admitted to the watched list.
+    //
+    // They are pure decoration: Office draws the frame shadow itself instead of letting DWM
+    // do it, as described at the top of this section. The gui daemon borders every window
+    // the agent announces, so dropping them does not weaken daemon-side bordering
+    // (CLAUDE.md 2A-chrome rule 4) - it stops presenting decoration fragments as windows.
+    //
+    // It also removes the precondition for a crash that is now fully understood (FINDINGS
+    // 2026-08-03): admitted, the strips were synthesized, materialized in one burst ("owner
+    // geometry changed, materializing child" x4), and the frame loop then sent MSG_CONFIGURE
+    // for a window it had never announced - gui-daemon exits on that ("msg 0x86 without
+    // CREATE for 0x20340"), costing the qube its GUI. The send-side gate and the overlap test
+    // already break that chain; this rule removes its precondition entirely, and also stops
+    // the strips being re-homed onto the maximized main frame they happen to overlap, where
+    // they paint a shadow band across the document. A window rejected here can take none of
+    // those steps: ExamineWindow() drops it before AddWindow(), and AddWindow() is both the only
+    // insertion into the watched list and the only caller of SynthActivate(), so it is
+    // never announced, never synthesized, and has no synthesis to materialize out of.
+    if (0 == wcscmp(data->Class, MSO_BORDER_EFFECT_CLASS))
+    {
+        // LogVerbose for rule 2's reason: the strips move with the window they decorate,
+        // so during a drag this is re-evaluated at input rate.
+        LogVerbose("0x%x: rejecting Office frame shadow strip (owner 0x%x, %ux%u)",
+            data->Handle, data->Owner, data->Width, data->Height);
         return FALSE;
     }
 
