@@ -1099,17 +1099,33 @@ static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerO
     return TRUE;
 }
 
-// Push the current synthesized-child rects of `owner` to its capture channel, so the
-// owner's PrintWindow pass leaves those pixels alone (the frame loop owns them).
-// No-ops when the computed mask is byte-identical to the last one pushed: WcSetMask
-// takes the engine lock exclusively AND forces a full recapture (wincapture.cpp), so
-// a redundant push is a pure loss. The memo is written before WcSetMask, which
-// silently no-ops when no channel exists; that is safe because PwAttachWindow is the
-// only channel-creation path and it clears the memo.
-C_ASSERT(RTL_NUMBER_OF(((WINDOW_DATA*)0)->SynthMaskLast) == WC_MAX_MASK);
-static void SynthUpdateMask(IN OUT WINDOW_DATA* owner)
+// Collect the owner-relative rects of `owner`'s synthesized children into `mask`
+// (clipped to the granted buffer) and return how many there are. Both modes traverse
+// the same insertion-ordered list with the same predicate, so the masks they produce
+// are comparable rect for rect.
+//
+// With `live`, the two screen positions each rect is built from are re-read from the
+// OS instead of taken from the tracked snapshot. That snapshot is not consistent: the
+// owner and the child are refreshed by SEPARATE UpdateWindowData interrogations, and
+// TrackWindows' non-resync path interrogates only the windows the current WinEvent
+// batch names - so a joint owner+child move arrives as two passes and each of them
+// sees a fresh owner against a stale child (or the reverse). The mask built from that
+// is displaced by one motion step in one direction, and by the same step back on the
+// next pass. A live pair is self-consistent apart from the microseconds between the
+// two reads. GetRealWindowRect is the same function that filled the snapshot, so live
+// and snapshot values are in the same coordinate space; when a live read fails
+// (window gone, DWM off) the snapshot value is kept for that window, which is exactly
+// the previous behaviour.
+static int SynthCollectMask(IN const WINDOW_DATA* owner, IN BOOL live, OUT RECT* mask)
 {
-    RECT mask[WC_MAX_MASK];
+    RECT liveRect;
+    int oX = owner->X, oY = owner->Y;
+    if (live && GetRealWindowRect(owner->Handle, &liveRect) == ERROR_SUCCESS)
+    {
+        oX = (int)liveRect.left;
+        oY = (int)liveRect.top;
+    }
+
     int n = 0;
     for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
          e != &g_WatchedWindowsList && n < WC_MAX_MASK; e = e->Flink)
@@ -1117,8 +1133,15 @@ static void SynthUpdateMask(IN OUT WINDOW_DATA* owner)
         const WINDOW_DATA* c = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
         if (!c->Synthesized || c->SynthOwner != owner->Handle)
             continue;
-        RECT r = { c->X - owner->X, c->Y - owner->Y,
-                   c->X - owner->X + (int)c->Width, c->Y - owner->Y + (int)c->Height };
+        int cX = c->X, cY = c->Y, cW = (int)c->Width, cH = (int)c->Height;
+        if (live && GetRealWindowRect(c->Handle, &liveRect) == ERROR_SUCCESS)
+        {
+            cX = (int)liveRect.left;
+            cY = (int)liveRect.top;
+            cW = (int)(liveRect.right - liveRect.left);
+            cH = (int)(liveRect.bottom - liveRect.top);
+        }
+        RECT r = { cX - oX, cY - oY, cX - oX + cW, cY - oY + cH };
         if (r.left < 0) r.left = 0;
         if (r.top < 0) r.top = 0;
         if (r.right > (int)owner->PwWidth) r.right = (int)owner->PwWidth;
@@ -1126,10 +1149,44 @@ static void SynthUpdateMask(IN OUT WINDOW_DATA* owner)
         if (r.right > r.left && r.bottom > r.top)
             mask[n++] = r;
     }
+    return n;
+}
 
-    if (n == owner->SynthMaskLastCount &&
-        memcmp(mask, owner->SynthMaskLast, (size_t)n * sizeof(RECT)) == 0)
+static BOOL SynthMaskUnchanged(IN const WINDOW_DATA* owner, IN const RECT* mask, IN int n)
+{
+    return n == owner->SynthMaskLastCount &&
+        memcmp(mask, owner->SynthMaskLast, (size_t)n * sizeof(RECT)) == 0;
+}
+
+// Push the current synthesized-child rects of `owner` to its capture channel, so the
+// owner's PrintWindow pass leaves those pixels alone (the frame loop owns them).
+// No-ops when the computed mask is byte-identical to the last one pushed: WcSetMask
+// takes the engine lock exclusively AND forces a full recapture (wincapture.cpp), so
+// a redundant push is a pure loss. The memo is written before WcSetMask, which
+// silently no-ops when no channel exists; that is safe because PwAttachWindow is the
+// only channel-creation path and it clears the memo.
+// Two stages, because the tracked snapshot alone cannot tell "the child moved
+// relative to its owner" from "owner and child moved together and the snapshot has
+// only caught up with one of them" (SynthCollectMask): the snapshot decides whether a
+// push is on the table at all, and only then is the pair re-read live to decide
+// whether it is real. So an owner whose mask did not move in the snapshot costs no OS
+// calls, and a joint move - where the snapshot moves but the live pair does not -
+// costs two rect reads instead of a forced recapture.
+C_ASSERT(RTL_NUMBER_OF(((WINDOW_DATA*)0)->SynthMaskLast) == WC_MAX_MASK);
+static void SynthUpdateMask(IN OUT WINDOW_DATA* owner)
+{
+    RECT mask[WC_MAX_MASK];
+    int n = SynthCollectMask(owner, FALSE, mask);
+
+    if (SynthMaskUnchanged(owner, mask, n))
         return; // the channel already has exactly this mask
+
+    if (owner->SynthChildCount > 0) // nothing to re-read when the last child just went away
+    {
+        n = SynthCollectMask(owner, TRUE, mask);
+        if (SynthMaskUnchanged(owner, mask, n))
+            return; // the snapshot was mid-move; the live mask is the one already pushed
+    }
 
     owner->SynthMaskLastCount = n;
     memcpy(owner->SynthMaskLast, mask, (size_t)n * sizeof(RECT));
@@ -1140,11 +1197,17 @@ static void SynthUpdateMask(IN OUT WINDOW_DATA* owner)
 
 // Flush the mask updates the geometry paths deferred (SynthMaskPending, main.h) -
 // called by TrackWindows exactly once per tracking pass, AFTER all interrogations of
-// the pass completed: every window's X/Y then comes from the same consistent
-// snapshot, so a pure joint owner+child move computes a mask identical to the memo
-// and pushes nothing. Computing at the call sites instead pushed a mixed-state mask
-// plus its restore - two forced recaptures per pass, at input rate during a
-// menu-over-drag. Watched windows critical section must be entered.
+// the pass completed, so a pass that touched an owner and several of its children
+// costs one mask computation rather than one per interrogation. Computing at the call
+// sites instead pushed a mixed-state mask plus its restore - two forced recaptures per
+// pass, at input rate during a menu-over-drag.
+// Batching does NOT by itself make the positions consistent: the non-resync path only
+// interrogates the windows the current WinEvent batch names, so a joint owner+child
+// move is split across two passes and each of them flushes a mixed snapshot (measured
+// on Win10 22H2: 58 QGADRAG,ev=maskpush in 2.6 s of lockstep owner+child motion, two
+// per motion step). Seeing through that is SynthUpdateMask's live re-read, not this
+// batching.
+// Watched windows critical section must be entered.
 static void SynthFlushMasks(void)
 {
     for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;

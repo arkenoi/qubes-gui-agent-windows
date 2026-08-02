@@ -163,8 +163,11 @@ typedef struct _WINDOW_DATA
     // (fresh owner + stale child, or vice versa) mask and the later interrogation
     // pushes again to restore it, each push forcing a full recapture. They set this
     // flag instead, and TrackWindows flushes ONCE per tracking pass after all
-    // interrogations completed (SynthFlushMasks), when every position is from the
-    // same consistent snapshot.
+    // interrogations completed (SynthFlushMasks).
+    // Batching alone does not make the positions consistent - only the windows the
+    // current WinEvent batch names are interrogated, so a joint owner+child move is
+    // split across two passes and each flush still sees a mixed snapshot; that is why
+    // SynthUpdateMask re-reads the pair from the OS before it believes a change.
     BOOL SynthMaskPending;
     // Last mask pushed to this owner's capture channel (SynthUpdateMask): WcSetMask
     // takes the engine lock EXCLUSIVELY (stalls behind an in-flight PrintWindow) and
