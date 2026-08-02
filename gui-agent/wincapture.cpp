@@ -54,6 +54,26 @@ struct Channel
     // content and overwrite them every pass - the popup would flicker.
     RECT mask[WC_MAX_MASK] = {};
     int maskCount = 0;
+    // Mask generation: bumped by WcSetMask on every mask change. CaptureAndDiff
+    // snapshots it together with the rects and re-checks it before committing any
+    // pixel, so a capture prepared against a superseded mask is dropped instead of
+    // writing over a region that has since become a synthesized child's.
+    //
+    // Protected by Engine::lock, exactly like mask/maskCount: written under the
+    // EXCLUSIVE lock (WcSetMask), read under the SHARED lock (CaptureAndDiff, on the
+    // capture thread and on the caller's thread via WcPrefill). No new lock and no
+    // change to the existing order (agent's g_csWatchedWindows -> Engine::lock; the
+    // damage callback still fires with no engine lock held).
+    //
+    // COVERAGE, stated exactly: in THIS build the check cannot fire. CaptureAndDiff
+    // runs entirely under the shared lock, so WcSetMask's exclusive acquire already
+    // waits out any capture in flight and every capture started afterwards reads the
+    // new mask. What the generation buys today is that the local mask copy below is
+    // provably not stale - a copy can go stale, and this is how that is detected. It
+    // is also the invariant that has to hold if the PrintWindow round-trip (15-18 ms
+    // on this guest, and every WcSetMask currently blocks behind it) is ever moved
+    // out of the lock. Cost: one unsigned compare per capture.
+    unsigned maskGen = 0;
 };
 
 struct Engine
@@ -103,6 +123,42 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
     // periodic sweep re-marks them dirty, so they catch up when they recover.
     if (IsHungAppWindow(c.hwnd))
         return true;
+
+    // Mask snapshot, taken BEFORE the PrintWindow round-trip so it is the mask this
+    // capture is prepared against.
+    //
+    // Sorted by left edge, because the row walk below is a single left-to-right sweep
+    // that assumes it: it copies [segStart, mask[seg].left) and then jumps segStart to
+    // mask[seg].right. The agent supplies the rects in watched-window-list order
+    // (SynthUpdateMask walks the list), which is discovery order, not x order. With two
+    // synthesized children on one owner sharing rows - a dropdown plus a tooltip, a
+    // menu plus its submenu - and the LEFT one discovered second, the first sweep step
+    // copies [0, right-child.left), which spans the left child's columns, and every
+    // capture overwrites that child's patched pixels with PrintWindow's owner-only
+    // content. PrintWindow does not render owned popups, so that child reads as a blank
+    // rectangle until real damage makes the frame loop re-patch it. Sorting a COPY
+    // (never the channel's own array, which is shared state read under a shared lock)
+    // makes the sweep correct for any input order; overlapping rects are then absorbed
+    // by the existing clamps.
+    RECT mask[WC_MAX_MASK] = {};
+    int maskCount = c.maskCount;
+    if (maskCount < 0) maskCount = 0;
+    if (maskCount > WC_MAX_MASK) maskCount = WC_MAX_MASK;
+    const unsigned maskGen = c.maskGen;
+    for (int i = 0; i < maskCount; i++)
+        mask[i] = c.mask[i];
+    for (int i = 1; i < maskCount; i++) // insertion sort, at most WC_MAX_MASK entries
+    {
+        RECT key = mask[i];
+        int j = i - 1;
+        while (j >= 0 && mask[j].left > key.left)
+        {
+            mask[j + 1] = mask[j];
+            j--;
+        }
+        mask[j + 1] = key;
+    }
+
     RECT wr;
     if (!GetWindowRect(c.hwnd, &wr))
         return false;
@@ -130,8 +186,13 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
     BOOL ok = PrintWindow(c.hwnd, memdc, PW_RENDERFULLCONTENT);
     GdiFlush();
 
+    // Did the mask move under this capture while it was being taken? Then these pixels
+    // were prepared against a layout that no longer holds and committing them could
+    // write into a region that now belongs to a synthesized child. Commit nothing.
+    const bool stale = (c.maskGen != maskGen);
+
     int y0 = -1, y1 = -1;
-    if (ok)
+    if (ok && !stale)
     {
         const size_t rowBytes = (size_t)c.width * 4;
         for (int y = 0; y < c.height; y++)
@@ -144,13 +205,13 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
             // column ranges, so synthesized-child pixels survive untouched.
             int segStart = 0;
             bool rowChanged = false;
-            for (int seg = 0; seg <= c.maskCount; seg++)
+            for (int seg = 0; seg <= maskCount; seg++)
             {
                 int segEnd = c.width;
                 int nextStart = c.width;
-                if (seg < c.maskCount)
+                if (seg < maskCount)
                 {
-                    const RECT& m = c.mask[seg];
+                    const RECT& m = mask[seg];
                     if (y < m.top || y >= m.bottom)
                         continue; // mask does not cover this row: no split here
                     segEnd = m.left < segStart ? segStart : (m.left > c.width ? c.width : m.left);
@@ -182,7 +243,15 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
     DeleteObject(bmp);
     DeleteDC(memdc);
 
-    if (ok && y0 >= 0 && out)
+    // A discarded capture must not lose the refresh it was going to deliver: re-arm the
+    // channel's existing dirty flag, which is the only thing the capture loop polls, so
+    // the very next pass of that loop redoes the capture against the current mask. No
+    // timer, no extra wakeup, and nothing to do when no capture is discarded - the loop
+    // is already running because this capture was running.
+    if (stale)
+        c.dirty.store(true);
+
+    if (ok && !stale && y0 >= 0 && out)
     {
         out->hwnd = c.hwnd;
         out->w = c.width;
@@ -349,6 +418,7 @@ void WcSetMask(HWND hwnd, const RECT* rects, int count)
             for (int i = 0; i < count; i++)
                 ch->mask[i] = rects[i];
             ch->maskCount = count;
+            ch->maskGen++;         // supersede any capture prepared against the old mask
             ch->dirty.store(true); // re-capture so unmasked areas refresh promptly
             break;
         }

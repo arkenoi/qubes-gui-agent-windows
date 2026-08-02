@@ -1165,6 +1165,14 @@ static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
     entry->Synthesized = TRUE;
     entry->SynthOwner = owner->Handle;
     owner->SynthChildCount++;
+    // ORDER IS LOAD-BEARING: mask first, pixels second, and it must stay that way.
+    // WcSetMask takes the capture engine lock EXCLUSIVELY while every capture runs
+    // under it SHARED, so it returns only once no capture is in flight, and every
+    // capture started after it reads the new mask. That makes the patch below the last
+    // writer of those pixels. Patching first and masking after would expose the patch
+    // to a capture still running against the old (unmasked) layout: it would overwrite
+    // the popup with PrintWindow output, which does not render owned popups, so the
+    // popup would read as a blank rectangle until real damage repainted it.
     SynthUpdateMask(owner);
     // Paint it NOW: a menu paints once, before it is tracked, and a static screen
     // produces no further frames - waiting for damage would leave it invisible.

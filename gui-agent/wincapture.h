@@ -61,6 +61,10 @@ void WcMarkDirty(HWND hwnd);
 
 // Set the buffer-relative regions this window's capture must not write, because a
 // synthesized child owns those pixels. Replaces any previous mask; count 0 clears.
+// Rects may be given in any order and may overlap; the engine sorts its own copy.
+// Takes the engine lock exclusively while captures hold it shared, so it returns only
+// once no capture is in flight - i.e. it is a rendezvous, and pixels written into the
+// masked regions AFTER it returns cannot be overwritten by an older capture.
 void WcSetMask(HWND hwnd, const RECT* rects, int count);
 
 // Synchronously render the window's current content into the buffer via
