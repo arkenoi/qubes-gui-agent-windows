@@ -1063,11 +1063,24 @@ static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerO
         if (!SynthOwnerQualifies(owner, entry))
             return FALSE;
     }
-    else if (entry->Owner && (owner = FindWindowByHandle(entry->Owner)) != NULL)
+    else if (entry->Owner)
     {
-        // GW_OWNER known and tracked: honor it exclusively. A menu owned by window A
-        // must never be synthesized into an overlapping window B of the same app.
-        if (!SynthOwnerQualifies(owner, entry))
+        // GW_OWNER set: honor it exclusively. A menu owned by window A must never be
+        // synthesized into an overlapping window B of the same app.
+        //
+        // "Exclusively" has to include the case where the owner is NOT tracked. Testing
+        // `FindWindowByHandle(entry->Owner) != NULL` in the condition let an owned popup
+        // whose owner the agent does not track fall through to the same-process fallback
+        // below, which then adopted it into whatever topmost sibling happened to contain
+        // it. Measured: Office's MSO_BORDEREFFECT shadow strips around a sign-in DIALOG
+        // were adopted by the maximized OpusApp main window (they do overlap it, so the
+        // geometric guard passes), their pixels patched in from the composited desktop,
+        // and the owner's capture masked those bands out - leaving a frozen L-shaped
+        // shadow ghost burned into the document area that nothing could ever repaint,
+        // outliving the dialog itself. An untracked owner means "not ours to composite
+        // into", so the popup must be refused, never re-homed.
+        owner = FindWindowByHandle(entry->Owner);
+        if (!owner || !SynthOwnerQualifies(owner, entry))
             return FALSE;
     }
     else if (entry->ProcessId != 0)
