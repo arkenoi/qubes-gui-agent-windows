@@ -56,6 +56,10 @@ ULONG SendWindowDump(IN HWND window, IN ULONG width, IN ULONG height,
     IN size_t numGrants, IN const ULONG* refs);
 ULONG SendWindowCreate(IN const WINDOW_DATA *windowData);
 ULONG SendWindowDestroy(IN HWND window);
+
+// Forget which windows the daemon has been told about (see send.c). Must be called
+// when a new vchan client connects, before anything is sent to it.
+void SendResetCreatedWindows(void);
 ULONG SendWindowFlags(IN HWND window, IN uint32_t flagsToSet, IN uint32_t flagsToUnset);
 ULONG SendWindowHints(IN HWND window, IN uint32_t flags);
 ULONG SendScreenHints(void);

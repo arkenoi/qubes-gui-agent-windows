@@ -1019,6 +1019,17 @@ static BOOL SynthOwnerQualifies(IN const WINDOW_DATA* owner, IN const WINDOW_DAT
         cR > oR + SYNTH_OVERHANG_MAX || cB > oB + SYNTH_OVERHANG_MAX)
         return FALSE;
 
+    // Proximity is not containment. The overhang allowance was meant for popups that
+    // stick out slightly WHILE STILL OVERLAPPING, but on its own it also admits children
+    // that lie entirely outside the buffer: Word's Document Recovery dialog owns four
+    // MSO_BORDEREFFECT strips that sit flush against its edges with EXACTLY zero
+    // intersection, 8 px out - inside the allowance. Composited, they can never be
+    // painted (the patch intersects to an empty rect, forever), and the resulting
+    // synthesize/materialize flip-flop was what eventually fed gui-daemon a message for
+    // a window it had no CREATE for. Require real overlap with the granted buffer.
+    if (cR <= oL || cL >= oR || cB <= oT || cT >= oB)
+        return FALSE;
+
     return TRUE;
 }
 
@@ -2975,6 +2986,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         if (entry->IsIconic || !entry->IsVisible)
             continue;
 
+        // A window awaiting removal is not a window we may talk about. Materialization
+        // ("owner geometry changed") clears Synthesized and sets DeletePending on an entry
+        // that stays in this list until TrackWindows re-examines it, and CreateSent is
+        // FALSE for one that was only ever composited - so without this skip the frame
+        // loop treats it as an ordinary legacy window and sends CONFIGURE/damage for a
+        // window dom0 has no CREATE for, which makes gui-daemon exit. It claims no area
+        // either: it is on its way out, and suppressing damage beneath a window that is
+        // about to vanish is the more visible error.
+        if (entry->DeletePending)
+            continue;
+
         // Synthesized windows have no dom0 window: never send anything for them. They
         // still claim their area so LEGACY windows below are clipped as before; their
         // pixels reach dom0 through the owner's buffer (PwPatchSynthChildren).
@@ -3559,6 +3581,10 @@ static ULONG WINAPI WatchForEvents(void)
                 // needs to be set before enumerating windows so maps get sent
                 // (and before sending anything really)
                 g_VchanClientConnected = TRUE;
+
+                // This daemon knows about no windows yet; forget what the previous one
+                // was told before any per-window message can be gated against it.
+                SendResetCreatedWindows();
 
                 if (ERROR_SUCCESS != SendProtocolVersion())
                 {

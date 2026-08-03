@@ -38,6 +38,10 @@
 
 static_assert(sizeof(ULONG) == sizeof(uint32_t), "ULONG has a different size than uint32_t");
 
+// Defined with the created-window set below; declared here because MSG_WINDOW_DUMP is
+// emitted above it and is just as fatal to the daemon when the window has no CREATE.
+static BOOL MaySendForWindowLocked(IN HWND window, IN const WCHAR *messageName);
+
 ULONG SendWindowDump(IN HWND window, IN ULONG width, IN ULONG height,
     IN size_t numGrants, IN const ULONG* refs)
 {
@@ -66,6 +70,12 @@ ULONG SendWindowDump(IN HWND window, IN ULONG width, IN ULONG height,
     header.untrusted_len = (uint32_t)untrusted_len;
 
     EnterCriticalSection(&g_VchanCriticalSection);
+    if (!MaySendForWindowLocked(window, L"MSG_WINDOW_DUMP"))
+    {
+        LeaveCriticalSection(&g_VchanCriticalSection);
+        status = ERROR_SUCCESS; // dropped on purpose; not an error the caller can act on
+        goto end;
+    }
     if (!VCHAN_SEND(header, L"MSG_WINDOW_DUMP"))
     {
         LeaveCriticalSection(&g_VchanCriticalSection);
@@ -142,6 +152,107 @@ static void ClearWindowDestroyedLocked(IN HWND window)
             g_DestroyedRing[i] = NULL;
 }
 
+// --- created-window set: the protocol backstop ---------------------------------------
+// gui-daemon calls exit(1) the moment it receives ANY per-window message for a window it
+// never got a CREATE for ("msg 0x86 without CREATE for 0x20340" in guid.<vm>.log). That
+// does not just break one window - it kills the GUI for the entire qube, and nothing
+// restarts the daemon, so the agent then waits forever for a vchan client. An agent-side
+// bookkeeping bug must never have that blast radius.
+//
+// WINDOW_DATA.CreateSent cannot serve as the guard: it lives under g_csWatchedWindows,
+// which the capture thread must not take (ABBA against the vchan lock - see the
+// destroyed-ring note above), and materialization (main.c, "owner geometry changed")
+// clears Synthesized while leaving CreateSent FALSE on an entry that stays in the watched
+// list, after which the ordinary damage/configure paths pick it up as a normal window.
+// That is exactly the hole Word's MSO_BORDEREFFECT strips fell through.
+//
+// So the set is maintained here, by the very calls that emit CREATE and DESTROY, under
+// g_VchanCriticalSection - the same lock that orders the messages themselves. Whatever
+// the callers believe, what the daemon has actually been told is what gets checked.
+static HWND *g_CreatedWindows;
+static ULONG g_CreatedCount;
+static ULONG g_CreatedCapacity;
+static ULONG64 g_GateDrops;
+
+static BOOL IsWindowCreatedLocked(IN HWND window)
+{
+    for (ULONG i = 0; i < g_CreatedCount; i++)
+        if (g_CreatedWindows[i] == window)
+            return TRUE;
+    return FALSE;
+}
+
+static void MarkWindowCreatedLocked(IN HWND window)
+{
+    if (IsWindowCreatedLocked(window))
+        return;
+
+    if (g_CreatedCount == g_CreatedCapacity)
+    {
+        ULONG newCapacity = g_CreatedCapacity ? g_CreatedCapacity * 2 : 64;
+        HWND *grown = realloc(g_CreatedWindows, newCapacity * sizeof(HWND));
+        if (!grown)
+        {
+            // Degrade to a window that never updates, never to a message the daemon kills
+            // us for: without the record every later message for this hwnd is dropped.
+            LogWarning("out of memory tracking created window 0x%x; its updates will be dropped", window);
+            return;
+        }
+        g_CreatedWindows = grown;
+        g_CreatedCapacity = newCapacity;
+    }
+    g_CreatedWindows[g_CreatedCount++] = window;
+}
+
+static void ClearWindowCreatedLocked(IN HWND window)
+{
+    for (ULONG i = 0; i < g_CreatedCount; i++)
+    {
+        if (g_CreatedWindows[i] == window)
+        {
+            g_CreatedWindows[i] = g_CreatedWindows[--g_CreatedCount];
+            return;
+        }
+    }
+}
+
+// TRUE if this message may go out. Screen-scoped messages (window == NULL, which the
+// protocol carries as window 0) are always allowed - the daemon requires no CREATE for
+// those. Call inside the g_VchanCriticalSection hold that would emit the message.
+// A reconnecting gui-daemon starts with an empty window table, so everything the previous
+// one was told is worthless: without this the set would vouch for windows the new daemon
+// has never seen, which is the exact condition it exits on. Call before sending anything
+// to a newly connected client.
+// Today this is only defence in depth - WatchForEvents runs once per process and returns
+// on vchan EOF, so a new client always means a freshly respawned agent with an empty set.
+// It matters the moment the agent is made to survive a daemon restart, and costs nothing
+// now. (Such an agent would also have to re-announce its existing windows; the gate would
+// then correctly drop their traffic rather than let it kill the new daemon.)
+void SendResetCreatedWindows(void)
+{
+    EnterCriticalSection(&g_VchanCriticalSection);
+    g_CreatedCount = 0;
+    g_GateDrops = 0;
+    LeaveCriticalSection(&g_VchanCriticalSection);
+}
+
+static BOOL MaySendForWindowLocked(IN HWND window, IN const WCHAR *messageName)
+{
+    if (!window || IsWindowCreatedLocked(window))
+        return TRUE;
+
+    // A window in this state is already broken; log enough to find the bug without
+    // flooding the file at frame rate when it repeats.
+    g_GateDrops++;
+    if (g_GateDrops <= 20 || (g_GateDrops % 1000) == 0)
+    {
+        LogWarning("dropping %s for 0x%x: no CREATE was sent for this window "
+            "(agent bug - sending it would make gui-daemon exit and take down the qube's GUI); "
+            "%I64u such drops so far", messageName, window, g_GateDrops);
+    }
+    return FALSE;
+}
+
 ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)
 {
     WINDOWINFO wi;
@@ -207,6 +318,10 @@ ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)
         LeaveCriticalSection(&g_VchanCriticalSection);
         return ERROR_UNIDENTIFIED_ERROR;
     }
+    // Recorded only after the CREATE is actually on the wire, so the set never claims more
+    // than the daemon has been told.
+    if (windowData)
+        MarkWindowCreatedLocked(windowData->Handle);
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     if (windowData)
@@ -235,10 +350,13 @@ ULONG SendWindowDestroy(IN HWND window)
     header.window = (uint32_t)window;
     header.untrusted_len = 0;
     EnterCriticalSection(&g_VchanCriticalSection);
-    status = VCHAN_SEND(header, L"MSG_DESTROY");
+    // A DESTROY for a window the daemon never saw created is fatal to it just like any
+    // other orphaned message, so it goes through the same gate.
+    status = MaySendForWindowLocked(window, L"MSG_DESTROY") ? VCHAN_SEND(header, L"MSG_DESTROY") : TRUE;
     // In the same lock hold as the send: from here on, damage for this hwnd is dropped
     // (see the destroyed-ring comment above SendWindowDamageEvent).
     MarkWindowDestroyedLocked(window);
+    ClearWindowCreatedLocked(window);
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
@@ -261,7 +379,7 @@ ULONG SendWindowFlags(IN HWND window, IN uint32_t flagsToSet, IN uint32_t flagsT
     flags.flags_set = flagsToSet;
     flags.flags_unset = flagsToUnset;
     EnterCriticalSection(&g_VchanCriticalSection);
-    status = VCHAN_SEND_MSG(header, flags, L"MSG_WINDOW_FLAGS");
+    status = MaySendForWindowLocked(window, L"MSG_WINDOW_FLAGS") ? VCHAN_SEND_MSG(header, flags, L"MSG_WINDOW_FLAGS") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
@@ -284,7 +402,7 @@ ULONG SendWindowHints(IN HWND window, IN uint32_t flags)
     header.type = MSG_WINDOW_HINTS;
 
     EnterCriticalSection(&g_VchanCriticalSection);
-    status = VCHAN_SEND_MSG(header, hintsMsg, L"MSG_WINDOW_HINTS");
+    status = MaySendForWindowLocked(window, L"MSG_WINDOW_HINTS") ? VCHAN_SEND_MSG(header, hintsMsg, L"MSG_WINDOW_HINTS") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
@@ -329,7 +447,7 @@ ULONG SendWindowUnmap(IN HWND window)
     header.window = (uint32_t)window;
     header.untrusted_len = 0;
     EnterCriticalSection(&g_VchanCriticalSection);
-    status = VCHAN_SEND(header, L"MSG_UNMAP");
+    status = MaySendForWindowLocked(window, L"MSG_UNMAP") ? VCHAN_SEND(header, L"MSG_UNMAP") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
@@ -383,6 +501,11 @@ ULONG SendWindowMap(IN const WINDOW_DATA *windowData OPTIONAL)
             windowData ? windowData->Width : 0, windowData ? windowData->Height : 0);
 
     EnterCriticalSection(&g_VchanCriticalSection);
+    if (windowData && !MaySendForWindowLocked(windowData->Handle, L"MSG_MAP"))
+    {
+        LeaveCriticalSection(&g_VchanCriticalSection);
+        return ERROR_SUCCESS;
+    }
     if (!VCHAN_SEND_MSG(header, mapMsg, L"MSG_MAP"))
     {
         LeaveCriticalSection(&g_VchanCriticalSection);
@@ -445,7 +568,7 @@ ULONG SendWindowConfigure(HANDLE window, int x, int y, int width, int height, BO
     // don't send resize to 0x0 - this window is just hiding itself, MSG_UNMAP will follow
     if (configureMsg.width > 0 && configureMsg.height > 0)
     {
-        status = VCHAN_SEND_MSG(header, configureMsg, L"MSG_CONFIGURE");
+        status = MaySendForWindowLocked(window, L"MSG_CONFIGURE") ? VCHAN_SEND_MSG(header, configureMsg, L"MSG_CONFIGURE") : TRUE;
         if (!status)
             goto cleanup;
     }
@@ -522,7 +645,7 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
         LogVerbose("0x%x: dropping damage for destroyed window", window);
         return ERROR_SUCCESS;
     }
-    status = VCHAN_SEND_MSG(header, shmMsg, L"MSG_SHMIMAGE");
+    status = MaySendForWindowLocked(window, L"MSG_SHMIMAGE") ? VCHAN_SEND_MSG(header, shmMsg, L"MSG_SHMIMAGE") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
@@ -563,7 +686,7 @@ ULONG SendWindowName(IN HWND window, IN const WCHAR *caption OPTIONAL)
     header.window = (uint32_t)window;
     header.type = MSG_WMNAME;
     EnterCriticalSection(&g_VchanCriticalSection);
-    status = VCHAN_SEND_MSG(header, nameMsg, L"MSG_WMNAME");
+    status = MaySendForWindowLocked(window, L"MSG_WMNAME") ? VCHAN_SEND_MSG(header, nameMsg, L"MSG_WMNAME") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
