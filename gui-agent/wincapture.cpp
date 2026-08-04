@@ -69,36 +69,8 @@ struct Engine
 
 Engine* g_eng = nullptr;
 
-// TRUE only while the INTERACTIVE desktop is the input desktop. When the user locks the
-// session, or UAC elevates, Winlogon switches the input desktop to the secure one
-// ("Winlogon" / "Screen-saver"); this reports FALSE for the whole of that period.
-//
-// Capture must stop dead while it is FALSE. PrintWindow round-trips SYNCHRONOUSLY into the
-// owning process (see CaptureAndDiff), and on the secure desktop the windows belong to
-// LogonUI. Driving PrintWindow at LogonUI from SYSTEM in session 1 while the session is
-// still initialising can stall logon itself - observed as a guest stuck at "Welcome"
-// across reboots, unrecoverable without a shell (FINDINGS 2026-08-03). The IsHungAppWindow
-// guard does not cover it: LogonUI is not hung, it is waiting on us.
-static bool InteractiveDesktopIsInput()
-{
-    HDESK d = OpenInputDesktop(0, FALSE, GENERIC_READ);
-    if (!d)
-        return false; // access denied == the secure desktop is up; treat as "not ours"
-
-    WCHAR name[64] = { 0 };
-    DWORD needed = 0;
-    bool isDefault = GetUserObjectInformationW(d, UOI_NAME, name, sizeof(name), &needed) &&
-                     0 == _wcsicmp(name, L"Default");
-    CloseDesktop(d);
-    return isDefault;
-}
-
 void AttachThreadToInputDesktop()
 {
-    // Never follow the input desktop onto Winlogon - see InteractiveDesktopIsInput().
-    if (!InteractiveDesktopIsInput())
-        return;
-
     HDESK d = OpenInputDesktop(0, FALSE, GENERIC_READ);
     if (d)
     {
@@ -260,16 +232,6 @@ DWORD WINAPI CaptureThread(LPVOID param)
     {
         bool didWork = false;
         fired.clear();
-
-        // Session locked / UAC prompt up: do not touch a single window until the
-        // interactive desktop is back. Channels keep their dirty flags, so everything
-        // is recaptured on the first pass after unlock.
-        if (!InteractiveDesktopIsInput())
-        {
-            Sleep(200);
-            continue;
-        }
-
         AcquireSRWLockShared(&e.lock);
         const size_t n = e.channels.size();
 
@@ -310,9 +272,7 @@ DWORD WINAPI CaptureThread(LPVOID param)
             }
             else
             {
-                // Window may live on another desktop now; re-attach and retry later.
-                // AttachThreadToInputDesktop refuses to follow the secure desktop, so a
-                // lock/UAC transition leaves this thread on Default and simply retries.
+                // window may live on another desktop now (UAC/lock); re-attach and retry later
                 AttachThreadToInputDesktop();
                 c.dirty.store(true);
             }
