@@ -272,17 +272,22 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
         {
             EnterCriticalSection(&ctx->frame.lock);
             ctx->duplication = duplication;
-            LeaveCriticalSection(&ctx->frame.lock);
 
             if (width != ctx->width || height != ctx->height)
             {
-                // The framebuffer geometry changed underneath us; the grants and the
-                // dom0-side window are sized for the old one, so a full reinit is the
-                // correct response here (unlike a plain ACCESS_LOST).
-                LogWarning("resolution changed during recovery (%ux%u -> %ux%u), reinitializing",
+                // A6 (approved design, 2.1): adopt the new geometry IN PLACE instead of
+                // failing out to the full teardown that unmapped and destroyed every
+                // window - the one path a resolution change always took. Everything
+                // downstream is already sized from these fields (A3): GetFrame maps the
+                // new surface and grants FRAMEBUFFER_PAGE_COUNT(ctx->width, ctx->height)
+                // pages, and the frame loop re-sends MSG_WINDOW_DUMP + MSG_CONFIGURE for
+                // window 0 from the same fields (main.c, grants_changed).
+                LogInfo("A6REGRANT resolution changed during recovery (%ux%u -> %ux%u), adopting in place",
                     ctx->width, ctx->height, width, height);
-                return FALSE;
+                ctx->width = width;
+                ctx->height = height;
             }
+            LeaveCriticalSection(&ctx->frame.lock);
 
             // INFO, not DEBUG: the guest runs LogLevel=3 by default, so at DEBUG this
             // recovery is invisible and an operator cannot tell in-place recovery from

@@ -77,6 +77,13 @@ BOOL g_LocalScreenDestroyed = FALSE;
 // so paths outside the frame loop (composite synthesis activation) can sample it too.
 static const BYTE* g_FbBits = NULL;
 static int g_FbPitch = 0;
+// Dimensions the published framebuffer was actually granted/mapped at. With A6 the
+// capture geometry can change in place (RecreateDuplication adopts a new desc), so the
+// readers above must clamp against THESE, not g_ScreenWidth/Height: the g_Screen*
+// globals are written by the resolution thread and can lag the live surface, and a
+// stale-larger value would walk the copy loops past the end of the mapped surface.
+static UINT g_FbWidth = 0;
+static UINT g_FbHeight = 0;
 
 DWORD g_HostScreenWidth = 0;
 DWORD g_HostScreenHeight = 0;
@@ -2802,7 +2809,7 @@ static void PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRA
     if (!fb || frame->rect.Pitch <= 0 || !entry->PwBuffer)
         return;
 
-    RECT screenR = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
+    RECT screenR = { 0, 0, (LONG)min(g_ScreenWidth, g_FbWidth), (LONG)min(g_ScreenHeight, g_FbHeight) };
     RECT winR = { entry->X, entry->Y,
                   entry->X + (int)entry->PwWidth, entry->Y + (int)entry->PwHeight };
     RECT r;
@@ -2853,7 +2860,7 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
     RECT childR = { c->X, c->Y, c->X + (int)c->Width, c->Y + (int)c->Height };
     RECT ownerR = { owner->X, owner->Y,
                     owner->X + (int)owner->PwWidth, owner->Y + (int)owner->PwHeight };
-    RECT screenR = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
+    RECT screenR = { 0, 0, (LONG)min(g_ScreenWidth, g_FbWidth), (LONG)min(g_ScreenHeight, g_FbHeight) };
     RECT r;
     if (!IntersectRect(&r, &childR, &ownerR) || !IntersectRect(&r, &r, &screenR))
     {
@@ -2918,15 +2925,20 @@ void PwInvalidateFramebuffer(void)
 {
     g_FbBits = NULL;
     g_FbPitch = 0;
+    g_FbWidth = 0;
+    g_FbHeight = 0;
 }
 
-static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer)
+static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
+    IN UINT fbWidth, IN UINT fbHeight)
 {
     // Publish the live desktop image for paths outside this loop (synthesis).
     if (framebuffer && frame->rect.Pitch > 0)
     {
         g_FbBits = framebuffer;
         g_FbPitch = frame->rect.Pitch;
+        g_FbWidth = fbWidth;
+        g_FbHeight = fbHeight;
     }
 
     // Menus/tooltips are override-redirect windows. They are mapped like any other window,
@@ -2972,9 +2984,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         if (frame->dirty_rects_count == 0)
         {
             // normally we don't get frames with 0 dirty rects unless it's the 1st one
-            // then refresh everything
+            // then refresh everything (at the size the dump was actually granted at,
+            // which after an A6 in-place resize can differ from g_Screen*)
             LogDebug("no dirty rects, updating whole screen");
-            SendWindowDamageEvent(NULL, 0, 0, g_ScreenWidth, g_ScreenHeight);
+            SendWindowDamageEvent(NULL, 0, 0, fbWidth, fbHeight);
         }
         else
         {
@@ -3572,7 +3585,21 @@ static ULONG WINAPI WatchForEvents(void)
                     if (grantStatus != ERROR_SUCCESS)
                         win_perror2(grantStatus, "SendScreenGrants (after recreate)");
                     else
+                    {
                         LogInfo("framebuffer re-granted after duplication recovery, MSG_WINDOW_DUMP re-sent");
+
+                        // A6: the re-grant may carry a new geometry (in-place resize).
+                        // Follow the dump with MSG_CONFIGURE for window 0 at the granted
+                        // size: the daemon adopts whatever the agent reports for window 0
+                        // (it is exempt from configure flow control, xside.c:2063-2069),
+                        // and for a same-size recovery the echo is a no-op.
+                        ULONG cfgStatus = SendWindowConfigure(NULL, 0, 0,
+                            capture->width, capture->height, FALSE);
+                        if (cfgStatus != ERROR_SUCCESS)
+                            win_perror2(cfgStatus, "SendWindowConfigure (screen, after recreate)");
+                        else
+                            LogInfo("A6CONFIGURE window 0 -> %ux%u", capture->width, capture->height);
+                    }
 
                     // Everything the daemon holds came from the old framebuffer, so repaint
                     // all of it rather than waiting for each window to happen to be damaged
@@ -3606,11 +3633,14 @@ static ULONG WINAPI WatchForEvents(void)
                     }
                     else
                     {
-                        SendWindowDamageEvent(NULL, 0, 0, g_ScreenWidth, g_ScreenHeight);
+                        // Repaint at the size the new dump was granted at, not g_Screen*
+                        // (which can lag an A6 in-place resize).
+                        SendWindowDamageEvent(NULL, 0, 0, capture->width, capture->height);
                     }
                 }
 
-                ProcessNewFrame(&capture->frame, (const BYTE*)capture->framebuffer);
+                ProcessNewFrame(&capture->frame, (const BYTE*)capture->framebuffer,
+                    capture->width, capture->height);
 
                 // Work-area drift check (frame path; ProcessWindowEvents has the
                 // matching call). Here, not inside ProcessNewFrame: no locks are held
