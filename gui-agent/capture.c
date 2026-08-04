@@ -227,6 +227,11 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
     // reset the whole frame state or the replacement inherits stale flags and the next
     // GetFrame asserts on a non-NULL texture / double-unmaps.
     ctx->frame.mapped = FALSE;
+    // The desktop surface backing the published framebuffer pointer is going away with this
+    // duplication. Synthesis reads that pointer from the window-event thread, outside the
+    // frame loop, so it must be dropped here - under frame.lock - not merely overwritten by
+    // the next ProcessNewFrame.
+    PwInvalidateFramebuffer();
     free(ctx->frame.dirty_rects);
     ctx->frame.dirty_rects = NULL;
     ctx->frame.dirty_rects_count = 0;
@@ -408,6 +413,12 @@ void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx)
 
     DWORD status = GetLastError(); // preserve
     CaptureStop(ctx);
+
+    // Same hazard as in RecreateDuplication: the mapped desktop surface is about to be
+    // released, so stop publishing a pointer into it.
+    EnterCriticalSection(&ctx->frame.lock);
+    PwInvalidateFramebuffer();
+    LeaveCriticalSection(&ctx->frame.lock);
 
     if (ctx->ready_event)
         CloseHandle(ctx->ready_event);

@@ -201,3 +201,9 @@ ULONG SetSeamlessMode(
     IN BOOL seamlessMode,
     IN BOOL forceUpdate
     );
+
+// Drop the desktop image published for composite synthesis. The capture layer must call this
+// under ctx->frame.lock whenever the mapped desktop surface is released (duplication recreate
+// or teardown): synthesis paints from the window-event thread and would otherwise read a
+// pointer into an unmapped surface.
+void PwInvalidateFramebuffer(void);

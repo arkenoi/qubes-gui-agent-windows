@@ -2907,6 +2907,19 @@ static void PwPatchSynthChildren(IN OUT WINDOW_DATA* owner, IN const RECT* area)
     }
 }
 
+// Drop the published desktop image. The pointer belongs to the mapped desktop surface of a
+// duplication object; when that duplication is discarded the mapping goes with it, but
+// synthesis reads g_FbBits from OUTSIDE the frame loop - SynthActivate() paints from the
+// window-event thread - so nothing else would stop it dereferencing the stale pointer.
+// Called by the capture layer under ctx->frame.lock whenever the surface is released.
+// PwPatchSynthChildClipped already handles NULL by declining to paint; the child is repainted
+// by the post-recovery sweep once a new frame has been published.
+void PwInvalidateFramebuffer(void)
+{
+    g_FbBits = NULL;
+    g_FbPitch = 0;
+}
+
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer)
 {
     // Publish the live desktop image for paths outside this loop (synthesis).
