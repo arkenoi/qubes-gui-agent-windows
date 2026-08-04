@@ -38,6 +38,7 @@ typedef struct _RESOLUTION_THREAD_PARAMS
     HANDLE Event; // event to wait on
     LONG Width; // requested resolution
     LONG Height;
+    const WCHAR* Source; // origin of the request, for instrumentation logging
 } RESOLUTION_THREAD_PARAMS;
 
 struct SUPPORTED_MODES
@@ -154,18 +155,28 @@ DWORD SelectSupportedMode(IN DWORD width, IN DWORD height)
     return mode;
 }
 
-ULONG SetVideoMode(IN ULONG width, IN ULONG height)
+ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
 {
     LogVerbose("%lu x %lu", width, height);
 
+    // instrumentation (log-only): what was requested, before any snapping
+    LogInfo("RESREQ %lux%lu src=%s", width, height, source);
+
     DWORD mode = SelectSupportedMode(width, height);
+
+    // instrumentation (log-only): what SelectSupportedMode chose,
+    // marked SNAPPED when it differs from the request
+    if ((ULONG)g_SupportedModes.Dimensions[mode].x != width || (ULONG)g_SupportedModes.Dimensions[mode].y != height)
+        LogInfo("RESSNAP %ldx%ld SNAPPED", g_SupportedModes.Dimensions[mode].x, g_SupportedModes.Dimensions[mode].y);
+    else
+        LogInfo("RESSNAP %ldx%ld", g_SupportedModes.Dimensions[mode].x, g_SupportedModes.Dimensions[mode].y);
 
     width = g_SupportedModes.Dimensions[mode].x;
     height = g_SupportedModes.Dimensions[mode].y;
 
     if (width == g_ScreenWidth && height == g_ScreenHeight)
     {
-        LogDebug("No change");
+        LogInfo("RESNOOP %lux%lu", width, height);
         return ERROR_SUCCESS;
     }
 
@@ -178,6 +189,23 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height)
     }
     else
     {
+        // instrumentation (log-only): re-read what Windows ACTUALLY applied.
+        // Do NOT feed this back into g_ScreenWidth/Height here (that is fix A2).
+        DEVMODE appliedMode;
+        ZeroMemory(&appliedMode, sizeof(appliedMode));
+        appliedMode.dmSize = sizeof(appliedMode);
+        if (EnumDisplaySettings(NULL, ENUM_CURRENT_SETTINGS, &appliedMode))
+        {
+            LogInfo("RESAPPLIED %lux%lu", appliedMode.dmPelsWidth, appliedMode.dmPelsHeight);
+            if (appliedMode.dmPelsWidth != width || appliedMode.dmPelsHeight != height)
+                LogInfo("RESAPPLIED-MISMATCH applied=%lux%lu expected=%lux%lu",
+                    appliedMode.dmPelsWidth, appliedMode.dmPelsHeight, width, height);
+        }
+        else
+        {
+            LogWarning("EnumDisplaySettings(ENUM_CURRENT_SETTINGS) failed, cannot verify applied resolution");
+        }
+
         g_ScreenWidth = width;
         g_ScreenHeight = height;
         // save last-set resolution to use on next startup
@@ -215,12 +243,12 @@ static DWORD WINAPI ResolutionChangeThread(void *param)
         // We can change the resolution now.
         LogInfo("resolution change: %dx%d", args->Width, args->Height);
 
-        SetVideoMode(args->Width, args->Height);
+        SetVideoMode(args->Width, args->Height, args->Source);
     }
     return ERROR_SUCCESS;
 }
 
-DWORD RequestResolutionChange(IN LONG width, IN LONG height)
+DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* source)
 {
     static RESOLUTION_THREAD_PARAMS threadArgs = { 0 };
 
@@ -245,6 +273,7 @@ DWORD RequestResolutionChange(IN LONG width, IN LONG height)
 
     threadArgs.Width = width;
     threadArgs.Height = height;
+    threadArgs.Source = source;
     if (!SetEvent(threadArgs.Event))
         return win_perror("signaling resolution change request event");
 

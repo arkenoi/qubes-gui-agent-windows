@@ -1889,7 +1889,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
         if (g_ScreenWidth != g_HostScreenWidth || g_ScreenHeight != g_HostScreenHeight)
         {
             LogDebug("Changing resolution to match host's");
-            status = RequestResolutionChange(g_HostScreenWidth, g_HostScreenHeight);
+            status = RequestResolutionChange(g_HostScreenWidth, g_HostScreenHeight, L"seamless-force");
             // FIXME: wait until the resolution actually changes?
             if (status != ERROR_SUCCESS)
             {

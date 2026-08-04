@@ -24,6 +24,8 @@
 
 #define RESOLUTION_CHANGE_TIMEOUT 500
 
-DWORD RequestResolutionChange(IN LONG width, IN LONG height);
-ULONG SetVideoMode(IN ULONG width, IN ULONG height);
+// 'source' tags where the request originated (dom0, xconf, lastapplied,
+// seamless-force) for the RESREQ/RESSNAP/RESAPPLIED instrumentation log lines.
+DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* source);
+ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source);
 void InitVideoModes();

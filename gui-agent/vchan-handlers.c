@@ -118,6 +118,7 @@ DWORD HandleXconf(void)
     // this is to preserve user-chosen resolution, it's saved by SetVideoMode
     DWORD fullscreenWidth = g_HostScreenWidth;
     DWORD fullscreenHeight = g_HostScreenHeight;
+    const WCHAR* source = L"xconf"; // instrumentation: where the resolution request came from
 
     DWORD status = CfgReadDword(NULL, REG_CONFIG_FULLSCREEN_WIDTH_VALUE, &fullscreenWidth, NULL);
     if (status != ERROR_SUCCESS)
@@ -126,12 +127,14 @@ DWORD HandleXconf(void)
         goto end;
     }
 
+    source = L"lastapplied"; // saved FullscreenWidth/Height from the registry
+
     status = CfgReadDword(NULL, REG_CONFIG_FULLSCREEN_HEIGHT_VALUE, &fullscreenHeight, NULL);
     if (status != ERROR_SUCCESS)
         LogDebug("no saved fullscreen height, using host's (%u)", xconf.h);
 
 end:
-    return SetVideoMode(fullscreenWidth, fullscreenHeight);
+    return SetVideoMode(fullscreenWidth, fullscreenHeight, source);
 }
 
 static int BitSet(IN OUT BYTE *keys, IN int num)
@@ -559,7 +562,7 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 
         if (valid)
         {
-            DWORD status = RequestResolutionChange(configureMsg.width, configureMsg.height);
+            DWORD status = RequestResolutionChange(configureMsg.width, configureMsg.height, L"dom0");
             if (status != ERROR_SUCCESS)
                 return win_perror2(status, "requesting resolution change");
         }
