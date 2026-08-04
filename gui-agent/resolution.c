@@ -189,8 +189,8 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
     }
     else
     {
-        // instrumentation (log-only): re-read what Windows ACTUALLY applied.
-        // Do NOT feed this back into g_ScreenWidth/Height here (that is fix A2).
+        // re-read what Windows ACTUALLY applied and adopt that as the screen size;
+        // the snapped size is only the expectation, the readback wins the assignment
         DEVMODE appliedMode;
         ZeroMemory(&appliedMode, sizeof(appliedMode));
         appliedMode.dmSize = sizeof(appliedMode);
@@ -198,12 +198,17 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
         {
             LogInfo("RESAPPLIED %lux%lu", appliedMode.dmPelsWidth, appliedMode.dmPelsHeight);
             if (appliedMode.dmPelsWidth != width || appliedMode.dmPelsHeight != height)
+            {
                 LogInfo("RESAPPLIED-MISMATCH applied=%lux%lu expected=%lux%lu",
                     appliedMode.dmPelsWidth, appliedMode.dmPelsHeight, width, height);
+                LogInfo("RESADOPTED %lux%lu src=readback", appliedMode.dmPelsWidth, appliedMode.dmPelsHeight);
+            }
+            width = appliedMode.dmPelsWidth;
+            height = appliedMode.dmPelsHeight;
         }
         else
         {
-            LogWarning("EnumDisplaySettings(ENUM_CURRENT_SETTINGS) failed, cannot verify applied resolution");
+            LogWarning("EnumDisplaySettings(ENUM_CURRENT_SETTINGS) failed, keeping snapped %lux%lu", width, height);
         }
 
         g_ScreenWidth = width;
