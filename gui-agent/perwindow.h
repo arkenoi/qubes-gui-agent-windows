@@ -67,3 +67,7 @@ ULONG PwRemapWindow(IN const WINDOW_DATA* entry);
 // WINDOW_DUMP / DESTROY). Called periodically from the main loop and from the
 // MSG_WINDOW_DUMP_ACK handler.
 void PwRevokeTick(void);
+
+// TRUE while any queued per-window grant revocation is still awaiting success.
+// Drives the bounded drain on the exit path (A6).
+BOOL PwRevokePending(void);

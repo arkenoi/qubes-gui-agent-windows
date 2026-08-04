@@ -169,6 +169,14 @@ static void PwQueueRevoke(PVOID shared, ULONG* refs, PVOID buffer)
     LeaveCriticalSection(&g_PwPendingLock);
 }
 
+BOOL PwRevokePending(void)
+{
+    EnterCriticalSection(&g_PwPendingLock);
+    BOOL pending = (g_PwPending != NULL);
+    LeaveCriticalSection(&g_PwPendingLock);
+    return pending;
+}
+
 void PwRevokeTick(void)
 {
     if (!g_PwXc)

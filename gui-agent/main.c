@@ -3473,6 +3473,15 @@ ULONG StopFrameProcessing(IN OUT CAPTURE_CONTEXT** capture)
     return ERROR_SUCCESS;
 }
 
+// A6 exit-path bounds (design 2.2). The drain budget caps how long exit waits for
+// dom0 to release its grant mappings; the ring headroom is the minimum free space in
+// the write ring below which the teardown notifications are skipped outright -
+// VchanSendBuffer blocks forever on a full ring, and a wedged daemon must not be able
+// to stall shutdown. The teardown traffic is tiny (two header-only messages per
+// window), so 16 KiB of a 64 KiB ring covers hundreds of windows with margin.
+#define A6_EXIT_DRAIN_MS 2000
+#define A6_EXIT_RING_HEADROOM 16384
+
 // main event loop
 // TODO: refactor into smaller parts
 static ULONG WINAPI WatchForEvents(void)
@@ -3797,13 +3806,67 @@ static ULONG WINAPI WatchForEvents(void)
 
     LogDebug("main loop finished");
 
-    // Join the WGC capture thread BEFORE tearing the vchan down: its damage callback
-    // sends on the vchan, and closing/freeing g_Vchan (or deleting the CS later in
-    // WinMain) with that thread alive is a use-after-free.
+    // --- A6 (approved design, 2.2): bounded, leak-free exit. Previously the exit order
+    // was PwShutdown -> libvchan_close -> StopFrameProcessing -> CaptureTeardown: no
+    // per-window teardown ever ran (every attached buffer leaked its grant silently) and
+    // the screen UNMAP/DESTROY went out after g_VchanClientConnected dropped, i.e. was
+    // silently discarded. New order: notify dom0 of everything while the vchan is still
+    // open, drain the queued grant revocations with a hard time budget, then close.
+    // A dead daemon must not stall exit: VchanSendBuffer blocks FOREVER on a full ring,
+    // so when the ring lacks headroom the client is declared gone (every send below is
+    // already gated on g_VchanClientConnected) and the exit proceeds notification-less.
+
+    // Join the WGC capture thread first: its damage callback sends on the vchan (so the
+    // close below would be a use-after-free with it alive), and stopping it makes this
+    // thread the only vchan writer - the ring headroom checked once cannot shrink under
+    // the sends that follow. PwShutdown below still runs the rest of the per-window
+    // shutdown (WcShutdown is idempotent).
+    WcShutdown();
+
+    BOOL closeVchan = g_VchanClientConnected;
+    if (g_VchanClientConnected &&
+        (!libvchan_is_open(g_Vchan) || VchanGetWriteBufferSize(g_Vchan) < A6_EXIT_RING_HEADROOM))
+    {
+        LogWarning("A6EXIT vchan dead or ring full (open=%d, space=%d) - exiting without teardown notifications",
+            libvchan_is_open(g_Vchan), VchanGetWriteBufferSize(g_Vchan));
+        EnterCriticalSection(&g_VchanCriticalSection);
+        g_VchanClientConnected = FALSE;
+        LeaveCriticalSection(&g_VchanCriticalSection);
+    }
+
+    // Detach-all, at last: RemoveWindow detaches the per-window buffer (queueing its
+    // grant revocation) and sends MSG_UNMAP/MSG_DESTROY for every tracked window;
+    // ResetWatch(FALSE) is the existing machinery for exactly that sweep. Then the
+    // screen window gets its UNMAP/DESTROY too, still on the open vchan. Both paths
+    // no-op their sends if the client was declared gone above.
+    ResetWatch(FALSE);
+    if (capture)
+        StopFrameProcessing(&capture);
+
+    // Bounded drain: dom0 releases its mappings as it processes the messages above (or
+    // when the daemon exits), after which the queued revocations succeed. Retry until
+    // everything is revoked or the budget expires - never longer, even with a dead
+    // daemon still mapping every page.
+    ULONGLONG drainStart = GetTickCount64();
+    while (TRUE)
+    {
+        PwRevokeTick();
+        if (capture)
+            CaptureRevokeStaleGrants(capture, L"exit-drain");
+        if (!PwRevokePending() && !(capture && CaptureHasStaleGrants(capture)))
+            break;
+        if (GetTickCount64() - drainStart >= A6_EXIT_DRAIN_MS)
+            break;
+        Sleep(100);
+    }
+    LogInfo("A6EXIT drain finished in %I64u ms - pending revocations: per-window=%d, screen=%d",
+        GetTickCount64() - drainStart, PwRevokePending(),
+        capture ? CaptureHasStaleGrants(capture) : FALSE);
+
     PwShutdown();
 
     EnterCriticalSection(&g_VchanCriticalSection);
-    if (g_VchanClientConnected)
+    if (closeVchan)
     {
         libvchan_close(g_Vchan);
         g_VchanClientConnected = FALSE;
@@ -3812,7 +3875,7 @@ static ULONG WINAPI WatchForEvents(void)
 
     if (capture)
     {
-        StopFrameProcessing(&capture);
+        StopFrameProcessing(&capture); // no-op sends now; kept for the not-connected exit path
         CaptureTeardown(capture);
     }
 
