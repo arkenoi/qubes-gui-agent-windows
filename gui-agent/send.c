@@ -112,14 +112,22 @@ end:
 ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs,
     IN UINT ctxWidth, IN UINT ctxHeight)
 {
-    // A3 instrumentation (log-only): the header geometry below and the page count computed
-    // by the callers derive from g_ScreenWidth/Height (written by the resolution-change
-    // thread), while the grant refs were sized from the capture context's DXGI desc on the
-    // capture thread (capture.c, FRAMEBUFFER_PAGE_COUNT(ctx->width, ctx->height)). If they
-    // diverge, a short count makes dom0's gui-daemon exit(1) and a long one reads past the
-    // malloc'd grant_refs array. Log both derivations on every screen dump.
-    ULONG dumpWidth = g_ScreenWidth;
-    ULONG dumpHeight = g_ScreenHeight;
+    // Single source of truth: the header geometry (here) and the grant count (at the call
+    // sites) both derive from the capture context's DXGI desc - the size grant_refs was
+    // actually allocated for. g_ScreenWidth/Height are written by the resolution-change
+    // thread and can lag or lead the capture geometry; a count derived from them can be
+    // short (dom0's gui-daemon exit(1)s) or long (reads past the malloc'd grant_refs).
+    // The A3CHECK instrumentation stays so the fix is visible: a fixed build must log
+    // zero A3MISMATCH.
+    ULONG dumpWidth = ctxWidth;
+    ULONG dumpHeight = ctxHeight;
+    if (ctxWidth == 0 || ctxHeight == 0)
+    {
+        // capture geometry not available: keep the legacy g_Screen* path, visibly
+        LogInfo("A3FALLBACK g=%lux%lu", g_ScreenWidth, g_ScreenHeight);
+        dumpWidth = g_ScreenWidth;
+        dumpHeight = g_ScreenHeight;
+    }
     size_t pagesG = FRAMEBUFFER_PAGE_COUNT(g_ScreenWidth, g_ScreenHeight);
     size_t pagesCtx = FRAMEBUFFER_PAGE_COUNT(ctxWidth, ctxHeight);
     LogInfo("A3CHECK g=%lux%lu ctx=%ux%u pages_g=%lu pages_ctx=%lu",

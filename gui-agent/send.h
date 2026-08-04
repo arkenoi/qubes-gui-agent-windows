@@ -49,7 +49,8 @@
 #define UrgencyHint      256  // urgency
 
 // ctxWidth/ctxHeight are the capture context's DXGI-desc-derived geometry (the size the
-// grant refs were actually allocated for), passed in for the A3CHECK instrumentation.
+// grant refs were actually allocated for); the dump header is built from them, falling
+// back to g_ScreenWidth/Height only when they are unavailable (zero).
 ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs,
     IN UINT ctxWidth, IN UINT ctxHeight);
 

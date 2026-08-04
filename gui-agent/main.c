@@ -3415,8 +3415,10 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
 
     // send the whole screen framebuffer map
     // ctx->width/height are written once in CaptureInitialize, before the capture thread
-    // starts, so reading them here is as safe as the grant_refs read below.
-    status = SendScreenGrants(FRAMEBUFFER_PAGE_COUNT(g_ScreenWidth, g_ScreenHeight), (*capture)->grant_refs,
+    // starts, so reading them here is as safe as the grant_refs read below. The page count
+    // MUST come from them, not g_ScreenWidth/Height: grant_refs was allocated for exactly
+    // FRAMEBUFFER_PAGE_COUNT(ctx->width, ctx->height) entries (capture.c, GetFrame).
+    status = SendScreenGrants(FRAMEBUFFER_PAGE_COUNT((*capture)->width, (*capture)->height), (*capture)->grant_refs,
         (*capture)->width, (*capture)->height);
     if (ERROR_SUCCESS != status)
         return win_perror2(status, "SendScreenGrants");
@@ -3565,7 +3567,7 @@ static ULONG WINAPI WatchForEvents(void)
                 {
                     capture->grants_changed = FALSE;
                     ULONG grantStatus = SendScreenGrants(
-                        FRAMEBUFFER_PAGE_COUNT(g_ScreenWidth, g_ScreenHeight),
+                        FRAMEBUFFER_PAGE_COUNT(capture->width, capture->height),
                         capture->grant_refs, capture->width, capture->height);
                     if (grantStatus != ERROR_SUCCESS)
                         win_perror2(grantStatus, "SendScreenGrants (after recreate)");
