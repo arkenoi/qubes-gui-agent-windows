@@ -24,6 +24,7 @@
 #include "common.h"
 #include "main.h"
 #include "vchan.h"
+#include "capture.h" // CaptureRevokeStaleGrants (A6 window-0 dump ack)
 #include "vchan-handlers.h"
 #include "send.h"
 #include "perwindow.h"
@@ -652,7 +653,8 @@ static DWORD HandleDestroy(IN HWND window, OUT BOOL* screenDestroyed)
     return ERROR_SUCCESS;
 }
 
-DWORD HandleServerData(BOOL replyToMessages, OUT BOOL* screenDestroyed)
+DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* capture OPTIONAL,
+    OUT BOOL* screenDestroyed)
 {
     struct msg_hdr header;
     BYTE discardBuffer[256];
@@ -701,6 +703,14 @@ DWORD HandleServerData(BOOL replyToMessages, OUT BOOL* screenDestroyed)
     case MSG_WINDOW_DUMP_ACK:
         // no body; the daemon has processed a WINDOW_DUMP, so superseded grants for
         // that window can now be revoked
+        if (header.window == 0 && capture)
+        {
+            // A6: dom0 has adopted the new screen dump - handle_window_dump releases
+            // the old framebuffer mapping before mapping the new refs - so the parked
+            // screen grant(s) can be revoked now.
+            LogInfo("A6ACK window-0 dump ack received");
+            CaptureRevokeStaleGrants(capture, L"ack");
+        }
         PwRevokeTick();
         status = ERROR_SUCCESS;
         break;

@@ -48,6 +48,22 @@ typedef struct _CAPTURE_FRAME
 	PERF_CAPTURE perf; // instrumentation, see perf.h (inert unless enabled)
 } CAPTURE_FRAME;
 
+// A6: a superseded screen grant awaiting revocation. dom0 releases its mapping of the
+// old framebuffer when it processes the superseding MSG_WINDOW_DUMP for window 0
+// (xside.c releases first, then maps the new refs), so revocation is gated on the
+// daemon's MSG_WINDOW_DUMP_ACK - with a timeout fallback retried by the capture thread.
+// Mirror of perwindow.c's PW_PENDING_REVOKE, but for the screen grant: that queue frees
+// its buffers with VirtualFree and revokes on the per-window xencontrol handle, neither
+// of which fits the mapped desktop surface granted on ctx->xc.
+typedef struct _STALE_GRANT
+{
+	void* framebuffer;             // grant handle == the granted address
+	ULONG* grant_refs;
+	ULONGLONG deadline;            // GetTickCount64() past which the timeout fallback fires
+	BOOL timeout_logged;
+	struct _STALE_GRANT* next;
+} STALE_GRANT;
+
 typedef struct _CAPTURE_CONTEXT
 {
 	UINT width;
@@ -71,6 +87,10 @@ typedef struct _CAPTURE_CONTEXT
 	HANDLE ready_event; // main loop -> capture thread: frame processed
 	HANDLE error_event; // capture thread -> main loop: capture error
 	CAPTURE_FRAME frame; // current frame data
+	// A6: superseded screen grants awaiting revocation (see STALE_GRANT above).
+	// stale_lock is a leaf lock: never take another lock while holding it.
+	CRITICAL_SECTION stale_lock;
+	STALE_GRANT* stale_grants;
 } CAPTURE_CONTEXT;
 
 // initialize capture interfaces and map framebuffer
@@ -83,3 +103,12 @@ HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx);
 void CaptureStop(IN OUT CAPTURE_CONTEXT* ctx);
 
 void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx);
+
+// A6: try to revoke every parked (superseded) screen grant now, regardless of the ack
+// deadline. Call when dom0 acknowledged the window-0 MSG_WINDOW_DUMP (it has released
+// its old mapping), on the exit drain, and from teardown. `why` tags the log line.
+// Never blocks: one revoke attempt per parked grant; failures stay queued.
+void CaptureRevokeStaleGrants(IN OUT CAPTURE_CONTEXT* ctx, IN const WCHAR* why);
+
+// A6: TRUE while any superseded screen grant is still awaiting successful revocation.
+BOOL CaptureHasStaleGrants(IN CAPTURE_CONTEXT* ctx);

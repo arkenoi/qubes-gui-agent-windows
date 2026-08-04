@@ -3745,7 +3745,7 @@ static ULONG WINAPI WatchForEvents(void)
             BOOL screenDestroyed = FALSE;
             while (VchanGetReadBufferSize(g_Vchan) > 0)
             {
-                status = HandleServerData(!g_LocalScreenDestroyed, &screenDestroyed);
+                status = HandleServerData(!g_LocalScreenDestroyed, capture, &screenDestroyed);
                 if (ERROR_SUCCESS != status)
                 {
                     exitLoop = TRUE;

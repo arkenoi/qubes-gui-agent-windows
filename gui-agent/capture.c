@@ -33,6 +33,10 @@
 // TODO: configure timeout through registry config (milliseconds)
 #define FRAME_TIMEOUT 1000
 
+// A6: how long a superseded screen grant waits for dom0's MSG_WINDOW_DUMP_ACK before
+// the capture thread falls back to retrying the revocation on its own (design 2.1).
+#define A6_ACK_TIMEOUT_MS 5000
+
 volatile LONG g_CaptureThreadEnable = 0;
 
 static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout);
@@ -209,6 +213,94 @@ static void AttachCaptureThreadToInputDesktop(void)
     (void)previous;
 }
 
+// A6: park the current screen grant for later, ack-gated revocation and clear the
+// context's grant fields so GetFrame re-maps and re-grants the next surface. dom0 still
+// maps these pages - revoking here is the revoke-before-notify inversion this design
+// removes (the revoke could fail, admitted in-code at the old call site). Called with
+// ctx->frame.lock held; takes only the leaf stale_lock inside.
+static void ParkStaleScreenGrant(IN OUT CAPTURE_CONTEXT* ctx)
+{
+    STALE_GRANT* s = (STALE_GRANT*)malloc(sizeof(*s));
+    if (!s)
+    {
+        // Out of memory: better the old immediate (possibly failing) revoke than an
+        // untracked leak.
+        ULONG status = XcGnttabRevokeForeignAccess(ctx->xc, ctx->framebuffer);
+        if (status != ERROR_SUCCESS)
+            win_perror2(status, "XcGnttabRevokeForeignAccess (park OOM fallback)");
+        free(ctx->grant_refs);
+    }
+    else
+    {
+        s->framebuffer = ctx->framebuffer;
+        s->grant_refs = ctx->grant_refs;
+        s->deadline = GetTickCount64() + A6_ACK_TIMEOUT_MS;
+        s->timeout_logged = FALSE;
+        EnterCriticalSection(&ctx->stale_lock);
+        s->next = ctx->stale_grants;
+        ctx->stale_grants = s;
+        LeaveCriticalSection(&ctx->stale_lock);
+        LogInfo("A6PARK old screen grant %p parked, awaiting window-0 MSG_WINDOW_DUMP_ACK", s->framebuffer);
+    }
+    ctx->grant_refs = NULL;
+    ctx->framebuffer = NULL;
+}
+
+// A6: one revoke attempt per parked grant. force revokes everything now (ack received,
+// exit drain, teardown); !force is the capture-thread tick and touches only grants whose
+// ack deadline has passed, logging the fallback loudly once per grant. Failures stay
+// queued for the next call - no waiting, no spinning, bounded work per call.
+static void StaleGrantSweep(IN OUT CAPTURE_CONTEXT* ctx, IN BOOL force, IN const WCHAR* why)
+{
+    EnterCriticalSection(&ctx->stale_lock);
+    STALE_GRANT** link = &ctx->stale_grants;
+    while (*link)
+    {
+        STALE_GRANT* s = *link;
+        if (!force && GetTickCount64() < s->deadline)
+        {
+            link = &s->next;
+            continue;
+        }
+        if (!force && !s->timeout_logged)
+        {
+            s->timeout_logged = TRUE;
+            LogWarning("A6ACKTIMEOUT no window-0 dump ack within %u ms for old grant %p"
+                " - falling back to revoke retries on the capture tick",
+                A6_ACK_TIMEOUT_MS, s->framebuffer);
+        }
+        ULONG status = XcGnttabRevokeForeignAccess(ctx->xc, s->framebuffer);
+        if (status == ERROR_SUCCESS)
+        {
+            LogInfo("A6REVOKE old screen grant %p revoked (%s)", s->framebuffer, why);
+            *link = s->next;
+            free(s->grant_refs);
+            free(s);
+        }
+        else
+        {
+            // Expected while dom0 still maps the pages; converges once the daemon
+            // processes the superseding dump (or exits).
+            LogVerbose("old screen grant %p still busy: 0x%x", s->framebuffer, status);
+            link = &s->next;
+        }
+    }
+    LeaveCriticalSection(&ctx->stale_lock);
+}
+
+void CaptureRevokeStaleGrants(IN OUT CAPTURE_CONTEXT* ctx, IN const WCHAR* why)
+{
+    StaleGrantSweep(ctx, TRUE, why);
+}
+
+BOOL CaptureHasStaleGrants(IN CAPTURE_CONTEXT* ctx)
+{
+    EnterCriticalSection(&ctx->stale_lock);
+    BOOL any = (ctx->stale_grants != NULL);
+    LeaveCriticalSection(&ctx->stale_lock);
+    return any;
+}
+
 static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
 {
     const UINT maxAttempts = 20;
@@ -246,15 +338,12 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
     // grants when grant_refs is NULL, so leaving it set means the agent never looks at the
     // new surface and the daemon reads the old pages forever - windows stay mapped and
     // correctly positioned, but their contents freeze at the moment of the loss.
+    // A6: the grant is PARKED, not revoked - dom0 still maps these pages and releases
+    // them only when it processes the superseding window-0 MSG_WINDOW_DUMP; revocation
+    // happens on its MSG_WINDOW_DUMP_ACK (or the timeout fallback). Both grants are
+    // transiently live, which the grant table comfortably holds (design 2.1).
     if (ctx->xc && ctx->grant_refs)
-    {
-        ULONG revokeStatus = XcGnttabRevokeForeignAccess(ctx->xc, ctx->framebuffer);
-        if (revokeStatus != ERROR_SUCCESS)
-            win_perror2(revokeStatus, "XcGnttabRevokeForeignAccess (recreate)");
-        free(ctx->grant_refs);
-        ctx->grant_refs = NULL;
-        ctx->framebuffer = NULL;
-    }
+        ParkStaleScreenGrant(ctx);
     LeaveCriticalSection(&ctx->frame.lock);
 
     for (UINT attempt = 0; attempt < maxAttempts; attempt++)
@@ -363,6 +452,7 @@ CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event)
         exit(ERROR_OUTOFMEMORY);
 
     InitializeCriticalSection(&ctx->frame.lock);
+    InitializeCriticalSection(&ctx->stale_lock); // A6: parked-grant list
 
     DWORD status = XcOpen(XcLogger, &ctx->xc);
     if (status != ERROR_SUCCESS)
@@ -439,9 +529,18 @@ void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx)
         }
     }
 
+    // A6: last chance for any parked grants (the capture thread is already joined).
+    // Failures here mean dom0 still maps the pages; mirror perwindow.c's shutdown and
+    // leak them loudly rather than free bookkeeping for a live grant.
+    if (ctx->xc)
+        StaleGrantSweep(ctx, TRUE, L"teardown");
+    if (ctx->stale_grants)
+        LogWarning("A6LEAK leaking un-revoked superseded screen grant(s) at capture teardown");
+
     ReleaseFrame(ctx);
 
     DeleteCriticalSection(&ctx->frame.lock);
+    DeleteCriticalSection(&ctx->stale_lock);
 
     if (ctx->duplication)
         IDXGIOutputDuplication_Release(ctx->duplication);
@@ -745,6 +844,11 @@ static DWORD WINAPI CaptureThread(void* param)
             LogDebug("stopping (disabled)");
             break;
         }
+
+        // A6 timeout fallback: this loop runs at least once per FRAME_TIMEOUT even on an
+        // idle desktop, so parked grants whose ack deadline passed are retried here.
+        // One attempt per grant per pass - never a wait.
+        StaleGrantSweep(capture, FALSE, L"timeout");
 
         status = GetFrame(capture, FRAME_TIMEOUT);
         if (FAILED(status))

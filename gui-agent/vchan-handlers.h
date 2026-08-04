@@ -22,6 +22,11 @@
 #pragma once
 #include <windef.h>
 
+struct _CAPTURE_CONTEXT; // capture.h; only a pointer is needed here
+
 DWORD HandleVersion(void);
 DWORD HandleXconf(void);
-DWORD HandleServerData(BOOL replyToMessages, OUT BOOL* screenDestroyed);
+// capture may be NULL (no active capture context); it is only used to revoke parked
+// screen grants when the daemon acks the window-0 MSG_WINDOW_DUMP (A6).
+DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* capture OPTIONAL,
+    OUT BOOL* screenDestroyed);
