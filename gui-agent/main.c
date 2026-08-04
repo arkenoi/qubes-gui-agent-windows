@@ -3562,18 +3562,27 @@ static ULONG WINAPI WatchForEvents(void)
                     if (g_SeamlessMode)
                     {
                         EnterCriticalSection(&g_csWatchedWindows);
-                        WINDOW_DATA* repaint = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
-                        while (repaint != (WINDOW_DATA*)&g_WatchedWindowsList)
+                        // Advance from the LIST_ENTRY, not from the converted record: the
+                        // `continue` below skips the tail of the loop body, so an advance
+                        // placed there was skipped for every synthesized window - leaving
+                        // `repaint` pointing at the already-converted WINDOW_DATA and
+                        // re-applying CONTAINING_RECORD to it on the next pass, which walks
+                        // the pointer backwards by offsetof(WINDOW_DATA, ListEntry) (~1 KB)
+                        // into unrelated heap and loops there reading garbage, on the main
+                        // event-loop thread, holding this critical section.
+                        for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
+                             e != &g_WatchedWindowsList;
+                             e = e->Flink)
                         {
-                            repaint = CONTAINING_RECORD(repaint, WINDOW_DATA, ListEntry);
-                            if (repaint->Synthesized) continue;
+                            WINDOW_DATA* repaint = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+                            if (repaint->Synthesized)
+                                continue; // painted into its owner; it has no buffer of its own
                             if (repaint->IsVisible && !repaint->IsIconic &&
                                 repaint->Width > 0 && repaint->Height > 0)
                             {
                                 SendWindowDamageEvent(repaint->Handle, 0, 0,
                                     repaint->Width, repaint->Height);
                             }
-                            repaint = (WINDOW_DATA*)repaint->ListEntry.Flink;
                         }
                         LeaveCriticalSection(&g_csWatchedWindows);
                     }
