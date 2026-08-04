@@ -3449,6 +3449,32 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
     return ERROR_SUCCESS;
 }
 
+// During a display mode switch or monitor replug DXGI can refuse duplication for several
+// seconds (observed: 0x887A0026 "keyed mutex abandoned" formatting of ACCESS_LOST,
+// 0x887A0005 device suspended). Treating that as fatal turned every topology change into an
+// agent crash + watchdog respawn, which then re-applied a stale cached resolution
+// (FINDINGS 2026-08-05). Retry briefly before giving up; anything else stays fatal.
+static ULONG StartFrameProcessingWithRetry(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent, OUT CAPTURE_CONTEXT** capture)
+{
+    ULONG status = ERROR_SUCCESS;
+    for (int attempt = 0; attempt < 10; attempt++)
+    {
+        if (attempt > 0)
+            Sleep(750);
+        status = StartFrameProcessing(newFrameEvent, captureErrorEvent, capture);
+        if (ERROR_SUCCESS == status)
+        {
+            if (attempt > 0)
+                LogInfo("A7RETRY capture initialized after %d retries", attempt);
+            return ERROR_SUCCESS;
+        }
+        if (status != 0x887A0026 && status != 0x887A0005)
+            break; // not a known-transient DXGI failure
+        LogWarning("A7RETRY transient capture init failure 0x%x, attempt %d", status, attempt + 1);
+    }
+    return status;
+}
+
 // CaptureTeardown() must be called separately after gui daemon confirms screen destruction
 ULONG StopFrameProcessing(IN OUT CAPTURE_CONTEXT** capture)
 {
@@ -3727,7 +3753,7 @@ static ULONG WINAPI WatchForEvents(void)
                 WorkAreaInit();
                 WorkAreaApply();
 
-                status = StartFrameProcessing(newFrameEvent, captureErrorEvent, &capture);
+                status = StartFrameProcessingWithRetry(newFrameEvent, captureErrorEvent, &capture);
                 if (ERROR_SUCCESS != status)
                 {
                     win_perror2(status, "StartFrameProcessing");
@@ -3769,7 +3795,7 @@ static ULONG WINAPI WatchForEvents(void)
                 LogDebug("gui daemon confirms screen destruction");
                 CaptureTeardown(capture);
                 capture = NULL;
-                status = StartFrameProcessing(newFrameEvent, captureErrorEvent, &capture);
+                status = StartFrameProcessingWithRetry(newFrameEvent, captureErrorEvent, &capture);
                 if (ERROR_SUCCESS != status)
                 {
                     win_perror2(status, "StartFrameProcessing");
