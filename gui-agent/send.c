@@ -29,6 +29,7 @@
 #include "perf.h"
 #include "main.h"
 #include "vchan.h"
+#include "capture.h" // FRAMEBUFFER_PAGE_COUNT, for the A3CHECK instrumentation
 
 #include <qubes-gui-protocol.h>
 
@@ -108,9 +109,26 @@ end:
     return status;
 }
 
-ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs)
+ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs,
+    IN UINT ctxWidth, IN UINT ctxHeight)
 {
-    return SendWindowDump(NULL, g_ScreenWidth, g_ScreenHeight, numGrants, refs);
+    // A3 instrumentation (log-only): the header geometry below and the page count computed
+    // by the callers derive from g_ScreenWidth/Height (written by the resolution-change
+    // thread), while the grant refs were sized from the capture context's DXGI desc on the
+    // capture thread (capture.c, FRAMEBUFFER_PAGE_COUNT(ctx->width, ctx->height)). If they
+    // diverge, a short count makes dom0's gui-daemon exit(1) and a long one reads past the
+    // malloc'd grant_refs array. Log both derivations on every screen dump.
+    ULONG dumpWidth = g_ScreenWidth;
+    ULONG dumpHeight = g_ScreenHeight;
+    size_t pagesG = FRAMEBUFFER_PAGE_COUNT(g_ScreenWidth, g_ScreenHeight);
+    size_t pagesCtx = FRAMEBUFFER_PAGE_COUNT(ctxWidth, ctxHeight);
+    LogInfo("A3CHECK g=%lux%lu ctx=%ux%u pages_g=%lu pages_ctx=%lu",
+        g_ScreenWidth, g_ScreenHeight, ctxWidth, ctxHeight, (ULONG)pagesG, (ULONG)pagesCtx);
+    if (dumpWidth != ctxWidth || dumpHeight != ctxHeight || numGrants != pagesCtx)
+        LogInfo("A3MISMATCH sent=%lux%lu pages_sent=%lu ctx=%ux%u pages_ctx=%lu",
+            dumpWidth, dumpHeight, (ULONG)numGrants, ctxWidth, ctxHeight, (ULONG)pagesCtx);
+
+    return SendWindowDump(NULL, dumpWidth, dumpHeight, numGrants, refs);
 }
 
 // --- recently-destroyed window ring -------------------------------------------------

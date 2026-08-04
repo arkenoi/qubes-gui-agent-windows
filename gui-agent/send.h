@@ -48,7 +48,10 @@
 #define MessageHint      128  // (this bit is obsolete)
 #define UrgencyHint      256  // urgency
 
-ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs);
+// ctxWidth/ctxHeight are the capture context's DXGI-desc-derived geometry (the size the
+// grant refs were actually allocated for), passed in for the A3CHECK instrumentation.
+ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs,
+    IN UINT ctxWidth, IN UINT ctxHeight);
 
 // Per-window MSG_WINDOW_DUMP: announce a window's own framebuffer (grant refs) to the
 // daemon. window==0 is the whole-screen dump (SendScreenGrants).
