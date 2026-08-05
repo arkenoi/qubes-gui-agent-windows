@@ -348,6 +348,38 @@ BOOL ResolutionExactObtainInFlight(void)
     return g_ExactInFlight != 0;
 }
 
+// Sizes the desktop transited during the current/last obtain (recorded by the
+// recovery path when it suppresses A6CONFIGURE). Only THESE, plus the pre-apply
+// size, are echo suspects - anything else inside the settle window is genuine
+// user intent and must be applied (a settled drag's request never re-arrives, so
+// dropping it loses it: measured 2026-08-05, RESECHO ate a real 2055x1308).
+#define ECHO_SUSPECT_MAX 6
+static ULONG g_EchoSuspectW[ECHO_SUSPECT_MAX], g_EchoSuspectH[ECHO_SUSPECT_MAX];
+static DWORD g_EchoSuspectCount;
+
+void ResolutionNoteTransitSize(IN ULONG width, IN ULONG height)
+{
+    for (DWORD i = 0; i < g_EchoSuspectCount; i++)
+        if (g_EchoSuspectW[i] == width && g_EchoSuspectH[i] == height)
+            return;
+    if (g_EchoSuspectCount < ECHO_SUSPECT_MAX)
+    {
+        g_EchoSuspectW[g_EchoSuspectCount] = width;
+        g_EchoSuspectH[g_EchoSuspectCount] = height;
+        g_EchoSuspectCount++;
+    }
+}
+
+static BOOL IsEchoSuspect(IN ULONG width, IN ULONG height)
+{
+    if (width == g_EchoPrevW && height == g_EchoPrevH)
+        return TRUE;
+    for (DWORD i = 0; i < g_EchoSuspectCount; i++)
+        if (g_EchoSuspectW[i] == width && g_EchoSuspectH[i] == height)
+            return TRUE;
+    return FALSE;
+}
+
 static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
 {
     if (!IS_RESOLUTION_VALID(width, height))
@@ -362,25 +394,32 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
         return ERROR_SUCCESS;
     }
 
-    // Echo suppression, two cases: (1) within the settle window after an apply, a
-    // request for a size that is NOT the size just applied is a daemon echo of a
-    // stale or mid-replug-transit size, never fresh intent (real intent keeps
-    // requesting and re-arrives after the window); (2) same while an obtain is
-    // still in flight. Case (1) generalizes the earlier pre-apply-size-only check:
-    // the desktop transits through intermediate modes during a replug and the
-    // daemon can echo ANY of them (measured: 1920x1080 transit echoed 1.3 s after
-    // a 1989x888 apply and reverted it).
-    if (g_EchoWindowEnd != 0 && GetTickCount64() < g_EchoWindowEnd &&
-        !(width == g_ExactTargetW && height == g_ExactTargetH))
+    // Echo handling inside the settle window after an apply. Only KNOWN-SUSPECT
+    // sizes (the pre-apply size and sizes the desktop transited during the
+    // obtain) are treated as possible daemon echoes - and even those are
+    // DEFERRED to the window's end rather than dropped, then applied: a settled
+    // drag's request never re-arrives, so a dropped genuine request is lost
+    // forever (measured: a real 2055x1308 was eaten by the drop version).
+    // Anything else is fresh user intent and applies immediately. Worst case for
+    // a residual echo: one late bounce, which converges (each apply is exact and
+    // the daemon follows it).
+    if (g_EchoWindowEnd != 0 && width != g_ExactTargetW && IsEchoSuspect(width, height))
     {
-        LogInfo("RESECHO %lux%lu dropped (settle window after %lux%lu apply)",
-            width, height, g_ExactTargetW, g_ExactTargetH);
-        return ERROR_SUCCESS;
+        ULONGLONG now = GetTickCount64();
+        if (now < g_EchoWindowEnd)
+        {
+            LogInfo("RESECHO %lux%lu suspect - deferring %I64u ms (settle window after %lux%lu)",
+                width, height, g_EchoWindowEnd - now, g_ExactTargetW, g_ExactTargetH);
+            Sleep((DWORD)(g_EchoWindowEnd - now));
+            // latest-wins still holds: if a newer request arrived meanwhile, the
+            // resolution thread's event is set and it will supersede this apply.
+        }
     }
 
     BOOL replugged = FALSE;
     g_ExactTargetW = width;
     g_ExactTargetH = height;
+    g_EchoSuspectCount = 0; // fresh obtain, fresh transit list
     InterlockedExchange(&g_ExactInFlight, 1);
     if (!IsExactModeAvailable(width, height))
     {

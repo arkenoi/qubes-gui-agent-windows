@@ -3750,6 +3750,7 @@ static ULONG WINAPI WatchForEvents(void)
                         {
                             LogInfo("A6CONFIGURE suppressed (transitional %ux%u during exact-obtain)",
                                 capture->width, capture->height);
+                            ResolutionNoteTransitSize(capture->width, capture->height);
                         }
                         else
                         {
