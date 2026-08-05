@@ -47,8 +47,8 @@ static DWORD InjectInput(IN INPUT* inputEvent, IN const char* what)
         return ERROR_SUCCESS;
 
     DWORD status = GetLastError();
-    win_perror2(status, what);
-    LogWarning("dropping input event (injection unavailable, likely secure desktop), re-attaching input desktop");
+    UNREFERENCED_PARAMETER(what);
+    LogWarning("SendInput failed with error 0x%x - dropping input event (likely secure desktop), re-attaching input desktop", status);
     AttachToInputDesktop(); // best effort - failure means we retry on a later event
     return ERROR_SUCCESS; // deliberately never fatal
 }
