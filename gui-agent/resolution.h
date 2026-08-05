@@ -22,7 +22,12 @@
 #pragma once
 #include <windef.h>
 
-#define RESOLUTION_CHANGE_TIMEOUT 500
+// Rolling quiet-period before a dom0-requested resolution is applied. 500 ms fired
+// mid-drag on every hesitation, so a window drag produced a stream of mode changes -
+// each one display-topology churn implicated in the guest livelock (FINDINGS
+// 2026-08-05). 1200 ms keeps single deliberate resizes responsive while riding out
+// drag hesitations.
+#define RESOLUTION_CHANGE_TIMEOUT 1200
 
 // 'source' tags where the request originated (dom0, xconf, lastapplied,
 // seamless-force) for the RESREQ/RESSNAP/RESAPPLIED instrumentation log lines.
