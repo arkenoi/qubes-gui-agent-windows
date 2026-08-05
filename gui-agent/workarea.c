@@ -7,6 +7,7 @@
 #include "common.h"
 #include "main.h"
 #include "workarea.h"
+#include "resolution.h"
 
 #include <log.h>
 #include <config.h>
@@ -235,6 +236,32 @@ void WorkAreaSetDom0(int x, int y, int w, int h, int fl, int fr, int ft, int fb)
     g_WaFrame[3] = fb;
     g_WaDom0Valid = TRUE;
     LeaveCriticalSection(&g_WaLock);
+
+    // The feed drives the published IDD mode set (maximize/tile sizes); keep it
+    // current. Registry-only on change - no reload, no blink (see resolution.c).
+    ResolutionRecomputeIddModeSet();
+}
+
+BOOL WorkAreaGetDom0Raw(int* x, int* y, int* w, int* h, int* fl, int* fr, int* ft, int* fb)
+{
+    if (!g_WaLockInit)
+        return FALSE;
+
+    EnterCriticalSection(&g_WaLock);
+    BOOL valid = g_WaDom0Valid;
+    if (valid)
+    {
+        *x = g_WaDom0.left;
+        *y = g_WaDom0.top;
+        *w = g_WaDom0.right - g_WaDom0.left;
+        *h = g_WaDom0.bottom - g_WaDom0.top;
+        *fl = g_WaFrame[0];
+        *fr = g_WaFrame[1];
+        *ft = g_WaFrame[2];
+        *fb = g_WaFrame[3];
+    }
+    LeaveCriticalSection(&g_WaLock);
+    return valid;
 }
 
 void WorkAreaNoteDaemonOrigin(int x, int y)
@@ -263,6 +290,19 @@ static BOOL WaParseDom0Value(const char* v)
     return TRUE;
 }
 
+// One read of /qubes-workarea -> WorkAreaSetDom0. Returns TRUE if a valid value
+// was read and stored.
+static BOOL WaReadDom0(qdb_handle_t h)
+{
+    unsigned len = 0;
+    char* v = qdb_read(h, QDB_WORKAREA_PATH, &len);
+    if (!v)
+        return FALSE;
+    BOOL ok = WaParseDom0Value(v);
+    free(v);
+    return ok;
+}
+
 // Watch thread: deliver /qubes-workarea (written by the dom0 watcher script)
 // and its changes. The value survives dom0 panel/monitor hotplug because the
 // watcher re-writes on _NET_WORKAREA changes. Reconnects if qubesdb-daemon
@@ -279,14 +319,8 @@ static DWORD WINAPI WaWatchThread(PVOID param)
             continue;
         }
 
-        unsigned len = 0;
-        char* v = qdb_read(h, QDB_WORKAREA_PATH, &len);
-        if (v)
-        {
-            if (WaParseDom0Value(v))
-                WorkAreaApply();
-            free(v);
-        }
+        if (WaReadDom0(h))
+            WorkAreaApply();
 
         if (qdb_watch(h, QDB_WORKAREA_PATH))
         {
@@ -294,13 +328,8 @@ static DWORD WINAPI WaWatchThread(PVOID param)
             while ((ev = qdb_read_watch(h)) != NULL)
             {
                 free(ev);
-                v = qdb_read(h, QDB_WORKAREA_PATH, &len);
-                if (v)
-                {
-                    if (WaParseDom0Value(v))
-                        WorkAreaApply();
-                    free(v);
-                }
+                if (WaReadDom0(h))
+                    WorkAreaApply();
             }
         }
 
@@ -478,6 +507,18 @@ void WorkAreaInit(void)
         return;
     WorkAreaLockInit(); // no-op when Init() already ran it (the normal path)
     g_WaInitDone = TRUE;
+
+    // One synchronous read of the dom0 feed before the watch thread exists:
+    // consumers that run right after this in the connect sequence (WorkAreaApply,
+    // the M6 boot mode-set publish) must not race the thread's first read.
+    // Failure is fine - the thread retries for the life of the process.
+    qdb_handle_t h = qdb_open(NULL);
+    if (h)
+    {
+        WaReadDom0(h); // apply happens in the connect sequence right after
+        qdb_close(h);
+    }
+
     HANDLE t = CreateThread(NULL, 0, WaWatchThread, NULL, 0, NULL);
     if (t)
         CloseHandle(t); // fire-and-forget; lives until process exit

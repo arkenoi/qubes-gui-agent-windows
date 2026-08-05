@@ -3923,6 +3923,11 @@ static ULONG WINAPI WatchForEvents(void)
                 WorkAreaInit();
                 WorkAreaApply();
 
+                // M6: arm the IDD's mode list with the computed set (target +
+                // maximize/tile-half) once per process, before capture starts, so
+                // the habitual sizes later switch with replug=0. Non-fatal.
+                ResolutionPublishBootModeSet();
+
                 status = StartFrameProcessingWithRetry(newFrameEvent, captureErrorEvent, &capture);
                 if (ERROR_SUCCESS != status)
                 {

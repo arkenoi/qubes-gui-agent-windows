@@ -43,4 +43,12 @@ BOOL ResolutionExactObtainInFlight(void);
 BOOL ResolutionShouldAnnounceGeometry(IN ULONG width, IN ULONG height);
 // Recovery path records desktop-transit sizes here; they become echo suspects.
 void ResolutionNoteTransitSize(IN ULONG width, IN ULONG height);
+// M6 one-shot: publish the computed IDD mode set (target + maximize/tile-half
+// from the dom0 work-area feed + fallback) and reload the driver once, so the
+// habitual sizes switch with replug=0 from first use. Non-fatal on failure.
+void ResolutionPublishBootModeSet(void);
+// M6: dom0 work-area feed changed - rewrite the registry set if it differs from
+// the last written one. Registry only, NO reload (no blink); called from
+// WorkAreaSetDom0.
+void ResolutionRecomputeIddModeSet(void);
 void InitVideoModes();

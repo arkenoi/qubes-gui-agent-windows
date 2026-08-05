@@ -56,5 +56,10 @@ void WorkAreaEnsureApplied(void);
 // Record a dom0-provided work area + frame extents (qubesdb or MSG_WORKAREA).
 void WorkAreaSetDom0(int x, int y, int w, int h, int fl, int fr, int ft, int fb);
 
+// Copy out the raw dom0 feed values as stored by WorkAreaSetDom0 (work area x,y,w,h
+// plus frame extents l/r/t/b). Returns FALSE when no dom0-sourced work area has
+// arrived yet - callers must never fabricate these from inference.
+BOOL WorkAreaGetDom0Raw(int* x, int* y, int* w, int* h, int* fl, int* fr, int* ft, int* fb);
+
 // Inference sample: a daemon-dictated window origin from MSG_CONFIGURE.
 void WorkAreaNoteDaemonOrigin(int x, int y);

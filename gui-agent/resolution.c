@@ -180,15 +180,100 @@ static BOOL IsExactModeAvailable(IN ULONG width, IN ULONG height)
     return DISP_CHANGE_SUCCESSFUL == ChangeDisplaySettings(&devMode, CDS_TEST);
 }
 
-// Publish the requested exact mode where the Qubes IDD driver picks it up on
-// monitor arrival (see REG_QUBES_IDD_KEY in include/common.h).
-static DWORD WriteRequestedIddMode(IN ULONG width, IN ULONG height)
-{
-    WCHAR modes[32]; // REG_MULTI_SZ: "WIDTHxHEIGHT\0\0"
-    ZeroMemory(modes, sizeof(modes));
-    if (FAILED(StringCchPrintf(modes, RTL_NUMBER_OF(modes) - 1, L"%lux%lu", width, height)))
-        return ERROR_INVALID_PARAMETER;
+// ---- M6: computed IDD mode set ---------------------------------------------
+// The registry mode list is a computed SET, not just the single requested entry,
+// so the user's habitual sizes (maximize, tile-half - both derived from the dom0
+// work-area feed, never fabricated from inference) are already offered and switch
+// with replug=0. Host-screen sizes are deliberately NOT added by the builder:
+// they may only enter through the target slot as an actual dom0 request.
+#define IDD_MODE_SET_MAX 8
+#define IDD_MODES_CCH 256
 
+typedef struct { ULONG w, h; } IDD_MODE;
+
+static SRWLOCK g_IddModeSetLock = SRWLOCK_INIT;
+static WCHAR g_IddModeSetLast[IDD_MODES_CCH]; // last multi-sz written to the key
+static DWORD g_IddModeSetLastCch;             // WCHARs incl. final terminator; 0 = never
+
+// Append WxH if valid, in bounds and not already present.
+static void IddModeSetAdd(IN OUT IDD_MODE* modes, IN OUT DWORD* count, IN LONG w, IN LONG h)
+{
+    if (w <= 0 || h <= 0 || !IS_RESOLUTION_VALID((ULONG)w, (ULONG)h))
+        return;
+    if (*count >= IDD_MODE_SET_MAX)
+        return;
+    for (DWORD i = 0; i < *count; i++)
+        if (modes[i].w == (ULONG)w && modes[i].h == (ULONG)h)
+            return; // dedupe
+    modes[*count].w = (ULONG)w;
+    modes[*count].h = (ULONG)h;
+    (*count)++;
+}
+
+// Build the multi-sz mode set for a target size. desc receives the M6SET log tail
+// ("n=<count> target=WxH [max=WxH] [half=WxH]", absent entries omitted); callers
+// log it when they actually write. Returns the multi-sz length in WCHARs
+// (including both terminators), 0 on failure.
+static DWORD BuildIddModeSet(IN ULONG targetW, IN ULONG targetH,
+    OUT WCHAR* multiSz, IN DWORD cchMax, OUT WCHAR* desc, IN DWORD cchDesc)
+{
+    IDD_MODE modes[IDD_MODE_SET_MAX];
+    DWORD count = 0;
+
+    // a. the target, always first (dom0's request slot)
+    IddModeSetAdd(modes, &count, (LONG)targetW, (LONG)targetH);
+
+    // b+c. habitual sizes from the dom0 work-area feed
+    int x, y, w, h, fl, fr, ft, fb;
+    LONG maxW = 0, maxH = 0, halfW = 0;
+    if (WorkAreaGetDom0Raw(&x, &y, &w, &h, &fl, &fr, &ft, &fb))
+    {
+        maxW = w - fl - fr;         // maximize: dom0 work area minus frame
+        maxH = h - ft - fb;
+        halfW = w / 2 - fl - fr;    // tile half: half the work area, same height
+        IddModeSetAdd(modes, &count, maxW, maxH);
+        IddModeSetAdd(modes, &count, halfW, maxH);
+    }
+
+    // d. safety-net fallback
+    IddModeSetAdd(modes, &count, 1024, 768);
+
+    if (count == 0)
+        return 0;
+
+    DWORD used = 0;
+    for (DWORD i = 0; i < count; i++)
+    {
+        if (cchMax - used < 13) // "99999x99999" + NUL + final multi-sz NUL
+            return 0;
+        if (FAILED(StringCchPrintf(multiSz + used, cchMax - used - 1, L"%lux%lu",
+            modes[i].w, modes[i].h)))
+            return 0;
+        used += (DWORD)wcslen(multiSz + used) + 1;
+    }
+    multiSz[used++] = L'\0'; // multi-sz double terminator
+
+    StringCchPrintf(desc, cchDesc, L"n=%lu target=%lux%lu", count, targetW, targetH);
+    WCHAR item[32];
+    if (maxW > 0 && maxH > 0 && IS_RESOLUTION_VALID((ULONG)maxW, (ULONG)maxH))
+    {
+        StringCchPrintf(item, RTL_NUMBER_OF(item), L" max=%ldx%ld", maxW, maxH);
+        StringCchCat(desc, cchDesc, item);
+    }
+    if (halfW > 0 && maxH > 0 && IS_RESOLUTION_VALID((ULONG)halfW, (ULONG)maxH))
+    {
+        StringCchPrintf(item, RTL_NUMBER_OF(item), L" half=%ldx%ld", halfW, maxH);
+        StringCchCat(desc, cchDesc, item);
+    }
+
+    return used;
+}
+
+// Write a built multi-sz to the key the Qubes IDD driver reads on monitor
+// arrival / IOCTL reload (REG_QUBES_IDD_KEY in include/common.h) and remember it
+// for change detection. Logs M6SET on success.
+static DWORD WriteIddModeSetRaw(IN const WCHAR* multiSz, IN DWORD cch, IN const WCHAR* desc)
+{
     HKEY key;
     DWORD status = RegCreateKeyEx(HKEY_LOCAL_MACHINE, REG_QUBES_IDD_KEY, 0, NULL, 0,
         KEY_SET_VALUE, NULL, &key, NULL);
@@ -196,12 +281,32 @@ static DWORD WriteRequestedIddMode(IN ULONG width, IN ULONG height)
         return win_perror2(status, "creating IDD modes registry key");
 
     status = RegSetValueEx(key, REG_QUBES_IDD_MODES_VALUE, 0, REG_MULTI_SZ,
-        (const BYTE*)modes, (DWORD)((wcslen(modes) + 2) * sizeof(WCHAR)));
+        (const BYTE*)multiSz, cch * sizeof(WCHAR));
     RegCloseKey(key);
     if (status != ERROR_SUCCESS)
         return win_perror2(status, "writing IDD modes registry value");
 
+    AcquireSRWLockExclusive(&g_IddModeSetLock);
+    memcpy(g_IddModeSetLast, multiSz, cch * sizeof(WCHAR));
+    g_IddModeSetLastCch = cch;
+    ReleaseSRWLockExclusive(&g_IddModeSetLock);
+
+    LogInfo("M6SET %s", desc);
     return ERROR_SUCCESS;
+}
+
+// Publish the computed mode set for a target size (unconditional write; callers
+// on the obtain path reload the driver afterwards).
+static DWORD WriteIddModeSet(IN ULONG targetW, IN ULONG targetH)
+{
+    WCHAR multiSz[IDD_MODES_CCH];
+    WCHAR desc[128];
+    DWORD cch = BuildIddModeSet(targetW, targetH, multiSz, RTL_NUMBER_OF(multiSz),
+        desc, RTL_NUMBER_OF(desc));
+    if (cch == 0)
+        return ERROR_INVALID_PARAMETER;
+
+    return WriteIddModeSetRaw(multiSz, cch, desc);
 }
 
 // Ask the RUNNING Qubes IDD driver to re-read the modes key via
@@ -316,6 +421,94 @@ static BOOL RestartQubesIddDevice(void)
 
     SetupDiDestroyDeviceInfoList(devList);
     return restarted;
+}
+
+// Is at least one QIDD device interface present? Guard for the boot publish so
+// non-IDD systems are left alone entirely.
+static BOOL QiddInterfacePresent(void)
+{
+    static const GUID qiddInterfaceGuid = QIDD_INTERFACE_GUID_INIT;
+
+    HDEVINFO devList = SetupDiGetClassDevs(&qiddInterfaceGuid, NULL, NULL,
+        DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
+    if (devList == INVALID_HANDLE_VALUE)
+        return FALSE;
+
+    SP_DEVICE_INTERFACE_DATA iface;
+    iface.cbSize = sizeof(iface);
+    BOOL present = SetupDiEnumDeviceInterfaces(devList, NULL, &qiddInterfaceGuid, 0, &iface);
+    SetupDiDestroyDeviceInfoList(devList);
+    return present;
+}
+
+// One-shot startup publish: arm the driver's mode list with the full computed set
+// and make it live with a single reload, so the habitual sizes switch blink-free
+// from first use. Called from the connect sequence after HandleXconf/SetVideoMode
+// and WorkAreaInit/WorkAreaApply, i.e. when g_Screen* is final and the dom0
+// work-area feed (if any) has been read. Every failure is non-fatal (NEVEREXIT):
+// log and continue - the exact-obtain path still works without it.
+void ResolutionPublishBootModeSet(void)
+{
+    static BOOL done; // connect sequence runs on the main loop thread only
+    if (done)
+        return;
+    done = TRUE;
+
+    if (!IS_RESOLUTION_VALID(g_ScreenWidth, g_ScreenHeight))
+    {
+        LogWarning("M6BOOT skipped: no valid screen size (%lux%lu)",
+            g_ScreenWidth, g_ScreenHeight);
+        return;
+    }
+
+    if (!QiddInterfacePresent())
+    {
+        LogInfo("M6BOOT skipped: QIDD interface not present");
+        return;
+    }
+
+    if (WriteIddModeSet(g_ScreenWidth, g_ScreenHeight) != ERROR_SUCCESS)
+    {
+        LogWarning("M6BOOT modes-key write failed - continuing"); // non-fatal
+        return;
+    }
+
+    if (QiddReloadModes())
+        LogInfo("M6BOOT target=%lux%lu reloaded", g_ScreenWidth, g_ScreenHeight);
+    else
+        LogWarning("M6BOOT reload failed - set published, live on next obtain");
+}
+
+// Recompute the published set when the dom0 work-area feed changes (called from
+// WorkAreaSetDom0, i.e. the qubesdb watcher and MSG_WORKAREA paths). Registry
+// rewrite ONLY, and only on an actual change - no reload: a dom0 panel move must
+// not blink the screen; the next natural obtain makes the new set live.
+void ResolutionRecomputeIddModeSet(void)
+{
+    // Target slot = the currently applied screen size (the last dom0 request that
+    // stuck). Before the first successful mode set there is no target yet; the
+    // boot publish covers first arming.
+    ULONG targetW = g_ScreenWidth, targetH = g_ScreenHeight;
+    if (!IS_RESOLUTION_VALID(targetW, targetH))
+        return;
+
+    WCHAR multiSz[IDD_MODES_CCH];
+    WCHAR desc[128];
+    DWORD cch = BuildIddModeSet(targetW, targetH, multiSz, RTL_NUMBER_OF(multiSz),
+        desc, RTL_NUMBER_OF(desc));
+    if (cch == 0)
+        return;
+
+    AcquireSRWLockShared(&g_IddModeSetLock);
+    BOOL same = (g_IddModeSetLastCch == cch &&
+        0 == memcmp(g_IddModeSetLast, multiSz, cch * sizeof(WCHAR)));
+    ReleaseSRWLockShared(&g_IddModeSetLock);
+    if (same)
+        return;
+
+    if (WriteIddModeSetRaw(multiSz, cch, desc) == ERROR_SUCCESS)
+        LogInfo("M6DEFER registry updated, live on next obtain");
+    // failure already logged by WriteIddModeSetRaw; non-fatal by design
 }
 
 // dom0's window size is the single source of truth: any applied size other than
@@ -438,10 +631,11 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     InterlockedExchange(&g_ExactInFlight, 1);
     if (!IsExactModeAvailable(width, height))
     {
-        // try to obtain the exact mode from the Qubes IDD: publish it in the
-        // driver's registry key, make the driver reload it (IOCTL preferred,
-        // PnP replug as fallback), wait for the mode to appear
-        if (WriteRequestedIddMode(width, height) != ERROR_SUCCESS)
+        // try to obtain the exact mode from the Qubes IDD: publish the computed
+        // mode set (target first) in the driver's registry key, make the driver
+        // reload it (IOCTL preferred, PnP replug as fallback), wait for the mode
+        // to appear
+        if (WriteIddModeSet(width, height) != ERROR_SUCCESS)
         {
             LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=modes-key-write-failed",
                 width, height, g_ScreenWidth, g_ScreenHeight);
