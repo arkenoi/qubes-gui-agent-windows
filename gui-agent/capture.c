@@ -740,6 +740,13 @@ void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx)
 {
     LogVerbose("start");
 
+    // NEVEREXIT hardening: with the A7 degraded state, capture is NULL for long
+    // stretches and teardown is reachable from several paths. Every current call
+    // site guards, but a NULL deref here is a crash (= an exit); make teardown
+    // NULL-safe so no future call site can turn a degraded state into one.
+    if (!ctx)
+        return;
+
     DWORD status = GetLastError(); // preserve
     CaptureStop(ctx);
 

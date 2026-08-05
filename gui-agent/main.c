@@ -3522,7 +3522,12 @@ static ULONG StartFrameProcessingWithRetry(IN HANDLE newFrameEvent, IN HANDLE ca
 ULONG StopFrameProcessing(IN OUT CAPTURE_CONTEXT** capture)
 {
     LogVerbose("start");
-    if (!capture)
+    // NEVEREXIT hardening: also check *capture - the old check only caught a NULL
+    // pointer-to-pointer (which no caller ever passes), while CaptureStop(*capture)
+    // dereferences the contained pointer, which IS legitimately NULL for long
+    // stretches in the A7 degraded state. All call sites guard today; this makes a
+    // future unguarded call a no-op instead of a crash (= an exit).
+    if (!capture || !*capture)
         return ERROR_SUCCESS;
 
     CaptureStop(*capture);
