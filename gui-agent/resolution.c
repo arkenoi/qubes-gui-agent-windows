@@ -251,7 +251,14 @@ static DWORD BuildIddModeSet(IN ULONG targetW, IN ULONG targetH,
         for (int i = 0; i < 4; i++)
         {
             IddModeSetAdd(modes, &count, cand[i][0], cand[i][1]);
-            if (g_SnapCandidateCount < RTL_NUMBER_OF(g_SnapCandidates) &&
+            // Snap targets are the BORDERED variants only (odd indices): a
+            // maximize gesture emits the borderless size EXACTLY (measured) and
+            // needs no snap, while any window close-but-not-equal is a normal
+            // bordered window - snapping it to a borderless height overflows
+            // the work area and pushes the bottom border off-screen (measured:
+            // taskbar at the last screen row, border invisible).
+            if ((i % 2) == 1 &&
+                g_SnapCandidateCount < RTL_NUMBER_OF(g_SnapCandidates) &&
                 IS_RESOLUTION_VALID((ULONG)cand[i][0], (ULONG)cand[i][1]))
             {
                 g_SnapCandidates[g_SnapCandidateCount][0] = (ULONG)cand[i][0];
