@@ -132,7 +132,12 @@ ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs,
     size_t pagesCtx = FRAMEBUFFER_PAGE_COUNT(ctxWidth, ctxHeight);
     LogInfo("A3CHECK g=%lux%lu ctx=%ux%u pages_g=%lu pages_ctx=%lu",
         g_ScreenWidth, g_ScreenHeight, ctxWidth, ctxHeight, (ULONG)pagesG, (ULONG)pagesCtx);
-    if (dumpWidth != ctxWidth || dumpHeight != ctxHeight || numGrants != pagesCtx)
+    // Count check is one-sided BY DESIGN: too small is the fatal direction - gui-daemon
+    // exit(1)s when the dump's data size is below width*height*4 (xside.c:3903-3913) -
+    // while a LARGER count is accepted. The staging grant (capture.c) intentionally
+    // sends its constant full-capacity count with every geometry, so numGrants >
+    // pagesCtx is the normal steady state there, not a mismatch.
+    if (dumpWidth != ctxWidth || dumpHeight != ctxHeight || numGrants < pagesCtx)
         LogInfo("A3MISMATCH sent=%lux%lu pages_sent=%lu ctx=%ux%u pages_ctx=%lu",
             dumpWidth, dumpHeight, (ULONG)numGrants, ctxWidth, ctxHeight, (ULONG)pagesCtx);
 

@@ -710,6 +710,10 @@ DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* cap
             // A6: dom0 has adopted the new screen dump - handle_window_dump releases
             // the old framebuffer mapping before mapping the new refs - so the parked
             // screen grant(s) can be revoked now.
+            // STAGING made the revoke arm of this DORMANT for the screen path: with
+            // the persistent staging grant nothing is ever parked (no re-grants), so
+            // the sweep below finds an empty list and no-ops. Kept for the direct-map
+            // fallback; the per-window path (PwRevokeTick below) is independent.
             LogInfo("A6ACK window-0 dump ack received");
             CaptureRevokeStaleGrants(capture, L"ack");
             // Repaint the whole screen against the mapping dom0 just adopted. Under

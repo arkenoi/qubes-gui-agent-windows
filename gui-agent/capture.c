@@ -265,6 +265,12 @@ static void AttachCaptureThreadToInputDesktop(void)
 // maps these pages - revoking here is the revoke-before-notify inversion this design
 // removes (the revoke could fail, admitted in-code at the old call site). Called with
 // ctx->frame.lock held; takes only the leaf stale_lock inside.
+//
+// STAGING made this DORMANT for the screen path: with the persistent staging grant
+// there are no screen re-grants, so nothing is ever parked (the call site is gated on
+// !uses_staging). Kept intact for the direct-map fallback (StagingGrant=0, or a
+// geometry beyond the staging capacity); the per-window path has its own machinery
+// in perwindow.c and is unaffected either way.
 static void ParkStaleScreenGrant(IN OUT CAPTURE_CONTEXT* ctx)
 {
     STALE_GRANT* s = (STALE_GRANT*)malloc(sizeof(*s));
