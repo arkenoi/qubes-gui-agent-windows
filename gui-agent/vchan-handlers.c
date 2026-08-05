@@ -29,10 +29,30 @@
 #include "send.h"
 #include "perwindow.h"
 #include "xorg-keymap.h"
+#include "util.h" // AttachToInputDesktop (input-injection resilience)
 #include "resolution.h"
 
 #include <config.h>
 #include <log.h>
+
+// Input injection must NEVER kill the agent. SendInput fails transiently whenever the
+// secure desktop owns input (UAC prompt, idle lock screen): measured 2026-08-05, one
+// denied HandleMotion made HandleServerData exit the agent, which closed the vchan and
+// took gui-daemon down with it (the user's window vanished). The event is dropped, we
+// try to re-attach to the input desktop so the NEXT event can land, and processing
+// continues. Dropping is protocol-safe: the message body was fully consumed already.
+static DWORD InjectInput(IN INPUT* inputEvent, IN const char* what)
+{
+    if (SendInput(1, inputEvent, sizeof(*inputEvent)))
+        return ERROR_SUCCESS;
+
+    DWORD status = GetLastError();
+    win_perror2(status, what);
+    LogWarning("dropping input event (injection unavailable, likely secure desktop), re-attaching input desktop");
+    AttachToInputDesktop(); // best effort - failure means we retry on a later event
+    return ERROR_SUCCESS; // deliberately never fatal
+}
+
 
 #include "workarea.h"
 
@@ -187,10 +207,7 @@ static DWORD HandleKeymapNotify(void)
             inputEvent.ki.dwFlags = KEYEVENTF_KEYUP;
             inputEvent.ki.dwExtraInfo = 0;
 
-            if (!SendInput(1, &inputEvent, sizeof(inputEvent)))
-            {
-                return win_perror("SendInput");
-            }
+            InjectInput(&inputEvent, "SendInput");
             LogDebug("unsetting key VK=0x%x (keycode=0x%x)", virtualKey, modifierKeys[i]);
         }
         i++;
@@ -225,10 +242,7 @@ static DWORD SynthesizeKeycode(IN UINT keycode, IN BOOL release)
     if (release)
         inputEvent.ki.dwFlags |= KEYEVENTF_KEYUP;
 
-    if (!SendInput(1, &inputEvent, sizeof(inputEvent)))
-    {
-        return win_perror("SendInput");
-    }
+    InjectInput(&inputEvent, "SendInput");
 
     return ERROR_SUCCESS;
 }
@@ -263,15 +277,9 @@ static DWORD HandleKeypress(IN HWND window)
         // toggle CapsLock state
         inputEvent.ki.wVk = VK_CAPITAL;
         inputEvent.ki.dwFlags = 0;
-        if (!SendInput(1, &inputEvent, sizeof(inputEvent)))
-        {
-            return win_perror("SendInput(VK_CAPITAL)");
-        }
+        InjectInput(&inputEvent, "SendInput(VK_CAPITAL)");
         inputEvent.ki.dwFlags = KEYEVENTF_KEYUP;
-        if (!SendInput(1, &inputEvent, sizeof(inputEvent)))
-        {
-            return win_perror("SendInput(KEYEVENTF_KEYUP)");
-        }
+        InjectInput(&inputEvent, "SendInput(KEYEVENTF_KEYUP)");
     }
 
     // produce the key press/release
@@ -337,10 +345,7 @@ static DWORD HandleButton(IN HWND window)
     }
 
     LogDebug("window 0x%x, (%d,%d), flags 0x%x", window, buttonMsg.x, buttonMsg.y, inputEvent.mi.dwFlags);
-    if (!SendInput(1, &inputEvent, sizeof(inputEvent)))
-    {
-        return win_perror("SendInput");
-    }
+    InjectInput(&inputEvent, "SendInput");
 
     return ERROR_SUCCESS;
 }
@@ -402,10 +407,7 @@ static DWORD HandleMotion(IN HWND window)
     inputEvent.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
     inputEvent.mi.dwExtraInfo = 0;
 
-    if (!SendInput(1, &inputEvent, sizeof(inputEvent)))
-    {
-        return win_perror("SendInput");
-    }
+    InjectInput(&inputEvent, "SendInput");
 
     return ERROR_SUCCESS;
 }
