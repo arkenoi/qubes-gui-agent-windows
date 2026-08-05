@@ -173,6 +173,41 @@ DWORD HandleXconf(void)
         LogDebug("no saved fullscreen height, using host's (%u)", xconf.h);
 
 end:
+    // A4CLAMP (A4/M2b-lite): the cached FullscreenWidth/Height can be the HOST
+    // screen size (saved while the window really was fullscreen). Applying it at
+    // boot makes gui-daemon's dom0 window fullscreen-sized, which the WM treats as
+    // maximized - wedging the window. Host-size modes are legitimate ONLY when the
+    // window is actually fullscreen, so clamp the boot size to the dom0 work-area
+    // maximize ceiling. HandleXconf runs BEFORE WorkAreaInit, so trigger one
+    // synchronous feed read first; if the feed is unavailable, do NOT fabricate a
+    // ceiling - keep the existing behavior unchanged.
+    {
+        int wax, way, waw, wah, wafl, wafr, waft, wafb;
+        BOOL haveCeiling = FALSE;
+
+        WorkAreaSyncReadDom0(); // result irrelevant: the accessor is the authority
+        if (WorkAreaGetDom0Raw(&wax, &way, &waw, &wah, &wafl, &wafr, &waft, &wafb))
+        {
+            int maxW = waw - wafl - wafr;
+            int maxH = wah - waft - wafb;
+            if (maxW > 0 && maxH > 0)
+            {
+                haveCeiling = TRUE;
+                if (fullscreenWidth > (DWORD)maxW || fullscreenHeight > (DWORD)maxH)
+                {
+                    DWORD clampedW = fullscreenWidth > (DWORD)maxW ? (DWORD)maxW : fullscreenWidth;
+                    DWORD clampedH = fullscreenHeight > (DWORD)maxH ? (DWORD)maxH : fullscreenHeight;
+                    LogInfo("A4CLAMP boot size %ux%u -> %ux%u (work-area ceiling)",
+                        fullscreenWidth, fullscreenHeight, clampedW, clampedH);
+                    fullscreenWidth = clampedW;
+                    fullscreenHeight = clampedH;
+                }
+            }
+        }
+        if (!haveCeiling)
+            LogDebug("A4CLAMP unavailable (no dom0 work area)");
+    }
+
     // NEVEREXIT (CONVERT, was fatal): a resolution we couldn't set is not a reason to
     // die - the vchan is fine and capture runs at whatever mode is current. This was
     // the one HandleXconf failure that killed the agent at connect time.

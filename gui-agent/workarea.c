@@ -303,6 +303,19 @@ static BOOL WaReadDom0(qdb_handle_t h)
     return ok;
 }
 
+BOOL WorkAreaSyncReadDom0(void)
+{
+    if (!g_WaLockInit)
+        return FALSE; // WorkAreaSetDom0 takes g_WaLock; too early to read
+
+    qdb_handle_t h = qdb_open(NULL);
+    if (!h)
+        return FALSE;
+    BOOL ok = WaReadDom0(h);
+    qdb_close(h);
+    return ok;
+}
+
 // Watch thread: deliver /qubes-workarea (written by the dom0 watcher script)
 // and its changes. The value survives dom0 panel/monitor hotplug because the
 // watcher re-writes on _NET_WORKAREA changes. Reconnects if qubesdb-daemon
@@ -512,12 +525,7 @@ void WorkAreaInit(void)
     // consumers that run right after this in the connect sequence (WorkAreaApply,
     // the M6 boot mode-set publish) must not race the thread's first read.
     // Failure is fine - the thread retries for the life of the process.
-    qdb_handle_t h = qdb_open(NULL);
-    if (h)
-    {
-        WaReadDom0(h); // apply happens in the connect sequence right after
-        qdb_close(h);
-    }
+    WorkAreaSyncReadDom0(); // apply happens in the connect sequence right after
 
     HANDLE t = CreateThread(NULL, 0, WaWatchThread, NULL, 0, NULL);
     if (t)

@@ -61,5 +61,12 @@ void WorkAreaSetDom0(int x, int y, int w, int h, int fl, int fr, int ft, int fb)
 // arrived yet - callers must never fabricate these from inference.
 BOOL WorkAreaGetDom0Raw(int* x, int* y, int* w, int* h, int* fl, int* fr, int* ft, int* fb);
 
+// One synchronous read of the qubesdb dom0 feed into the stored values, for callers
+// that run BEFORE WorkAreaInit in the connect sequence (HandleXconf's boot-size
+// clamp - the watch thread does not exist yet). Requires WorkAreaLockInit (Init()
+// runs it). Returns TRUE if a valid value was read and stored; FALSE = feed
+// unavailable, stored values untouched.
+BOOL WorkAreaSyncReadDom0(void);
+
 // Inference sample: a daemon-dictated window origin from MSG_CONFIGURE.
 void WorkAreaNoteDaemonOrigin(int x, int y);
