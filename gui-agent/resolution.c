@@ -335,6 +335,19 @@ static ULONG g_EchoPrevW, g_EchoPrevH;
 static ULONGLONG g_EchoWindowEnd; // GetTickCount64 deadline; 0 = no window
 #define EXACT_ECHO_WINDOW_MS 4000
 
+// While an exact-obtain (replug + apply) is in flight the desktop TRANSITS through
+// intermediate real modes (monitor re-arrival default, e.g. 1920x1080); the daemon
+// must never learn about them (they echo back as fake dom0 intent and the window
+// visibly twitches - user-reported spontaneous revert, FINDINGS 2026-08-05).
+// Written on the resolution thread only; read cross-thread as a benign racy hint.
+static volatile LONG g_ExactInFlight;
+static ULONG g_ExactTargetW, g_ExactTargetH;
+
+BOOL ResolutionExactObtainInFlight(void)
+{
+    return g_ExactInFlight != 0;
+}
+
 static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
 {
     if (!IS_RESOLUTION_VALID(width, height))
@@ -349,14 +362,26 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
         return ERROR_SUCCESS;
     }
 
+    // Echo suppression, two cases: (1) within the settle window after an apply, a
+    // request for a size that is NOT the size just applied is a daemon echo of a
+    // stale or mid-replug-transit size, never fresh intent (real intent keeps
+    // requesting and re-arrives after the window); (2) same while an obtain is
+    // still in flight. Case (1) generalizes the earlier pre-apply-size-only check:
+    // the desktop transits through intermediate modes during a replug and the
+    // daemon can echo ANY of them (measured: 1920x1080 transit echoed 1.3 s after
+    // a 1989x888 apply and reverted it).
     if (g_EchoWindowEnd != 0 && GetTickCount64() < g_EchoWindowEnd &&
-        width == g_EchoPrevW && height == g_EchoPrevH)
+        !(width == g_ExactTargetW && height == g_ExactTargetH))
     {
-        LogInfo("RESECHO %lux%lu dropped (stale daemon echo of the pre-apply size)", width, height);
+        LogInfo("RESECHO %lux%lu dropped (settle window after %lux%lu apply)",
+            width, height, g_ExactTargetW, g_ExactTargetH);
         return ERROR_SUCCESS;
     }
 
     BOOL replugged = FALSE;
+    g_ExactTargetW = width;
+    g_ExactTargetH = height;
+    InterlockedExchange(&g_ExactInFlight, 1);
     if (!IsExactModeAvailable(width, height))
     {
         // try to obtain the exact mode from the Qubes IDD: publish it in the
@@ -366,6 +391,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
         {
             LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=modes-key-write-failed",
                 width, height, g_ScreenWidth, g_ScreenHeight);
+            InterlockedExchange(&g_ExactInFlight, 0);
             return ERROR_SUCCESS;
         }
 
@@ -380,6 +406,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
             {
                 LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=idd-not-present",
                     width, height, g_ScreenWidth, g_ScreenHeight);
+                InterlockedExchange(&g_ExactInFlight, 0);
                 return ERROR_SUCCESS;
             }
         }
@@ -396,6 +423,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
         {
             LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=mode-never-appeared",
                 width, height, g_ScreenWidth, g_ScreenHeight);
+            InterlockedExchange(&g_ExactInFlight, 0);
             return ERROR_SUCCESS;
         }
 
@@ -407,6 +435,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     {
         LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=apply-failed-0x%lx",
             width, height, g_ScreenWidth, g_ScreenHeight, status);
+        InterlockedExchange(&g_ExactInFlight, 0);
         return status;
     }
 
@@ -425,6 +454,8 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     }
 
     LogInfo("RESEXACT %lux%lu replug=%d", width, height, replugged ? 1 : 0);
+
+    InterlockedExchange(&g_ExactInFlight, 0);
 
     // A display mode change makes Windows reload the cursor scheme, undoing
     // HideCursors()' blanked system cursors - the guest "shadow cursor" returns

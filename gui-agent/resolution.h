@@ -35,4 +35,7 @@
 // not at all (never snapped), obtaining the mode from the Qubes IDD if needed.
 DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* source);
 ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source);
+// TRUE while an exact-obtain (replug+apply) is in flight on the resolution thread;
+// the recovery path must not tell the daemon about transitional geometries then.
+BOOL ResolutionExactObtainInFlight(void);
 void InitVideoModes();

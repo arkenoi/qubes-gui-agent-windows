@@ -3741,12 +3741,25 @@ static ULONG WINAPI WatchForEvents(void)
                         // size: the daemon adopts whatever the agent reports for window 0
                         // (it is exempt from configure flow control, xside.c:2063-2069),
                         // and for a same-size recovery the echo is a no-op.
-                        ULONG cfgStatus = SendWindowConfigure(NULL, 0, 0,
-                            capture->width, capture->height, FALSE);
-                        if (cfgStatus != ERROR_SUCCESS)
-                            win_perror2(cfgStatus, "SendWindowConfigure (screen, after recreate)");
+                        // EXCEPT while an exact-obtain is in flight: the desktop transits
+                        // through intermediate real modes during the replug, and telling
+                        // the daemon about them makes its window twitch and echo the
+                        // transit size back as fake dom0 intent (measured revert,
+                        // FINDINGS 2026-08-05). The final apply sends the real one.
+                        if (ResolutionExactObtainInFlight())
+                        {
+                            LogInfo("A6CONFIGURE suppressed (transitional %ux%u during exact-obtain)",
+                                capture->width, capture->height);
+                        }
                         else
-                            LogInfo("A6CONFIGURE window 0 -> %ux%u", capture->width, capture->height);
+                        {
+                            ULONG cfgStatus = SendWindowConfigure(NULL, 0, 0,
+                                capture->width, capture->height, FALSE);
+                            if (cfgStatus != ERROR_SUCCESS)
+                                win_perror2(cfgStatus, "SendWindowConfigure (screen, after recreate)");
+                            else
+                                LogInfo("A6CONFIGURE window 0 -> %ux%u", capture->width, capture->height);
+                        }
                     }
 
                     // Everything the daemon holds came from the old framebuffer, so repaint
