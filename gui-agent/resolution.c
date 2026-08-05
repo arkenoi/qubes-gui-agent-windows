@@ -324,6 +324,17 @@ static BOOL RestartQubesIddDevice(void)
 // after obtaining it from the Qubes IDD, or the current resolution is kept as-is.
 // Runs only on the resolution-change thread (the sole dom0-sourced call site goes
 // through RequestResolutionChange), so the replug+wait never blocks the vchan loop.
+// Stale-echo filter state: during the replug's capture outage gui-daemon's window
+// still has the PREVIOUS size and echoes it back as MSG_CONFIGURE; treating that
+// echo as fresh dom0 intent reverted a just-applied exact size (user-reported
+// 2026-08-05). Remember what size an exact apply REPLACED and when; a dom0 request
+// for exactly that size arriving within the echo window is dropped. Genuine user
+// intent survives: a real drag back keeps requesting past the window and the
+// debounced latest-wins path re-delivers it.
+static ULONG g_EchoPrevW, g_EchoPrevH;
+static ULONGLONG g_EchoWindowEnd; // GetTickCount64 deadline; 0 = no window
+#define EXACT_ECHO_WINDOW_MS 4000
+
 static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
 {
     if (!IS_RESOLUTION_VALID(width, height))
@@ -335,6 +346,13 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     if (width == g_ScreenWidth && height == g_ScreenHeight)
     {
         LogInfo("RESNOOP %lux%lu", width, height);
+        return ERROR_SUCCESS;
+    }
+
+    if (g_EchoWindowEnd != 0 && GetTickCount64() < g_EchoWindowEnd &&
+        width == g_EchoPrevW && height == g_EchoPrevH)
+    {
+        LogInfo("RESECHO %lux%lu dropped (stale daemon echo of the pre-apply size)", width, height);
         return ERROR_SUCCESS;
     }
 
@@ -407,6 +425,11 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     }
 
     LogInfo("RESEXACT %lux%lu replug=%d", width, height, replugged ? 1 : 0);
+
+    // arm the stale-echo filter with the size this apply REPLACED
+    g_EchoPrevW = g_ScreenWidth;
+    g_EchoPrevH = g_ScreenHeight;
+    g_EchoWindowEnd = GetTickCount64() + EXACT_ECHO_WINDOW_MS;
 
     g_ScreenWidth = width;
     g_ScreenHeight = height;
