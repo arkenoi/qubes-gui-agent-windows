@@ -214,6 +214,14 @@ static void IddModeSetAdd(IN OUT IDD_MODE* modes, IN OUT DWORD* count, IN LONG w
 // ("n=<count> target=WxH [max=WxH] [half=WxH]", absent entries omitted); callers
 // log it when they actually write. Returns the multi-sz length in WCHARs
 // (including both terminators), 0 on failure.
+// Habitual-size snap candidates (work-area-derived entries of the published
+// set ONLY - never the previous target, so small deliberate adjustments are
+// not undone). User rule 2026-08-05: a dom0 request within 15 px of one of
+// these snaps to it (blink-free, since it is published).
+static ULONG g_SnapCandidates[4][2];
+static DWORD g_SnapCandidateCount;
+#define HABITUAL_SNAP_PX 15
+
 static DWORD BuildIddModeSet(IN ULONG targetW, IN ULONG targetH,
     OUT WCHAR* multiSz, IN DWORD cchMax, OUT WCHAR* desc, IN DWORD cchDesc)
 {
@@ -579,14 +587,6 @@ BOOL ResolutionShouldAnnounceGeometry(IN ULONG width, IN ULONG height)
 // size, are echo suspects - anything else inside the settle window is genuine
 // user intent and must be applied (a settled drag's request never re-arrives, so
 // dropping it loses it: measured 2026-08-05, RESECHO ate a real 2055x1308).
-// Habitual-size snap candidates (work-area-derived entries of the published
-// set ONLY - never the previous target, so small deliberate adjustments are
-// not undone). User rule 2026-08-05: a dom0 request within 15 px of one of
-// these snaps to it (blink-free, since it is published).
-static ULONG g_SnapCandidates[4][2];
-static DWORD g_SnapCandidateCount;
-#define HABITUAL_SNAP_PX 15
-
 #define ECHO_SUSPECT_MAX 6
 static ULONG g_EchoSuspectW[ECHO_SUSPECT_MAX], g_EchoSuspectH[ECHO_SUSPECT_MAX];
 static DWORD g_EchoSuspectCount;
