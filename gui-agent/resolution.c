@@ -223,16 +223,34 @@ static DWORD BuildIddModeSet(IN ULONG targetW, IN ULONG targetH,
     // a. the target, always first (dom0's request slot)
     IddModeSetAdd(modes, &count, (LONG)targetW, (LONG)targetH);
 
-    // b+c. habitual sizes from the dom0 work-area feed
+    // b+c. habitual sizes from the dom0 work-area feed. Frame extents are
+    // WINDOW-STATE-DEPENDENT: this WM hides borders when maximized (measured:
+    // real maximized client = waW x (waH - title) while normal windows carry
+    // 5/5/25/5) - so publish BOTH variants of maximize and tile-half; dedupe
+    // collapses them when extents are zero anyway. These entries double as the
+    // snap candidates (user rule: requests within 15 px of a habitual size
+    // snap to it - see SetVideoModeExact).
     int x, y, w, h, fl, fr, ft, fb;
-    LONG maxW = 0, maxH = 0, halfW = 0;
+    g_SnapCandidateCount = 0;
     if (WorkAreaGetDom0Raw(&x, &y, &w, &h, &fl, &fr, &ft, &fb))
     {
-        maxW = w - fl - fr;         // maximize: dom0 work area minus frame
-        maxH = h - ft - fb;
-        halfW = w / 2 - fl - fr;    // tile half: half the work area, same height
-        IddModeSetAdd(modes, &count, maxW, maxH);
-        IddModeSetAdd(modes, &count, halfW, maxH);
+        LONG cand[4][2] = {
+            { w,           h - ft },           // maximize, borderless-maximized WM
+            { w - fl - fr, h - ft - fb },      // maximize, bordered
+            { w / 2,           h - ft },       // tile half, borderless
+            { w / 2 - fl - fr, h - ft - fb },  // tile half, bordered
+        };
+        for (int i = 0; i < 4; i++)
+        {
+            IddModeSetAdd(modes, &count, cand[i][0], cand[i][1]);
+            if (g_SnapCandidateCount < RTL_NUMBER_OF(g_SnapCandidates) &&
+                IS_RESOLUTION_VALID((ULONG)cand[i][0], (ULONG)cand[i][1]))
+            {
+                g_SnapCandidates[g_SnapCandidateCount][0] = (ULONG)cand[i][0];
+                g_SnapCandidates[g_SnapCandidateCount][1] = (ULONG)cand[i][1];
+                g_SnapCandidateCount++;
+            }
+        }
     }
 
     // d. safety-net fallback
@@ -561,6 +579,14 @@ BOOL ResolutionShouldAnnounceGeometry(IN ULONG width, IN ULONG height)
 // size, are echo suspects - anything else inside the settle window is genuine
 // user intent and must be applied (a settled drag's request never re-arrives, so
 // dropping it loses it: measured 2026-08-05, RESECHO ate a real 2055x1308).
+// Habitual-size snap candidates (work-area-derived entries of the published
+// set ONLY - never the previous target, so small deliberate adjustments are
+// not undone). User rule 2026-08-05: a dom0 request within 15 px of one of
+// these snaps to it (blink-free, since it is published).
+static ULONG g_SnapCandidates[4][2];
+static DWORD g_SnapCandidateCount;
+#define HABITUAL_SNAP_PX 15
+
 #define ECHO_SUSPECT_MAX 6
 static ULONG g_EchoSuspectW[ECHO_SUSPECT_MAX], g_EchoSuspectH[ECHO_SUSPECT_MAX];
 static DWORD g_EchoSuspectCount;
@@ -621,6 +647,32 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
             Sleep((DWORD)(g_EchoWindowEnd - now));
             // latest-wins still holds: if a newer request arrived meanwhile, the
             // resolution thread's event is set and it will supersede this apply.
+        }
+    }
+
+    // Habitual-size snap (user rule): a request within 15 px of a published
+    // work-area-derived mode takes that mode - blink-free and intentional; the
+    // daemon then nudges the window to match (sanctioned resize-to-viewport,
+    // bounded by 15 px and only toward tiles/maximize).
+    for (DWORD i = 0; i < g_SnapCandidateCount; i++)
+    {
+        LONG dw = (LONG)width - (LONG)g_SnapCandidates[i][0];
+        LONG dh = (LONG)height - (LONG)g_SnapCandidates[i][1];
+        if (dw > -HABITUAL_SNAP_PX && dw < HABITUAL_SNAP_PX &&
+            dh > -HABITUAL_SNAP_PX && dh < HABITUAL_SNAP_PX &&
+            (dw != 0 || dh != 0))
+        {
+            LogInfo("RESSNAP15 %lux%lu -> %lux%lu (habitual size within %d px)",
+                width, height, g_SnapCandidates[i][0], g_SnapCandidates[i][1],
+                HABITUAL_SNAP_PX);
+            width = g_SnapCandidates[i][0];
+            height = g_SnapCandidates[i][1];
+            if (width == g_ScreenWidth && height == g_ScreenHeight)
+            {
+                LogInfo("RESNOOP %lux%lu (post-snap)", width, height);
+                return ERROR_SUCCESS;
+            }
+            break;
         }
     }
 
