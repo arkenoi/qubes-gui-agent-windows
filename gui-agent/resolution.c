@@ -426,6 +426,12 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
 
     LogInfo("RESEXACT %lux%lu replug=%d", width, height, replugged ? 1 : 0);
 
+    // A display mode change makes Windows reload the cursor scheme, undoing
+    // HideCursors()' blanked system cursors - the guest "shadow cursor" returns
+    // (user-reported after resizes). Re-blank after every applied mode change;
+    // HideCursors self-guards on DisableCursor and is idempotent.
+    HideCursors();
+
     // arm the stale-echo filter with the size this apply REPLACED
     g_EchoPrevW = g_ScreenWidth;
     g_EchoPrevH = g_ScreenHeight;
@@ -498,6 +504,7 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
             LogWarning("EnumDisplaySettings(ENUM_CURRENT_SETTINGS) failed, cannot verify applied resolution");
         }
 
+        HideCursors(); // mode change reloads the cursor scheme - re-blank (see exact path)
         g_ScreenWidth = width;
         g_ScreenHeight = height;
         // save last-set resolution to use on next startup

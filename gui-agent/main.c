@@ -3732,6 +3732,9 @@ static ULONG WINAPI WatchForEvents(void)
                     else
                     {
                         LogInfo("framebuffer re-granted after duplication recovery, MSG_WINDOW_DUMP re-sent");
+                    // externally-driven mode changes (not via SetVideoMode) also
+                    // reload the cursor scheme - re-blank here too
+                    HideCursors();
 
                         // A6: the re-grant may carry a new geometry (in-place resize).
                         // Follow the dump with MSG_CONFIGURE for window 0 at the granted
