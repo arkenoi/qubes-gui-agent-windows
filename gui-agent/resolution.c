@@ -21,6 +21,8 @@
 
 #include <windows.h>
 #include <assert.h>
+#include <setupapi.h>
+#include <strsafe.h>
 
 #include "common.h"
 #include "main.h"
@@ -31,6 +33,14 @@
 
 #include <config.h>
 #include <log.h>
+
+// Hardware id of the Qubes IDD device, matched case-insensitively when replugging
+// it so the driver re-reads REG_QUBES_IDD_KEY\REG_QUBES_IDD_MODES_VALUE.
+#define QUBES_IDD_HARDWARE_ID L"root\\iddsampledriver"
+
+// How long to wait for a replugged IDD to start offering a freshly requested mode.
+#define EXACT_MODE_WAIT_TIMEOUT_MS 12000
+#define EXACT_MODE_WAIT_STEP_MS    250
 
 // parameters for the resolution change thread
 typedef struct _RESOLUTION_THREAD_PARAMS
@@ -155,12 +165,205 @@ DWORD SelectSupportedMode(IN DWORD width, IN DWORD height)
     return mode;
 }
 
+// CDS_TEST the exact size directly with a DEVMODE. Deliberately does NOT consult
+// the Init-time g_SupportedModes cache: it goes stale across IDD replugs.
+static BOOL IsExactModeAvailable(IN ULONG width, IN ULONG height)
+{
+    DEVMODE devMode;
+    ZeroMemory(&devMode, sizeof(devMode));
+    devMode.dmSize = sizeof(devMode);
+    devMode.dmPelsWidth = width;
+    devMode.dmPelsHeight = height;
+    devMode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
+
+    return DISP_CHANGE_SUCCESSFUL == ChangeDisplaySettings(&devMode, CDS_TEST);
+}
+
+// Publish the requested exact mode where the Qubes IDD driver picks it up on
+// monitor arrival (see REG_QUBES_IDD_KEY in include/common.h).
+static DWORD WriteRequestedIddMode(IN ULONG width, IN ULONG height)
+{
+    WCHAR modes[32]; // REG_MULTI_SZ: "WIDTHxHEIGHT\0\0"
+    ZeroMemory(modes, sizeof(modes));
+    if (FAILED(StringCchPrintf(modes, RTL_NUMBER_OF(modes) - 1, L"%lux%lu", width, height)))
+        return ERROR_INVALID_PARAMETER;
+
+    HKEY key;
+    DWORD status = RegCreateKeyEx(HKEY_LOCAL_MACHINE, REG_QUBES_IDD_KEY, 0, NULL, 0,
+        KEY_SET_VALUE, NULL, &key, NULL);
+    if (status != ERROR_SUCCESS)
+        return win_perror2(status, "creating IDD modes registry key");
+
+    status = RegSetValueEx(key, REG_QUBES_IDD_MODES_VALUE, 0, REG_MULTI_SZ,
+        (const BYTE*)modes, (DWORD)((wcslen(modes) + 2) * sizeof(WCHAR)));
+    RegCloseKey(key);
+    if (status != ERROR_SUCCESS)
+        return win_perror2(status, "writing IDD modes registry value");
+
+    return ERROR_SUCCESS;
+}
+
+// Restart the Qubes IDD device in-process (what `devcon restart` does) so the
+// driver re-reads the modes key. Returns TRUE if a matching device was restarted.
+static BOOL RestartQubesIddDevice(void)
+{
+    HDEVINFO devList = SetupDiGetClassDevs(NULL, NULL, NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (devList == INVALID_HANDLE_VALUE)
+    {
+        win_perror("SetupDiGetClassDevs");
+        return FALSE;
+    }
+
+    BOOL restarted = FALSE;
+    SP_DEVINFO_DATA device;
+    device.cbSize = sizeof(device);
+    for (DWORD i = 0; SetupDiEnumDeviceInfo(devList, i, &device); i++)
+    {
+        WCHAR hardwareIds[512]; // REG_MULTI_SZ
+        ZeroMemory(hardwareIds, sizeof(hardwareIds)); // guarantee multi-sz termination
+        if (!SetupDiGetDeviceRegistryProperty(devList, &device, SPDRP_HARDWAREID, NULL,
+            (BYTE*)hardwareIds, (DWORD)(sizeof(hardwareIds) - 2 * sizeof(WCHAR)), NULL))
+            continue;
+
+        BOOL match = FALSE;
+        for (const WCHAR* id = hardwareIds; *id; id += wcslen(id) + 1)
+        {
+            if (0 == _wcsicmp(id, QUBES_IDD_HARDWARE_ID))
+            {
+                match = TRUE;
+                break;
+            }
+        }
+
+        if (!match)
+            continue;
+
+        SP_PROPCHANGE_PARAMS propChange;
+        ZeroMemory(&propChange, sizeof(propChange));
+        propChange.ClassInstallHeader.cbSize = sizeof(SP_CLASSINSTALL_HEADER);
+        propChange.ClassInstallHeader.InstallFunction = DIF_PROPERTYCHANGE;
+        propChange.StateChange = DICS_PROPCHANGE;
+        propChange.Scope = DICS_FLAG_GLOBAL;
+        propChange.HwProfile = 0;
+
+        if (!SetupDiSetClassInstallParams(devList, &device, &propChange.ClassInstallHeader, sizeof(propChange)) ||
+            !SetupDiCallClassInstaller(DIF_PROPERTYCHANGE, devList, &device))
+        {
+            win_perror("restarting Qubes IDD device");
+            continue;
+        }
+
+        LogInfo("replugged Qubes IDD device (index %lu)", i);
+        restarted = TRUE;
+    }
+
+    SetupDiDestroyDeviceInfoList(devList);
+    return restarted;
+}
+
+// dom0's window size is the single source of truth: any applied size other than
+// the exact requested one makes gui-daemon resize the user's window to match
+// ("resize-to-viewport" - forbidden). Either the exact size is applied, if needed
+// after obtaining it from the Qubes IDD, or the current resolution is kept as-is.
+// Runs only on the resolution-change thread (the sole dom0-sourced call site goes
+// through RequestResolutionChange), so the replug+wait never blocks the vchan loop.
+static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
+{
+    if (!IS_RESOLUTION_VALID(width, height))
+    {
+        LogError("Resolution is invalid: %lu x %lu", width, height);
+        return ERROR_INVALID_PARAMETER;
+    }
+
+    if (width == g_ScreenWidth && height == g_ScreenHeight)
+    {
+        LogInfo("RESNOOP %lux%lu", width, height);
+        return ERROR_SUCCESS;
+    }
+
+    BOOL replugged = FALSE;
+    if (!IsExactModeAvailable(width, height))
+    {
+        // try to obtain the exact mode from the Qubes IDD: publish it in the
+        // driver's registry key, replug the device, wait for the mode to appear
+        if (WriteRequestedIddMode(width, height) != ERROR_SUCCESS)
+        {
+            LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=modes-key-write-failed",
+                width, height, g_ScreenWidth, g_ScreenHeight);
+            return ERROR_SUCCESS;
+        }
+
+        if (!RestartQubesIddDevice())
+        {
+            LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=idd-not-present",
+                width, height, g_ScreenWidth, g_ScreenHeight);
+            return ERROR_SUCCESS;
+        }
+
+        DWORD waited;
+        for (waited = 0; waited < EXACT_MODE_WAIT_TIMEOUT_MS; waited += EXACT_MODE_WAIT_STEP_MS)
+        {
+            Sleep(EXACT_MODE_WAIT_STEP_MS);
+            if (IsExactModeAvailable(width, height))
+                break;
+        }
+
+        if (waited >= EXACT_MODE_WAIT_TIMEOUT_MS)
+        {
+            LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=mode-never-appeared",
+                width, height, g_ScreenWidth, g_ScreenHeight);
+            return ERROR_SUCCESS;
+        }
+
+        replugged = TRUE;
+    }
+
+    ULONG status = SetVideoModeInternal(width, height);
+    if (status != ERROR_SUCCESS)
+    {
+        LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=apply-failed-0x%lx",
+            width, height, g_ScreenWidth, g_ScreenHeight, status);
+        return status;
+    }
+
+    // readback-verify (A2-style): re-read what Windows actually applied
+    DEVMODE appliedMode;
+    ZeroMemory(&appliedMode, sizeof(appliedMode));
+    appliedMode.dmSize = sizeof(appliedMode);
+    if (!EnumDisplaySettings(NULL, ENUM_CURRENT_SETTINGS, &appliedMode))
+    {
+        LogWarning("EnumDisplaySettings(ENUM_CURRENT_SETTINGS) failed, cannot verify applied resolution");
+    }
+    else if (appliedMode.dmPelsWidth != width || appliedMode.dmPelsHeight != height)
+    {
+        LogWarning("RESAPPLIED-MISMATCH applied=%lux%lu expected=%lux%lu",
+            appliedMode.dmPelsWidth, appliedMode.dmPelsHeight, width, height);
+    }
+
+    LogInfo("RESEXACT %lux%lu replug=%d", width, height, replugged ? 1 : 0);
+
+    g_ScreenWidth = width;
+    g_ScreenHeight = height;
+    // save last-set resolution to use on next startup
+    CfgWriteDword(NULL, REG_CONFIG_FULLSCREEN_WIDTH_VALUE, g_ScreenWidth, NULL);
+    CfgWriteDword(NULL, REG_CONFIG_FULLSCREEN_HEIGHT_VALUE, g_ScreenHeight, NULL);
+    // resolution changed: recompute the guest work area against the new screen
+    WorkAreaApply();
+
+    return ERROR_SUCCESS;
+}
+
 ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
 {
     LogVerbose("%lu x %lu", width, height);
 
     // instrumentation (log-only): what was requested, before any snapping
     LogInfo("RESREQ %lux%lu src=%s", width, height, source);
+
+    // dom0-sourced requests must never be snapped to a different mode:
+    // exact size or keep the current one (see SetVideoModeExact)
+    if (source && 0 == wcscmp(source, L"dom0"))
+        return SetVideoModeExact(width, height);
 
     DWORD mode = SelectSupportedMode(width, height);
 

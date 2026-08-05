@@ -31,6 +31,8 @@
 
 // 'source' tags where the request originated (dom0, xconf, lastapplied,
 // seamless-force) for the RESREQ/RESSNAP/RESAPPLIED instrumentation log lines.
+// src=dom0 requests are exact-follow: the requested size is applied verbatim or
+// not at all (never snapped), obtaining the mode from the Qubes IDD if needed.
 DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* source);
 ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source);
 void InitVideoModes();

@@ -39,6 +39,12 @@
 // path to the gui agent, launched by the watchdog service
 #define REG_CONFIG_AGENT_PATH_VALUE  L"GuiAgentPath"
 
+// Qubes IDD dynamic mode key (under HKLM): the agent publishes exact modes the
+// daemon asked for as REG_MULTI_SZ "WIDTHxHEIGHT" entries and replugs the IDD
+// device; the D4 driver (t2/d4-registry-modes) reads them at monitor arrival.
+#define REG_QUBES_IDD_KEY           L"SOFTWARE\\QubesIDD"
+#define REG_QUBES_IDD_MODES_VALUE   L"Modes"
+
 // event created by the helper service, trigger to simulate SAS (ctrl-alt-delete)
 #define QGA_SAS_EVENT_NAME L"Global\\QGA_SAS_TRIGGER"
 
