@@ -3719,7 +3719,21 @@ static ULONG WINAPI WatchForEvents(void)
                 // was re-granted, so the daemon is still mapping the old pages. Republish
                 // the refs BEFORE sending any damage for this frame: damage that refers to
                 // pages the daemon has not mapped yet would be painted from stale memory.
-                if (capture->grants_changed)
+                if (capture->grants_changed &&
+                    !ResolutionShouldAnnounceGeometry(capture->width, capture->height))
+                {
+                    // The daemon adopts window-0 size from the DUMP geometry too, not
+                    // just from MSG_CONFIGURE - a transitional re-dump resized the
+                    // daemon's window to the mid-replug default and it echoed that
+                    // back (measured, first scripted resize 2026-08-05). Skip the
+                    // whole transitional republish: with staging the refs are
+                    // unchanged, frames during the blink are junk anyway, and the
+                    // final target geometry sets grants_changed again itself.
+                    LogInfo("A6DUMP suppressed (transitional %ux%u during exact-obtain/settle)",
+                        capture->width, capture->height);
+                    ResolutionNoteTransitSize(capture->width, capture->height);
+                }
+                else if (capture->grants_changed)
                 {
                     capture->grants_changed = FALSE;
                     // STAGING: same refs and constant page count every time - this
