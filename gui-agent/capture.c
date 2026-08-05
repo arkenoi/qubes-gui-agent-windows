@@ -43,6 +43,53 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout);
 static HRESULT ReleaseFrame(IN OUT CAPTURE_CONTEXT* ctx);
 static DWORD WINAPI CaptureThread(void* param);
 
+// ---------------------------------------------------------------------------
+// STAGING: the screen framebuffer granted to dom0 EXACTLY ONCE per agent lifetime.
+//
+// Evidence (FINDINGS.md 2026-08-05 "cont 8"): at the whole-guest livelock the wedged
+// domain held ~22,000 ACTIVE grant entries still mapped by dom0 - dozens of stale
+// framebuffer generations accumulated because every resize re-granted the desktop
+// surface and dom0-side release could not keep pace. This object removes the
+// accumulation class structurally: ONE maximum-size page-aligned buffer is
+// VirtualAlloc'd and granted the first time capture initializes, every frame is
+// COPIED into it (dirty rects only), and every window-0 MSG_WINDOW_DUMP re-uses the
+// same refs. Resizes stop creating grant traffic entirely.
+//
+// Lifetime: this state deliberately lives OUTSIDE CAPTURE_CONTEXT. It survives
+// RecreateDuplication, CaptureTeardown(!) and reinitialization, and has its OWN
+// xencontrol handle so CaptureTeardown's XcClose(ctx->xc) cannot orphan the
+// revocation path. Revoked only in the A6 exit path (CaptureStagingRevokeOnExit),
+// after the drain, best effort.
+//
+// Cost trade: one memcpy of the dirty region per frame (~microseconds per MB)
+// against 4.7-6.5 ms per 1080p re-grant and ~90 us per revoke on the direct path
+// (FINDINGS.md measured grant costs) - and against the livelock above.
+typedef struct _STAGING_GRANT
+{
+    PXENCONTROL_CONTEXT xc; // dedicated handle, never closed by capture teardown
+    BYTE* buffer;           // VirtualAlloc'd, page-aligned
+    size_t size;            // bytes == page_count * PAGE_SIZE
+    size_t page_count;
+    ULONG* refs;
+    void* handle;           // grant handle from XcGnttabPermitForeignAccess2
+    UINT cap_width;         // capacity geometry (for logs/guards only; the current
+    UINT cap_height;        // frame geometry lives in ctx->width/height)
+} STAGING_GRANT;
+
+static STAGING_GRANT g_Staging;
+
+// Guaranteed minimum capacity; the actual capacity is the larger of this and the
+// dom0 host resolution from msg_xconf (known before capture ever initializes:
+// HandleXconf runs before StartFrameProcessing).
+#define STAGING_MIN_WIDTH  2560
+#define STAGING_MIN_HEIGHT 1600
+
+// TRUE when a frame of width x height fits the granted staging buffer.
+static BOOL StagingCapacityOk(IN UINT width, IN UINT height)
+{
+    return g_Staging.handle && ((size_t)width * height * 4 <= g_Staging.size);
+}
+
 // note: win_perror* functions set last error
 
 static IDXGIAdapter* GetAdapter(void)
@@ -343,7 +390,19 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
     // happens on its MSG_WINDOW_DUMP_ACK (or the timeout fallback). Both grants are
     // transiently live, which the grant table comfortably holds (design 2.1).
     if (ctx->xc && ctx->grant_refs)
-        ParkStaleScreenGrant(ctx);
+    {
+        if (ctx->uses_staging)
+        {
+            // STAGING dormant-park-path: with the persistent staging grant there is no
+            // re-grant on recovery - dom0 keeps mapping the SAME pages - so the A6
+            // park/ack-revoke machinery above has nothing to do for the screen path.
+            // Keep the refs: the re-dump after recovery is a pure header refresh over
+            // the same grant, and the next frame refills the buffer (full copy below).
+            LogInfo("STAGING dormant-park-path (screen grant kept across duplication recreate)");
+        }
+        else
+            ParkStaleScreenGrant(ctx);
+    }
     LeaveCriticalSection(&ctx->frame.lock);
 
     for (UINT attempt = 0; attempt < maxAttempts; attempt++)
@@ -364,6 +423,21 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
 
             if (width != ctx->width || height != ctx->height)
             {
+                // STAGING guard: never overflow the granted buffer. A geometry beyond
+                // the staging capacity rejects the in-place adoption and takes the old
+                // teardown path (return FALSE -> reinitialize; the next
+                // CaptureInitialize then falls back to the direct per-geometry grant
+                // for the oversized mode).
+                if (ctx->uses_staging && !StagingCapacityOk(width, height))
+                {
+                    LogWarning("STAGING too-large %ux%u > capacity %ux%u - taking teardown path",
+                        width, height, g_Staging.cap_width, g_Staging.cap_height);
+                    IDXGIOutputDuplication_Release(ctx->duplication);
+                    ctx->duplication = NULL;
+                    LeaveCriticalSection(&ctx->frame.lock);
+                    return FALSE;
+                }
+
                 // A6 (approved design, 2.1): adopt the new geometry IN PLACE instead of
                 // failing out to the full teardown that unmapped and destroyed every
                 // window - the one path a resolution change always took. Everything
@@ -375,6 +449,16 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                     ctx->width, ctx->height, width, height);
                 ctx->width = width;
                 ctx->height = height;
+            }
+
+            if (ctx->uses_staging)
+            {
+                // Same effect the direct path gets from clearing + re-granting in
+                // GetFrame: re-send the window-0 dump - now a header refresh over the
+                // SAME refs (CaptureGrantPageCount is constant) - and refill the whole
+                // staging buffer before the repaint that follows it.
+                ctx->grants_changed = TRUE;
+                ctx->staging_full_copy = TRUE;
             }
             LeaveCriticalSection(&ctx->frame.lock);
 
@@ -440,53 +524,6 @@ static void XcLogger(IN XENCONTROL_LOG_LEVEL logLevel, IN const char* function, 
     StringCbVPrintfW(buf, sizeof(buf), format, args);
     // XC log levels are the same as ours
     _LogFormat(logLevel, /*raw=*/FALSE, function, buf);
-}
-
-// ---------------------------------------------------------------------------
-// STAGING: the screen framebuffer granted to dom0 EXACTLY ONCE per agent lifetime.
-//
-// Evidence (FINDINGS.md 2026-08-05 "cont 8"): at the whole-guest livelock the wedged
-// domain held ~22,000 ACTIVE grant entries still mapped by dom0 - dozens of stale
-// framebuffer generations accumulated because every resize re-granted the desktop
-// surface and dom0-side release could not keep pace. This object removes the
-// accumulation class structurally: ONE maximum-size page-aligned buffer is
-// VirtualAlloc'd and granted the first time capture initializes, every frame is
-// COPIED into it (dirty rects only), and every window-0 MSG_WINDOW_DUMP re-uses the
-// same refs. Resizes stop creating grant traffic entirely.
-//
-// Lifetime: this state deliberately lives OUTSIDE CAPTURE_CONTEXT. It survives
-// RecreateDuplication, CaptureTeardown(!) and reinitialization, and has its OWN
-// xencontrol handle so CaptureTeardown's XcClose(ctx->xc) cannot orphan the
-// revocation path. Revoked only in the A6 exit path (CaptureStagingRevokeOnExit),
-// after the drain, best effort.
-//
-// Cost trade: one memcpy of the dirty region per frame (~microseconds per MB)
-// against 4.7-6.5 ms per 1080p re-grant and ~90 us per revoke on the direct path
-// (FINDINGS.md measured grant costs) - and against the livelock above.
-typedef struct _STAGING_GRANT
-{
-    PXENCONTROL_CONTEXT xc; // dedicated handle, never closed by capture teardown
-    BYTE* buffer;           // VirtualAlloc'd, page-aligned
-    size_t size;            // bytes == page_count * PAGE_SIZE
-    size_t page_count;
-    ULONG* refs;
-    void* handle;           // grant handle from XcGnttabPermitForeignAccess2
-    UINT cap_width;         // capacity geometry (for logs/guards only; the current
-    UINT cap_height;        // frame geometry lives in ctx->width/height)
-} STAGING_GRANT;
-
-static STAGING_GRANT g_Staging;
-
-// Guaranteed minimum capacity; the actual capacity is the larger of this and the
-// dom0 host resolution from msg_xconf (known before capture ever initializes:
-// HandleXconf runs before StartFrameProcessing).
-#define STAGING_MIN_WIDTH  2560
-#define STAGING_MIN_HEIGHT 1600
-
-// TRUE when a frame of width x height fits the granted staging buffer.
-static BOOL StagingCapacityOk(IN UINT width, IN UINT height)
-{
-    return g_Staging.handle && ((size_t)width * height * 4 <= g_Staging.size);
 }
 
 // Allocate and grant the staging buffer, once per process. Returns TRUE when the
@@ -642,7 +679,31 @@ CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event)
     if (!ctx->duplication)
         goto fail;
 
-    // get one frame to acquire framebuffer map
+    // STAGING: adopt the persistent staging grant when enabled and the geometry fits
+    // its capacity. framebuffer/grant_refs become ALIASES of the module-lifetime
+    // staging state - with grant_refs pre-set, GetFrame's map-and-grant first-frame
+    // branch is never entered, and every teardown/park path is gated on
+    // !uses_staging so the aliases are never freed or revoked.
+    if (StagingEnsure())
+    {
+        if (StagingCapacityOk(ctx->width, ctx->height))
+        {
+            ctx->uses_staging = TRUE;
+            ctx->staging_full_copy = TRUE; // first frame fills the whole buffer
+            ctx->framebuffer = g_Staging.buffer;
+            ctx->grant_refs = g_Staging.refs;
+            ctx->granted_once = TRUE;
+        }
+        else
+        {
+            // Never overflow the buffer: this generation runs the legacy direct
+            // per-geometry grant instead (the old teardown-path behavior).
+            LogWarning("STAGING too-large %ux%u > capacity %ux%u - falling back to direct grant",
+                ctx->width, ctx->height, g_Staging.cap_width, g_Staging.cap_height);
+        }
+    }
+
+    // get one frame to acquire framebuffer map (staging: to fill the staging buffer)
     if (FAILED(GetFrame(ctx, 5*FRAME_TIMEOUT)))
         goto fail;
 
@@ -679,7 +740,12 @@ void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx)
     if (ctx->ready_event)
         CloseHandle(ctx->ready_event);
 
-    if (ctx->xc && ctx->grant_refs)
+    // STAGING: framebuffer/grant_refs are then aliases of the module-lifetime staging
+    // grant, which deliberately SURVIVES capture teardown and reinitialization - the
+    // whole point is that the next generation re-uses the same grant, so a resize
+    // (teardown + reinit) creates zero grant traffic. Its one revocation point is the
+    // A6 exit path (CaptureStagingRevokeOnExit).
+    if (ctx->xc && ctx->grant_refs && !ctx->uses_staging)
     {
         // grants are not automatically revoked when the xeniface device handle is closed
         assert(ctx->framebuffer);
@@ -756,6 +822,83 @@ void CaptureStop(IN OUT CAPTURE_CONTEXT* ctx)
     LogVerbose("end");
 }
 
+// STAGING: copy the acquired frame into the persistent staging buffer. Runs on the
+// capture thread, under ctx->frame.lock, with a frame acquired (the thread already
+// owns the frame - no locking change). Maps the DXGI desktop surface, copies
+// row-by-row honoring the SOURCE Pitch - which also removes the latent
+// pitch != width*4 hazard of the direct-map path, since the staging buffer is
+// always tightly packed at width*4 - restricted to the frame's dirty rects unless
+// a full copy is pending, then unmaps the surface again. On success the published
+// frame pointer/pitch (frame.rect) are swapped to the staging buffer, so every
+// consumer (ProcessNewFrame, slice copies, synthesis) reads the pages dom0 maps;
+// the locking structure around those consumers is unchanged.
+static HRESULT StagingCopyFrame(IN OUT CAPTURE_CONTEXT* ctx)
+{
+    if (!ctx->staging_full_copy && ctx->frame.dirty_rects_count == 0)
+        return S_OK; // no pixels changed; the staging content is already current
+
+    DXGI_MAPPED_RECT src;
+    HRESULT status = IDXGIOutputDuplication_MapDesktopSurface(ctx->duplication, &src);
+    if (FAILED(status))
+    {
+        win_perror2(status, "MapDesktopSurface (staging copy)");
+        return status;
+    }
+
+    if (src.Pitch <= 0)
+    {
+        // never observed with the DDA; refuse to walk a bogus source layout
+        LogError("STAGING source pitch %d unusable", src.Pitch);
+        IDXGIOutputDuplication_UnMapDesktopSurface(ctx->duplication);
+        return E_UNEXPECTED;
+    }
+
+    const UINT width = ctx->width;
+    const UINT height = ctx->height;
+    const size_t dstPitch = (size_t)width * 4;
+    RECT full = { 0, 0, (LONG)width, (LONG)height };
+    const RECT* rects = &full;
+    UINT count = 1;
+
+    if (!ctx->staging_full_copy)
+    {
+        rects = ctx->frame.dirty_rects;
+        count = ctx->frame.dirty_rects_count;
+    }
+
+    for (UINT i = 0; i < count; i++)
+    {
+        RECT r;
+        // clip to the current geometry; capacity >= width*height*4 is guaranteed by
+        // the StagingCapacityOk gates at init/recreate, so clipped rows cannot
+        // overrun the buffer
+        if (!IntersectRect(&r, &rects[i], &full))
+            continue;
+        const BYTE* s = (const BYTE*)src.pBits + (size_t)r.top * src.Pitch + (size_t)r.left * 4;
+        BYTE* d = g_Staging.buffer + (size_t)r.top * dstPitch + (size_t)r.left * 4;
+        size_t rowBytes = (size_t)(r.right - r.left) * 4;
+        for (LONG row = r.top; row < r.bottom; row++)
+        {
+            memcpy(d, s, rowBytes);
+            s += src.Pitch;
+            d += dstPitch;
+        }
+    }
+    LogVerbose("STAGING copy %u rect(s)%s", count, ctx->staging_full_copy ? " (full)" : "");
+    ctx->staging_full_copy = FALSE;
+
+    status = IDXGIOutputDuplication_UnMapDesktopSurface(ctx->duplication);
+    if (FAILED(status))
+        win_perror2(status, "UnMapDesktopSurface (staging copy)"); // copy is done; not fatal
+
+    // Publish the staging buffer as THE frame pixels. frame.mapped stays FALSE: the
+    // transient DXGI mapping is already gone, there is nothing for ReleaseFrame (or
+    // the fail paths) to undo, and nothing may free the aliased grant_refs.
+    ctx->frame.rect.pBits = g_Staging.buffer;
+    ctx->frame.rect.Pitch = (INT)dstPitch;
+    return S_OK;
+}
+
 static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
 {
     LogVerbose("start");
@@ -775,7 +918,11 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
         goto fail1;
     }
 
-    if (ctx->frame.info.LastPresentTime.QuadPart == 0 && ctx->grant_refs)
+    // STAGING: a pending full copy must not take this early-out - after a geometry
+    // change the staging content is laid out at the old pitch and must be refilled
+    // from the current desktop image even if nothing new was presented.
+    if (ctx->frame.info.LastPresentTime.QuadPart == 0 && ctx->grant_refs &&
+        !(ctx->uses_staging && ctx->staging_full_copy))
     {
         // only skip here after we shared the framebuffer
         LogVerbose("framebuffer unchanged");
@@ -919,6 +1066,16 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
     // MSDN note: To produce a visually accurate copy of the desktop,
     // an application must first process all move RECTs before it processes dirty RECTs.
 
+    // STAGING: copy this frame's changes into the persistently granted buffer. Needs
+    // the dirty rects, so it runs after their retrieval; the DXGI surface is mapped
+    // and unmapped inside (frame.mapped stays FALSE - see the fail3 note below).
+    if (ctx->uses_staging)
+    {
+        status = StagingCopyFrame(ctx);
+        if (FAILED(status))
+            goto fail4;
+    }
+
 end:
     LeaveCriticalSection(&ctx->frame.lock);
     LogVerbose("end");
@@ -929,6 +1086,9 @@ fail4:
     ctx->frame.dirty_rects = NULL;
     ctx->frame.dirty_rects_count = 0;
 fail3:
+    // Only the direct-map grant branch arrives here with frame.mapped set; the staging
+    // path never sets it (StagingCopyFrame unmaps before returning), so the aliased
+    // staging grant_refs can never be freed here.
     if (ctx->frame.mapped)
     {
         free(ctx->grant_refs);
