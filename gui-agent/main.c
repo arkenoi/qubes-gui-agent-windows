@@ -3556,7 +3556,7 @@ ULONG StopFrameProcessing(IN OUT CAPTURE_CONTEXT** capture)
 // VchanSendBuffer blocks forever on a full ring, and a wedged daemon must not be able
 // to stall shutdown. The teardown traffic is tiny (two header-only messages per
 // window), so 16 KiB of a 64 KiB ring covers hundreds of windows with margin.
-#define A6_EXIT_DRAIN_MS 2000
+#define A6_EXIT_SETTLE_MS 1000
 #define A6_EXIT_RING_HEADROOM 16384
 
 // A7/NEVEREXIT degraded no-capture state: when capture init keeps failing after the
@@ -4055,25 +4055,20 @@ static ULONG WINAPI WatchForEvents(void)
     if (capture)
         StopFrameProcessing(&capture);
 
-    // Bounded drain: dom0 releases its mappings as it processes the messages above (or
-    // when the daemon exits), after which the queued revocations succeed. Retry until
-    // everything is revoked or the budget expires - never longer, even with a dead
-    // daemon still mapping every page.
-    ULONGLONG drainStart = GetTickCount64();
-    while (TRUE)
-    {
-        PwRevokeTick();
-        if (capture)
-            CaptureRevokeStaleGrants(capture, L"exit-drain");
-        if (!PwRevokePending() && !(capture && CaptureHasStaleGrants(capture)))
-            break;
-        if (GetTickCount64() - drainStart >= A6_EXIT_DRAIN_MS)
-            break;
-        Sleep(100);
-    }
-    LogInfo("A6EXIT drain finished in %I64u ms - pending revocations: per-window=%d, screen=%d",
-        GetTickCount64() - drainStart, PwRevokePending(),
-        capture ? CaptureHasStaleGrants(capture) : FALSE);
+    // SETTLE, then a SINGLE revoke pass - never a retry loop. A revoke racing
+    // dom0's unmap can spin unboundedly inside xenbus (NMI-dump-proven, FINDINGS
+    // 2026-08-05 cont 9); the retry loop here rolled that race ~20x per exit and
+    // wedged the guest during OS shutdown (cont 11). The settle delay gives the
+    // daemon time to process the DESTROYs above so the one attempt lands AFTER
+    // its unmaps, not concurrently. Anything still busy is leaked loudly; domain
+    // teardown reclaims it.
+    Sleep(A6_EXIT_SETTLE_MS);
+    PwRevokeTick();
+    if (capture)
+        CaptureRevokeStaleGrants(capture, L"exit-single-pass");
+    if (PwRevokePending() || (capture && CaptureHasStaleGrants(capture)))
+        LogWarning("A6LEAK exit: abandoning busy grants after single pass (per-window=%d, screen=%d)",
+            PwRevokePending(), capture ? CaptureHasStaleGrants(capture) : FALSE);
 
     PwShutdown();
 

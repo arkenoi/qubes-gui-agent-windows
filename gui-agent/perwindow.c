@@ -118,15 +118,15 @@ void PwShutdown(void)
         return;
     g_PwOn = FALSE;
     WcShutdown();
-    // best effort: drain pending revokes (daemon may be gone; bounded retries)
-    for (int i = 0; i < 3 && g_PwPending; i++)
-    {
-        PwRevokeTick();
-        if (g_PwPending)
-            Sleep(100);
-    }
+    // EXACTLY ONE revoke attempt, never a retry loop: a revoke racing dom0's unmap
+    // can spin unboundedly inside xenbus (NMI-dump-proven, FINDINGS 2026-08-05
+    // cont 9; recurred on the OS-shutdown path, cont 11). Each retry is another
+    // roll of that race. Whatever stays busy is leaked LOUDLY - the domain
+    // teardown reclaims the entries; buffers are deliberately not freed (dom0 may
+    // still map them).
+    PwRevokeTick();
     if (g_PwPending)
-        LogWarning("per-window: leaking un-revoked grants at shutdown");
+        LogWarning("A6LEAK per-window: abandoning un-revoked grants at shutdown (dom0 still maps them)");
     if (g_PwXc)
     {
         XcClose(g_PwXc);
