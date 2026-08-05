@@ -49,6 +49,20 @@
 #define REG_QUBES_IDD_KEY           L"SOFTWARE\\QubesIDD"
 #define REG_QUBES_IDD_MODES_VALUE   L"Modes"
 
+// Qubes IDD control device interface + reload IOCTL (driver branch
+// t2/d4v3-ioctl-reload): DeviceIoControl(IOCTL_QIDD_RELOAD_MODES) makes the
+// RUNNING driver re-read REG_QUBES_IDD_KEY\REG_QUBES_IDD_MODES_VALUE via a
+// monitor-level departure/arrival - no PnP device restart (which disturbs the
+// Xen platform device; see FINDINGS 2026-08-05 cont 10).
+// Values match the driver (driver/IddSampleDriver/Driver.h on t2/d4v3-ioctl-reload,
+// commit ce8edf6): interface GUID {C7817EB4-B2B6-4996-A48C-04EF247952AB}, control
+// code (FILE_DEVICE_UNKNOWN, function 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+// = 0x00222000.
+#define QIDD_INTERFACE_GUID_INIT \
+    { 0xc7817eb4, 0xb2b6, 0x4996, { 0xa4, 0x8c, 0x04, 0xef, 0x24, 0x79, 0x52, 0xab } }
+#define IOCTL_QIDD_RELOAD_MODES \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 // event created by the helper service, trigger to simulate SAS (ctrl-alt-delete)
 #define QGA_SAS_EVENT_NAME L"Global\\QGA_SAS_TRIGGER"
 

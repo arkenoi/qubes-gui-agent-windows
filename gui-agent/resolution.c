@@ -20,6 +20,7 @@
  */
 
 #include <windows.h>
+#include <winioctl.h>
 #include <assert.h>
 #include <setupapi.h>
 #include <strsafe.h>
@@ -203,8 +204,64 @@ static DWORD WriteRequestedIddMode(IN ULONG width, IN ULONG height)
     return ERROR_SUCCESS;
 }
 
+// Ask the RUNNING Qubes IDD driver to re-read the modes key via
+// IOCTL_QIDD_RELOAD_MODES (monitor-level departure/arrival, no PnP restart;
+// see QIDD_INTERFACE_GUID_INIT in include/common.h). Returns TRUE if at least
+// one interface instance accepted the IOCTL.
+static BOOL QiddReloadModes(void)
+{
+    static const GUID qiddInterfaceGuid = QIDD_INTERFACE_GUID_INIT;
+
+    HDEVINFO devList = SetupDiGetClassDevs(&qiddInterfaceGuid, NULL, NULL,
+        DIGCF_DEVICEINTERFACE | DIGCF_PRESENT);
+    if (devList == INVALID_HANDLE_VALUE)
+    {
+        win_perror("SetupDiGetClassDevs(QIDD interface)");
+        return FALSE;
+    }
+
+    BOOL reloaded = FALSE;
+    SP_DEVICE_INTERFACE_DATA iface;
+    iface.cbSize = sizeof(iface);
+    for (DWORD i = 0; SetupDiEnumDeviceInterfaces(devList, NULL, &qiddInterfaceGuid, i, &iface); i++)
+    {
+        BYTE detailBuffer[sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA) + MAX_PATH * sizeof(WCHAR)];
+        SP_DEVICE_INTERFACE_DETAIL_DATA* detail = (SP_DEVICE_INTERFACE_DETAIL_DATA*)detailBuffer;
+        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
+        if (!SetupDiGetDeviceInterfaceDetail(devList, &iface, detail, sizeof(detailBuffer), NULL, NULL))
+        {
+            win_perror("SetupDiGetDeviceInterfaceDetail(QIDD)");
+            continue;
+        }
+
+        HANDLE device = CreateFile(detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (device == INVALID_HANDLE_VALUE)
+        {
+            win_perror("opening QIDD device interface");
+            continue;
+        }
+
+        DWORD returned = 0;
+        BOOL ok = DeviceIoControl(device, IOCTL_QIDD_RELOAD_MODES, NULL, 0, NULL, 0, &returned, NULL);
+        CloseHandle(device);
+        if (!ok)
+        {
+            win_perror("IOCTL_QIDD_RELOAD_MODES");
+            continue;
+        }
+
+        reloaded = TRUE;
+    }
+
+    SetupDiDestroyDeviceInfoList(devList);
+    return reloaded;
+}
+
 // Restart the Qubes IDD device in-process (what `devcon restart` does) so the
 // driver re-reads the modes key. Returns TRUE if a matching device was restarted.
+// Fallback only: the PnP replug disturbs the Xen platform device (grant-revoke
+// spins, lost event-channel delivery) - prefer QiddReloadModes().
 static BOOL RestartQubesIddDevice(void)
 {
     HDEVINFO devList = SetupDiGetClassDevs(NULL, NULL, NULL, DIGCF_ALLCLASSES | DIGCF_PRESENT);
@@ -285,7 +342,8 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     if (!IsExactModeAvailable(width, height))
     {
         // try to obtain the exact mode from the Qubes IDD: publish it in the
-        // driver's registry key, replug the device, wait for the mode to appear
+        // driver's registry key, make the driver reload it (IOCTL preferred,
+        // PnP replug as fallback), wait for the mode to appear
         if (WriteRequestedIddMode(width, height) != ERROR_SUCCESS)
         {
             LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=modes-key-write-failed",
@@ -293,11 +351,19 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
             return ERROR_SUCCESS;
         }
 
-        if (!RestartQubesIddDevice())
+        if (QiddReloadModes())
         {
-            LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=idd-not-present",
-                width, height, g_ScreenWidth, g_ScreenHeight);
-            return ERROR_SUCCESS;
+            LogInfo("QIDD ioctl-reload ok");
+        }
+        else
+        {
+            LogWarning("QIDD ioctl-reload unavailable, falling back to device restart (PnP)");
+            if (!RestartQubesIddDevice())
+            {
+                LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=idd-not-present",
+                    width, height, g_ScreenWidth, g_ScreenHeight);
+                return ERROR_SUCCESS;
+            }
         }
 
         DWORD waited;
