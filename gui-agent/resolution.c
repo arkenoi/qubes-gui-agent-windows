@@ -280,15 +280,19 @@ static DWORD BuildIddModeSet(IN ULONG targetW, IN ULONG targetH,
     multiSz[used++] = L'\0'; // multi-sz double terminator
 
     StringCchPrintf(desc, cchDesc, L"n=%lu target=%lux%lu", count, targetW, targetH);
-    WCHAR item[32];
-    if (maxW > 0 && maxH > 0 && IS_RESOLUTION_VALID((ULONG)maxW, (ULONG)maxH))
+    WCHAR item[48];
+    if (g_SnapCandidateCount >= 2)
     {
-        StringCchPrintf(item, RTL_NUMBER_OF(item), L" max=%ldx%ld", maxW, maxH);
+        StringCchPrintf(item, RTL_NUMBER_OF(item), L" max=%lux%lu/%lux%lu",
+            g_SnapCandidates[0][0], g_SnapCandidates[0][1],
+            g_SnapCandidates[1][0], g_SnapCandidates[1][1]);
         StringCchCat(desc, cchDesc, item);
     }
-    if (halfW > 0 && maxH > 0 && IS_RESOLUTION_VALID((ULONG)halfW, (ULONG)maxH))
+    if (g_SnapCandidateCount >= 4)
     {
-        StringCchPrintf(item, RTL_NUMBER_OF(item), L" half=%ldx%ld", halfW, maxH);
+        StringCchPrintf(item, RTL_NUMBER_OF(item), L" half=%lux%lu/%lux%lu",
+            g_SnapCandidates[2][0], g_SnapCandidates[2][1],
+            g_SnapCandidates[3][0], g_SnapCandidates[3][1]);
         StringCchCat(desc, cchDesc, item);
     }
 
