@@ -70,6 +70,17 @@ BOOL g_SeamlessMode = TRUE;
 // we shouldn't reply to that before sending MSG_CREATE
 BOOL g_LocalScreenDestroyed = FALSE;
 
+// NEVEREXIT: whether MSG_CREATE for the screen window (id 0) is currently outstanding
+// with the connected daemon. Written only by StartFrameProcessing (set after a
+// successful CREATE) and StopFrameProcessing (cleared after a successful DESTROY),
+// both on the main loop thread. Two consumers:
+//   - StartFrameProcessing skips the CREATE when set: the A7 degraded state retries
+//     it after PARTIAL failures, and gui-daemon exit(1)s on a duplicate CREATE for an
+//     existing window id (xside.c "CREATE for already existing window id");
+//   - SetSeamlessMode refuses to send window-0 MAP/UNMAP when clear: any window-0
+//     message before CREATE(0) hits gui-daemon's "msg without CREATE" exit(1).
+static BOOL g_ScreenAnnounced = FALSE;
+
 // used to determine whether our window in fullscreen mode should be borderless
 // (when resolution is smaller than host's)
 // Live desktop image (the granted DDA framebuffer) and its pitch, refreshed every
@@ -1886,6 +1897,21 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     if (status != ERROR_SUCCESS)
         LogWarning("Failed to write seamless mode registry value");
 
+    // NEVEREXIT guard: with the screen window not announced (A7 degraded capture
+    // before CREATE(0) went out, or between screen DESTROY and the restart) the
+    // window-0 MAP/UNMAP below would hit gui-daemon's "msg without CREATE" exit(1)
+    // and take down the qube's GUI. Record the mode only; StartFrameProcessing
+    // applies it for real via SetSeamlessMode(g_SeamlessMode, TRUE) when capture
+    // (re)starts.
+    if (g_VchanClientConnected && !g_ScreenAnnounced)
+    {
+        g_SeamlessMode = seamlessMode;
+        LogWarning("NEVEREXIT seamless mode %d recorded only (screen window not announced); applied on capture (re)start",
+            seamlessMode);
+        status = ERROR_SUCCESS;
+        goto end;
+    }
+
     if (!seamlessMode)
     {
         // show the screen window
@@ -3425,10 +3451,17 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
         return win_perror("CaptureInitialize");
 
     ULONG status;
-    // send whole screen window, needed even in seamless mode
-    status = SendWindowCreate(NULL);
-    if (ERROR_SUCCESS != status)
-        return win_perror2(status, "SendWindowCreate(NULL)");
+    // send whole screen window, needed even in seamless mode.
+    // NEVEREXIT: exactly once per announced generation - a degraded-state retry
+    // re-runs this function after a partial failure, and a duplicate CREATE(0) makes
+    // gui-daemon exit(1) (see g_ScreenAnnounced).
+    if (!g_ScreenAnnounced)
+    {
+        status = SendWindowCreate(NULL);
+        if (ERROR_SUCCESS != status)
+            return win_perror2(status, "SendWindowCreate(NULL)");
+        g_ScreenAnnounced = TRUE;
+    }
 
     g_LocalScreenDestroyed = FALSE;
 
@@ -3461,7 +3494,9 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
 // seconds (observed: 0x887A0026 "keyed mutex abandoned" formatting of ACCESS_LOST,
 // 0x887A0005 device suspended). Treating that as fatal turned every topology change into an
 // agent crash + watchdog respawn, which then re-applied a stale cached resolution
-// (FINDINGS 2026-08-05). Retry briefly before giving up; anything else stays fatal.
+// (FINDINGS 2026-08-05). Retry the known-transient errors briefly in-line here; when this
+// still fails (or the error is not one of the transients) the CALLERS no longer exit -
+// they enter the A7 degraded state and keep retrying at A7_DEGRADED_RETRY_MS (NEVEREXIT).
 static ULONG StartFrameProcessingWithRetry(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent, OUT CAPTURE_CONTEXT** capture)
 {
     ULONG status = ERROR_SUCCESS;
@@ -3500,6 +3535,9 @@ ULONG StopFrameProcessing(IN OUT CAPTURE_CONTEXT** capture)
     if (ERROR_SUCCESS != status)
         return win_perror2(status, "SendWindowDestroy(screen)");
 
+    // the daemon forgets window 0 on DESTROY; the next start must re-CREATE it
+    g_ScreenAnnounced = FALSE;
+
     // pause replying to gui daemon's messages for the destroyed screen window
     g_LocalScreenDestroyed = TRUE;
 
@@ -3515,6 +3553,41 @@ ULONG StopFrameProcessing(IN OUT CAPTURE_CONTEXT** capture)
 // window), so 16 KiB of a 64 KiB ring covers hundreds of windows with margin.
 #define A6_EXIT_DRAIN_MS 2000
 #define A6_EXIT_RING_HEADROOM 16384
+
+// A7/NEVEREXIT degraded no-capture state: when capture init keeps failing after the
+// fast in-line retries, the agent does NOT exit (every needless exit risks killing
+// gui-daemon via the dom0 EOF-on-write bug). It keeps servicing the vchan - input,
+// configure, per-window capture if alive - and re-attempts capture init at this
+// cadence, logging at most once per A7_DEGRADED_LOG_MS so soaks can count episodes
+// without flooding.
+#define A7_DEGRADED_RETRY_MS 5000
+#define A7_DEGRADED_LOG_MS   60000
+
+// Enter (or re-arm) the degraded state after a StartFrameProcessing failure.
+// A partial failure can leave a capture context that never went live - tear it down
+// to a known state first. CaptureTeardown handles half-built contexts (every field
+// is guarded); under the default staging grant the screen grant persists by design,
+// and on the direct-map path a still-mapped grant is parked/leaked loudly by the A6
+// sweep rather than freed under dom0.
+static void EnterCaptureDegraded(IN ULONG failStatus, IN OUT CAPTURE_CONTEXT** capture,
+    IN OUT BOOL* degraded, IN OUT ULONGLONG* retryDue, IN OUT ULONGLONG* logLast)
+{
+    if (*capture)
+    {
+        CaptureTeardown(*capture);
+        *capture = NULL;
+    }
+
+    *retryDue = GetTickCount64() + A7_DEGRADED_RETRY_MS;
+    if (!*degraded)
+    {
+        *degraded = TRUE;
+        *logLast = GetTickCount64();
+        LogError("A7DEGRADED entering degraded state: capture init failed (0x%x); "
+            "vchan stays serviced, retrying capture init every %u ms",
+            failStatus, A7_DEGRADED_RETRY_MS);
+    }
+}
 
 // main event loop
 // TODO: refactor into smaller parts
@@ -3536,12 +3609,16 @@ static ULONG WINAPI WatchForEvents(void)
     HANDLE captureErrorEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
 
     // This will not block.
+    // KEEP-FATAL: no vchan could even be set up, so no daemon is connected - exiting
+    // is harmless (nothing to EOF at) and the service respawn retries with backoff.
     if (!VchanInit(g_GuiDomainId, 6000))
     {
         LogError("VchanInit() failed");
         return GetLastError();
     }
 
+    // KEEP-FATAL (both): startup resource failure before any daemon connection;
+    // there is no degraded state to fall back to and nothing connected to protect.
     HANDLE fullScreenOnEvent = CreateNamedEvent(FULLSCREEN_ON_EVENT_NAME);
     if (!fullScreenOnEvent)
         return GetLastError();
@@ -3566,16 +3643,33 @@ static ULONG WINAPI WatchForEvents(void)
 
     CAPTURE_CONTEXT* capture = NULL;
 
+    // A7/NEVEREXIT degraded no-capture state (see EnterCaptureDegraded)
+    BOOL captureDegraded = FALSE;
+    ULONGLONG captureRetryDue = 0;
+    ULONGLONG degradedLogLast = 0;
+
     while (TRUE)
     {
         status = ERROR_SUCCESS;
 
         vchanIoInProgress = TRUE;
 
-        // Wait for events.
-        signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, INFINITE);
-        if (signaledEvent >= MAXIMUM_WAIT_OBJECTS)
+        // A7: while degraded, wake in time for the next capture-init retry; the
+        // vchan/input events below are still serviced normally in between.
+        DWORD waitTimeout = INFINITE;
+        if (captureDegraded)
         {
+            ULONGLONG now64 = GetTickCount64();
+            waitTimeout = (captureRetryDue > now64) ? (DWORD)(captureRetryDue - now64) : 0;
+        }
+
+        // Wait for events.
+        signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, waitTimeout);
+        if (signaledEvent != WAIT_TIMEOUT && signaledEvent >= MAXIMUM_WAIT_OBJECTS)
+        {
+            // KEEP-FATAL: the wait itself failing means our own handle table is
+            // broken - the loop cannot service the vchan at all anymore, and a
+            // retry would spin at 100% CPU. Not convertible to a degraded state.
             status = win_perror("WaitForMultipleObjects");
             break;
         }
@@ -3601,7 +3695,7 @@ static ULONG WINAPI WatchForEvents(void)
 
         if (0 == signaledEvent)
         {
-            // shutdown event
+            // KEEP-FATAL: QGA_SHUTDOWN - the explicit stop request, case (b).
             LogDebug("Shutdown event signaled");
             exitLoop = TRUE;
             break;
@@ -3611,10 +3705,11 @@ static ULONG WINAPI WatchForEvents(void)
         {
         case 1: // new frame available
             LogVerbose("new frame");
-            if (g_VchanClientConnected)
+            // NEVEREXIT: capture can legitimately be NULL here - in the A7 degraded
+            // state a stale frame event set by the torn-down capture generation can
+            // still be signaled once; dereferencing it was a crash (= an exit).
+            if (g_VchanClientConnected && capture)
             {
-                assert(capture);
-
                 // The duplication was recreated in place after a loss and the framebuffer
                 // was re-granted, so the daemon is still mapping the old pages. Republish
                 // the refs BEFORE sending any damage for this frame: damage that refers to
@@ -3705,8 +3800,11 @@ static ULONG WINAPI WatchForEvents(void)
             status = SetSeamlessMode(FALSE, FALSE);
             if (ERROR_SUCCESS != status)
             {
+                // NEVEREXIT (CONVERT, was exitLoop): a failed mode switch leaves us in
+                // the previous mode - degraded, not dead. If the cause was a vchan
+                // send failure the receive path detects the dead vchan fatally (a).
                 win_perror2(status, "SetSeamlessMode(FALSE)");
-                exitLoop = TRUE;
+                LogWarning("NEVEREXIT seamless-off switch failed (0x%x) - staying in current mode", status);
             }
             break;
 
@@ -3715,8 +3813,9 @@ static ULONG WINAPI WatchForEvents(void)
             status = SetSeamlessMode(TRUE, FALSE);
             if (ERROR_SUCCESS != status)
             {
+                // NEVEREXIT (CONVERT, was exitLoop): see case 2.
                 win_perror2(status, "SetSeamlessMode(TRUE)");
-                exitLoop = TRUE;
+                LogWarning("NEVEREXIT seamless-on switch failed (0x%x) - staying in current mode", status);
             }
             break;
 
@@ -3736,24 +3835,37 @@ static ULONG WINAPI WatchForEvents(void)
                 // was told before any per-window message can be gated against it.
                 SendResetCreatedWindows();
 
+                // KEEP-FATAL: SendProtocolVersion only fails when the vchan write
+                // fails (daemon dead/EOF) - case (a). If the vchan somehow reports
+                // open, the handshake stream position is unknown and no recovery is
+                // protocol-safe; log the distinction loudly.
                 if (ERROR_SUCCESS != SendProtocolVersion())
                 {
-                    LogError("SendProtocolVersion failed");
+                    LogError("SendProtocolVersion failed (vchan open=%d) - "
+                        "handshake cannot proceed, exiting", libvchan_is_open(g_Vchan));
                     exitLoop = TRUE;
                     break;
                 }
 
+                // KEEP-FATAL: HandleVersion only fails on a vchan receive failure
+                // (dead/EOF) - case (a). Continuing without the daemon's version
+                // would also leave the version-gated paths (per-window) undefined.
                 if (ERROR_SUCCESS != HandleVersion())
                 {
-                    LogError("HandleVersion failed");
+                    LogError("HandleVersion failed (vchan open=%d) - "
+                        "handshake cannot proceed, exiting", libvchan_is_open(g_Vchan));
                     exitLoop = TRUE;
                     break;
                 }
 
                 // This will probably change the current video mode if we don't have one saved in the registry.
+                // KEEP-FATAL here, but only the vchan receive failure can still reach
+                // this (case (a), msg_xconf possibly part-consumed): a SetVideoMode
+                // failure no longer propagates - HandleXconf falls back to the current
+                // resolution and returns success (NEVEREXIT conversion there).
                 if (ERROR_SUCCESS != HandleXconf())
                 {
-                    LogError("HandleXconf failed");
+                    LogError("HandleXconf failed (vchan open=%d) - exiting", libvchan_is_open(g_Vchan));
                     exitLoop = TRUE;
                     break;
                 }
@@ -3766,9 +3878,14 @@ static ULONG WINAPI WatchForEvents(void)
                 status = StartFrameProcessingWithRetry(newFrameEvent, captureErrorEvent, &capture);
                 if (ERROR_SUCCESS != status)
                 {
+                    // NEVEREXIT (CONVERT, was exitLoop): capture down is a degraded
+                    // state, not a fatal one - the vchan is alive (we just finished
+                    // the handshake on it), and exiting needlessly risks killing
+                    // gui-daemon via the dom0 EOF bug. Keep servicing the vchan and
+                    // retry capture init periodically.
                     win_perror2(status, "StartFrameProcessing");
-                    exitLoop = TRUE;
-                    break;
+                    EnterCaptureDegraded(status, &capture,
+                        &captureDegraded, &captureRetryDue, &degradedLogLast);
                 }
 
                 break;
@@ -3781,6 +3898,8 @@ static ULONG WINAPI WatchForEvents(void)
 
             if (!libvchan_is_open(g_Vchan))
             {
+                // KEEP-FATAL: the vchan is genuinely dead / the daemon disconnected -
+                // case (a). Exit is harmless here and the service respawn handles it.
                 LogError("vchan disconnected");
                 exitLoop = TRUE;
                 LeaveCriticalSection(&g_VchanCriticalSection);
@@ -3793,6 +3912,12 @@ static ULONG WINAPI WatchForEvents(void)
                 status = HandleServerData(!g_LocalScreenDestroyed, capture, &screenDestroyed);
                 if (ERROR_SUCCESS != status)
                 {
+                    // KEEP-FATAL: after the NEVEREXIT conversions in vchan-handlers.c
+                    // every failure that still propagates here is a vchan-level
+                    // receive/send failure - the stream is broken or a message body
+                    // was left partially consumed. Re-parsing a desynced stream could
+                    // interpret arbitrary bytes as messages (including synthesized
+                    // input), so this must never be converted. Case (a).
                     exitLoop = TRUE;
                     LogError("HandleServerData failed: 0x%x", status);
                     break;
@@ -3803,14 +3928,26 @@ static ULONG WINAPI WatchForEvents(void)
             if (screenDestroyed)
             {
                 LogDebug("gui daemon confirms screen destruction");
-                CaptureTeardown(capture);
-                capture = NULL;
+                // NEVEREXIT: capture is NULL if this confirm arrives while already in
+                // the A7 degraded state (CaptureTeardown would crash on NULL).
+                if (capture)
+                {
+                    CaptureTeardown(capture);
+                    capture = NULL;
+                }
                 status = StartFrameProcessingWithRetry(newFrameEvent, captureErrorEvent, &capture);
                 if (ERROR_SUCCESS != status)
                 {
+                    // NEVEREXIT (CONVERT, was exitLoop): same as the connect-time
+                    // site - degrade and retry instead of exiting.
                     win_perror2(status, "StartFrameProcessing");
-                    exitLoop = TRUE;
-                    break;
+                    EnterCaptureDegraded(status, &capture,
+                        &captureDegraded, &captureRetryDue, &degradedLogLast);
+                }
+                else if (captureDegraded)
+                {
+                    captureDegraded = FALSE;
+                    LogInfo("A7DEGRADED recovered: capture restarted");
                 }
             }
             break;
@@ -3818,7 +3955,11 @@ static ULONG WINAPI WatchForEvents(void)
         case 5: // capture error, can be due to a desktop switch or resolution change
             LogDebug("capture error");
 
-            StopFrameProcessing(&capture);
+            // NEVEREXIT: a stale error event from a torn-down capture generation can
+            // fire while degraded (capture == NULL); StopFrameProcessing dereferences
+            // *capture. Nothing to stop in that case.
+            if (capture)
+                StopFrameProcessing(&capture);
             // CaptureTeardown() is delayed until we receive confirming MSG_DESTROY for 0x0 from gui daemon
             // revoking framebuffer access before that is unsafe
             break;
@@ -3834,6 +3975,36 @@ static ULONG WINAPI WatchForEvents(void)
             else
                 DiscardWindowEvents();
             break;
+        }
+
+        // A7/NEVEREXIT: degraded-state capture re-init. Runs on the wait timeout armed
+        // above, but also opportunistically after any other event once the retry is
+        // due. Single attempt per period (not the 10x fast retry - that would stall
+        // vchan servicing for seconds at a time while capture is persistently down).
+        if (captureDegraded && !exitLoop && g_VchanClientConnected &&
+            GetTickCount64() >= captureRetryDue)
+        {
+            ULONG retryStatus = StartFrameProcessing(newFrameEvent, captureErrorEvent, &capture);
+            if (ERROR_SUCCESS == retryStatus)
+            {
+                captureDegraded = FALSE;
+                LogInfo("A7DEGRADED recovered: capture restarted");
+            }
+            else
+            {
+                if (capture)
+                {
+                    // partial init - back to a known state (see EnterCaptureDegraded)
+                    CaptureTeardown(capture);
+                    capture = NULL;
+                }
+                captureRetryDue = GetTickCount64() + A7_DEGRADED_RETRY_MS;
+                if (GetTickCount64() - degradedLogLast >= A7_DEGRADED_LOG_MS)
+                {
+                    degradedLogLast = GetTickCount64();
+                    LogWarning("A7DEGRADED capture unavailable, retrying");
+                }
+            }
         }
 
         if (exitLoop)

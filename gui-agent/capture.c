@@ -653,7 +653,13 @@ CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event)
 
     CAPTURE_CONTEXT* ctx = (CAPTURE_CONTEXT*)calloc(1, sizeof(CAPTURE_CONTEXT));
     if (!ctx)
-        exit(ERROR_OUTOFMEMORY);
+    {
+        // NEVEREXIT (CONVERT, was exit(ERROR_OUTOFMEMORY)): a failed ~1 KB alloc must
+        // fail this capture generation, not the process - the caller's A7 degraded
+        // path keeps the vchan alive and retries the init.
+        LogError("out of memory allocating CAPTURE_CONTEXT");
+        return NULL;
+    }
 
     InitializeCriticalSection(&ctx->frame.lock);
     InitializeCriticalSection(&ctx->stale_lock); // A6: parked-grant list

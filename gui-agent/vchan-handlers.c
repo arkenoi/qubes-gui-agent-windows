@@ -35,6 +35,22 @@
 #include <config.h>
 #include <log.h>
 
+// NEVEREXIT policy (user directive 2026-08-05): the agent exits only when (a) the
+// vchan is genuinely dead / the daemon disconnected, or (b) it is explicitly told to
+// stop (QGA_SHUTDOWN). Every other failure is a logged, degraded, retrying state -
+// each needless exit risks killing gui-daemon via the dom0 EOF-on-write bug.
+// In this file that means:
+//   - Every VchanReceiveBuffer failure stays FATAL. It is not just "vchan probably
+//     dead": on a failed/partial receive the stream position is unknown, and a
+//     handler that continued would re-parse arbitrary stream bytes as messages -
+//     including MSG_KEYPRESS/MSG_BUTTON, i.e. synthesized input into the guest. This
+//     fatality is a guest-side input-integrity mechanism; never convert it.
+//   - Send failures (SendWindowConfigure ACKs) stay fatal: VchanSendBuffer blocks on
+//     a full ring and fails only on a broken vchan - case (a).
+//   - Handler failures whose message body was FULLY consumed are converted to
+//     log-and-continue (InjectInput below was the prototype; SetVideoMode in
+//     HandleXconf and RequestResolutionChange in HandleConfigure follow it).
+//
 // Input injection must NEVER kill the agent. SendInput fails transiently whenever the
 // secure desktop owns input (UAC prompt, idle lock screen): measured 2026-08-05, one
 // denied HandleMotion made HandleServerData exit the agent, which closed the vchan and
@@ -76,7 +92,7 @@ static DWORD HandleWorkarea(void)
     struct qga_msg_workarea m;
     if (!VchanReceiveBuffer(g_Vchan, &m, sizeof(m), L"msg_workarea"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
     LogInfo("dom0 workarea (%u,%u) %ux%u frame %u/%u/%u/%u",
@@ -113,7 +129,7 @@ DWORD HandleVersion(void)
     DWORD guidVersion;
     if (!VchanReceiveBuffer(g_Vchan, &guidVersion, sizeof(guidVersion), L"version"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
     LogInfo("gui daemon version: 0x%x", guidVersion);
@@ -126,9 +142,11 @@ DWORD HandleXconf(void)
     struct msg_xconf xconf;
 
     LogVerbose("start");
+    // KEEP-FATAL: vchan receive failed - stream broken/EOF, msg_xconf body possibly
+    // part-consumed; re-parsing a desynced stream is never protocol-safe (case (a)).
     if (!VchanReceiveBuffer(g_Vchan, &xconf, sizeof(xconf), L"msg_xconf"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
     LogInfo("host resolution: %lux%lu, mem: %lu, depth: %lu", xconf.w, xconf.h, xconf.mem, xconf.depth);
@@ -155,7 +173,40 @@ DWORD HandleXconf(void)
         LogDebug("no saved fullscreen height, using host's (%u)", xconf.h);
 
 end:
-    return SetVideoMode(fullscreenWidth, fullscreenHeight, source);
+    // NEVEREXIT (CONVERT, was fatal): a resolution we couldn't set is not a reason to
+    // die - the vchan is fine and capture runs at whatever mode is current. This was
+    // the one HandleXconf failure that killed the agent at connect time.
+    status = SetVideoMode(fullscreenWidth, fullscreenHeight, source);
+    if (status != ERROR_SUCCESS)
+    {
+        LogError("NEVEREXIT SetVideoMode(%ux%u) failed (0x%x) - continuing at current resolution",
+            fullscreenWidth, fullscreenHeight, status);
+
+        // g_ScreenWidth/Height are only ever written on a SUCCESSFUL mode set
+        // (resolution.c); at first connect they are still 0 here, and the input
+        // handlers (HandleMotion/HandleButton) divide by them. Adopt the mode
+        // Windows is actually in, falling back to xconf's values.
+        if (g_ScreenWidth == 0 || g_ScreenHeight == 0)
+        {
+            DEVMODE current;
+            ZeroMemory(&current, sizeof(current));
+            current.dmSize = sizeof(current);
+            if (EnumDisplaySettings(NULL, ENUM_CURRENT_SETTINGS, &current) &&
+                current.dmPelsWidth > 0 && current.dmPelsHeight > 0)
+            {
+                g_ScreenWidth = current.dmPelsWidth;
+                g_ScreenHeight = current.dmPelsHeight;
+            }
+            else
+            {
+                g_ScreenWidth = xconf.w;
+                g_ScreenHeight = xconf.h;
+            }
+            LogWarning("NEVEREXIT adopted %ux%u as the current screen size",
+                g_ScreenWidth, g_ScreenHeight);
+        }
+    }
+    return ERROR_SUCCESS;
 }
 
 static int BitSet(IN OUT BYTE *keys, IN int num)
@@ -190,7 +241,7 @@ static DWORD HandleKeymapNotify(void)
     LogVerbose("start");
     if (!VchanReceiveBuffer(g_Vchan, remoteKeys, sizeof(remoteKeys), L"keymap"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
 
@@ -257,7 +308,7 @@ static DWORD HandleKeypress(IN HWND window)
     LogVerbose("0x%x", window);
     if (!VchanReceiveBuffer(g_Vchan, &keyMsg, sizeof(keyMsg), L"msg_keypress"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
 
@@ -303,7 +354,7 @@ static DWORD HandleButton(IN HWND window)
     LogVerbose("0x%x", window);
     if (!VchanReceiveBuffer(g_Vchan, &buttonMsg, sizeof(buttonMsg), L"msg_button"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
 
@@ -358,7 +409,7 @@ static DWORD HandleMotion(IN HWND window)
     LogVerbose("0x%x", window);
     if (!VchanReceiveBuffer(g_Vchan, &motionMsg, sizeof(motionMsg), L"msg_motion"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
 
@@ -418,7 +469,7 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 
     if (!VchanReceiveBuffer(g_Vchan, &configureMsg, sizeof(configureMsg), L"msg_configure"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
 
@@ -537,6 +588,9 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
             // (UNMAP/DESTROY, also under this lock) cannot interleave: an ACK for a
             // just-destroyed window would hit the daemon's "msg without CREATE"
             // exit(1). For the same reason no ACK at all for untracked windows.
+            // KEEP-FATAL (propagated): SendWindowConfigure only fails when the vchan
+            // write fails (VchanSendBuffer blocks rather than failing on a full
+            // ring), i.e. the vchan is broken - case (a).
             ULONG ackStatus = SendWindowConfigure(window,
                 configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height,
                 configureMsg.override_redirect);
@@ -567,11 +621,21 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
         {
             DWORD status = RequestResolutionChange(configureMsg.width, configureMsg.height, L"dom0");
             if (status != ERROR_SUCCESS)
-                return win_perror2(status, "requesting resolution change");
+            {
+                // NEVEREXIT (CONVERT, was fatal): the msg_configure body is fully
+                // consumed, so dropping the request is protocol-safe. Failure here is
+                // a local resource problem (event/thread creation) - keep the current
+                // resolution, still ACK below, keep running.
+                win_perror2(status, "requesting resolution change");
+                LogWarning("NEVEREXIT resolution change request %ux%u dropped - keeping current resolution",
+                    configureMsg.width, configureMsg.height);
+            }
         }
     }
 
     // Screen (window 0) ACK: the screen window is never destroyed, no ordering hazard.
+    // KEEP-FATAL (propagated): send failure = broken vchan, case (a) - see the
+    // per-window ACK above.
     if (replyToMessages)
     {
         return SendWindowConfigure(window,
@@ -587,7 +651,7 @@ static DWORD HandleFocus(IN HWND window)
 
     if (!VchanReceiveBuffer(g_Vchan, &focusMsg, sizeof(focusMsg), L"msg_focus"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
     LogVerbose("0x%x: type %x, mode %x, detail %x", window, focusMsg.type, focusMsg.mode, focusMsg.detail);
@@ -627,7 +691,7 @@ static DWORD HandleWindowFlags(IN HWND window)
 
     if (!VchanReceiveBuffer(g_Vchan, &flagsMsg, sizeof(flagsMsg), L"msg_window_flags"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
 
@@ -665,7 +729,7 @@ DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* cap
 
     if (!VchanReceiveBuffer(g_Vchan, &header, sizeof(header), L"msg_hdr"))
     {
-        LogError("VchanReceiveBuffer failed");
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
 
@@ -751,7 +815,10 @@ DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* cap
 
     if (ERROR_SUCCESS != status)
     {
-        LogError("handler failed: 0x%x, exiting", status);
+        // KEEP-FATAL: after the NEVEREXIT conversions (see the policy comment at the
+        // top of this file) every status that reaches this point is a vchan-level
+        // receive or send failure - the stream is broken or desynced. Case (a).
+        LogError("handler failed: 0x%x, exiting (vchan-level failure)", status);
     }
 
     return status;
