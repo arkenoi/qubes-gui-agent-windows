@@ -442,6 +442,167 @@ static void XcLogger(IN XENCONTROL_LOG_LEVEL logLevel, IN const char* function, 
     _LogFormat(logLevel, /*raw=*/FALSE, function, buf);
 }
 
+// ---------------------------------------------------------------------------
+// STAGING: the screen framebuffer granted to dom0 EXACTLY ONCE per agent lifetime.
+//
+// Evidence (FINDINGS.md 2026-08-05 "cont 8"): at the whole-guest livelock the wedged
+// domain held ~22,000 ACTIVE grant entries still mapped by dom0 - dozens of stale
+// framebuffer generations accumulated because every resize re-granted the desktop
+// surface and dom0-side release could not keep pace. This object removes the
+// accumulation class structurally: ONE maximum-size page-aligned buffer is
+// VirtualAlloc'd and granted the first time capture initializes, every frame is
+// COPIED into it (dirty rects only), and every window-0 MSG_WINDOW_DUMP re-uses the
+// same refs. Resizes stop creating grant traffic entirely.
+//
+// Lifetime: this state deliberately lives OUTSIDE CAPTURE_CONTEXT. It survives
+// RecreateDuplication, CaptureTeardown(!) and reinitialization, and has its OWN
+// xencontrol handle so CaptureTeardown's XcClose(ctx->xc) cannot orphan the
+// revocation path. Revoked only in the A6 exit path (CaptureStagingRevokeOnExit),
+// after the drain, best effort.
+//
+// Cost trade: one memcpy of the dirty region per frame (~microseconds per MB)
+// against 4.7-6.5 ms per 1080p re-grant and ~90 us per revoke on the direct path
+// (FINDINGS.md measured grant costs) - and against the livelock above.
+typedef struct _STAGING_GRANT
+{
+    PXENCONTROL_CONTEXT xc; // dedicated handle, never closed by capture teardown
+    BYTE* buffer;           // VirtualAlloc'd, page-aligned
+    size_t size;            // bytes == page_count * PAGE_SIZE
+    size_t page_count;
+    ULONG* refs;
+    void* handle;           // grant handle from XcGnttabPermitForeignAccess2
+    UINT cap_width;         // capacity geometry (for logs/guards only; the current
+    UINT cap_height;        // frame geometry lives in ctx->width/height)
+} STAGING_GRANT;
+
+static STAGING_GRANT g_Staging;
+
+// Guaranteed minimum capacity; the actual capacity is the larger of this and the
+// dom0 host resolution from msg_xconf (known before capture ever initializes:
+// HandleXconf runs before StartFrameProcessing).
+#define STAGING_MIN_WIDTH  2560
+#define STAGING_MIN_HEIGHT 1600
+
+// TRUE when a frame of width x height fits the granted staging buffer.
+static BOOL StagingCapacityOk(IN UINT width, IN UINT height)
+{
+    return g_Staging.handle && ((size_t)width * height * 4 <= g_Staging.size);
+}
+
+// Allocate and grant the staging buffer, once per process. Returns TRUE when the
+// grant is live. On failure everything is released and the next CaptureInitialize
+// retries (at most one grant attempt per init - no accumulation). Called only from
+// CaptureInitialize, so single-threaded by construction.
+static BOOL StagingEnsure(void)
+{
+    if (g_Staging.handle)
+        return TRUE;
+
+    if (!g_StagingGrant)
+        return FALSE; // registry gate: direct-map A/B build
+
+    UINT capW = (UINT)g_HostScreenWidth;
+    UINT capH = (UINT)g_HostScreenHeight;
+    if ((size_t)capW * capH < (size_t)STAGING_MIN_WIDTH * STAGING_MIN_HEIGHT)
+    {
+        capW = STAGING_MIN_WIDTH;
+        capH = STAGING_MIN_HEIGHT;
+    }
+
+    size_t page_count = FRAMEBUFFER_PAGE_COUNT(capW, capH);
+    size_t size = page_count * PAGE_SIZE;
+
+    BYTE* buffer = (BYTE*)VirtualAlloc(NULL, size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!buffer)
+    {
+        win_perror("VirtualAlloc(staging framebuffer)");
+        return FALSE;
+    }
+
+    ULONG* refs = (ULONG*)malloc(page_count * sizeof(ULONG));
+    if (!refs)
+    {
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        return FALSE;
+    }
+
+    PXENCONTROL_CONTEXT xc = NULL;
+    DWORD status = XcOpen(XcLogger, &xc);
+    if (status != ERROR_SUCCESS || !xc)
+    {
+        win_perror2(status, "XcOpen (staging)");
+        free(refs);
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    XcSetLogLevel(xc, LogGetLevel());
+
+    void* handle = NULL;
+    status = XcGnttabPermitForeignAccess2(xc,
+        g_GuiDomainId,
+        buffer,
+        (ULONG)page_count,
+        0,
+        0,
+        XENIFACE_GNTTAB_READONLY,
+        &handle,
+        refs);
+    if (status != ERROR_SUCCESS)
+    {
+        win_perror2(status, "XcGnttabPermitForeignAccess2 (staging)");
+        XcClose(xc);
+        free(refs);
+        VirtualFree(buffer, 0, MEM_RELEASE);
+        return FALSE;
+    }
+    assert(handle == buffer);
+
+    g_Staging.xc = xc;
+    g_Staging.buffer = buffer;
+    g_Staging.size = size;
+    g_Staging.page_count = page_count;
+    g_Staging.refs = refs;
+    g_Staging.handle = handle;
+    g_Staging.cap_width = capW;
+    g_Staging.cap_height = capH;
+
+    LogInfo("STAGING granted %lu pages capacity %ux%u", (ULONG)page_count, capW, capH);
+    return TRUE;
+}
+
+size_t CaptureGrantPageCount(IN const CAPTURE_CONTEXT* ctx)
+{
+    // Constant full-capacity count with the staging grant; the daemon accepts a count
+    // larger than width*height needs and exit(1)s only on a TOO SMALL one (see the
+    // declaration in capture.h).
+    if (ctx->uses_staging)
+        return g_Staging.page_count;
+    return FRAMEBUFFER_PAGE_COUNT(ctx->width, ctx->height);
+}
+
+void CaptureStagingRevokeOnExit(void)
+{
+    if (!g_Staging.handle)
+        return;
+
+    ULONG status = XcGnttabRevokeForeignAccess(g_Staging.xc, g_Staging.handle);
+    if (status != ERROR_SUCCESS)
+    {
+        // dom0 still maps the pages (daemon alive or wedged). Best effort by design:
+        // leak the one buffer loudly rather than spin - the process is exiting and
+        // this is a single bounded allocation, not the per-resize accumulation the
+        // staging grant exists to prevent.
+        LogWarning("STAGING revoke failed on exit (0x%x) - leaking the staging grant", status);
+        return;
+    }
+
+    LogInfo("STAGING revoked on exit (%lu pages)", (ULONG)g_Staging.page_count);
+    XcClose(g_Staging.xc);
+    free(g_Staging.refs);
+    VirtualFree(g_Staging.buffer, 0, MEM_RELEASE);
+    ZeroMemory(&g_Staging, sizeof(g_Staging));
+}
+
 // TODO: use callbacks instead of events
 CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event)
 {

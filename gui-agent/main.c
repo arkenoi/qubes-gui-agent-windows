@@ -88,6 +88,12 @@ static UINT g_FbHeight = 0;
 DWORD g_HostScreenWidth = 0;
 DWORD g_HostScreenHeight = 0;
 
+// Registry gate REG_CONFIG_STAGING_VALUE ("StagingGrant", default ON): use the
+// persistent staging framebuffer grant (capture.c) instead of granting the mapped
+// DXGI desktop surface per capture generation. One registry flip + agent restart
+// gives the A/B against the direct-map path.
+BOOL g_StagingGrant = TRUE;
+
 // minimal acceptable window dimensions
 DWORD g_MinWindowWidth = 0;
 DWORD g_MinWindowHeight = 0;
@@ -3905,6 +3911,12 @@ static ULONG WINAPI WatchForEvents(void)
         CaptureTeardown(capture);
     }
 
+    // STAGING: the persistent screen grant outlives every capture generation by design
+    // (CaptureTeardown must never revoke it). This is its ONE revocation point: after
+    // the teardown notifications and the drain above, best effort - a failure is
+    // logged and the single buffer leaked, never a stall.
+    CaptureStagingRevokeOnExit();
+
     LogInfo("exiting");
     // all handles will be closed on exit anyway
 
@@ -4020,6 +4032,18 @@ static ULONG Init(void)
     else
     {
         g_SeamlessMode = seamlessMode;
+    }
+
+    DWORD stagingGrant;
+    status = CfgReadDword(moduleName, REG_CONFIG_STAGING_VALUE, &stagingGrant, NULL);
+    if (ERROR_SUCCESS != status)
+    {
+        LogWarning("Failed to read '%s' config value, using default (TRUE)", REG_CONFIG_STAGING_VALUE);
+        g_StagingGrant = TRUE;
+    }
+    else
+    {
+        g_StagingGrant = (stagingGrant != 0);
     }
 
     SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, SPIF_UPDATEINIFILE);

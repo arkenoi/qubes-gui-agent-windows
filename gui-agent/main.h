@@ -32,6 +32,7 @@ extern BOOL g_LocalScreenDestroyed;
 extern DWORD g_HostScreenWidth;
 extern DWORD g_HostScreenHeight;
 extern BOOL g_VchanClientConnected;
+extern BOOL g_StagingGrant;
 extern HWND g_DesktopWindow;
 extern char g_DomainName[256];
 extern USHORT g_GuiDomainId;

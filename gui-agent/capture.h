@@ -91,6 +91,14 @@ typedef struct _CAPTURE_CONTEXT
 	// stale_lock is a leaf lock: never take another lock while holding it.
 	CRITICAL_SECTION stale_lock;
 	STALE_GRANT* stale_grants;
+	// STAGING: this capture generation publishes frames through the persistent
+	// module-lifetime staging buffer (capture.c). framebuffer/grant_refs are then
+	// ALIASES of the staging state: no teardown/park path may free or revoke them.
+	BOOL uses_staging;
+	// STAGING: the next successful frame must copy the FULL frame into the staging
+	// buffer, ignoring dirty rects (first frame, and after any geometry change or
+	// duplication recreate - staging content at the old pitch is garbage for the new).
+	BOOL staging_full_copy;
 } CAPTURE_CONTEXT;
 
 // initialize capture interfaces and map framebuffer
@@ -112,3 +120,18 @@ void CaptureRevokeStaleGrants(IN OUT CAPTURE_CONTEXT* ctx, IN const WCHAR* why);
 
 // A6: TRUE while any superseded screen grant is still awaiting successful revocation.
 BOOL CaptureHasStaleGrants(IN CAPTURE_CONTEXT* ctx);
+
+// STAGING: page count to send with the window-0 MSG_WINDOW_DUMP. With the staging
+// grant this is the CONSTANT full capacity of the staging buffer regardless of the
+// current geometry: gui-daemon exit(1)s only when the count is TOO SMALL for
+// width*height (xside.c:3903-3913, img_data_size < w*h*4); a larger count is
+// accepted. The constant count is what makes a resize a pure header refresh over
+// the same grant refs. Direct-map path: the exact per-geometry count, as before.
+size_t CaptureGrantPageCount(IN const CAPTURE_CONTEXT* ctx);
+
+// STAGING: best-effort revocation of the persistent staging grant. The staging
+// buffer deliberately survives CaptureTeardown and reinitialization; call this
+// ONLY from the A6 exit path, after the teardown notifications and revoke drain.
+// Failure (dom0 still maps the pages) is logged and the buffer leaked - the
+// process is exiting.
+void CaptureStagingRevokeOnExit(void);

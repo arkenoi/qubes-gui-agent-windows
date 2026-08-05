@@ -35,6 +35,10 @@
 #define REG_CONFIG_FULLSCREEN_HEIGHT_VALUE  L"FullscreenHeight"
 // guest work area override "x,y,w,h" (see gui-agent/workarea.h)
 #define REG_CONFIG_WORKAREA_VALUE           L"WorkArea"
+// persistent staging framebuffer grant (DWORD, default 1=ON): the screen framebuffer
+// is granted to dom0 once per agent lifetime and frames are copied into it; 0 restores
+// the legacy direct-map per-geometry grant (A/B switch, see gui-agent/capture.c)
+#define REG_CONFIG_STAGING_VALUE            L"StagingGrant"
 
 // path to the gui agent, launched by the watchdog service
 #define REG_CONFIG_AGENT_PATH_VALUE  L"GuiAgentPath"
