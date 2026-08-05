@@ -348,6 +348,21 @@ BOOL ResolutionExactObtainInFlight(void)
     return g_ExactInFlight != 0;
 }
 
+// May the recovery path announce this geometry to the daemon (MSG_CONFIGURE w0)?
+// The capture thread's recovery cycle LAGS the resolution thread's apply: a
+// transit mode observed during the replug can surface up to ~100 ms after the
+// in-flight flag clears (measured 75 ms - the transit leaked, the daemon echoed
+// it, wrong size applied). So the gate covers the whole settle window: while it
+// is open, ONLY the exact target may be announced.
+BOOL ResolutionShouldAnnounceGeometry(IN ULONG width, IN ULONG height)
+{
+    if (g_ExactInFlight)
+        return width == g_ExactTargetW && height == g_ExactTargetH;
+    if (g_EchoWindowEnd != 0 && GetTickCount64() < g_EchoWindowEnd)
+        return width == g_ExactTargetW && height == g_ExactTargetH;
+    return TRUE;
+}
+
 // Sizes the desktop transited during the current/last obtain (recorded by the
 // recovery path when it suppresses A6CONFIGURE). Only THESE, plus the pre-apply
 // size, are echo suspects - anything else inside the settle window is genuine

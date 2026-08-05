@@ -3746,9 +3746,9 @@ static ULONG WINAPI WatchForEvents(void)
                         // the daemon about them makes its window twitch and echo the
                         // transit size back as fake dom0 intent (measured revert,
                         // FINDINGS 2026-08-05). The final apply sends the real one.
-                        if (ResolutionExactObtainInFlight())
+                        if (!ResolutionShouldAnnounceGeometry(capture->width, capture->height))
                         {
-                            LogInfo("A6CONFIGURE suppressed (transitional %ux%u during exact-obtain)",
+                            LogInfo("A6CONFIGURE suppressed (transitional %ux%u during exact-obtain/settle)",
                                 capture->width, capture->height);
                             ResolutionNoteTransitSize(capture->width, capture->height);
                         }

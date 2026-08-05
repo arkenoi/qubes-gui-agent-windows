@@ -38,6 +38,9 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source);
 // TRUE while an exact-obtain (replug+apply) is in flight on the resolution thread;
 // the recovery path must not tell the daemon about transitional geometries then.
 BOOL ResolutionExactObtainInFlight(void);
+// FALSE while a non-target geometry must not be announced to the daemon
+// (exact-obtain in flight OR settle window open).
+BOOL ResolutionShouldAnnounceGeometry(IN ULONG width, IN ULONG height);
 // Recovery path records desktop-transit sizes here; they become echo suspects.
 void ResolutionNoteTransitSize(IN ULONG width, IN ULONG height);
 void InitVideoModes();
