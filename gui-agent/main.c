@@ -3013,6 +3013,18 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         perfPhase = PerfNow();
         perfSendPhase = g_PerfSendTicks;
 
+        // HELD FRAME: while an exact-obtain/settle is in flight the daemon's window
+        // still has the pre-resize geometry (transitional dumps are suppressed);
+        // damage computed against the transit geometry paints as sheared garbage
+        // there (user-reported brief mangling). Send nothing - the daemon freezes
+        // on the last clean frame, and the post-apply A6ACKREPAINT repaints
+        // everything at the final size.
+        if (!ResolutionShouldAnnounceGeometry(fbWidth, fbHeight))
+        {
+            LogVerbose("held frame (transitional %ux%u)", fbWidth, fbHeight);
+            return ERROR_SUCCESS;
+        }
+
         if (frame->dirty_rects_count == 0)
         {
             // normally we don't get frames with 0 dirty rects unless it's the 1st one
