@@ -710,6 +710,15 @@ DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* cap
             // screen grant(s) can be revoked now.
             LogInfo("A6ACK window-0 dump ack received");
             CaptureRevokeStaleGrants(capture, L"ack");
+            // Repaint the whole screen against the mapping dom0 just adopted. Under
+            // back-to-back resizes dom0 can be left showing interleaved content
+            // generations (sheared bands, measured 2026-08-05); the ack is the one
+            // point where the new mapping is provably current on both sides.
+            if (!g_SeamlessMode)
+            {
+                LogInfo("A6ACKREPAINT full damage %ux%u", capture->width, capture->height);
+                SendWindowDamageEvent(NULL, 0, 0, capture->width, capture->height);
+            }
         }
         PwRevokeTick();
         status = ERROR_SUCCESS;
