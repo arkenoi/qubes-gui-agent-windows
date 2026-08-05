@@ -890,7 +890,8 @@ static HRESULT StagingCopyFrame(IN OUT CAPTURE_CONTEXT* ctx)
             d += dstPitch;
         }
     }
-    LogVerbose("STAGING copy %u rect(s)%s", count, ctx->staging_full_copy ? " (full)" : "");
+    // %s is WIDE here: the Log* macros L-paste the format (wide printf semantics)
+    LogVerbose("STAGING copy %u rect(s)%s", count, ctx->staging_full_copy ? L" (full)" : L"");
     ctx->staging_full_copy = FALSE;
 
     status = IDXGIOutputDuplication_UnMapDesktopSurface(ctx->duplication);
