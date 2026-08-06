@@ -373,8 +373,28 @@ BOOL CaptureHasStaleGrants(IN CAPTURE_CONTEXT* ctx)
 
 static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
 {
-    const UINT maxAttempts = 20;
-    const DWORD retryDelayMs = 250;
+    // Retry cadence. The recovery WINDOW is unchanged (the old loop was 20 attempts
+    // x 250 ms = 5 s): a trip to the secure desktop lasts seconds and must still be
+    // ridden out, so shortening the window would trade a rare blink for a rare
+    // teardown-of-every-window. What changes is the SHAPE of the wait.
+    //
+    // Right after a mode change the display topology is still settling and
+    // DuplicateOutput fails for a few tens of milliseconds. With a flat 250 ms
+    // cadence a single such failure costs a flat 250 ms - over half of the measured
+    // 470 ms applied->repaint tail - even though the retry that succeeds would have
+    // succeeded far earlier. Probe fast first, then fall back to exactly the old
+    // cadence, so an outage that is genuinely long costs no more wakeups than before.
+    //
+    // Not a busy loop: the shortest delay is 25 ms and the fast phase is bounded to
+    // 8 probes (200 ms total). The attempt cap exists because every attempt
+    // re-attaches to the input desktop and that deliberately leaks one HDESK (see
+    // AttachCaptureThreadToInputDesktop); 28 vs the old 20 in the rare
+    // recovery-failed-entirely case is the accepted cost.
+    const ULONGLONG deadline = GetTickCount64() + 5000;
+    const UINT fastAttempts = 8;
+    const DWORD fastDelayMs = 25;
+    const DWORD slowDelayMs = 250;
+    const UINT maxAttempts = 28;
     UINT width = 0, height = 0;
 
     EnterCriticalSection(&ctx->frame.lock);
@@ -493,7 +513,15 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
             return TRUE;
         }
 
-        Sleep(retryDelayMs);
+        // Deadline, not a fixed sleep count: with a mixed cadence the attempt number
+        // no longer implies the elapsed time, and this also drops the pointless final
+        // sleep the old loop performed just before giving up.
+        if (GetTickCount64() >= deadline)
+        {
+            LogError("failed to recreate duplication after %u attempt(s) within the 5000 ms window", attempt + 1);
+            return FALSE;
+        }
+        Sleep(attempt < fastAttempts ? fastDelayMs : slowDelayMs);
     }
 
     LogError("failed to recreate duplication after %u attempts", maxAttempts);
