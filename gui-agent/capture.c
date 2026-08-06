@@ -22,6 +22,7 @@
 #include "capture.h"
 #include "common.h"
 #include "main.h"
+#include "resolution.h" // M0BLINK obtain-start stamp (instrumentation only)
 
 #include <log.h>
 
@@ -38,6 +39,22 @@
 #define A6_ACK_TIMEOUT_MS 5000
 
 volatile LONG g_CaptureThreadEnable = 0;
+
+// M0BLINK phase marker for the applied->repaint tail. The 470 ms between the mode
+// APPLY and the repaint is spent entirely on this thread plus one vchan round trip,
+// and until now nothing inside it was timestamped. Silent unless a novel-size obtain
+// is in flight (the stamp is 0 otherwise), so this costs one relaxed read per event
+// in steady state and never logs on ordinary desktop-switch/UAC recoveries.
+// `detail` is a per-marker count (recreate attempts); 0 where meaningless.
+static void M0BlinkMark(IN const WCHAR* what, IN ULONG detail)
+{
+    LONG64 start = ResolutionM0BlinkObtainStart();
+    if (start == 0)
+        return;
+    ULONGLONG now = GetTickCount64();
+    LogInfo("M0BLINK %s n=%lu t=%I64u sinceobtain=%I64u ms",
+        what, detail, now, now - (ULONGLONG)start);
+}
 
 static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout);
 static HRESULT ReleaseFrame(IN OUT CAPTURE_CONTEXT* ctx);
@@ -472,6 +489,7 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
             // recovery is invisible and an operator cannot tell in-place recovery from
             // a silent teardown. This line is the evidence that the fix worked.
             LogInfo("duplication recreated in place after %u attempt(s) - windows kept", attempt + 1);
+            M0BlinkMark(L"recreate-done", attempt + 1);
             return TRUE;
         }
 
@@ -1217,6 +1235,11 @@ static DWORD WINAPI CaptureThread(void* param)
             // keyed mutex involved - see instrumentation/ACCESS-LOST-BUG.md.
             if (status == DXGI_ERROR_ACCESS_LOST || status == DXGI_ERROR_ACCESS_DENIED)
             {
+                // How long after the APPLY did this thread find out? AcquireNextFrame
+                // is a blocking call that no event can interrupt, so this delta is the
+                // floor on the tail - and the one number that says whether FRAME_TIMEOUT
+                // (1000 ms) is being waited out or DXGI wakes the acquire immediately.
+                M0BlinkMark(L"access-lost-noticed-acquire", 0);
                 if (RecreateDuplication(capture))
                     continue; // recovered in place, window list untouched
 
@@ -1267,6 +1290,7 @@ end_frame:
             // here or the in-place recovery is unreachable in practice.
             if (status == DXGI_ERROR_ACCESS_LOST || status == DXGI_ERROR_ACCESS_DENIED)
             {
+                M0BlinkMark(L"access-lost-noticed-release", 0);
                 if (RecreateDuplication(capture))
                     continue; // recovered in place, window list untouched
 

@@ -3760,6 +3760,17 @@ static ULONG WINAPI WatchForEvents(void)
                     else
                     {
                         LogInfo("framebuffer re-granted after duplication recovery, MSG_WINDOW_DUMP re-sent");
+                        {
+                            // M0BLINK: the dump is on the wire. Everything after this
+                            // point until repaint-first is local send cost only.
+                            LONG64 m0 = ResolutionM0BlinkObtainStart();
+                            if (m0 != 0)
+                            {
+                                ULONGLONG now = GetTickCount64();
+                                LogInfo("M0BLINK dump-sent t=%I64u sinceobtain=%I64u ms",
+                                    now, now - (ULONGLONG)m0);
+                            }
+                        }
                     // externally-driven mode changes (not via SetVideoMode) also
                     // reload the cursor scheme - re-blank here too
                     HideCursors();
@@ -3830,6 +3841,23 @@ static ULONG WINAPI WatchForEvents(void)
                         // Repaint at the size the new dump was granted at, not g_Screen*
                         // (which can lag an A6 in-place resize).
                         SendWindowDamageEvent(NULL, 0, 0, capture->width, capture->height);
+                    }
+
+                    // M0BLINK: THIS is when the user gets pixels back after a novel-size
+                    // resize - not A6ACKREPAINT. The daemon processes the vchan strictly
+                    // in order (xside.c handle_message) and handle_window_dump releases
+                    // the old mapping before mapping the new refs, so damage queued after
+                    // the dump above can only be painted against the new mapping. The
+                    // ack-gated repaint that follows is a belt-and-braces second pass one
+                    // round trip later; timing the blink at it overstates the blink.
+                    {
+                        LONG64 m0 = InterlockedExchange64(&g_M0BlinkFirstPaintStart, 0);
+                        if (m0 != 0)
+                        {
+                            ULONGLONG now = GetTickCount64();
+                            LogInfo("M0BLINK repaint-first t=%I64u sinceobtain=%I64u ms",
+                                now, now - (ULONGLONG)m0);
+                        }
                     }
                 }
 

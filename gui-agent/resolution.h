@@ -57,3 +57,15 @@ void InitVideoModes();
 // The A6ACKREPAINT site (vchan-handlers.c) InterlockedExchange64s it to 0 and
 // logs "M0BLINK repaint-sent ... sinceobtain=" when nonzero.
 extern volatile LONG64 g_M0BlinkObtainStart;
+
+// M0BLINK: same stamp, consumed by the FIRST (optimistic, post-dump) repaint in
+// main.c instead of by the ack-gated one. Two variables, not one, because both
+// repaints happen and each must get exactly one line per obtain - the ack-gated
+// A6ACKREPAINT is NOT the moment the user sees pixels, it is one vchan round
+// trip later, and reporting only it overstates the blink.
+extern volatile LONG64 g_M0BlinkFirstPaintStart;
+
+// M0BLINK: non-consuming read of the obtain-start stamp, for the intermediate
+// phase markers on the applied->repaint tail (capture.c). 0 = no obtain in
+// flight, marker stays silent.
+LONG64 ResolutionM0BlinkObtainStart(void);

@@ -829,9 +829,11 @@ DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* cap
             {
                 LogInfo("A6ACKREPAINT full damage %ux%u", capture->width, capture->height);
                 SendWindowDamageEvent(NULL, 0, 0, capture->width, capture->height);
-                // M0BLINK: first full repaint after a novel-size obtain = the user
-                // sees pixels again. Consume the obtain-start stamp (one line per
-                // obtain; later unrelated acks stay silent).
+                // M0BLINK: the ACK-GATED repaint - one vchan round trip AFTER the
+                // optimistic post-dump repaint that main.c already sent (logged as
+                // "M0BLINK repaint-first"). Time-to-pixels is repaint-first; this
+                // line is the ack round-trip cost on top of it. Consume the
+                // obtain-start stamp (one line per obtain; later acks stay silent).
                 LONG64 m0Start = InterlockedExchange64(&g_M0BlinkObtainStart, 0);
                 if (m0Start != 0)
                 {
