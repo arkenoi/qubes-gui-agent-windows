@@ -476,6 +476,53 @@ static BOOL QiddReloadModes(void)
     return reloaded;
 }
 
+// ---- M7: reload rate limiter -----------------------------------------------
+// A reload is a display-topology change (monitor departure + arrival). Two of
+// them in quick succession is the pattern under which the guest livelocks
+// against the Xen PV machinery (FINDINGS 2026-08-05 cont 9, 2026-08-06 cont 4),
+// and the dom0-side fixes are gated on upstream review, so the guest enforces a
+// minimum spacing itself.
+//
+// The wait happens ONLY on the obtain path in SetVideoModeExact, INSIDE the
+// branch that has already established that the requested mode is not offered and
+// a reload is therefore unavoidable. Every replug=0 route (RESNOOP, the habitual
+// snap onto a published size, an LRU/published size that IsExactModeAvailable
+// accepts) returns or falls through without ever reaching this call, so nothing
+// that would not have replugged anyway can be delayed by it.
+//
+// Sleeping there is safe: the obtain runs on the resolution thread, which is
+// debounced and latest-wins - it holds no vchan state and a newer dom0 request
+// simply supersedes this one. ResolutionPublishBootModeSet runs on the main loop
+// thread instead and therefore only STAMPS the tick, never waits.
+#define MIN_REPLUG_INTERVAL_MS 2500
+
+// GetTickCount64 of the last reload we issued; 0 = none this process.
+// Written on the resolution thread and once on the main loop thread (boot
+// publish, which cannot race it - the connect sequence precedes any obtain).
+static ULONGLONG g_LastReloadTick;
+
+static void NoteIddReload(void)
+{
+    g_LastReloadTick = GetTickCount64();
+}
+
+// Block until MIN_REPLUG_INTERVAL_MS has passed since the last reload.
+// Resolution thread only.
+static void ThrottleBeforeIddReload(void)
+{
+    if (g_LastReloadTick == 0)
+        return;
+
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG since = now - g_LastReloadTick;
+    if (since >= MIN_REPLUG_INTERVAL_MS)
+        return;
+
+    ULONGLONG wait = MIN_REPLUG_INTERVAL_MS - since;
+    LogInfo("M7THROTTLE waiting %I64u ms before reload", wait);
+    Sleep((DWORD)wait);
+}
+
 // Restart the Qubes IDD device in-process (what `devcon restart` does) so the
 // driver re-reads the modes key. Returns TRUE if a matching device was restarted.
 // Fallback only: the PnP replug disturbs the Xen platform device (grant-revoke
@@ -591,6 +638,10 @@ void ResolutionPublishBootModeSet(void)
         return;
     }
 
+    // No throttle wait here (main loop thread must not sleep), but the boot
+    // reload still counts as a topology change: stamp it so an obtain arriving
+    // right after connect is spaced away from it by the limiter.
+    NoteIddReload();
     if (QiddReloadModes())
         LogInfo("M6BOOT target=%lux%lu reloaded", g_ScreenWidth, g_ScreenHeight);
     else
@@ -782,13 +833,39 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
         }
     }
 
+    // Decide ONCE whether this apply needs a reload, BEFORE anything is armed.
+    // Everything the driver already offers - the target of the last obtain, the
+    // M7 LRU entries, the habitual sizes - answers TRUE here and takes the
+    // replug=0 route below without ever touching the rate limiter.
+    // This block deliberately precedes the in-flight/target arming: while the
+    // limiter waits, the desktop is still at the PREVIOUS target and must keep
+    // streaming to dom0. Arming first would make ResolutionShouldAnnounceGeometry
+    // hold every frame for the length of the wait (visible freeze).
+    BOOL needObtain = !IsExactModeAvailable(width, height);
+    if (needObtain)
+    {
+        // A reload is unavoidable, so it is now legal to spend time spacing it
+        // away from the previous one.
+        ThrottleBeforeIddReload();
+        // The wait is long enough that a reload issued just before this request
+        // (the boot publish, or a preceding obtain) may have landed meanwhile;
+        // re-check rather than force a topology change nobody needs any more.
+        needObtain = !IsExactModeAvailable(width, height);
+        if (!needObtain)
+            LogInfo("M7THROTTLE mode became available while waiting - no reload");
+        // latest-wins still holds across the wait: a newer dom0 request has
+        // already re-signalled the resolution thread's event and supersedes this
+        // apply once it returns (same contract as the RESECHO defer above).
+    }
+
     BOOL replugged = FALSE;
     ULONGLONG m0Start = 0; // M0BLINK obtain-start stamp; 0 = no obtain needed
     g_ExactTargetW = width;
     g_ExactTargetH = height;
     g_EchoSuspectCount = 0; // fresh obtain, fresh transit list
     InterlockedExchange(&g_ExactInFlight, 1);
-    if (!IsExactModeAvailable(width, height))
+
+    if (needObtain)
     {
         // try to obtain the exact mode from the Qubes IDD: publish the computed
         // mode set (target first) in the driver's registry key, make the driver
@@ -825,6 +902,10 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
                 return ERROR_SUCCESS;
             }
         }
+
+        // A topology change was issued (either branch above returned early on
+        // failure): stamp it so the next one is spaced by the M7 limiter.
+        NoteIddReload();
 
         {
             ULONGLONG now = GetTickCount64();
