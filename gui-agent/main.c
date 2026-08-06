@@ -4116,13 +4116,26 @@ static ULONG WINAPI WatchForEvents(void)
     // daemon time to process the DESTROYs above so the one attempt lands AFTER
     // its unmaps, not concurrently. Anything still busy is leaked loudly; domain
     // teardown reclaims it.
-    Sleep(A6_EXIT_SETTLE_MS);
-    PwRevokeTick();
-    if (capture)
-        CaptureRevokeStaleGrants(capture, L"exit-single-pass");
-    if (PwRevokePending() || (capture && CaptureHasStaleGrants(capture)))
-        LogWarning("A6LEAK exit: abandoning busy grants after single pass (per-window=%d, screen=%d)",
-            PwRevokePending(), capture ? CaptureHasStaleGrants(capture) : FALSE);
+    // ...and even the single pass only when the daemon is GONE (vchan dead or
+    // declared so above): a live daemon still maps the pages, so the revoke
+    // cannot succeed and can only lose the race (the single attempt wedged one
+    // more OS shutdown, 2026-08-06). Daemon alive => leak by design: one staging
+    // grant (~7200 pages) per agent exit, reboot-cleared, loudly logged.
+    if (!g_VchanClientConnected || !libvchan_is_open(g_Vchan))
+    {
+        Sleep(A6_EXIT_SETTLE_MS);
+        PwRevokeTick();
+        if (capture)
+            CaptureRevokeStaleGrants(capture, L"exit-single-pass");
+        if (PwRevokePending() || (capture && CaptureHasStaleGrants(capture)))
+            LogWarning("A6LEAK exit: abandoning busy grants after single pass (per-window=%d, screen=%d)",
+                PwRevokePending(), capture ? CaptureHasStaleGrants(capture) : FALSE);
+    }
+    else
+    {
+        LogWarning("A6LEAK exit by design: daemon still alive and mapping - skipping all revokes "
+            "(xenbus revoke-vs-unmap race; see FINDINGS 2026-08-05 cont 9)");
+    }
 
     PwShutdown();
 
