@@ -187,8 +187,10 @@ static BOOL IsExactModeAvailable(IN ULONG width, IN ULONG height)
 // The registry mode list is a computed SET, not just the single requested entry,
 // so the user's habitual sizes (maximize, tile-half - both derived from the dom0
 // work-area feed, never fabricated from inference) are already offered and switch
-// with replug=0. Host-screen sizes are deliberately NOT added by the builder:
-// they may only enter through the target slot as an actual dom0 request.
+// with replug=0. In WINDOWED (non-seamless) use host-screen sizes are
+// deliberately NOT added by the builder: they may only enter through the target
+// slot as an actual dom0 request. Seamless mode is the one exception (entry a1
+// below): there the desktop is the host-sized surface by definition.
 #define IDD_MODE_SET_MAX 8
 #define IDD_MODES_CCH 256
 
@@ -288,6 +290,26 @@ static DWORD BuildIddModeSet(IN ULONG targetW, IN ULONG targetH,
 
     // a. the target, always first (dom0's request slot)
     IddModeSetAdd(modes, &count, (LONG)targetW, (LONG)targetH);
+
+    // a1. SEAMLESS: while seamless mode is active the guest desktop IS the
+    // host-sized surface - SetSeamlessMode forces g_HostScreen* on every
+    // StartFrameProcessing - so the host size must be OFFERED or that force
+    // fails with DISP_CHANGE_BADMODE and seamless is dead (measured
+    // 2026-08-06: host 5120x1440 absent from the computed set, work area and
+    // capture failed behind it). This is consistent with the user's rule that
+    // host-size modes appear only when the window is effectively fullscreen:
+    // in seamless the whole host screen IS the window. Placed right after the
+    // target so the 8-entry cap can never drop it, and deliberately NOT a snap
+    // candidate - snapping a windowed resize toward the host size is exactly
+    // what the user forbade.
+    if (g_SeamlessMode && IS_RESOLUTION_VALID(g_HostScreenWidth, g_HostScreenHeight))
+    {
+        if (IddModeSetAdd(modes, &count, (LONG)g_HostScreenWidth, (LONG)g_HostScreenHeight))
+            LogInfo("M6SEAMLESS host %lux%lu added to set", g_HostScreenWidth, g_HostScreenHeight);
+        else
+            LogWarning("M6SEAMLESS host %lux%lu NOT in set - seamless force will fail",
+                g_HostScreenWidth, g_HostScreenHeight);
+    }
 
     // a2. recently applied dom0 sizes (M7 LRU), most recent first, right after
     // the target: returning to one of them then needs no reload at all.
@@ -771,7 +793,12 @@ static BOOL IsEchoSuspect(IN ULONG width, IN ULONG height)
     return FALSE;
 }
 
-static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
+// allowSnap: apply the 15-px habitual-size snap below. TRUE for dom0 window
+// follows (its whole point), FALSE for the seamless force - that one must land
+// on the host size EXACTLY, and a work-area-derived habitual size can sit within
+// 15 px of it (thin dom0 panel), which would silently mis-size the seamless
+// desktop.
+static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSnap)
 {
     if (!IS_RESOLUTION_VALID(width, height))
     {
@@ -811,7 +838,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     // work-area-derived mode takes that mode - blink-free and intentional; the
     // daemon then nudges the window to match (sanctioned resize-to-viewport,
     // bounded by 15 px and only toward tiles/maximize).
-    for (DWORD i = 0; i < g_SnapCandidateCount; i++)
+    for (DWORD i = 0; allowSnap && i < g_SnapCandidateCount; i++)
     {
         LONG dw = (LONG)width - (LONG)g_SnapCandidates[i][0];
         LONG dh = (LONG)height - (LONG)g_SnapCandidates[i][1];
@@ -1029,7 +1056,21 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
     // dom0-sourced requests must never be snapped to a different mode:
     // exact size or keep the current one (see SetVideoModeExact)
     if (source && 0 == wcscmp(source, L"dom0"))
-        return SetVideoModeExact(width, height);
+        return SetVideoModeExact(width, height, TRUE);
+
+    // Seamless needs the HOST size EXACTLY (the framebuffer the daemon composits
+    // from is host-sized). On an IDD-backed desktop the offered modes are the
+    // computed set, so SelectSupportedMode's boot-time g_SupportedModes cache
+    // cannot contain the host size and its "closest" pick is a mode the driver
+    // no longer offers -> ChangeDisplaySettings BADMODE, no seamless (measured
+    // 2026-08-06). Route the force through the exact-follow path instead, which
+    // publishes the set (host entry included by BuildIddModeSet, see a1),
+    // reloads the driver through QiddReloadModes and waits for the mode - all
+    // under the M7 replug rate limiter. Only when the Qubes IDD is actually
+    // present: on a fixed-mode adapter the legacy snap is still the better
+    // answer, and stock behaviour must not change.
+    if (source && 0 == wcscmp(source, L"seamless-force") && QiddInterfacePresent())
+        return SetVideoModeExact(width, height, FALSE); // never snapped
 
     DWORD mode = SelectSupportedMode(width, height);
 

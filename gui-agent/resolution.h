@@ -47,9 +47,10 @@ void ResolutionNoteTransitSize(IN ULONG width, IN ULONG height);
 // from the dom0 work-area feed + fallback) and reload the driver once, so the
 // habitual sizes switch with replug=0 from first use. Non-fatal on failure.
 void ResolutionPublishBootModeSet(void);
-// M6: dom0 work-area feed changed - rewrite the registry set if it differs from
-// the last written one. Registry only, NO reload (no blink); called from
-// WorkAreaSetDom0.
+// M6: dom0 work-area feed changed, or seamless mode changed (the set carries the
+// host size only while seamless is active) - rewrite the registry set if it
+// differs from the last written one. Registry only, NO reload (no blink);
+// called from WorkAreaSetDom0 and from SetSeamlessMode after it commits the mode.
 void ResolutionRecomputeIddModeSet(void);
 void InitVideoModes();
 // M0BLINK instrumentation: GetTickCount64 stamp of the current novel-size

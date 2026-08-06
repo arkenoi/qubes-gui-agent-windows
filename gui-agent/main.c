@@ -1958,6 +1958,16 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
 
     g_SeamlessMode = seamlessMode;
 
+    // The published IDD mode set is seamless-dependent (the host size is only in
+    // it while seamless is active - resolution.c BuildIddModeSet a1), so a
+    // transition must republish it. Only here, after the commit above, does
+    // BuildIddModeSet read the new mode. Registry only - the entering-seamless
+    // direction is made live by the exact-follow obtain that the
+    // RequestResolutionChange above ends in (it reloads the driver itself),
+    // and the leaving-seamless direction only DROPS an unused entry, which must
+    // not cost a topology change.
+    ResolutionRecomputeIddModeSet();
+
     LogInfo("Seamless mode changed to %d", seamlessMode);
     status = ERROR_SUCCESS;
 
