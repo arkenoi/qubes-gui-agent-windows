@@ -573,6 +573,12 @@ static ULONGLONG g_EchoWindowEnd; // GetTickCount64 deadline; 0 = no window
 static volatile LONG g_ExactInFlight;
 static ULONG g_ExactTargetW, g_ExactTargetH;
 
+// M0BLINK: GetTickCount64 stamp taken at obtain-start (just before the registry
+// write of a novel-size obtain). Shared with the A6ACKREPAINT site in
+// vchan-handlers.c, which read-and-clears it to log repaint latency relative to
+// the obtain. 0 = no obtain awaiting its repaint.
+volatile LONG64 g_M0BlinkObtainStart;
+
 BOOL ResolutionExactObtainInFlight(void)
 {
     return g_ExactInFlight != 0;
@@ -688,6 +694,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     }
 
     BOOL replugged = FALSE;
+    ULONGLONG m0Start = 0; // M0BLINK obtain-start stamp; 0 = no obtain needed
     g_ExactTargetW = width;
     g_ExactTargetH = height;
     g_EchoSuspectCount = 0; // fresh obtain, fresh transit list
@@ -698,10 +705,14 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
         // mode set (target first) in the driver's registry key, make the driver
         // reload it (IOCTL preferred, PnP replug as fallback), wait for the mode
         // to appear
+        m0Start = GetTickCount64();
+        InterlockedExchange64(&g_M0BlinkObtainStart, (LONG64)m0Start);
+        LogInfo("M0BLINK obtain-start %lux%lu t=%I64u", width, height, m0Start);
         if (WriteIddModeSet(width, height) != ERROR_SUCCESS)
         {
             LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=modes-key-write-failed",
                 width, height, g_ScreenWidth, g_ScreenHeight);
+            InterlockedExchange64(&g_M0BlinkObtainStart, 0); // obtain aborted, no repaint expected
             InterlockedExchange(&g_ExactInFlight, 0);
             return ERROR_SUCCESS;
         }
@@ -717,9 +728,15 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
             {
                 LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=idd-not-present",
                     width, height, g_ScreenWidth, g_ScreenHeight);
+                InterlockedExchange64(&g_M0BlinkObtainStart, 0); // obtain aborted, no repaint expected
                 InterlockedExchange(&g_ExactInFlight, 0);
                 return ERROR_SUCCESS;
             }
+        }
+
+        {
+            ULONGLONG now = GetTickCount64();
+            LogInfo("M0BLINK reload-returned t=%I64u sinceobtain=%I64u ms", now, now - m0Start);
         }
 
         DWORD waited;
@@ -734,8 +751,15 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
         {
             LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=mode-never-appeared",
                 width, height, g_ScreenWidth, g_ScreenHeight);
+            InterlockedExchange64(&g_M0BlinkObtainStart, 0); // obtain aborted, no repaint expected
             InterlockedExchange(&g_ExactInFlight, 0);
             return ERROR_SUCCESS;
+        }
+
+        {
+            ULONGLONG now = GetTickCount64();
+            LogInfo("M0BLINK mode-offered t=%I64u polls=%lu sinceobtain=%I64u ms",
+                now, waited / EXACT_MODE_WAIT_STEP_MS + 1, now - m0Start);
         }
 
         replugged = TRUE;
@@ -746,6 +770,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     {
         LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=apply-failed-0x%lx",
             width, height, g_ScreenWidth, g_ScreenHeight, status);
+        InterlockedExchange64(&g_M0BlinkObtainStart, 0); // no repaint expected for this obtain
         InterlockedExchange(&g_ExactInFlight, 0);
         return status;
     }
@@ -765,6 +790,12 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     }
 
     LogInfo("RESEXACT %lux%lu replug=%d", width, height, replugged ? 1 : 0);
+
+    if (m0Start != 0)
+    {
+        ULONGLONG now = GetTickCount64();
+        LogInfo("M0BLINK applied %lux%lu t=%I64u sinceobtain=%I64u ms", width, height, now, now - m0Start);
+    }
 
     InterlockedExchange(&g_ExactInFlight, 0);
 

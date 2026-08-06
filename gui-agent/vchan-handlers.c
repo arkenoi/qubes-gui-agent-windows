@@ -829,6 +829,16 @@ DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* cap
             {
                 LogInfo("A6ACKREPAINT full damage %ux%u", capture->width, capture->height);
                 SendWindowDamageEvent(NULL, 0, 0, capture->width, capture->height);
+                // M0BLINK: first full repaint after a novel-size obtain = the user
+                // sees pixels again. Consume the obtain-start stamp (one line per
+                // obtain; later unrelated acks stay silent).
+                LONG64 m0Start = InterlockedExchange64(&g_M0BlinkObtainStart, 0);
+                if (m0Start != 0)
+                {
+                    ULONGLONG now = GetTickCount64();
+                    LogInfo("M0BLINK repaint-sent t=%I64u sinceobtain=%I64u ms",
+                        now, now - (ULONGLONG)m0Start);
+                }
             }
         }
         PwRevokeTick();

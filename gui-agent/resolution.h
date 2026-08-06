@@ -52,3 +52,8 @@ void ResolutionPublishBootModeSet(void);
 // WorkAreaSetDom0.
 void ResolutionRecomputeIddModeSet(void);
 void InitVideoModes();
+// M0BLINK instrumentation: GetTickCount64 stamp of the current novel-size
+// obtain's start (set before the registry write in SetVideoModeExact).
+// The A6ACKREPAINT site (vchan-handlers.c) InterlockedExchange64s it to 0 and
+// logs "M0BLINK repaint-sent ... sinceobtain=" when nonzero.
+extern volatile LONG64 g_M0BlinkObtainStart;
