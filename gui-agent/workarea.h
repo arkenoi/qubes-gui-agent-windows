@@ -61,19 +61,20 @@ void WorkAreaSetDom0(int x, int y, int w, int h, int fl, int fr, int ft, int fb)
 // arrived yet - callers must never fabricate these from inference.
 BOOL WorkAreaGetDom0Raw(int* x, int* y, int* w, int* h, int* fl, int* fr, int* ft, int* fb);
 
+// Copy out the last work-area TARGET (physical px, screen coordinates). This is
+// dom0's displayable constraint whether or not the guest-side SPI_SETWORKAREA
+// call stuck - exactly what geometry reported to dom0 should be clamped against.
+// Returns FALSE (rect empty) until the first WorkAreaApply computes a target -
+// callers must fall back to screen bounds, never fabricate a work area.
+// (Used by the WS_MAXIMIZE geometry clamp in main.c.)
+BOOL WorkAreaGetApplied(OUT RECT* applied);
+
 // One synchronous read of the qubesdb dom0 feed into the stored values, for callers
 // that run BEFORE WorkAreaInit in the connect sequence (HandleXconf's boot-size
 // clamp - the watch thread does not exist yet). Requires WorkAreaLockInit (Init()
 // runs it). Returns TRUE if a valid value was read and stored; FALSE = feed
 // unavailable, stored values untouched.
 BOOL WorkAreaSyncReadDom0(void);
-
-// Copy out the last work-area target (physical px). This is dom0's displayable
-// constraint whether or not the guest-side SPI_SETWORKAREA call stuck, which is
-// exactly what geometry reported to dom0 should be clamped against. FALSE (rect
-// empty) until the first WorkAreaApply computes a target - callers fall back to
-// screen bounds.
-BOOL WorkAreaGetApplied(OUT RECT* applied);
 
 // Inference sample: a daemon-dictated window origin from MSG_CONFIGURE.
 void WorkAreaNoteDaemonOrigin(int x, int y);
