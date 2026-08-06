@@ -1284,7 +1284,24 @@ static DWORD WINAPI CaptureThread(void* param)
             break;
         }
 
-        if (capture->frame.dirty_rects_count == 0)
+        // A pending re-dump must not be held hostage to a dirty frame. After
+        // RecreateDuplication the daemon is still mapping the geometry of the
+        // duplication that just died, and the ONLY way the main loop learns
+        // otherwise is this frame event: MSG_WINDOW_DUMP, MSG_CONFIGURE and the
+        // repaint all live in its handler. Skipping clean frames here meant the
+        // re-dump waited for whatever happened to repaint the desktop next - up to
+        // a full FRAME_TIMEOUT per empty acquire, and unbounded on a desktop that
+        // is genuinely idle after the mode change (the "framebuffer unchanged"
+        // early-out in GetFrame returns zero dirty rects forever). grants_changed
+        // is a plain flag read racily, exactly as the main loop already writes it;
+        // a missed read costs one more frame, never correctness.
+        //
+        // Zero dirty rects is already a supported input downstream: the fullscreen
+        // arm of ProcessNewFrame treats it as whole-screen damage, the seamless arm
+        // sends nothing (the per-window repaint in the grants_changed handler has
+        // already covered it). Held-frame masking is untouched and still runs first
+        // in ProcessNewFrame, so a transitional geometry still sends nothing at all.
+        if (capture->frame.dirty_rects_count == 0 && !capture->grants_changed)
         {
             PerfNoteSkippedFrame();
             goto end_frame; // framebuffer contents not changed
