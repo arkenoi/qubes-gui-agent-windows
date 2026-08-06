@@ -807,6 +807,55 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
         }
     }
 
+    // FIT GUARD (user rule 2026-08-06: "if remembered geometry does not make
+    // sense, snap to the nearest that does"). A dom0 request whose FRAME cannot
+    // fit the dom0 work area is not real intent - it is a WM-remembered or stale
+    // geometry (seen after an agent restart recreates the daemon window). Obeying
+    // it pushes borders off-screen. Snap to the largest published habitual size
+    // that does fit; if none is known, keep the current resolution.
+    {
+        int wx, wy, ww, wh, wfl, wfr, wft, wfb;
+        if (WorkAreaGetDom0Raw(&wx, &wy, &ww, &wh, &wfl, &wfr, &wft, &wfb))
+        {
+            LONG fitW = ww - wfl - wfr;
+            LONG fitH = wh - wft - wfb;
+            if (fitW > 0 && fitH > 0 &&
+                ((LONG)width > fitW || (LONG)height > fitH))
+            {
+                ULONG bestW = 0, bestH = 0;
+                for (DWORD i = 0; i < g_SnapCandidateCount; i++)
+                {
+                    if ((LONG)g_SnapCandidates[i][0] <= fitW &&
+                        (LONG)g_SnapCandidates[i][1] <= fitH &&
+                        (ULONG)(g_SnapCandidates[i][0] * g_SnapCandidates[i][1]) >
+                        (ULONG)(bestW * bestH))
+                    {
+                        bestW = g_SnapCandidates[i][0];
+                        bestH = g_SnapCandidates[i][1];
+                    }
+                }
+                if (bestW && bestH)
+                {
+                    LogInfo("RESFIT %lux%lu does not fit work area %ldx%ld - snapping to %lux%lu",
+                        width, height, fitW, fitH, bestW, bestH);
+                    width = bestW; height = bestH;
+                    if (width == g_ScreenWidth && height == g_ScreenHeight)
+                    {
+                        LogInfo("RESNOOP %lux%lu (post-fit)", width, height);
+                        return ERROR_SUCCESS;
+                    }
+                }
+                else
+                {
+                    LogWarning("RESKEEP %lux%lu does not fit work area %ldx%ld and no fitting "
+                        "habitual size is known - keeping %lux%lu",
+                        width, height, fitW, fitH, g_ScreenWidth, g_ScreenHeight);
+                    return ERROR_SUCCESS;
+                }
+            }
+        }
+    }
+
     // Habitual-size snap (user rule): a request within 15 px of a published
     // work-area-derived mode takes that mode - blink-free and intentional; the
     // daemon then nudges the window to match (sanctioned resize-to-viewport,
