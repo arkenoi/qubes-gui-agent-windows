@@ -223,6 +223,14 @@ void WorkAreaApply(void)
     EnumWindows(WaRefitProc, 0);
 }
 
+BOOL WorkAreaGetApplied(OUT RECT* applied)
+{
+    EnterCriticalSection(&g_WaLock);
+    *applied = g_WaLastApplied;
+    LeaveCriticalSection(&g_WaLock);
+    return !IsRectEmpty(applied);
+}
+
 void WorkAreaSetDom0(int x, int y, int w, int h, int fl, int fr, int ft, int fb)
 {
     EnterCriticalSection(&g_WaLock);

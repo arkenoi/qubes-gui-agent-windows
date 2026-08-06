@@ -977,14 +977,23 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     if ((entry->Style & WS_MAXIMIZE) && entry->IsVisible &&
         g_HostScreenWidth > 0 && g_HostScreenHeight > 0)
     {
-        int cx = entry->X < 0 ? 0 : entry->X;
-        int cy = entry->Y < 0 ? 0 : entry->Y;
+        // Clamp to the work area dom0 can actually display, not the raw screen:
+        // dom0's WM constrains the window to ITS work area anyway, so reporting
+        // anything larger only buys a CONFIGURE round-trip, a grant rebuild and a
+        // content-mismatch band until the DaemonMax feedback settles (measured
+        // 2026-08-07: maximized Word reported 5120x1395 against a 5120x1384 work
+        // area). Screen bounds remain the fallback until the first work-area apply.
+        RECT wa;
+        if (!WorkAreaGetApplied(&wa))
+            SetRect(&wa, 0, 0, (LONG)g_HostScreenWidth, (LONG)g_HostScreenHeight);
+        int cx = entry->X < wa.left ? wa.left : entry->X;
+        int cy = entry->Y < wa.top ? wa.top : entry->Y;
         int x2 = entry->X + (int)entry->Width;
         int y2 = entry->Y + (int)entry->Height;
-        if (x2 > (int)g_HostScreenWidth)
-            x2 = (int)g_HostScreenWidth;
-        if (y2 > (int)g_HostScreenHeight)
-            y2 = (int)g_HostScreenHeight;
+        if (x2 > wa.right)
+            x2 = wa.right;
+        if (y2 > wa.bottom)
+            y2 = wa.bottom;
         // All-or-nothing: a window entirely off-screen keeps its raw geometry rather
         // than getting a half-applied clamp.
         if (x2 > cx && y2 > cy)

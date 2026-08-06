@@ -68,5 +68,12 @@ BOOL WorkAreaGetDom0Raw(int* x, int* y, int* w, int* h, int* fl, int* fr, int* f
 // unavailable, stored values untouched.
 BOOL WorkAreaSyncReadDom0(void);
 
+// Copy out the last work-area target (physical px). This is dom0's displayable
+// constraint whether or not the guest-side SPI_SETWORKAREA call stuck, which is
+// exactly what geometry reported to dom0 should be clamped against. FALSE (rect
+// empty) until the first WorkAreaApply computes a target - callers fall back to
+// screen bounds.
+BOOL WorkAreaGetApplied(OUT RECT* applied);
+
 // Inference sample: a daemon-dictated window origin from MSG_CONFIGURE.
 void WorkAreaNoteDaemonOrigin(int x, int y);
