@@ -977,23 +977,25 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     if ((entry->Style & WS_MAXIMIZE) && entry->IsVisible &&
         g_HostScreenWidth > 0 && g_HostScreenHeight > 0)
     {
-        // Clamp to the work area dom0 can actually display, not the raw screen:
-        // dom0's WM constrains the window to ITS work area anyway, so reporting
-        // anything larger only buys a CONFIGURE round-trip, a grant rebuild and a
-        // content-mismatch band until the DaemonMax feedback settles (measured
-        // 2026-08-07: maximized Word reported 5120x1395 against a 5120x1384 work
-        // area). Screen bounds remain the fallback until the first work-area apply.
-        RECT wa;
-        if (!WorkAreaGetApplied(&wa))
-            SetRect(&wa, 0, 0, (LONG)g_HostScreenWidth, (LONG)g_HostScreenHeight);
-        int cx = entry->X < wa.left ? wa.left : entry->X;
-        int cy = entry->Y < wa.top ? wa.top : entry->Y;
+        // DELIBERATELY the SCREEN, not the work area. entry->X/Y/W/H is not merely what
+        // we report to dom0: perwindow.c derives the capture crop from it
+        // (cropY = entry->Y - wr.top), so shrinking this rect CROPS REAL CONTENT.
+        // Clamping to the work area was tried on 2026-08-07 and cut 64 px off the top of
+        // a maximized Notepad - its title bar and menu bar vanished in dom0 - because
+        // Windows had maximized against the full screen while our work area started at
+        // y=56. Against the screen the clamp only ever trims the invisible resize border,
+        // which is exactly what the per-window crop is supposed to skip.
+        // A maximized window overflowing dom0's workspace is a WORK-AREA problem: fix it
+        // by making SPI_SETWORKAREA stick so Windows maximizes into the right rect, never
+        // by reporting geometry that does not match the pixels.
+        int cx = entry->X < 0 ? 0 : entry->X;
+        int cy = entry->Y < 0 ? 0 : entry->Y;
         int x2 = entry->X + (int)entry->Width;
         int y2 = entry->Y + (int)entry->Height;
-        if (x2 > wa.right)
-            x2 = wa.right;
-        if (y2 > wa.bottom)
-            y2 = wa.bottom;
+        if (x2 > (int)g_HostScreenWidth)
+            x2 = (int)g_HostScreenWidth;
+        if (y2 > (int)g_HostScreenHeight)
+            y2 = (int)g_HostScreenHeight;
         // All-or-nothing: a window entirely off-screen keeps its raw geometry rather
         // than getting a half-applied clamp.
         if (x2 > cx && y2 > cy)
