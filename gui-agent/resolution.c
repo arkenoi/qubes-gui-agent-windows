@@ -40,6 +40,9 @@
 #define QUBES_IDD_HARDWARE_ID L"root\\iddsampledriver"
 
 // How long to wait for a replugged IDD to start offering a freshly requested mode.
+// STEP is now only the DECAYED (late) poll interval - the wait starts by checking
+// immediately and polls tightly for the first two seconds; see the loop in
+// SetVideoModeExact for why.
 #define EXACT_MODE_WAIT_TIMEOUT_MS 12000
 #define EXACT_MODE_WAIT_STEP_MS    250
 
@@ -750,15 +753,33 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
             LogInfo("M0BLINK reload-returned t=%I64u sinceobtain=%I64u ms", now, now - m0Start);
         }
 
-        DWORD waited;
-        for (waited = 0; waited < EXACT_MODE_WAIT_TIMEOUT_MS; waited += EXACT_MODE_WAIT_STEP_MS)
+        // Poll cadence. The old loop SLEPT A FULL 250 ms STEP BEFORE ITS FIRST CHECK,
+        // so the mode-offered phase could never cost less than 250 ms no matter how
+        // fast the driver was - and the measurement says the driver is fast:
+        // reload-returned at 16 ms, mode-offered at 281 ms, polls=1. That is one
+        // quantum of sleeping followed by a check that passed on its first try; the
+        // mode was already being offered and nothing was looking. Check immediately,
+        // then poll tightly, then decay to the old step so a driver that genuinely
+        // takes seconds costs the same handful of wakeups it always did. The probe is
+        // ChangeDisplaySettings(CDS_TEST) - a query, it never changes the mode.
+        ULONGLONG waitStart = GetTickCount64();
+        ULONG polls = 0;
+        BOOL offered = FALSE;
+        for (;;)
         {
-            Sleep(EXACT_MODE_WAIT_STEP_MS);
+            polls++;
             if (IsExactModeAvailable(width, height))
+            {
+                offered = TRUE;
                 break;
+            }
+            ULONGLONG elapsed = GetTickCount64() - waitStart;
+            if (elapsed >= EXACT_MODE_WAIT_TIMEOUT_MS)
+                break;
+            Sleep(elapsed < 500 ? 15 : (elapsed < 2000 ? 50 : EXACT_MODE_WAIT_STEP_MS));
         }
 
-        if (waited >= EXACT_MODE_WAIT_TIMEOUT_MS)
+        if (!offered)
         {
             LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=mode-never-appeared",
                 width, height, g_ScreenWidth, g_ScreenHeight);
@@ -771,7 +792,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
         {
             ULONGLONG now = GetTickCount64();
             LogInfo("M0BLINK mode-offered t=%I64u polls=%lu sinceobtain=%I64u ms",
-                now, waited / EXACT_MODE_WAIT_STEP_MS + 1, now - m0Start);
+                now, polls, now - m0Start);
         }
 
         replugged = TRUE;
