@@ -198,23 +198,78 @@ static SRWLOCK g_IddModeSetLock = SRWLOCK_INIT;
 static WCHAR g_IddModeSetLast[IDD_MODES_CCH]; // last multi-sz written to the key
 static DWORD g_IddModeSetLastCch;             // WCHARs incl. final terminator; 0 = never
 
-// Append WxH if valid, in bounds and not already present.
-static void IddModeSetAdd(IN OUT IDD_MODE* modes, IN OUT DWORD* count, IN LONG w, IN LONG h)
+// Append WxH if valid, in bounds and not already present. Returns TRUE if the
+// size is IN the set after the call (freshly added or already there), FALSE if
+// it was rejected as invalid or the set is full - callers that must not point at
+// an unpublished mode (the snap candidates) depend on that distinction, which
+// only became reachable once the M7 LRU started competing for the 8 slots.
+static BOOL IddModeSetAdd(IN OUT IDD_MODE* modes, IN OUT DWORD* count, IN LONG w, IN LONG h)
 {
     if (w <= 0 || h <= 0 || !IS_RESOLUTION_VALID((ULONG)w, (ULONG)h))
-        return;
-    if (*count >= IDD_MODE_SET_MAX)
-        return;
+        return FALSE;
     for (DWORD i = 0; i < *count; i++)
         if (modes[i].w == (ULONG)w && modes[i].h == (ULONG)h)
-            return; // dedupe
+            return TRUE; // dedupe: already published
+    if (*count >= IDD_MODE_SET_MAX)
+        return FALSE;
     modes[*count].w = (ULONG)w;
     modes[*count].h = (ULONG)h;
     (*count)++;
+    return TRUE;
+}
+
+// ---- M7: recent-size LRU ---------------------------------------------------
+// Every novel size costs an IDD reload (monitor departure/arrival), and rapid
+// display-topology churn is what livelocks the guest (FINDINGS 2026-08-05 cont 9,
+// 2026-08-06 cont 4). Publishing the last N distinct dom0-requested sizes makes
+// "go back to a size I just had" - a large fraction of real resizing - cost
+// replug=0, which removes the reload entirely instead of merely spacing it out.
+// Memory only: the LRU is never persisted anywhere except inside the mode set it
+// helps compute, so an agent restart starts from an empty LRU.
+// Only sizes that were APPLIED successfully are recorded (never a RESKEEP), so a
+// size the driver or Windows refused can never enter the set through here.
+// Host-screen-sized entries CAN appear in the LRU, but only because dom0 asked
+// for them through the target slot - the same condition under which the builder
+// is already allowed to publish them (user rule 2: the builder still never
+// fabricates a host size on its own).
+#define RECENT_SIZE_MAX 4
+
+static SRWLOCK g_RecentLock = SRWLOCK_INIT;
+static IDD_MODE g_RecentSizes[RECENT_SIZE_MAX]; // [0] = most recent
+static DWORD g_RecentCount;
+
+// Move WxH to the front of the LRU (insert + evict oldest when full).
+// Called from the resolution thread (successful exact apply) and once from the
+// main loop thread (boot publish); readers take the lock shared.
+static void RecentSizeNote(IN ULONG w, IN ULONG h)
+{
+    if (!IS_RESOLUTION_VALID(w, h))
+        return;
+
+    AcquireSRWLockExclusive(&g_RecentLock);
+    DWORD at = g_RecentCount; // insertion point when not already present
+    for (DWORD i = 0; i < g_RecentCount; i++)
+    {
+        if (g_RecentSizes[i].w == w && g_RecentSizes[i].h == h)
+        {
+            at = i;
+            break;
+        }
+    }
+    if (at == g_RecentCount && g_RecentCount < RECENT_SIZE_MAX)
+        g_RecentCount++;
+    if (at >= RECENT_SIZE_MAX)
+        at = RECENT_SIZE_MAX - 1; // full and novel: the oldest entry falls off
+    for (DWORD i = at; i > 0; i--)
+        g_RecentSizes[i] = g_RecentSizes[i - 1];
+    g_RecentSizes[0].w = w;
+    g_RecentSizes[0].h = h;
+    ReleaseSRWLockExclusive(&g_RecentLock);
 }
 
 // Build the multi-sz mode set for a target size. desc receives the M6SET log tail
-// ("n=<count> target=WxH [max=WxH] [half=WxH]", absent entries omitted); callers
+// ("n=<count> target=WxH lru=<n> [max=WxH] [half=WxH]", absent entries omitted;
+// lru = how many of the 8 slots the M7 recent-size LRU contributed); callers
 // log it when they actually write. Returns the multi-sz length in WCHARs
 // (including both terminators), 0 on failure.
 // Habitual-size snap candidates (work-area-derived entries of the published
@@ -233,6 +288,19 @@ static DWORD BuildIddModeSet(IN ULONG targetW, IN ULONG targetH,
 
     // a. the target, always first (dom0's request slot)
     IddModeSetAdd(modes, &count, (LONG)targetW, (LONG)targetH);
+
+    // a2. recently applied dom0 sizes (M7 LRU), most recent first, right after
+    // the target: returning to one of them then needs no reload at all.
+    DWORD lru = 0;
+    AcquireSRWLockShared(&g_RecentLock);
+    for (DWORD i = 0; i < g_RecentCount; i++)
+    {
+        DWORD before = count;
+        IddModeSetAdd(modes, &count, (LONG)g_RecentSizes[i].w, (LONG)g_RecentSizes[i].h);
+        if (count > before)
+            lru++; // carried by the LRU (deduped-away entries are not counted)
+    }
+    ReleaseSRWLockShared(&g_RecentLock);
 
     // b+c. habitual sizes from the dom0 work-area feed. Frame extents are
     // WINDOW-STATE-DEPENDENT: this WM hides borders when maximized (measured:
@@ -253,14 +321,19 @@ static DWORD BuildIddModeSet(IN ULONG targetW, IN ULONG targetH,
         };
         for (int i = 0; i < 4; i++)
         {
-            IddModeSetAdd(modes, &count, cand[i][0], cand[i][1]);
+            // A snap candidate MUST be in the published set - snapping to a mode
+            // the driver does not offer would cost a replug, the exact opposite
+            // of the snap's purpose. With the M7 LRU competing for the 8 slots a
+            // habitual size can now be squeezed out, so record only what was
+            // actually published.
+            BOOL published = IddModeSetAdd(modes, &count, cand[i][0], cand[i][1]);
             // Snap targets are the BORDERED variants only (odd indices): a
             // maximize gesture emits the borderless size EXACTLY (measured) and
             // needs no snap, while any window close-but-not-equal is a normal
             // bordered window - snapping it to a borderless height overflows
             // the work area and pushes the bottom border off-screen (measured:
             // taskbar at the last screen row, border invisible).
-            if ((i % 2) == 1 &&
+            if ((i % 2) == 1 && published &&
                 g_SnapCandidateCount < RTL_NUMBER_OF(g_SnapCandidates) &&
                 IS_RESOLUTION_VALID((ULONG)cand[i][0], (ULONG)cand[i][1]))
             {
@@ -289,7 +362,7 @@ static DWORD BuildIddModeSet(IN ULONG targetW, IN ULONG targetH,
     }
     multiSz[used++] = L'\0'; // multi-sz double terminator
 
-    StringCchPrintf(desc, cchDesc, L"n=%lu target=%lux%lu", count, targetW, targetH);
+    StringCchPrintf(desc, cchDesc, L"n=%lu target=%lux%lu lru=%lu", count, targetW, targetH, lru);
     WCHAR item[48];
     if (g_SnapCandidateCount >= 2)
     {
@@ -506,6 +579,11 @@ void ResolutionPublishBootModeSet(void)
         LogInfo("M6BOOT skipped: QIDD interface not present");
         return;
     }
+
+    // Seed the M7 LRU with the size the desktop is actually running at (dom0's
+    // xconf / the last size that stuck), so the first resize away from it can
+    // come back for free. It is an applied size by definition, not a request.
+    RecentSizeNote(g_ScreenWidth, g_ScreenHeight);
 
     if (WriteIddModeSet(g_ScreenWidth, g_ScreenHeight) != ERROR_SUCCESS)
     {
@@ -838,6 +916,11 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height)
     // (user-reported after resizes). Re-blank after every applied mode change;
     // HideCursors self-guards on DisableCursor and is idempotent.
     HideCursors();
+
+    // M7: this size is now APPLIED (every RESKEEP path returned above), so it
+    // earns its place in the LRU and will be published with the next mode set -
+    // coming back to it later is then a replug=0 apply.
+    RecentSizeNote(width, height);
 
     // arm the stale-echo filter with the size this apply REPLACED
     g_EchoPrevW = g_ScreenWidth;
