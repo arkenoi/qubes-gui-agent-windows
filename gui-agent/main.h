@@ -26,6 +26,10 @@
 
 extern BOOL g_UseDirtyBits;
 extern BOOL g_SeamlessMode;
+// dom0's window-0 position as last reported by the daemon (MSG_CONFIGURE);
+// echoed back in our own w0 configures so the daemon never repositions.
+extern LONG g_ScreenWinX;
+extern LONG g_ScreenWinY;
 extern DWORD g_ScreenHeight;
 extern DWORD g_ScreenWidth;
 extern BOOL g_LocalScreenDestroyed;

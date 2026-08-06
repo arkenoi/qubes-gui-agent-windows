@@ -654,6 +654,12 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 
         if (valid)
         {
+            // Remember where dom0's window actually sits: our own w0 configure
+            // after a resize must echo THIS position, not (0,0) - sending origin
+            // made the daemon move the client to x=0 and pushed the left frame
+            // border off-screen (user-reported after every snap).
+            g_ScreenWinX = configureMsg.x;
+            g_ScreenWinY = configureMsg.y;
             DWORD status = RequestResolutionChange(configureMsg.width, configureMsg.height, L"dom0");
             if (status != ERROR_SUCCESS)
             {

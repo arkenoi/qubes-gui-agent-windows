@@ -65,6 +65,8 @@ DWORD g_ScreenWidth;
 
 BOOL g_VchanClientConnected = FALSE;
 BOOL g_SeamlessMode = TRUE;
+LONG g_ScreenWinX = 0;
+LONG g_ScreenWinY = 0;
 
 // after we send MSG_DESTROY in fullscreen mode we can get delayed MSG_CONFIGURE,
 // we shouldn't reply to that before sending MSG_CREATE
@@ -3780,7 +3782,11 @@ static ULONG WINAPI WatchForEvents(void)
                         }
                         else
                         {
-                            ULONG cfgStatus = SendWindowConfigure(NULL, 0, 0,
+                            // Echo dom0's own last-reported window position - never
+                            // (0,0), which would MOVE the window and clip its left
+                            // border (see HandleConfigure).
+                            ULONG cfgStatus = SendWindowConfigure(NULL,
+                                g_ScreenWinX, g_ScreenWinY,
                                 capture->width, capture->height, FALSE);
                             if (cfgStatus != ERROR_SUCCESS)
                                 win_perror2(cfgStatus, "SendWindowConfigure (screen, after recreate)");
