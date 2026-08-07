@@ -139,10 +139,24 @@ ULONG EnsureQubesIddSolo(void)
     AttachToInputDesktop();
 
     // Enumerate once; DISPLAY_DEVICE.DeviceString identifies the IDD adapter.
+    // KILL SWITCH. HKLM\SOFTWARE\QubesIDD!NoTopologyApply != 0 disables this entirely.
+    // It exists so the acceptance check can be SEEN TO FAIL on a build with the defect
+    // deliberately re-introduced (CLAUDE.md: a check counts as evidence only once it has
+    // failed on a known-bad build). Without it, "desktop_on_idd passes" is unproven.
+    DWORD noApply = 0, cbNoApply = sizeof(noApply), typeNoApply = 0;
+    if (ERROR_SUCCESS == RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\QubesIDD",
+                                      L"NoTopologyApply", RRF_RT_REG_DWORD, &typeNoApply,
+                                      &noApply, &cbNoApply) && noApply != 0)
+    {
+        LogWarning("IDD solo: DISABLED by HKLM\\SOFTWARE\\QubesIDD!NoTopologyApply=%lu", noApply);
+        return ERROR_SUCCESS;
+    }
+
     DISPLAY_DEVICEW dev;
     WCHAR iddName[CCHDEVICENAME] = { 0 };
     WCHAR attached[16][CCHDEVICENAME];
     DWORD attachedCount = 0;
+    BOOL iddIsPrimary = FALSE;
 
     for (DWORD i = 0; ; i++)
     {
@@ -157,9 +171,12 @@ ULONG EnsureQubesIddSolo(void)
                            ARRAYSIZE(QUBES_IDD_DEVICE_STRING) - 1))
         {
             StringCchCopyW(iddName, ARRAYSIZE(iddName), dev.DeviceName);
-            LogInfo("IDD solo: found IDD adapter '%s' ('%s'), attached=%d",
+            iddIsPrimary = ((dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) &&
+                            (dev.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE)) ? TRUE : FALSE;
+            LogInfo("IDD solo: found IDD adapter '%s' ('%s'), attached=%d primary=%d",
                 dev.DeviceName, dev.DeviceString,
-                (dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ? 1 : 0);
+                (dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ? 1 : 0,
+                (dev.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? 1 : 0);
         }
         else if ((dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) &&
                  attachedCount < ARRAYSIZE(attached))
@@ -174,6 +191,17 @@ ULONG EnsureQubesIddSolo(void)
         // No IDD present. This is the Basic Display Adapter configuration, which is a
         // supported way to run - say so once and leave the topology alone.
         LogDebug("IDD solo: no Qubes IDD adapter present, leaving display topology untouched");
+        return ERROR_SUCCESS;
+    }
+
+    // IDEMPOTENCE. If the IDD is ALREADY the sole attached display, do nothing at all.
+    // This is what protects the platform that already works: Win11 24H2 performs the
+    // topology apply itself, so an unconditional detach/set-primary/commit would tear the
+    // topology down and rebuild it on every boot - a visible blink and a needless chance
+    // to break a guest that was fine. It also makes repeated calls free.
+    if (iddIsPrimary && attachedCount == 0)
+    {
+        LogInfo("IDD solo: '%s' is already the sole active display - nothing to do", iddName);
         return ERROR_SUCCESS;
     }
 
