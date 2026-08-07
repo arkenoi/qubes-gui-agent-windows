@@ -33,6 +33,12 @@
 // seamless-force) for the RESREQ/RESSNAP/RESAPPLIED instrumentation log lines.
 // src=dom0 requests are exact-follow: the requested size is applied verbatim or
 // not at all (never snapped), obtaining the mode from the Qubes IDD if needed.
+// Attach the Qubes IddCx monitor and make it the SOLE active display, persisting the
+// topology. Must run in the INTERACTIVE session (session 0 gets ERROR_ACCESS_DENIED).
+// No-op returning ERROR_SUCCESS when no IDD is present (Basic Display Adapter guests).
+// Returns ERROR_INVALID_STATE if readback shows the IDD is not solo-primary.
+ULONG EnsureQubesIddSolo(void);
+
 DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* source);
 ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source);
 // TRUE while an exact-obtain (replug+apply) is in flight on the resolution thread;

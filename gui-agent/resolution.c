@@ -100,6 +100,147 @@ void InitVideoModes()
     LogDebug("Initialized %u supported modes", g_SupportedModes.Count);
 }
 
+// ---------------------------------------------------------------------------------------
+// EnsureQubesIddSolo - attach the Qubes IddCx monitor and make it the SOLE active display.
+//
+// WHY THIS EXISTS (measured 2026-08-07, FINDINGS.md). The installer's /idd path does
+// pnputil -> devcon create root devnode -> disable the emulated VGA -> reboot, and assumes
+// "the next boot comes up IDD-primary". That assumption is false: an IddCx monitor arrives
+// CONNECTED but INACTIVE and is not attached to the desktop until a topology apply names
+// its path. Nothing in the package ever performed one. So on Win10 the desktop stayed on
+// the emulated VGA - which keeps driving video at full resolution even though its devnode
+// reports CM_PROB_DISABLED - and the IDD sat at Availability=8 forever. (The old claim that
+// Windows "fell back to ROOT\BASICDISPLAY" was a friendly-name mis-attribution; that device
+// is absent from the controller list entirely.) Win11 24H2 performs the apply itself, which
+// is the whole of the Win10/Win11 difference - the driver has no OS-build branch at all.
+//
+// WHY IN THE AGENT and not the installer: this needs the INTERACTIVE session. The
+// installer's boot-resume task runs as SYSTEM in session 0, where ChangeDisplaySettingsEx
+// returns DISP_CHANGE_FAILED / ERROR_ACCESS_DENIED. The agent already attaches to the input
+// desktop and must observe the resulting geometry anyway, so it is the right owner.
+//
+// WHY EVERY OTHER DISPLAY IS DETACHED, not merely deprioritised: an additional ACTIVE
+// display enlarges the desktop bounding box the agent maps as the screen, so Windows can
+// place windows in a region dom0 never sees and seamless coordinates break (CLAUDE.md
+// Phase 1B). Solo is the requirement, not a nicety.
+//
+// Mirrors tools/modeprobe --solo, which is the implementation this was proven with on
+// win-idd-test (same Win10 19045 build): detach others with CDS_UPDATEREGISTRY|CDS_NORESET,
+// set the target primary, then commit once with a NULL ChangeDisplaySettingsEx. Persisting
+// to the registry is deliberate - it also overwrites stale GraphicsDrivers\Configuration
+// entries so the topology survives the next reboot.
+//
+// Returns ERROR_SUCCESS only when READBACK confirms the end state. It is a no-op (and NOT
+// an error) on a guest with no IDD - the Basic Display Adapter configuration is supported.
+#define QUBES_IDD_DEVICE_STRING L"IddSampleDriver Device"
+
+ULONG EnsureQubesIddSolo(void)
+{
+    AttachToInputDesktop();
+
+    // Enumerate once; DISPLAY_DEVICE.DeviceString identifies the IDD adapter.
+    DISPLAY_DEVICEW dev;
+    WCHAR iddName[CCHDEVICENAME] = { 0 };
+    WCHAR attached[16][CCHDEVICENAME];
+    DWORD attachedCount = 0;
+
+    for (DWORD i = 0; ; i++)
+    {
+        ZeroMemory(&dev, sizeof(dev));
+        dev.cb = sizeof(dev);
+        if (!EnumDisplayDevicesW(NULL, i, &dev, 0))
+            break;
+        if (dev.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER)
+            continue;
+
+        if (0 == _wcsnicmp(dev.DeviceString, QUBES_IDD_DEVICE_STRING,
+                           ARRAYSIZE(QUBES_IDD_DEVICE_STRING) - 1))
+        {
+            StringCchCopyW(iddName, ARRAYSIZE(iddName), dev.DeviceName);
+            LogInfo("IDD solo: found IDD adapter '%s' ('%s'), attached=%d",
+                dev.DeviceName, dev.DeviceString,
+                (dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) ? 1 : 0);
+        }
+        else if ((dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) &&
+                 attachedCount < ARRAYSIZE(attached))
+        {
+            StringCchCopyW(attached[attachedCount], CCHDEVICENAME, dev.DeviceName);
+            attachedCount++;
+        }
+    }
+
+    if (!iddName[0])
+    {
+        // No IDD present. This is the Basic Display Adapter configuration, which is a
+        // supported way to run - say so once and leave the topology alone.
+        LogDebug("IDD solo: no Qubes IDD adapter present, leaving display topology untouched");
+        return ERROR_SUCCESS;
+    }
+
+    // Detach every other attached display FIRST. NORESET batches the changes so the
+    // desktop is never momentarily headless between the detach and the set-primary.
+    for (DWORD i = 0; i < attachedCount; i++)
+    {
+        DEVMODEW det;
+        ZeroMemory(&det, sizeof(det));
+        det.dmSize = sizeof(det);
+        det.dmFields = DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+        LONG rc = ChangeDisplaySettingsExW(attached[i], &det, NULL,
+                                           CDS_UPDATEREGISTRY | CDS_NORESET, NULL);
+        LogInfo("IDD solo: detach '%s' -> %ld", attached[i], rc);
+    }
+
+    // Make the IDD primary at (0,0). Width/height are left to the driver's own preferred
+    // mode: the mode set is published separately (ResolutionPublishBootModeSet) and forcing
+    // a size here would race it.
+    DEVMODEW pm;
+    ZeroMemory(&pm, sizeof(pm));
+    pm.dmSize = sizeof(pm);
+    pm.dmFields = DM_POSITION;
+    LONG prc = ChangeDisplaySettingsExW(iddName, &pm, NULL,
+                                        CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET, NULL);
+    LONG crc = ChangeDisplaySettingsExW(NULL, NULL, NULL, 0, NULL);
+    LogInfo("IDD solo: set-primary '%s' -> %ld, commit -> %ld", iddName, prc, crc);
+
+    // READBACK. "The call returned success" is not the criterion - re-enumerate and require
+    // the IDD attached+primary with ZERO other attached displays. Without this the function
+    // would report success on exactly the failure it exists to fix.
+    DWORD othersStillAttached = 0;
+    BOOL iddAttached = FALSE, iddPrimary = FALSE;
+    for (DWORD i = 0; ; i++)
+    {
+        ZeroMemory(&dev, sizeof(dev));
+        dev.cb = sizeof(dev);
+        if (!EnumDisplayDevicesW(NULL, i, &dev, 0))
+            break;
+        if (dev.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER)
+            continue;
+        if (!(dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP))
+            continue;
+
+        if (0 == _wcsicmp(dev.DeviceName, iddName))
+        {
+            iddAttached = TRUE;
+            iddPrimary = (dev.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? TRUE : FALSE;
+        }
+        else
+        {
+            othersStillAttached++;
+            LogWarning("IDD solo: '%s' ('%s') is STILL attached", dev.DeviceName, dev.DeviceString);
+        }
+    }
+
+    if (iddAttached && iddPrimary && othersStillAttached == 0)
+    {
+        LogInfo("IDD solo: OK - '%s' is the sole active display", iddName);
+        return ERROR_SUCCESS;
+    }
+
+    LogError("IDD solo: FAILED - idd attached=%d primary=%d, others still attached=%lu",
+        iddAttached, iddPrimary, othersStillAttached);
+    return ERROR_INVALID_STATE;
+}
+
 static ULONG SetVideoModeInternal(IN ULONG width, IN ULONG height)
 {
     if (!IS_RESOLUTION_VALID(width, height))

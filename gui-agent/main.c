@@ -4380,6 +4380,15 @@ static ULONG Init(void)
     InitializeListHead(&g_WatchedWindowsList);
     InitializeCriticalSection(&g_csWatchedWindows);
 
+    // Attach the Qubes IDD and make it the sole active display BEFORE InitVideoModes() and
+    // before the screen is mapped: both read the current topology, so doing this afterwards
+    // would enumerate the emulated VGA's mode list and map the wrong screen geometry.
+    // A failure here is deliberately NOT fatal - a guest whose IDD did not come up must
+    // still get a working agent on the Basic Display Adapter rather than no GUI at all.
+    // The failure is loud in the log and the health gate asserts the end state separately.
+    if (ERROR_SUCCESS != EnsureQubesIddSolo())
+        LogWarning("IDD solo failed - continuing on the current display topology");
+
     InitVideoModes();
 
     g_MinWindowWidth = GetSystemMetrics(SM_CXMIN);
