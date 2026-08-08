@@ -2959,6 +2959,79 @@ static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child)
     PwPatchSynthChildClipped(owner, child, NULL);
 }
 
+// Has the SCREEN content over this window's rect changed since the last recapture trigger?
+//
+// WHY THIS EXISTS. Windows 11 presents far more frames than Windows 10 for the same input -
+// measured at 488 vs 259 frames over an identical 20 s typing workload with the agent,
+// display path (Basic Display Adapter) and resolution (3440x1440) all held constant, i.e.
+// 1.88x with only the OS differing. Every present whose dirty rect touches a window triggers
+// a PrintWindow recapture. The surplus ones are byte-identical, so the row-diff in
+// wincapture.cpp sends nothing to dom0 - the wasted work is the capture itself (~15-18 ms on
+// a WARP guest). Nothing in the DDA dirty rects distinguishes "DWM re-presented the same
+// pixels" from "the user typed a character", so the only cheap discriminator is the screen
+// content itself: hashing the window's rect costs memcmp-class time (~0.2 ms for 800x600).
+//
+// WHY A HASH AND NOT A RETAINED COPY. A copy would cost ~1.7 MB per window; the hash is 8
+// bytes. A collision would skip one real update, but wincapture's round-robin sweep refreshes
+// every attached window regardless of dirty rects, so a missed update converges instead of
+// leaving a permanently stale window. That safety net is what makes hashing acceptable here.
+//
+// WHY THE OCCLUSION GUARD IS MANDATORY. PrintWindow renders the WINDOW; the screen shows
+// whatever is on top of it. If anything overlaps the window, screen pixels are not a proxy
+// for window content - an occluded window could change underneath an unchanged screen region
+// and we would skip a real update forever (the sweep would still fix it, but only after a
+// visible delay). rgnCovered accumulates windows ABOVE this one as the Z-ordered loop walks
+// down, so at the call site it is exactly this window's occluders. Any overlap, or a
+// Z-order we do not trust, and this returns FALSE = "assume changed".
+//
+// Returns TRUE only when it is SAFE and CERTAIN that nothing changed. Every uncertainty -
+// no framebuffer, unknown Z-order, occlusion, off-screen, zero area - returns FALSE, so the
+// worst case is the previous behaviour.
+// Recaptures avoided by the screen-content compare. Exposed so the effect is measurable
+// rather than asserted: a fix whose benefit cannot be counted cannot be shown not to regress.
+static volatile LONG g_PwSkippedCaptures = 0;
+
+static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN UINT pitch,
+                              IN UINT fbWidth, IN UINT fbHeight, IN const RECT* rect,
+                              IN HRGN rgnCoveredAbove)
+{
+    if (!fb || pitch == 0 || !g_ZOrderValid)
+        return FALSE;                       // cannot reason about occlusion -> recapture
+
+    // Fully on-screen only: a clipped rect would hash a different area each time the window
+    // straddles an edge, which is a false "changed" at best and a false "unchanged" at worst.
+    if (rect->left < 0 || rect->top < 0 ||
+        rect->right > (LONG)fbWidth || rect->bottom > (LONG)fbHeight ||
+        rect->right <= rect->left || rect->bottom <= rect->top)
+        return FALSE;
+
+    // Anything above this window makes the screen an invalid proxy for its content.
+    if (RectInRegion(rgnCoveredAbove, rect))
+        return FALSE;
+
+    // FNV-1a over the rows. Reading 4 bytes at a time keeps this a streaming scan; the
+    // window is contiguous per row, so this is memcmp-class work.
+    ULONGLONG h = 1469598103934665603ULL;
+    const UINT bpp = 4;
+    const UINT rowBytes = (UINT)(rect->right - rect->left) * bpp;
+    for (LONG y = rect->top; y < rect->bottom; y++)
+    {
+        const BYTE* row = fb + (SIZE_T)y * pitch + (SIZE_T)rect->left * bpp;
+        for (UINT i = 0; i < rowBytes; i += 4)
+        {
+            h ^= (ULONGLONG)(*(const UINT32*)(row + i));
+            h *= 1099511628211ULL;
+        }
+    }
+
+    if (entry->PwScreenHashValid && entry->PwScreenHash == h)
+        return TRUE;                        // identical screen content: capture would be a no-op
+
+    entry->PwScreenHash = h;
+    entry->PwScreenHashValid = TRUE;
+    return FALSE;
+}
+
 static void PwPatchSynthChildren(IN OUT WINDOW_DATA* owner, IN const RECT* area)
 {
     for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
@@ -3248,12 +3321,31 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 }
                 else
                 {
+                    BOOL pwDamaged = FALSE;
                     for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
                     {
                         if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
                         {
-                            WcMarkDirty(entry->Handle);
+                            pwDamaged = TRUE;
                             break;
+                        }
+                    }
+                    // The dirty rect says the screen was PRESENTED here, not that this
+                    // window's content changed. Windows 11 re-presents ~1.9x more often than
+                    // Windows 10 for identical input, and those extra recaptures are
+                    // byte-identical - they cost a PrintWindow each and send nothing. Compare
+                    // the screen bytes first; skip only when they are provably unchanged AND
+                    // the window is unoccluded (see PwScreenUnchanged).
+                    if (pwDamaged)
+                    {
+                        if (PwScreenUnchanged(entry, framebuffer, frame->rect.Pitch,
+                                              fbWidth, fbHeight, &pwRect, rgnCovered))
+                        {
+                            g_PwSkippedCaptures++;
+                        }
+                        else
+                        {
+                            WcMarkDirty(entry->Handle);
                         }
                     }
                 }

@@ -146,6 +146,18 @@ typedef struct _WINDOW_DATA
     DWORD PwLastMoveTick;
     DWORD PwLastMoveCapTick;
 
+    // Hash of the SCREEN pixels over this window's rect at the last recapture trigger.
+    // Windows 11 presents ~1.9x more frames than Windows 10 for identical input (measured
+    // with agent, display path and resolution held constant: 488 vs 259 frames over the same
+    // 20 s workload), and every present whose dirty rect touches a window triggers a
+    // PrintWindow recapture. The surplus captures are byte-identical, so the row-diff sends
+    // nothing - the cost is the capture itself, ~15-18 ms on a WARP guest, and it is not
+    // detectable from the dirty rects. Comparing the screen bytes first turns that into a
+    // memcmp-class hash (~0.2 ms). Valid ONLY while the window is unoccluded; see
+    // PwScreenUnchanged.
+    ULONGLONG PwScreenHash;
+    BOOL PwScreenHashValid;
+
     // Composite synthesis (CLAUDE.md 2A-chrome, taken further): an override-redirect
     // window fully contained in its owner's rect is NOT announced to dom0 at all -
     // no CREATE/MAP/CONFIGURE/DAMAGE/UNMAP/DESTROY ever names it. Instead the frame

@@ -350,6 +350,10 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     // over from a previous buffer (a resize rebuild lands here mid-drag).
     entry->SynthMaskLastCount = 0;
     entry->PwFrameXYValid = FALSE;
+    // Clear with the rest of the Pw state: a hash from a previous attachment
+    // would suppress the FIRST capture after re-attach.
+    entry->PwScreenHashValid = FALSE;
+    entry->PwScreenHash = 0;
     entry->PwSettleDue = FALSE;
     entry->PwLastMoveTick = 0;
     entry->PwLastMoveCapTick = 0;
@@ -380,6 +384,10 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
     // The channel (and the mask it held) is gone; move state dies with it.
     entry->SynthMaskLastCount = 0;
     entry->PwFrameXYValid = FALSE;
+    // Clear with the rest of the Pw state: a hash from a previous attachment
+    // would suppress the FIRST capture after re-attach.
+    entry->PwScreenHashValid = FALSE;
+    entry->PwScreenHash = 0;
     entry->PwSettleDue = FALSE;
     entry->PwLastMoveTick = 0;
     entry->PwLastMoveCapTick = 0;
