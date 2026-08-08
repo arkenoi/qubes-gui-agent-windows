@@ -61,7 +61,7 @@
 
 // Version of the CSV record format, bumped when fields change.
 // v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
-#define PERF_RECORD_VERSION 3
+#define PERF_RECORD_VERSION 4
 
 extern BOOL     g_PerfEnabled;  // master switch
 
@@ -115,6 +115,23 @@ void PerfNoteSkippedFrame(void);
 // revision incremented a file-static that was never read by anything, which made the effect
 // unmeasurable and its acceptance criterion unable to pass.
 void PerfNotePwDecision(IN BOOL skipped);
+
+// Why a per-window fast-path decision refused to skip. A bare hit rate of 0 % cannot
+// distinguish a guard that always refuses (a defect in the check) from content that genuinely
+// changes every frame (which would falsify the premise that the extra presents are redundant).
+// Those call for opposite responses, so the cause is counted rather than inferred.
+typedef enum _PW_REFUSE_REASON
+{
+    PW_REFUSE_NO_FB = 0,        // no framebuffer / zero pitch - cannot look at the screen
+    PW_REFUSE_NO_ZORDER,        // Z-order unknown - cannot reason about occlusion
+    PW_REFUSE_OFFSCREEN,        // window not wholly inside the framebuffer
+    PW_REFUSE_OCCLUDED,         // something is stacked above it; screen is not its content
+    PW_REFUSE_FIRST_SEEN,       // no previous hash yet - unavoidable once per window
+    PW_REFUSE_CONTENT_CHANGED,  // hashed and DIFFERENT: a genuine repaint, not a redundant one
+    PW_REFUSE_MAX
+} PW_REFUSE_REASON;
+
+void PerfNotePwRefusal(IN PW_REFUSE_REASON reason);
 
 // Capture thread: GetFrameMoveRects returned a non-empty set. Logs the first
 // occurrence loudly (this is the answer to the capture.c move-rects TODO),

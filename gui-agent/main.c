@@ -2995,19 +2995,38 @@ static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN U
                               IN UINT fbWidth, IN UINT fbHeight, IN const RECT* rect,
                               IN HRGN rgnCoveredAbove)
 {
-    if (!fb || pitch == 0 || !g_ZOrderValid)
-        return FALSE;                       // cannot reason about occlusion -> recapture
+    // Each refusal is counted by CAUSE. A bare 0 % hit rate is ambiguous between "a guard
+    // always refuses" and "the content genuinely changes every time" - and those have opposite
+    // conclusions: the first is a bug in this function, the second falsifies the premise that
+    // Windows 11's extra presents are redundant. Measured 0 skips in 5557 decisions, so the
+    // distinction has to be made from data, not argued.
+    if (!fb || pitch == 0)
+    {
+        PerfNotePwRefusal(PW_REFUSE_NO_FB);
+        return FALSE;
+    }
+    if (!g_ZOrderValid)
+    {
+        PerfNotePwRefusal(PW_REFUSE_NO_ZORDER);
+        return FALSE;
+    }
 
     // Fully on-screen only: a clipped rect would hash a different area each time the window
     // straddles an edge, which is a false "changed" at best and a false "unchanged" at worst.
     if (rect->left < 0 || rect->top < 0 ||
         rect->right > (LONG)fbWidth || rect->bottom > (LONG)fbHeight ||
         rect->right <= rect->left || rect->bottom <= rect->top)
+    {
+        PerfNotePwRefusal(PW_REFUSE_OFFSCREEN);
         return FALSE;
+    }
 
     // Anything above this window makes the screen an invalid proxy for its content.
     if (RectInRegion(rgnCoveredAbove, rect))
+    {
+        PerfNotePwRefusal(PW_REFUSE_OCCLUDED);
         return FALSE;
+    }
 
     // FNV-1a over the rows. Reading 4 bytes at a time keeps this a streaming scan; the
     // window is contiguous per row, so this is memcmp-class work.
@@ -3027,6 +3046,10 @@ static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN U
     if (entry->PwScreenHashValid && entry->PwScreenHash == h)
         return TRUE;                        // identical screen content: capture would be a no-op
 
+    // Reached the hash and it differed: the window's screen pixels really did change. This is
+    // the ONLY refusal that supports "the present was not redundant"; every other one above is
+    // this function declining to look.
+    PerfNotePwRefusal(entry->PwScreenHashValid ? PW_REFUSE_CONTENT_CHANGED : PW_REFUSE_FIRST_SEEN);
     entry->PwScreenHash = h;
     entry->PwScreenHashValid = TRUE;
     return FALSE;

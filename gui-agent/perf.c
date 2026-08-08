@@ -67,6 +67,7 @@ static LONGLONG g_EmitTicks = 0;        // cost of the *previous* emit, reported
 static volatile LONG g_SkippedFrames = 0;   // capture thread -> main loop
 static volatile LONG g_PwSkipped = 0;       // per-window recaptures avoided (screen bytes unchanged)
 static volatile LONG g_PwCaptured = 0;      // per-window recaptures actually issued
+static volatile LONG g_PwRefuse[PW_REFUSE_MAX];  // why the fast path declined, by cause
 
 void PerfInit(void)
 {
@@ -142,7 +143,7 @@ void PerfInit(void)
 
     LogInfo("QGAPERF on: freq=%I64d everyN=%u qpc_cost_ns=%I64d default=%d (sink %I64d)",
         g_PerfFreq, g_PerfEveryN, qpcCostNs, QGA_PERF_DEFAULT, sink);
-    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,pwskip,pwcap,log (times in microseconds)",
+    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwnoz,pwoff,pwocc,pwfirst,pwchg,log (times in microseconds)",
         PERF_RECORD_VERSION);
 }
 
@@ -160,6 +161,14 @@ void PerfNotePwDecision(IN BOOL skipped)
         return;
 
     InterlockedIncrement(skipped ? &g_PwSkipped : &g_PwCaptured);
+}
+
+void PerfNotePwRefusal(IN PW_REFUSE_REASON reason)
+{
+    if (!g_PerfEnabled || (unsigned)reason >= PW_REFUSE_MAX)
+        return;
+
+    InterlockedIncrement(&g_PwRefuse[reason]);
 }
 
 void PerfNoteMoveRects(IN UINT count, IN LONG srcX, IN LONG srcY, IN const RECT* dst)
@@ -234,7 +243,8 @@ void PerfEmitFrame(
     // One line, integers only, no allocation and no string building of our own.
     LogInfo("QGAPERF,v=%d,seq=%I64u,n=%u,mode=%c,dt=%I64d,acq=%I64d,wak=%I64d,mrq=%I64d,drq=%I64d,"
         L"upd=%I64d,enu=%I64d,rem=%I64d,dmg=%I64d,snd=%I64d,tot=%I64d,"
-        L"dr=%u,mr=%u,mrmax=%u,area=%I64u,win=%u,iwn=%u,wev=%u,sends=%d,skip=%d,pwskip=%d,pwcap=%d,log=%I64d",
+        L"dr=%u,mr=%u,mrmax=%u,area=%I64u,win=%u,iwn=%u,wev=%u,sends=%d,skip=%d,pwskip=%d,pwcap=%d,"
+        L"pwnofb=%d,pwnoz=%d,pwoff=%d,pwocc=%d,pwfirst=%d,pwchg=%d,log=%I64d",
         PERF_RECORD_VERSION,
         g_Seq,
         g_Acc.frames,
@@ -261,6 +271,12 @@ void PerfEmitFrame(
         InterlockedExchange(&g_SkippedFrames, 0),
         InterlockedExchange(&g_PwSkipped, 0),
         InterlockedExchange(&g_PwCaptured, 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_NO_FB], 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_NO_ZORDER], 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_OFFSCREEN], 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_OCCLUDED], 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_FIRST_SEEN], 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_CONTENT_CHANGED], 0),
         PerfUs(g_EmitTicks));
 
     g_EmitTicks = PerfNow() - emitStart;
