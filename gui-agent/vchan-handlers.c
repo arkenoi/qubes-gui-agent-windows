@@ -71,6 +71,7 @@ static DWORD InjectInput(IN INPUT* inputEvent, IN const char* what)
 
 
 #include "workarea.h"
+#include "perf.h"
 
 // Protocol 1.9 proposal (DESIGN-workarea-propagation.md): daemon-sent work area.
 // Defined locally until the vendored qubes-gui-protocol.h carries it; a daemon
@@ -710,7 +711,22 @@ static DWORD HandleFocus(IN HWND window)
             if (data->IsIconic)
                 ShowWindow(window, SW_RESTORE);
             SetForegroundWindow(window);
-            //BringWindowToTop(window);
+
+            // Z-ORDER SYNC, runtime-switchable (registry DWORD "FocusRaise", default 0 =
+            // historic behaviour). MSG_FOCUS is the only stacking-adjacent thing dom0 sends:
+            // the protocol has no restack message, so this is the one point where dom0's
+            // notion of "in front" reaches the guest. Raising here makes the guest's z-order
+            // agree with dom0's for the window the user is actually in - which is what makes
+            // the screen framebuffer a valid content source for it, and therefore what the
+            // per-window fast path's hit rate depends on.
+            //
+            // Kept behind a switch rather than simply uncommented: SetForegroundWindow
+            // usually raises already, so the increment may be nil, and the line was commented
+            // out originally for a reason nobody recorded. A switch lets both conditions be
+            // measured on ONE binary, interleaved, with no reinstall and no doubt about which
+            // build produced which number.
+            if (g_FocusRaise)
+                BringWindowToTop(window);
         }
         LeaveCriticalSection(&g_csWatchedWindows);
     }

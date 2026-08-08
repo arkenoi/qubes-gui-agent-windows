@@ -2987,10 +2987,10 @@ static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child)
 // Returns TRUE only when it is SAFE and CERTAIN that nothing changed. Every uncertainty -
 // no framebuffer, unknown Z-order, occlusion, off-screen, zero area - returns FALSE, so the
 // worst case is the previous behaviour.
-// Recaptures avoided by the screen-content compare. Exposed so the effect is measurable
-// rather than asserted: a fix whose benefit cannot be counted cannot be shown not to regress.
-static volatile LONG g_PwSkippedCaptures = 0;
-
+// Recaptures avoided by the screen-content compare are counted through PerfNotePwDecision()
+// into the QGAPERF record's pwskip/pwcap pair. This used to be a file-static that nothing
+// ever read, under a comment claiming it was "exposed so the effect is measurable" - it was
+// not, and the acceptance criterion written against it could never pass.
 static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN UINT pitch,
                               IN UINT fbWidth, IN UINT fbHeight, IN const RECT* rect,
                               IN HRGN rgnCoveredAbove)
@@ -3338,15 +3338,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // the window is unoccluded (see PwScreenUnchanged).
                     if (pwDamaged)
                     {
-                        if (PwScreenUnchanged(entry, framebuffer, frame->rect.Pitch,
-                                              fbWidth, fbHeight, &pwRect, rgnCovered))
-                        {
-                            g_PwSkippedCaptures++;
-                        }
-                        else
-                        {
+                        BOOL pwSkip = PwScreenUnchanged(entry, framebuffer, frame->rect.Pitch,
+                                                        fbWidth, fbHeight, &pwRect, rgnCovered);
+                        // Record BOTH outcomes: the claim this fix makes is a rate (captures
+                        // avoided over captures considered), and skips alone cannot express
+                        // one - they only grow with how long the workload ran.
+                        PerfNotePwDecision(pwSkip);
+                        if (!pwSkip)
                             WcMarkDirty(entry->Handle);
-                        }
                     }
                 }
 

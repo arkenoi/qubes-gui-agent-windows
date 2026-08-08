@@ -26,6 +26,7 @@
 
 BOOL     g_PerfEnabled = FALSE;
 BOOL     g_ProtoTrace  = FALSE;
+BOOL     g_FocusRaise  = FALSE;
 LONGLONG g_PerfFreq = 0;
 DWORD    g_PerfEveryN = 1;
 
@@ -64,6 +65,8 @@ static BOOL     g_MoveRectsReported = FALSE;
 static LONGLONG g_PrevFrameQpc = 0;
 static LONGLONG g_EmitTicks = 0;        // cost of the *previous* emit, reported as "log"
 static volatile LONG g_SkippedFrames = 0;   // capture thread -> main loop
+static volatile LONG g_PwSkipped = 0;       // per-window recaptures avoided (screen bytes unchanged)
+static volatile LONG g_PwCaptured = 0;      // per-window recaptures actually issued
 
 void PerfInit(void)
 {
@@ -103,6 +106,20 @@ void PerfInit(void)
         LogInfo("QGAPROTO %s", g_ProtoTrace ? "on" : "off");
     }
 
+    // Z-order sync switch. Read here for the same reason as ProtoTrace: it is behaviour, not
+    // measurement, so it must apply whether or not the perf log is on. Logged unconditionally
+    // so any captured log states which condition produced it - a hit rate is meaningless
+    // without knowing whether the raise was active.
+    {
+        BOOL raise = FALSE;
+        DWORD rv = 0;
+        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
+            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_FOCUS_RAISE_VALUE, &rv, NULL))
+            raise = (rv != 0);
+        g_FocusRaise = raise;
+        LogInfo("QGAFOCUSRAISE %s", g_FocusRaise ? "on" : "off");
+    }
+
     if (!g_PerfEnabled)
     {
         LogInfo("QGAPERF off");
@@ -125,7 +142,7 @@ void PerfInit(void)
 
     LogInfo("QGAPERF on: freq=%I64d everyN=%u qpc_cost_ns=%I64d default=%d (sink %I64d)",
         g_PerfFreq, g_PerfEveryN, qpcCostNs, QGA_PERF_DEFAULT, sink);
-    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,log (times in microseconds)",
+    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,pwskip,pwcap,log (times in microseconds)",
         PERF_RECORD_VERSION);
 }
 
@@ -135,6 +152,14 @@ void PerfNoteSkippedFrame(void)
         return;
 
     InterlockedIncrement(&g_SkippedFrames);
+}
+
+void PerfNotePwDecision(IN BOOL skipped)
+{
+    if (!g_PerfEnabled)
+        return;
+
+    InterlockedIncrement(skipped ? &g_PwSkipped : &g_PwCaptured);
 }
 
 void PerfNoteMoveRects(IN UINT count, IN LONG srcX, IN LONG srcY, IN const RECT* dst)
@@ -209,7 +234,7 @@ void PerfEmitFrame(
     // One line, integers only, no allocation and no string building of our own.
     LogInfo("QGAPERF,v=%d,seq=%I64u,n=%u,mode=%c,dt=%I64d,acq=%I64d,wak=%I64d,mrq=%I64d,drq=%I64d,"
         L"upd=%I64d,enu=%I64d,rem=%I64d,dmg=%I64d,snd=%I64d,tot=%I64d,"
-        L"dr=%u,mr=%u,mrmax=%u,area=%I64u,win=%u,iwn=%u,wev=%u,sends=%d,skip=%d,log=%I64d",
+        L"dr=%u,mr=%u,mrmax=%u,area=%I64u,win=%u,iwn=%u,wev=%u,sends=%d,skip=%d,pwskip=%d,pwcap=%d,log=%I64d",
         PERF_RECORD_VERSION,
         g_Seq,
         g_Acc.frames,
@@ -234,6 +259,8 @@ void PerfEmitFrame(
         g_Acc.events,
         g_Acc.sends,
         InterlockedExchange(&g_SkippedFrames, 0),
+        InterlockedExchange(&g_PwSkipped, 0),
+        InterlockedExchange(&g_PwCaptured, 0),
         PerfUs(g_EmitTicks));
 
     g_EmitTicks = PerfNow() - emitStart;

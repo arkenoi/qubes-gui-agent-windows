@@ -56,10 +56,12 @@
 #define PERF_ENV_VALUE L"QUBES_GUI_PERF"
 #define PROTO_ENV_VALUE L"QUBES_GUI_PROTO"
 #define REG_CONFIG_PROTO_VALUE L"ProtoTrace"
+// Z-order sync experiment: raise the window dom0 focused (see HandleFocus). DWORD 0/1.
+#define REG_CONFIG_FOCUS_RAISE_VALUE L"FocusRaise"
 
 // Version of the CSV record format, bumped when fields change.
 // v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
-#define PERF_RECORD_VERSION 2
+#define PERF_RECORD_VERSION 3
 
 extern BOOL     g_PerfEnabled;  // master switch
 
@@ -70,6 +72,10 @@ extern BOOL     g_PerfEnabled;  // master switch
 // only ground truth for a protocol defect is the field that went out.
 // Off by default; registry DWORD "ProtoTrace" or env QUBES_GUI_PROTO=1.
 extern BOOL     g_ProtoTrace;
+
+// Raise on MSG_FOCUS, making guest z-order agree with dom0 for the focused window.
+// Off by default = historic behaviour. Read once in PerfInit().
+extern BOOL     g_FocusRaise;
 extern LONGLONG g_PerfFreq;     // QueryPerformanceFrequency, ticks per second
 extern DWORD    g_PerfEveryN;   // emit one line per this many processed frames
 
@@ -98,6 +104,17 @@ void PerfInit(void);
 
 // Capture thread: a frame arrived with no dirty rects and was dropped.
 void PerfNoteSkippedFrame(void);
+
+// Main loop: one per-window recapture DECISION taken on the screen-hash fast path.
+// skipped == TRUE  -> the window's screen bytes were provably unchanged, no PrintWindow
+// skipped == FALSE -> the bytes moved (or the guard refused), so the window was recaptured
+//
+// Both halves are required. The fix's headline claim is a RATE - captures avoided over
+// captures considered - and a counter that records only the skips cannot express it: it
+// grows with workload length and says nothing about how often the path applied. An earlier
+// revision incremented a file-static that was never read by anything, which made the effect
+// unmeasurable and its acceptance criterion unable to pass.
+void PerfNotePwDecision(IN BOOL skipped);
 
 // Capture thread: GetFrameMoveRects returned a non-empty set. Logs the first
 // occurrence loudly (this is the answer to the capture.c move-rects TODO),
