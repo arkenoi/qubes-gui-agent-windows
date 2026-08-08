@@ -126,6 +126,8 @@ typedef enum _PW_REFUSE_REASON
     PW_REFUSE_NO_ZORDER,        // Z-order unknown - cannot reason about occlusion
     PW_REFUSE_OFFSCREEN,        // window not wholly inside the framebuffer
     PW_REFUSE_OCCLUDED,         // something is stacked above it; screen is not its content
+    PW_REFUSE_NOT_FOREGROUND,   // Z-order unknown and this is not the foreground window
+    PW_REFUSE_OVERLAP,          // Z-order unknown and another visible window overlaps it
     PW_REFUSE_FIRST_SEEN,       // no previous hash yet - unavoidable once per window
     PW_REFUSE_CONTENT_CHANGED,  // hashed and DIFFERENT: a genuine repaint, not a redundant one
     PW_REFUSE_MAX

@@ -2991,9 +2991,40 @@ static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child)
 // into the QGAPERF record's pwskip/pwcap pair. This used to be a file-static that nothing
 // ever read, under a comment claiming it was "exposed so the effect is measurable" - it was
 // not, and the acceptance criterion written against it could never pass.
+// Occlusion WITHOUT a Z-order. CollectZOrder deliberately skips its EnumWindows pass unless
+// an override-redirect popup is on screen (main.c: "roughly 4x the Phase 2A drag figure"), so
+// g_ZOrderValid is FALSE during any ordinary workload. The first version of this check simply
+// required g_ZOrderValid and therefore refused 100% of the time: 0 skips in 5557 decisions,
+// which read as "the premise is wrong" when it actually meant "the code never ran".
+//
+// A cheap, order-free substitute: if NO other visible window's rectangle intersects this one,
+// nothing can be covering it whatever the order is. That alone is too conservative - a
+// full-screen window BELOW (the shell desktop) would veto everything - so it is paired with
+// "this is the foreground window", which by definition has nothing above it but topmost
+// windows. Together they are sound without paying for an ordering, and they cover exactly the
+// case that matters for typing and scrolling: the window the user is working in.
+static BOOL PwAnyVisibleOverlap(IN const WINDOW_DATA* self, IN const RECT* rect)
+{
+    RECT hit;
+    WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
+    {
+        e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (e != self && e->IsVisible && !e->IsIconic && !e->DeletePending &&
+            e->Width > 0 && e->Height > 0)
+        {
+            RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
+            if (IntersectRect(&hit, &other, rect))
+                return TRUE;
+        }
+        e = (WINDOW_DATA*)e->ListEntry.Flink;
+    }
+    return FALSE;
+}
+
 static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN UINT pitch,
                               IN UINT fbWidth, IN UINT fbHeight, IN const RECT* rect,
-                              IN HRGN rgnCoveredAbove)
+                              IN HRGN rgnCoveredAbove, IN HWND foreground)
 {
     // Each refusal is counted by CAUSE. A bare 0 % hit rate is ambiguous between "a guard
     // always refuses" and "the content genuinely changes every time" - and those have opposite
@@ -3003,11 +3034,6 @@ static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN U
     if (!fb || pitch == 0)
     {
         PerfNotePwRefusal(PW_REFUSE_NO_FB);
-        return FALSE;
-    }
-    if (!g_ZOrderValid)
-    {
-        PerfNotePwRefusal(PW_REFUSE_NO_ZORDER);
         return FALSE;
     }
 
@@ -3022,10 +3048,27 @@ static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN U
     }
 
     // Anything above this window makes the screen an invalid proxy for its content.
-    if (RectInRegion(rgnCoveredAbove, rect))
+    if (g_ZOrderValid)
     {
-        PerfNotePwRefusal(PW_REFUSE_OCCLUDED);
-        return FALSE;
+        if (RectInRegion(rgnCoveredAbove, rect))
+        {
+            PerfNotePwRefusal(PW_REFUSE_OCCLUDED);
+            return FALSE;
+        }
+    }
+    else
+    {
+        // No ordering available - use the order-free pair described above.
+        if (entry->Handle != foreground)
+        {
+            PerfNotePwRefusal(PW_REFUSE_NOT_FOREGROUND);
+            return FALSE;
+        }
+        if (PwAnyVisibleOverlap(entry, rect))
+        {
+            PerfNotePwRefusal(PW_REFUSE_OVERLAP);
+            return FALSE;
+        }
     }
 
     // FNV-1a over the rows. Reading 4 bytes at a time keeps this a streaming scan; the
@@ -3211,6 +3254,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
 
     // send damage notifications, TOPMOST FIRST so each window can be clipped against the
     // area already claimed by the windows above it
+    // Once per frame, not once per window: the per-window fast path needs it for every
+    // candidate and a syscall per window would eat the saving it is trying to make.
+    HWND pwForeground = GetForegroundWindow();
     zCount = CollectZOrder(zSorted, RTL_NUMBER_OF(zSorted));
     for (UINT zi = 0; zi < zCount; zi++)
     {
@@ -3362,7 +3408,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     if (pwDamaged)
                     {
                         BOOL pwSkip = PwScreenUnchanged(entry, framebuffer, frame->rect.Pitch,
-                                                        fbWidth, fbHeight, &pwRect, rgnCovered);
+                                                        fbWidth, fbHeight, &pwRect, rgnCovered,
+                                                        pwForeground);
                         // Record BOTH outcomes: the claim this fix makes is a rate (captures
                         // avoided over captures considered), and skips alone cannot express
                         // one - they only grow with how long the workload ran.
