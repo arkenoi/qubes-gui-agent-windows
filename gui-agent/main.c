@@ -3593,45 +3593,51 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // DDA source when the screen provably holds this window's pixels:
                         // copy only the damaged sub-rects instead of re-rendering the whole
                         // window. Falls back to PrintWindow the moment any predicate fails,
-                        // and a periodic forced recapture (below) bounds any pixel-equality
+                        // and a periodic forced recapture bounds any pixel-equality
                         // difference between the two sources to at most PW_DDA_VERIFY_MS.
-                        if (g_ZOrderValid
-                            ? !RectInRegion(rgnCovered, &pwRect)
-                            : TRUE)
+                        //
+                        // NOTE: this must NOT `continue`. The rest of this loop body paints
+                        // synthesized children and, critically, ORs this window into
+                        // rgnCovered. Skipping that would make every window BELOW this one
+                        // look unoccluded, and they would then be served screen content
+                        // containing THIS window's pixels - exactly the corruption the
+                        // occlusion logic exists to prevent.
+                        BOOL ddaHandled = FALSE;
+                        if ((g_ZOrderValid ? !RectInRegion(rgnCovered, &pwRect) : TRUE) &&
+                            PwDdaEligible(entry, &pwRect, fbWidth, fbHeight, pwForeground))
                         {
-                            if (PwDdaEligible(entry, &pwRect, fbWidth, fbHeight, pwForeground))
+                            DWORD ddaNow = GetTickCount();
+                            if (ddaNow - entry->PwDdaVerifyTick >= PW_DDA_VERIFY_MS)
                             {
-                                DWORD ddaNow = GetTickCount();
-                                if (ddaNow - entry->PwDdaVerifyTick >= PW_DDA_VERIFY_MS)
-                                {
-                                    // Periodic ground truth: one PrintWindow re-establishes
-                                    // the buffer from the authoritative source, so any
-                                    // systematic difference (alpha byte, rounded corners,
-                                    // DWM per-window effects) cannot accumulate.
-                                    entry->PwDdaVerifyTick = ddaNow;
-                                    PerfNotePwDecision(FALSE);
-                                    WcMarkDirty(entry->Handle);
-                                }
-                                else
-                                {
-                                    for (UINT ddi = 0; ddi < frame->dirty_rects_count; ddi++)
-                                        if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pwRect))
-                                            PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit);
-                                    PerfNoteDdaCapture();
-                                }
-                                continue;   // handled; do not fall through to PrintWindow
+                                // Periodic ground truth: one PrintWindow re-establishes the
+                                // buffer from the authoritative source, so any systematic
+                                // difference (alpha byte, rounded corners, DWM per-window
+                                // effects) is corrected rather than accumulating.
+                                entry->PwDdaVerifyTick = ddaNow;
+                                PerfNotePwDecision(FALSE);
+                                WcMarkDirty(entry->Handle);
                             }
+                            else
+                            {
+                                for (UINT ddi = 0; ddi < frame->dirty_rects_count; ddi++)
+                                    if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pwRect))
+                                        PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit);
+                                PerfNoteDdaCapture();
+                            }
+                            ddaHandled = TRUE;
                         }
 
-                        BOOL pwSkip = PwScreenUnchanged(entry, framebuffer, frame->rect.Pitch,
-                                                        fbWidth, fbHeight, &pwRect, rgnCovered,
-                                                        pwForeground);
-                        // Record BOTH outcomes: the claim this fix makes is a rate (captures
-                        // avoided over captures considered), and skips alone cannot express
-                        // one - they only grow with how long the workload ran.
-                        PerfNotePwDecision(pwSkip);
-                        if (!pwSkip)
-                            WcMarkDirty(entry->Handle);
+                        if (!ddaHandled)
+                        {
+                            BOOL pwSkip = PwScreenUnchanged(entry, framebuffer, frame->rect.Pitch,
+                                                            fbWidth, fbHeight, &pwRect, rgnCovered,
+                                                            pwForeground);
+                            // Record BOTH outcomes: the claim is a rate - captures avoided over
+                            // captures considered - and skips alone cannot express one.
+                            PerfNotePwDecision(pwSkip);
+                            if (!pwSkip)
+                                WcMarkDirty(entry->Handle);
+                        }
                     }
                 }
 
