@@ -3682,11 +3682,35 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         {
                             if (!entry->PwDdaActive)
                             {
-                                // Entering: establish from PrintWindow this frame only.
+                                // Entering DDA mode: establish the buffer from the
+                                // authoritative source SYNCHRONOUSLY, on this thread.
+                                //
+                                // WcPrefill, not WcMarkDirty. WcMarkDirty queues an ASYNC
+                                // capture on the engine thread, which would then be writing
+                                // entry->PwBuffer while this thread starts memcpying screen
+                                // pixels into it - the buffer-ownership race the design calls
+                                // "the one genuinely new race" (section 4.3). WcPrefill runs
+                                // CaptureAndDiff inline, so the establish completes before any
+                                // DDA copy begins, and while DDA-active nothing ever marks the
+                                // window dirty - so the engine never touches the buffer at all.
+                                // The race closes by construction rather than by locking.
+                                //
+                                // WcPrefill deliberately does not fire the damage callback, so
+                                // the full-window damage is sent here.
                                 entry->PwDdaActive = TRUE;
                                 PerfNotePwDecision(FALSE);
-                                WcMarkDirty(entry->Handle);
-                                ddaHandled = TRUE;
+                                if (WcPrefill(entry->Handle) == ERROR_SUCCESS)
+                                {
+                                    (void)SendWindowDamageEvent(entry->Handle, 0, 0,
+                                                                entry->PwWidth, entry->PwHeight);
+                                    ddaHandled = TRUE;
+                                }
+                                else
+                                {
+                                    // Could not establish - do not start copying into a buffer
+                                    // whose contents are unknown; fall back to the normal path.
+                                    entry->PwDdaActive = FALSE;
+                                }
                             }
                             else
                             {
