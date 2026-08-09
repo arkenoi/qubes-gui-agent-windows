@@ -58,6 +58,11 @@
 #define REG_CONFIG_PROTO_VALUE L"ProtoTrace"
 // Z-order sync experiment: raise the window dom0 focused (see HandleFocus). DWORD 0/1.
 #define REG_CONFIG_FOCUS_RAISE_VALUE L"FocusRaise"
+// Attribution switches. The typing improvement was measured on a build carrying BOTH
+// frame-level redundant-frame dropping AND DDA-sourced capture, so it could not be assigned
+// to either. These allow each to be disabled independently.
+#define REG_CONFIG_DDA_CAPTURE_VALUE L"DdaCapture"     // DWORD 0/1, default 1
+#define REG_CONFIG_FRAME_DROP_VALUE  L"FrameDrop"      // DWORD 0/1, default 1
 
 // Version of the CSV record format, bumped when fields change.
 // v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
@@ -76,6 +81,16 @@ extern BOOL     g_ProtoTrace;
 // Raise on MSG_FOCUS, making guest z-order agree with dom0 for the focused window.
 // Off by default = historic behaviour. Read once in PerfInit().
 extern BOOL     g_FocusRaise;
+
+// Feature switches for attribution. Registry sets the default; a MARKER FILE overrides it at
+// runtime without elevation - which matters because qrexec runs unelevated on clean-room
+// guests, and that is exactly what reduced the FocusRaise A/B to zero valid points.
+//   C:\Users\Public\qga-dda-off     present -> DDA-sourced capture disabled
+//   C:\Users\Public\qga-frdrop-off  present -> redundant-frame dropping disabled
+// Public is writable by any user, and these only affect the guest's own capture path - no
+// isolation property depends on them.
+extern BOOL     g_DdaCapture;
+extern BOOL     g_FrameDrop;
 extern LONGLONG g_PerfFreq;     // QueryPerformanceFrequency, ticks per second
 extern DWORD    g_PerfEveryN;   // emit one line per this many processed frames
 

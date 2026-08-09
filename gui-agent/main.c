@@ -3038,6 +3038,48 @@ static BOOL PwAnyVisibleOverlap(IN const WINDOW_DATA* self, IN const RECT* rect)
 //
 // E6 ("fully unoccluded") was the design's one unanswered predicate. It is answered here by
 // the same order-free test the screen-hash fast path uses, so it costs nothing extra.
+// Runtime feature switches for ATTRIBUTION, checkable without elevation.
+//
+// The typing improvement (9.371 -> ~5.3) was measured on a build carrying BOTH frame-level
+// redundant-frame dropping AND DDA-sourced capture, with frdrop firing 565-882 times per rep
+// and ddacap at 94.5%. Either could have produced it, so the result could not be assigned -
+// which is exactly what the project's own rule about one change per measurement exists to
+// prevent.
+//
+// A registry DWORD alone is not enough: qrexec runs UNELEVATED on clean-room guests, and that
+// is what reduced the FocusRaise A/B to zero valid points. So a marker file under
+// C:\Users\Public (writable by any user) overrides the registry default at runtime, letting
+// both halves be measured on ONE binary with no reinstall.
+//
+// The check is throttled to once a second: a GetFileAttributes per frame would be a cost of
+// its own inside the very path being measured.
+static BOOL MarkerPresent(IN const WCHAR* path, IN OUT DWORD* lastTick, IN OUT BOOL* cached)
+{
+    DWORD now = GetTickCount();
+    if (*lastTick == 0 || now - *lastTick >= 1000)
+    {
+        *lastTick = now ? now : 1;
+        *cached = (GetFileAttributes(path) != INVALID_FILE_ATTRIBUTES);
+    }
+    return *cached;
+}
+
+static BOOL DdaCaptureEnabled(void)
+{
+    static DWORD tick = 0; static BOOL off = FALSE;
+    if (!g_DdaCapture)
+        return FALSE;
+    return !MarkerPresent(L"C:\\Users\\Public\\qga-dda-off", &tick, &off);
+}
+
+static BOOL FrameDropEnabled(void)
+{
+    static DWORD tick = 0; static BOOL off = FALSE;
+    if (!g_FrameDrop)
+        return FALSE;
+    return !MarkerPresent(L"C:\\Users\\Public\\qga-frdrop-off", &tick, &off);
+}
+
 // How long a window must be STILL before the composited desktop is used as its source.
 // Measured: with no such guard, drag CPU went 11.106 -> 18.622 (+68%) while typing improved
 // 43%. The reason is that the legacy path deliberately does almost NOTHING while a window
@@ -3451,7 +3493,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
     // which is the expensive part and the only part that has nothing to do when no pixel
     // changed. Emptying the list rather than returning keeps the GDI regions freed and the
     // frame accounted for in QGAPERF exactly as before.
-    if (zCount > 0 && FrameRedundant(frame, framebuffer, frame->rect.Pitch, fbWidth, fbHeight))
+    if (FrameDropEnabled() && zCount > 0 &&
+        FrameRedundant(frame, framebuffer, frame->rect.Pitch, fbWidth, fbHeight))
     {
         PerfNoteRedundantFrame();
         zCount = 0;
@@ -3633,7 +3676,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // transition, never a repeating flicker. Whether the sources actually
                         // differ is a separate question that must now be MEASURED, not assumed.
                         BOOL ddaHandled = FALSE;
-                        if ((g_ZOrderValid ? !RectInRegion(rgnCovered, &pwRect) : TRUE) &&
+                        if (DdaCaptureEnabled() &&
+                            (g_ZOrderValid ? !RectInRegion(rgnCovered, &pwRect) : TRUE) &&
                             PwDdaEligible(entry, &pwRect, fbWidth, fbHeight, pwForeground))
                         {
                             if (!entry->PwDdaActive)

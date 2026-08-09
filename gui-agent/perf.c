@@ -27,6 +27,8 @@
 BOOL     g_PerfEnabled = FALSE;
 BOOL     g_ProtoTrace  = FALSE;
 BOOL     g_FocusRaise  = FALSE;
+BOOL     g_DdaCapture  = TRUE;
+BOOL     g_FrameDrop   = TRUE;
 LONGLONG g_PerfFreq = 0;
 DWORD    g_PerfEveryN = 1;
 
@@ -121,6 +123,20 @@ void PerfInit(void)
             raise = (rv != 0);
         g_FocusRaise = raise;
         LogInfo("QGAFOCUSRAISE %s", g_FocusRaise ? "on" : "off");
+    }
+
+    // Attribution switches - registry default, marker file overrides at runtime.
+    {
+        DWORD v = 0;
+        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)))
+        {
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_DDA_CAPTURE_VALUE, &v, NULL))
+                g_DdaCapture = (v != 0);
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_FRAME_DROP_VALUE, &v, NULL))
+                g_FrameDrop = (v != 0);
+        }
+        LogInfo("QGADDACAPTURE %s", g_DdaCapture ? "on" : "off");
+        LogInfo("QGAFRAMEDROP %s", g_FrameDrop ? "on" : "off");
     }
 
     if (!g_PerfEnabled)
