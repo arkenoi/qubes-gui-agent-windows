@@ -62,7 +62,7 @@
 // frame-level redundant-frame dropping AND DDA-sourced capture, so it could not be assigned
 // to either. These allow each to be disabled independently.
 #define REG_CONFIG_DDA_CAPTURE_VALUE L"DdaCapture"     // DWORD 0/1, default 1
-#define REG_CONFIG_FRAME_DROP_VALUE  L"FrameDrop"      // DWORD 0/1, default 1
+#define REG_CONFIG_FRAME_DROP_VALUE  L"FrameDrop"      // DWORD 0/1, default 0 - see below
 
 // Version of the CSV record format, bumped when fields change.
 // v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
@@ -89,6 +89,18 @@ extern BOOL     g_FocusRaise;
 //   C:\Users\Public\qga-frdrop-off  present -> redundant-frame dropping disabled
 // Public is writable by any user, and these only affect the guest's own capture path - no
 // isolation property depends on them.
+// MEASURED AND TURNED OFF. Four-condition run, one binary, interleaved:
+//     baseline (both off)   typing 11.508  drag 14.541  scroll 10.041
+//     frame-drop only       typing 14.765 (+28%)  drag 20.051 (+38%)  scroll 10.159 (+1%)
+//     DDA only              typing  4.089 (-64%)  drag 13.498 ( -7%)  scroll  4.611 (-54%)
+//     both                  typing  5.313 (-54%)  drag 16.408 (+13%)  scroll  7.971 (-21%)
+// Frame dropping is a NET LOSS under workload and it degrades DDA when combined - "both" is
+// worse than "DDA only" on every metric. The reason is plain once measured: FrameSignature
+// hashes the damaged pixels every frame, and during a workload those pixels really did change,
+// so the hash almost never matches. It is ~440k pixels hashed per frame for nothing.
+// It only pays at IDLE, where ~90% of presents carry no pixel change - and idle is the row
+// worth 0.343 %CPU. Default OFF; the code and counters stay so the idle case can be revisited
+// deliberately rather than re-derived.
 extern BOOL     g_DdaCapture;
 extern BOOL     g_FrameDrop;
 extern LONGLONG g_PerfFreq;     // QueryPerformanceFrequency, ticks per second

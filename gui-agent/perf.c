@@ -28,7 +28,7 @@ BOOL     g_PerfEnabled = FALSE;
 BOOL     g_ProtoTrace  = FALSE;
 BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
-BOOL     g_FrameDrop   = TRUE;
+BOOL     g_FrameDrop   = FALSE;
 LONGLONG g_PerfFreq = 0;
 DWORD    g_PerfEveryN = 1;
 
