@@ -69,6 +69,7 @@ static volatile LONG g_PwSkipped = 0;       // per-window recaptures avoided (sc
 static volatile LONG g_PwCaptured = 0;      // per-window recaptures actually issued
 static volatile LONG g_PwRefuse[PW_REFUSE_MAX];  // why the fast path declined, by cause
 static volatile LONG g_RedundantFrames = 0;      // frames dropped: damage reported, pixels identical
+static volatile LONG g_DdaCaptures = 0;          // windows served from the composited desktop
 
 void PerfInit(void)
 {
@@ -144,7 +145,7 @@ void PerfInit(void)
 
     LogInfo("QGAPERF on: freq=%I64d everyN=%u qpc_cost_ns=%I64d default=%d (sink %I64d)",
         g_PerfFreq, g_PerfEveryN, qpcCostNs, QGA_PERF_DEFAULT, sink);
-    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwnoz,pwoff,pwocc,pwnofg,pwovl,pwfirst,pwchg,frdrop,log (times in microseconds)",
+    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwnoz,pwoff,pwocc,pwnofg,pwovl,pwfirst,pwchg,frdrop,ddacap,log (times in microseconds)",
         PERF_RECORD_VERSION);
 }
 
@@ -170,6 +171,14 @@ void PerfNoteRedundantFrame(void)
         return;
 
     InterlockedIncrement(&g_RedundantFrames);
+}
+
+void PerfNoteDdaCapture(void)
+{
+    if (!g_PerfEnabled)
+        return;
+
+    InterlockedIncrement(&g_DdaCaptures);
 }
 
 void PerfNotePwRefusal(IN PW_REFUSE_REASON reason)
@@ -289,6 +298,7 @@ void PerfEmitFrame(
         InterlockedExchange(&g_PwRefuse[PW_REFUSE_FIRST_SEEN], 0),
         InterlockedExchange(&g_PwRefuse[PW_REFUSE_CONTENT_CHANGED], 0),
         InterlockedExchange(&g_RedundantFrames, 0),
+        InterlockedExchange(&g_DdaCaptures, 0),
         PerfUs(g_EmitTicks));
 
     g_EmitTicks = PerfNow() - emitStart;

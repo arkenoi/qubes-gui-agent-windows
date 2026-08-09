@@ -2837,6 +2837,10 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
 
 static HWND g_LastPopupDamageWindow = NULL;
 
+// How often a DDA-sourced window is re-established from PrintWindow, so any pixel difference
+// between the two sources is corrected rather than accumulating.
+#define PW_DDA_VERIFY_MS 2000
+
 // While a PrintWindow-fed window is moving, refresh its content at most this often.
 // Covers content that genuinely changes mid-drag (video, progress bars); the engine's
 // 250 ms round-robin sweep (wincapture.cpp) independently bounds staleness for
@@ -3020,6 +3024,52 @@ static BOOL PwAnyVisibleOverlap(IN const WINDOW_DATA* self, IN const RECT* rect)
         e = (WINDOW_DATA*)e->ListEntry.Flink;
     }
     return FALSE;
+}
+
+// DDA-SOURCED CAPTURE (hybrid-capture-design.md S1.1, predicates E1-E6).
+//
+// PrintWindow re-renders the ENTIRE window - 15-18 ms on a WARP guest - even when a keystroke
+// dirtied a 560x48 line. Measured against stock QWT on Windows 11 that is where the gap lives:
+// typing 3.00x and scroll 2.11x worse, while drag is at parity and 98.1% of per-window
+// refusals are genuine content change, so no amount of skipping can help. Stock pays a cheap
+// screen crop for the same damage.
+//
+// When a window is unoccluded, the composited desktop already CONTAINS its pixels, so the
+// damaged sub-rect can be memcpy'd out of the granted framebuffer instead - which is exactly
+// what PwSliceCopyAndDamage already does for slice-fed windows. This is a routing decision,
+// not new machinery.
+//
+// E6 ("fully unoccluded") was the design's one unanswered predicate. It is answered here by
+// the same order-free test the screen-hash fast path uses, so it costs nothing extra.
+static BOOL PwDdaEligible(IN const WINDOW_DATA* entry, IN const RECT* rect,
+                          IN UINT fbWidth, IN UINT fbHeight, IN HWND foreground)
+{
+    // E2: the granted buffer must match the window's current size, or a dump claiming more
+    // pixels than were granted makes gui-daemon exit(1).
+    if (entry->PwWidth != entry->Width || entry->PwHeight != entry->Height)
+        return FALSE;
+
+    // E4: DDA holds no pixels off-screen; an off-screen band would freeze.
+    if (rect->left < 0 || rect->top < 0 ||
+        rect->right > (LONG)fbWidth || rect->bottom > (LONG)fbHeight ||
+        rect->right <= rect->left || rect->bottom <= rect->top)
+        return FALSE;
+
+    // E5: a layered window is COMPOSITED into the desktop, so the screen shows the blended
+    // result while PrintWindow shows unblended content - different pixels, not a shortcut.
+    if (entry->ExStyle & WS_EX_LAYERED)
+        return FALSE;
+
+    // E6: unoccluded. Same reasoning as PwScreenUnchanged: with a valid Z-order use it,
+    // otherwise "is the foreground window" plus "no other visible window overlaps".
+    if (!g_ZOrderValid)
+    {
+        if (entry->Handle != foreground)
+            return FALSE;
+        if (PwAnyVisibleOverlap(entry, rect))
+            return FALSE;
+    }
+    return TRUE;
 }
 
 static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN UINT pitch,
@@ -3540,6 +3590,39 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // the window is unoccluded (see PwScreenUnchanged).
                     if (pwDamaged)
                     {
+                        // DDA source when the screen provably holds this window's pixels:
+                        // copy only the damaged sub-rects instead of re-rendering the whole
+                        // window. Falls back to PrintWindow the moment any predicate fails,
+                        // and a periodic forced recapture (below) bounds any pixel-equality
+                        // difference between the two sources to at most PW_DDA_VERIFY_MS.
+                        if (g_ZOrderValid
+                            ? !RectInRegion(rgnCovered, &pwRect)
+                            : TRUE)
+                        {
+                            if (PwDdaEligible(entry, &pwRect, fbWidth, fbHeight, pwForeground))
+                            {
+                                DWORD ddaNow = GetTickCount();
+                                if (ddaNow - entry->PwDdaVerifyTick >= PW_DDA_VERIFY_MS)
+                                {
+                                    // Periodic ground truth: one PrintWindow re-establishes
+                                    // the buffer from the authoritative source, so any
+                                    // systematic difference (alpha byte, rounded corners,
+                                    // DWM per-window effects) cannot accumulate.
+                                    entry->PwDdaVerifyTick = ddaNow;
+                                    PerfNotePwDecision(FALSE);
+                                    WcMarkDirty(entry->Handle);
+                                }
+                                else
+                                {
+                                    for (UINT ddi = 0; ddi < frame->dirty_rects_count; ddi++)
+                                        if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pwRect))
+                                            PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit);
+                                    PerfNoteDdaCapture();
+                                }
+                                continue;   // handled; do not fall through to PrintWindow
+                            }
+                        }
+
                         BOOL pwSkip = PwScreenUnchanged(entry, framebuffer, frame->rect.Pitch,
                                                         fbWidth, fbHeight, &pwRect, rgnCovered,
                                                         pwForeground);

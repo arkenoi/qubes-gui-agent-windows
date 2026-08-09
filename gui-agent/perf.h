@@ -61,7 +61,7 @@
 
 // Version of the CSV record format, bumped when fields change.
 // v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
-#define PERF_RECORD_VERSION 5
+#define PERF_RECORD_VERSION 6
 
 extern BOOL     g_PerfEnabled;  // master switch
 
@@ -139,6 +139,11 @@ void PerfNotePwRefusal(IN PW_REFUSE_REASON reason);
 // previous frame's. Distinct from PerfNoteSkippedFrame, which counts frames that arrived with
 // NO dirty rects: this one had damage reported and none of it was real.
 void PerfNoteRedundantFrame(void);
+
+// Main loop: a window's damage was served by copying the damaged sub-rects out of the
+// composited desktop instead of re-rendering the whole window with PrintWindow. The ratio of
+// this to pwcap is what the typing/scroll gap against stock turns on.
+void PerfNoteDdaCapture(void);
 
 // Capture thread: GetFrameMoveRects returned a non-empty set. Logs the first
 // occurrence loudly (this is the answer to the capture.c move-rects TODO),

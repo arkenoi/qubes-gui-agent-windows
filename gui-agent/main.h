@@ -155,6 +155,7 @@ typedef struct _WINDOW_DATA
     // detectable from the dirty rects. Comparing the screen bytes first turns that into a
     // memcmp-class hash (~0.2 ms). Valid ONLY while the window is unoccluded; see
     // PwScreenUnchanged.
+    DWORD PwDdaVerifyTick;   // last forced PrintWindow while DDA-sourced
     ULONGLONG PwScreenHash;
     BOOL PwScreenHashValid;
 
