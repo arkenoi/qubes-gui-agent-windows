@@ -63,6 +63,16 @@
 // to either. These allow each to be disabled independently.
 #define REG_CONFIG_DDA_CAPTURE_VALUE L"DdaCapture"     // DWORD 0/1, default 1
 #define REG_CONFIG_FRAME_DROP_VALUE  L"FrameDrop"      // DWORD 0/1, default 0 - see below
+// Exempt DDA-active windows from the wincapture engine's 250ms round-robin sweep.
+// The sweep exists so guest-occluded windows (invisible to DDA) still converge, but a
+// DDA-active window is by definition foreground and unoccluded - sweeping it runs a full
+// PrintWindow + DIB alloc + whole-buffer row-diff 4x/s for a window whose every real
+// change the DDA path already serves. Measured as the fork's ~2.5-point idle CPU floor
+// vs stock (idle 3.04% vs 0.57%; the whole typing gap, since the typing increment over
+// idle is equal on both sides). The sweep also violates the ESTABLISH-ONCE invariant
+// ("while DDA-active nothing ever marks the window dirty") - it re-opens the
+// buffer-ownership race and can re-introduce the 4 Hz content swap that rework removed.
+#define REG_CONFIG_SWEEP_EXEMPT_VALUE L"SweepDdaExempt" // DWORD 0/1, default 1
 
 // Version of the CSV record format, bumped when fields change.
 // v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
@@ -101,8 +111,10 @@ extern BOOL     g_FocusRaise;
 // It only pays at IDLE, where ~90% of presents carry no pixel change - and idle is the row
 // worth 0.343 %CPU. Default OFF; the code and counters stay so the idle case can be revisited
 // deliberately rather than re-derived.
+//   C:\Users\Public\qga-sweepdda-off  present -> DDA-active sweep exemption disabled
 extern BOOL     g_DdaCapture;
 extern BOOL     g_FrameDrop;
+extern BOOL     g_SweepDdaExempt;
 extern LONGLONG g_PerfFreq;     // QueryPerformanceFrequency, ticks per second
 extern DWORD    g_PerfEveryN;   // emit one line per this many processed frames
 

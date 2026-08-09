@@ -29,6 +29,7 @@ BOOL     g_ProtoTrace  = FALSE;
 BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
 BOOL     g_FrameDrop   = FALSE;
+BOOL     g_SweepDdaExempt = TRUE;
 LONGLONG g_PerfFreq = 0;
 DWORD    g_PerfEveryN = 1;
 
@@ -134,9 +135,12 @@ void PerfInit(void)
                 g_DdaCapture = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_FRAME_DROP_VALUE, &v, NULL))
                 g_FrameDrop = (v != 0);
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SWEEP_EXEMPT_VALUE, &v, NULL))
+                g_SweepDdaExempt = (v != 0);
         }
         LogInfo("QGADDACAPTURE %s", g_DdaCapture ? "on" : "off");
         LogInfo("QGAFRAMEDROP %s", g_FrameDrop ? "on" : "off");
+        LogInfo("QGASWEEPEXEMPT %s", g_SweepDdaExempt ? "on" : "off");
     }
 
     if (!g_PerfEnabled)

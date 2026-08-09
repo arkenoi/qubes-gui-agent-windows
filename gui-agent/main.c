@@ -3080,6 +3080,17 @@ static BOOL FrameDropEnabled(void)
     return !MarkerPresent(L"C:\\Users\\Public\\qga-frdrop-off", &tick, &off);
 }
 
+// See REG_CONFIG_SWEEP_EXEMPT_VALUE (perf.h): keep the engine's periodic sweep off the
+// window the DDA path is actively serving. Marker-file override so the exemption can be
+// A/B'd on one binary, like the other attribution switches.
+static BOOL SweepExemptEnabled(void)
+{
+    static DWORD tick = 0; static BOOL off = FALSE;
+    if (!g_SweepDdaExempt)
+        return FALSE;
+    return !MarkerPresent(L"C:\\Users\\Public\\qga-sweepdda-off", &tick, &off);
+}
+
 // How long a window must be STILL before the composited desktop is used as its source.
 // Measured: with no such guard, drag CPU went 11.106 -> 18.622 (+68%) while typing improved
 // 43%. The reason is that the legacy path deliberately does almost NOTHING while a window
@@ -3722,6 +3733,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 // WcPrefill deliberately does not fire the damage callback, so
                                 // the full-window damage is sent here.
                                 entry->PwDdaActive = TRUE;
+                                // Claim the buffer BEFORE the establish: from here on the
+                                // engine must neither sweep nor async-capture this channel
+                                // (WcPrefill below is a direct call and unaffected).
+                                WcSetDdaOwned(entry->Handle, SweepExemptEnabled());
                                 PerfNotePwDecision(FALSE);
                                 if (WcPrefill(entry->Handle) == ERROR_SUCCESS)
                                 {
@@ -3734,6 +3749,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                     // Could not establish - do not start copying into a buffer
                                     // whose contents are unknown; fall back to the normal path.
                                     entry->PwDdaActive = FALSE;
+                                    WcSetDdaOwned(entry->Handle, FALSE);
                                 }
                             }
                             else
@@ -3751,15 +3767,25 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 {
                                     PerfNoteDdaCapture();
                                     ddaHandled = TRUE;
+                                    // Re-asserted per steady-state frame (sub-us: one SRW
+                                    // shared acquire + a walk of <= a handful of channels)
+                                    // so a marker-file toggle applies within a second even
+                                    // with no eligibility transition, and so a channel
+                                    // re-created behind our back (detach/re-attach) does
+                                    // not linger sweepable while DDA-active.
+                                    WcSetDdaOwned(entry->Handle, SweepExemptEnabled());
                                 }
                                 else
                                 {
                                     entry->PwDdaActive = FALSE;   // re-establish next time
+                                    WcSetDdaOwned(entry->Handle, FALSE);
                                 }
                             }
                         }
                         else
                         {
+                            if (entry->PwDdaActive)
+                                WcSetDdaOwned(entry->Handle, FALSE);
                             entry->PwDdaActive = FALSE;   // left DDA mode; re-establish on return
                         }
 

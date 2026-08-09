@@ -391,6 +391,10 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwSettleDue = FALSE;
     entry->PwLastMoveTick = 0;
     entry->PwLastMoveCapTick = 0;
+    // The channel this flag described is gone; a re-attach gets a fresh channel whose
+    // buffer holds no established content, so DDA mode must re-enter via prefill.
+    // Left stale, the steady-state branch would slice-copy into an unestablished buffer.
+    entry->PwDdaActive = FALSE;
 }
 
 // Drop an attached window back to the legacy screen-slice path at runtime. The daemon

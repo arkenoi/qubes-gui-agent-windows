@@ -55,6 +55,12 @@ BOOL WcIsDead(HWND hwnd);
 // intersect the window). Cheap; coalesces.
 void WcMarkDirty(HWND hwnd);
 
+// Declare frame-loop ownership of hwnd's buffer (DDA slice mode). While owned, the
+// engine neither captures the channel asynchronously nor sweeps it (a pending dirty
+// stays pending until ownership drops); direct WcPrefill calls still work. Set TRUE
+// on entering DDA mode / per steady-state DDA frame, FALSE on leaving. Cheap.
+void WcSetDdaOwned(HWND hwnd, BOOL owned);
+
 // Maximum masked regions per window (synthesized children composited by the frame
 // loop; see WcSetMask).
 #define WC_MAX_MASK 8

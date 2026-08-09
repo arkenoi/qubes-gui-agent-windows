@@ -45,6 +45,15 @@ struct Channel
     int cropX = 0, cropY = 0;    // visible-rect offset inside the OS window rect
     BYTE* buffer = nullptr;      // caller-owned, width*height*4
     std::atomic<bool> dirty{ true }; // capture requested (starts dirty: initial fill)
+    // While TRUE the frame loop owns the buffer (DDA slice copies) and the engine must
+    // not write it: the async capture loop leaves the channel alone (a pending dirty
+    // stays pending and is honoured when ownership drops), and the round-robin sweep
+    // skips it - the sweep exists for guest-occluded windows invisible to DDA, and a
+    // DDA-active window is by definition foreground and unoccluded, so sweeping it is
+    // a full PrintWindow + whole-buffer diff 4x/s for nothing (measured: the agent's
+    // ~2.5-point idle CPU floor over stock). Direct WcPrefill calls are unaffected -
+    // the frame loop uses them to establish the buffer it is taking ownership of.
+    std::atomic<bool> ddaOwned{ false };
     int failures = 0;
     bool dead = false;
     // Buffer-relative regions this channel must NOT write: they are owned by
@@ -244,7 +253,7 @@ DWORD WINAPI CaptureThread(LPVOID param)
             for (size_t k = 0; k < n; k++)
             {
                 Channel& sc = *e.channels[(e.sweepNext + k) % n];
-                if (!sc.dead)
+                if (!sc.dead && !sc.ddaOwned.load())
                 {
                     sc.dirty.store(true);
                     e.sweepNext = (e.sweepNext + k + 1) % n;
@@ -256,7 +265,10 @@ DWORD WINAPI CaptureThread(LPVOID param)
         for (auto& cp : e.channels)
         {
             Channel& c = *cp;
-            if (c.dead || !c.dirty.exchange(false))
+            // ddaOwned checked BEFORE consuming dirty: a mark arriving while the frame
+            // loop owns the buffer stays pending and is served when ownership drops,
+            // instead of being eaten here or triggering a write into an owned buffer.
+            if (c.dead || c.ddaOwned.load() || !c.dirty.exchange(false))
                 continue;
             didWork = true;
             DamageOut dmg{ nullptr, 0, 0, 0 };
@@ -411,6 +423,20 @@ void WcMarkDirty(HWND hwnd)
         if (ch->hwnd == hwnd)
         {
             ch->dirty.store(true);
+            break;
+        }
+    ReleaseSRWLockShared(&g_eng->lock);
+}
+
+void WcSetDdaOwned(HWND hwnd, BOOL owned)
+{
+    if (!g_eng)
+        return;
+    AcquireSRWLockShared(&g_eng->lock);
+    for (auto& ch : g_eng->channels)
+        if (ch->hwnd == hwnd)
+        {
+            ch->ddaOwned.store(owned ? true : false);
             break;
         }
     ReleaseSRWLockShared(&g_eng->lock);
