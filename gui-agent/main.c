@@ -3108,6 +3108,8 @@ static void PwPatchSynthChildren(IN OUT WINDOW_DATA* owner, IN const RECT* area)
     }
 }
 
+static void FrameSigInvalidate(void);   // defined with the frame-coalescing helpers below
+
 // Drop the published desktop image. The pointer belongs to the mapped desktop surface of a
 // duplication object; when that duplication is discarded the mapping goes with it, but
 // synthesis reads g_FbBits from OUTSIDE the frame loop - SynthActivate() paints from the
@@ -3117,10 +3119,93 @@ static void PwPatchSynthChildren(IN OUT WINDOW_DATA* owner, IN const RECT* area)
 // by the post-recovery sweep once a new frame has been published.
 void PwInvalidateFramebuffer(void)
 {
+    // The frame signature describes pixels in THIS buffer. Once the surface is released the
+    // next buffer may hold identical bytes at the same coordinates for an unrelated reason,
+    // and a stale signature would authorise skipping the first real frame after recovery -
+    // exactly the frame that repaints everything.
+    FrameSigInvalidate();
     g_FbBits = NULL;
     g_FbPitch = 0;
     g_FbWidth = 0;
     g_FbHeight = 0;
+}
+
+
+// ---------------------------------------------------------------- frame-level coalescing --
+// MEASURED: on a settled Windows 11 guest with a verified session, the desktop presents ~5.2
+// frames/s while ABSOLUTELY IDLE, each carrying real dirty rects (empty=0, ~350k px). An
+// in-guest probe sampling at 250 ms with jitter found actual pixel change in only 6 of 39
+// intervals, and every changed region lay inside the one open application window. So roughly
+// nine out of ten idle presents carry no pixel change at all: DWM reports composition damage
+// for regions whose contents are identical.
+//
+// Those frames cost the whole per-frame pipeline - window walk, region arithmetic, and a
+// PrintWindow per intersecting window - to deliver nothing. Hashing the damaged pixels and
+// dropping the frame when they are unchanged removes that entirely.
+//
+// WHY THIS IS SAFE. DDA reports ALL damage, so if the union of dirty rects is byte-identical
+// to the previous frame's, nothing on screen moved. Comparing CONSECUTIVE frames is what makes
+// it sound: whatever content this hash describes was already delivered when the previous frame
+// was processed, so there is nothing left to send.
+//
+// COST CONTROL. Hashing is linear in damaged area, so it is skipped above a threshold: a frame
+// dirtying most of the screen is doing real work and would only be slowed by the check. Idle
+// and typing damage sit far below it.
+#define FRAME_HASH_MAX_AREA (1500u * 1000u)   // px; above this, do not hash - just process
+
+static ULONGLONG g_LastFrameSig = 0;
+static BOOL      g_LastFrameSigValid = FALSE;
+
+// Called whenever the framebuffer identity changes (resolution change, re-grant, duplication
+// recreated). Without this the agent could compare a hash taken from a buffer that no longer
+// exists and wrongly skip the first real frame after the change.
+static void FrameSigInvalidate(void)
+{
+    g_LastFrameSigValid = FALSE;
+}
+
+// FNV-1a over the dirty rects: their geometry AND their pixels. Geometry is included so a
+// frame damaging a DIFFERENT region with coincidentally equal bytes cannot collide with it.
+// Returns FALSE when the frame must not be hashed (no buffer, or too much damage).
+static BOOL FrameSignature(IN const CAPTURE_FRAME* frame, IN const BYTE* fb, IN UINT pitch,
+                           IN UINT fbWidth, IN UINT fbHeight, OUT ULONGLONG* outSig)
+{
+    if (!fb || pitch == 0 || frame->dirty_rects_count == 0)
+        return FALSE;
+
+    UINT64 area = 0;
+    for (UINT i = 0; i < frame->dirty_rects_count; i++)
+    {
+        const RECT* r = &frame->dirty_rects[i];
+        if (r->left < 0 || r->top < 0 || r->right > (LONG)fbWidth || r->bottom > (LONG)fbHeight ||
+            r->right <= r->left || r->bottom <= r->top)
+            return FALSE;                       // clipped or bogus rect: do not reason about it
+        area += (UINT64)(r->right - r->left) * (UINT64)(r->bottom - r->top);
+        if (area > FRAME_HASH_MAX_AREA)
+            return FALSE;                       // too much damage to be worth hashing
+    }
+
+    ULONGLONG h = 1469598103934665603ULL;
+    for (UINT i = 0; i < frame->dirty_rects_count; i++)
+    {
+        const RECT* r = &frame->dirty_rects[i];
+        h ^= (ULONGLONG)(UINT)r->left;  h *= 1099511628211ULL;
+        h ^= (ULONGLONG)(UINT)r->top;   h *= 1099511628211ULL;
+        h ^= (ULONGLONG)(UINT)r->right; h *= 1099511628211ULL;
+        h ^= (ULONGLONG)(UINT)r->bottom;h *= 1099511628211ULL;
+        const UINT rowBytes = (UINT)(r->right - r->left) * 4;
+        for (LONG y = r->top; y < r->bottom; y++)
+        {
+            const BYTE* row = fb + (SIZE_T)y * pitch + (SIZE_T)r->left * 4;
+            for (UINT b = 0; b < rowBytes; b += 4)
+            {
+                h ^= (ULONGLONG)(*(const UINT32*)(row + b));
+                h *= 1099511628211ULL;
+            }
+        }
+    }
+    *outSig = h;
+    return TRUE;
 }
 
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
@@ -3133,6 +3218,26 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         g_FbPitch = frame->rect.Pitch;
         g_FbWidth = fbWidth;
         g_FbHeight = fbHeight;
+    }
+
+    // Drop the frame if the damaged pixels are byte-identical to the previous frame's.
+    {
+        ULONGLONG sig;
+        if (FrameSignature(frame, framebuffer, frame->rect.Pitch, fbWidth, fbHeight, &sig))
+        {
+            if (g_LastFrameSigValid && sig == g_LastFrameSig)
+            {
+                PerfNoteRedundantFrame();
+                return ERROR_SUCCESS;
+            }
+            g_LastFrameSig = sig;
+            g_LastFrameSigValid = TRUE;
+        }
+        else
+        {
+            // Not hashable this time - do not let a stale signature authorise a later skip.
+            g_LastFrameSigValid = FALSE;
+        }
     }
 
     // Menus/tooltips are override-redirect windows. They are mapped like any other window,

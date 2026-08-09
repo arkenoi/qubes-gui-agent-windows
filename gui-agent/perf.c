@@ -68,6 +68,7 @@ static volatile LONG g_SkippedFrames = 0;   // capture thread -> main loop
 static volatile LONG g_PwSkipped = 0;       // per-window recaptures avoided (screen bytes unchanged)
 static volatile LONG g_PwCaptured = 0;      // per-window recaptures actually issued
 static volatile LONG g_PwRefuse[PW_REFUSE_MAX];  // why the fast path declined, by cause
+static volatile LONG g_RedundantFrames = 0;      // frames dropped: damage reported, pixels identical
 
 void PerfInit(void)
 {
@@ -143,7 +144,7 @@ void PerfInit(void)
 
     LogInfo("QGAPERF on: freq=%I64d everyN=%u qpc_cost_ns=%I64d default=%d (sink %I64d)",
         g_PerfFreq, g_PerfEveryN, qpcCostNs, QGA_PERF_DEFAULT, sink);
-    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwnoz,pwoff,pwocc,pwnofg,pwovl,pwfirst,pwchg,log (times in microseconds)",
+    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwnoz,pwoff,pwocc,pwnofg,pwovl,pwfirst,pwchg,frdrop,log (times in microseconds)",
         PERF_RECORD_VERSION);
 }
 
@@ -161,6 +162,14 @@ void PerfNotePwDecision(IN BOOL skipped)
         return;
 
     InterlockedIncrement(skipped ? &g_PwSkipped : &g_PwCaptured);
+}
+
+void PerfNoteRedundantFrame(void)
+{
+    if (!g_PerfEnabled)
+        return;
+
+    InterlockedIncrement(&g_RedundantFrames);
 }
 
 void PerfNotePwRefusal(IN PW_REFUSE_REASON reason)
@@ -244,7 +253,7 @@ void PerfEmitFrame(
     LogInfo("QGAPERF,v=%d,seq=%I64u,n=%u,mode=%c,dt=%I64d,acq=%I64d,wak=%I64d,mrq=%I64d,drq=%I64d,"
         L"upd=%I64d,enu=%I64d,rem=%I64d,dmg=%I64d,snd=%I64d,tot=%I64d,"
         L"dr=%u,mr=%u,mrmax=%u,area=%I64u,win=%u,iwn=%u,wev=%u,sends=%d,skip=%d,pwskip=%d,pwcap=%d,"
-        L"pwnofb=%d,pwnoz=%d,pwoff=%d,pwocc=%d,pwnofg=%d,pwovl=%d,pwfirst=%d,pwchg=%d,log=%I64d",
+        L"pwnofb=%d,pwnoz=%d,pwoff=%d,pwocc=%d,pwnofg=%d,pwovl=%d,pwfirst=%d,pwchg=%d,frdrop=%d,log=%I64d",
         PERF_RECORD_VERSION,
         g_Seq,
         g_Acc.frames,
@@ -279,6 +288,7 @@ void PerfEmitFrame(
         InterlockedExchange(&g_PwRefuse[PW_REFUSE_OVERLAP], 0),
         InterlockedExchange(&g_PwRefuse[PW_REFUSE_FIRST_SEEN], 0),
         InterlockedExchange(&g_PwRefuse[PW_REFUSE_CONTENT_CHANGED], 0),
+        InterlockedExchange(&g_RedundantFrames, 0),
         PerfUs(g_EmitTicks));
 
     g_EmitTicks = PerfNow() - emitStart;

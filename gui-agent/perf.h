@@ -61,7 +61,7 @@
 
 // Version of the CSV record format, bumped when fields change.
 // v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
-#define PERF_RECORD_VERSION 4
+#define PERF_RECORD_VERSION 5
 
 extern BOOL     g_PerfEnabled;  // master switch
 
@@ -134,6 +134,11 @@ typedef enum _PW_REFUSE_REASON
 } PW_REFUSE_REASON;
 
 void PerfNotePwRefusal(IN PW_REFUSE_REASON reason);
+
+// Main loop: a whole frame was dropped because its damaged pixels were byte-identical to the
+// previous frame's. Distinct from PerfNoteSkippedFrame, which counts frames that arrived with
+// NO dirty rects: this one had damage reported and none of it was real.
+void PerfNoteRedundantFrame(void);
 
 // Capture thread: GetFrameMoveRects returned a non-empty set. Logs the first
 // occurrence loudly (this is the answer to the capture.c move-rects TODO),
