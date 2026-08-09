@@ -3167,6 +3167,11 @@ static void FrameSigInvalidate(void)
 // FNV-1a over the dirty rects: their geometry AND their pixels. Geometry is included so a
 // frame damaging a DIFFERENT region with coincidentally equal bytes cannot collide with it.
 // Returns FALSE when the frame must not be hashed (no buffer, or too much damage).
+// TRUE when this frame's damaged pixels are byte-identical to the previous frame's, so no
+// window needs recapturing. Updates the stored signature as a side effect.
+static BOOL FrameRedundant(IN const CAPTURE_FRAME* frame, IN const BYTE* fb, IN UINT pitch,
+                           IN UINT fbWidth, IN UINT fbHeight);
+
 static BOOL FrameSignature(IN const CAPTURE_FRAME* frame, IN const BYTE* fb, IN UINT pitch,
                            IN UINT fbWidth, IN UINT fbHeight, OUT ULONGLONG* outSig)
 {
@@ -3208,6 +3213,24 @@ static BOOL FrameSignature(IN const CAPTURE_FRAME* frame, IN const BYTE* fb, IN 
     return TRUE;
 }
 
+static BOOL FrameRedundant(IN const CAPTURE_FRAME* frame, IN const BYTE* fb, IN UINT pitch,
+                           IN UINT fbWidth, IN UINT fbHeight)
+{
+    ULONGLONG sig;
+    if (!FrameSignature(frame, fb, pitch, fbWidth, fbHeight, &sig))
+    {
+        // Not hashable (no buffer, or too much damage): do not let a stale signature
+        // authorise a later skip.
+        g_LastFrameSigValid = FALSE;
+        return FALSE;
+    }
+    if (g_LastFrameSigValid && sig == g_LastFrameSig)
+        return TRUE;
+    g_LastFrameSig = sig;
+    g_LastFrameSigValid = TRUE;
+    return FALSE;
+}
+
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
     IN UINT fbWidth, IN UINT fbHeight)
 {
@@ -3220,25 +3243,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         g_FbHeight = fbHeight;
     }
 
-    // Drop the frame if the damaged pixels are byte-identical to the previous frame's.
-    {
-        ULONGLONG sig;
-        if (FrameSignature(frame, framebuffer, frame->rect.Pitch, fbWidth, fbHeight, &sig))
-        {
-            if (g_LastFrameSigValid && sig == g_LastFrameSig)
-            {
-                PerfNoteRedundantFrame();
-                return ERROR_SUCCESS;
-            }
-            g_LastFrameSig = sig;
-            g_LastFrameSigValid = TRUE;
-        }
-        else
-        {
-            // Not hashable this time - do not let a stale signature authorise a later skip.
-            g_LastFrameSigValid = FALSE;
-        }
-    }
+    // The redundant-frame check does NOT belong here, and putting it here produced a BLACK
+    // guest window. Returning early from the top of this function skips:
+    //   - TrackWindows() below, which discovers windows and sends CREATE/CONFIGURE/MAP, so
+    //     window management stops entirely;
+    //   - in FULLSCREEN mode, the SendWindowDamageEvent(NULL, 0, 0, fbWidth, fbHeight) further
+    //     down, which is the ONLY thing that tells dom0 to repaint. A static boot screen then
+    //     yields identical frame after identical frame, every one skipped, and dom0 never
+    //     paints anything at all.
+    // It now lives in the SEAMLESS branch only, after tracking - see the FrameRedundant() call
+    // there. Fullscreen is deliberately excluded: its per-frame cost is one damage message,
+    // so there is nothing worth saving and everything to lose.
 
     // Menus/tooltips are override-redirect windows. They are mapped like any other window,
     // but dom0 screenshot tooling enumerates only managed windows, so whether their repaints
@@ -3363,6 +3378,19 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
     // candidate and a syscall per window would eat the saving it is trying to make.
     HWND pwForeground = GetForegroundWindow();
     zCount = CollectZOrder(zSorted, RTL_NUMBER_OF(zSorted));
+
+    // Redundant-frame drop, deliberately HERE and not at the top of the function:
+    // TrackWindows() above has already run, so window discovery and CREATE/CONFIGURE/MAP are
+    // unaffected, and the fullscreen path returned long before this point so its one damage
+    // message per frame is untouched. Only the per-window damage/capture walk is skipped -
+    // which is the expensive part and the only part that has nothing to do when no pixel
+    // changed. Emptying the list rather than returning keeps the GDI regions freed and the
+    // frame accounted for in QGAPERF exactly as before.
+    if (zCount > 0 && FrameRedundant(frame, framebuffer, frame->rect.Pitch, fbWidth, fbHeight))
+    {
+        PerfNoteRedundantFrame();
+        zCount = 0;
+    }
     for (UINT zi = 0; zi < zCount; zi++)
     {
         entry = zSorted[zi];
