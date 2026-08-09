@@ -66,7 +66,7 @@
 
 // Version of the CSV record format, bumped when fields change.
 // v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
-#define PERF_RECORD_VERSION 6
+#define PERF_RECORD_VERSION 7
 
 extern BOOL     g_PerfEnabled;  // master switch
 
@@ -145,6 +145,17 @@ typedef enum _PW_REFUSE_REASON
     PW_REFUSE_OVERLAP,          // Z-order unknown and another visible window overlaps it
     PW_REFUSE_FIRST_SEEN,       // no previous hash yet - unavoidable once per window
     PW_REFUSE_CONTENT_CHANGED,  // hashed and DIFFERENT: a genuine repaint, not a redundant one
+    // DDA-path refusals. Separate from the screen-hash refusals above because they are a
+    // DIFFERENT decision: those say "the pixels did not change", these say "the composited
+    // desktop is not a valid source for this window right now". Uninstrumented, a run where
+    // DDA never engaged looked identical to one where it was never eligible - and the
+    // difference was 5.3 vs 20.4 %CPU on typing.
+    PW_REFUSE_DDA_MOVING,       // moving, or moved within PW_DDA_MOVE_QUIET_MS
+    PW_REFUSE_DDA_GEOMETRY,     // granted buffer size != current window size
+    PW_REFUSE_DDA_OFFSCREEN,    // window not wholly inside the framebuffer
+    PW_REFUSE_DDA_LAYERED,      // WS_EX_LAYERED: screen shows the blended result
+    PW_REFUSE_DDA_NOTFG,        // not the foreground window - see note below
+    PW_REFUSE_DDA_OVERLAP,      // another visible window overlaps it
     PW_REFUSE_MAX
 } PW_REFUSE_REASON;
 

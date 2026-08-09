@@ -161,7 +161,7 @@ void PerfInit(void)
 
     LogInfo("QGAPERF on: freq=%I64d everyN=%u qpc_cost_ns=%I64d default=%d (sink %I64d)",
         g_PerfFreq, g_PerfEveryN, qpcCostNs, QGA_PERF_DEFAULT, sink);
-    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwnoz,pwoff,pwocc,pwnofg,pwovl,pwfirst,pwchg,frdrop,ddacap,log (times in microseconds)",
+    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwnoz,pwoff,pwocc,pwnofg,pwovl,pwfirst,pwchg,frdrop,ddacap,ddmov,ddgeo,ddoff,ddlay,ddfg,ddovl,log (times in microseconds)",
         PERF_RECORD_VERSION);
 }
 
@@ -278,7 +278,8 @@ void PerfEmitFrame(
     LogInfo("QGAPERF,v=%d,seq=%I64u,n=%u,mode=%c,dt=%I64d,acq=%I64d,wak=%I64d,mrq=%I64d,drq=%I64d,"
         L"upd=%I64d,enu=%I64d,rem=%I64d,dmg=%I64d,snd=%I64d,tot=%I64d,"
         L"dr=%u,mr=%u,mrmax=%u,area=%I64u,win=%u,iwn=%u,wev=%u,sends=%d,skip=%d,pwskip=%d,pwcap=%d,"
-        L"pwnofb=%d,pwnoz=%d,pwoff=%d,pwocc=%d,pwnofg=%d,pwovl=%d,pwfirst=%d,pwchg=%d,frdrop=%d,ddacap=%d,log=%I64d",
+        L"pwnofb=%d,pwnoz=%d,pwoff=%d,pwocc=%d,pwnofg=%d,pwovl=%d,pwfirst=%d,pwchg=%d,frdrop=%d,ddacap=%d,"
+        L"ddmov=%d,ddgeo=%d,ddoff=%d,ddlay=%d,ddfg=%d,ddovl=%d,log=%I64d",
         PERF_RECORD_VERSION,
         g_Seq,
         g_Acc.frames,
@@ -315,6 +316,12 @@ void PerfEmitFrame(
         InterlockedExchange(&g_PwRefuse[PW_REFUSE_CONTENT_CHANGED], 0),
         InterlockedExchange(&g_RedundantFrames, 0),
         InterlockedExchange(&g_DdaCaptures, 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_DDA_MOVING], 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_DDA_GEOMETRY], 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_DDA_OFFSCREEN], 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_DDA_LAYERED], 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_DDA_NOTFG], 0),
+        InterlockedExchange(&g_PwRefuse[PW_REFUSE_DDA_OVERLAP], 0),
         PerfUs(g_EmitTicks));
 
     g_EmitTicks = PerfNow() - emitStart;

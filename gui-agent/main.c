@@ -3096,35 +3096,59 @@ static BOOL PwDdaEligible(IN const WINDOW_DATA* entry, IN const RECT* rect,
     // frames where movement is in progress, but PwSettleDue clears between LOCATIONCHANGE
     // events (about 5% of drag frames apply none), so without a quiet period the DDA path
     // still runs during a drag on those frames and pays the full-window copy.
-    if (entry->PwSettleDue)
+    if (entry->PwSettleDue ||
+        GetTickCount() - entry->PwLastMoveTick < PW_DDA_MOVE_QUIET_MS)
+    {
+        PerfNotePwRefusal(PW_REFUSE_DDA_MOVING);
         return FALSE;
-    if (GetTickCount() - entry->PwLastMoveTick < PW_DDA_MOVE_QUIET_MS)
-        return FALSE;
+    }
 
     // E2: the granted buffer must match the window's current size, or a dump claiming more
     // pixels than were granted makes gui-daemon exit(1).
     if (entry->PwWidth != entry->Width || entry->PwHeight != entry->Height)
+    {
+        PerfNotePwRefusal(PW_REFUSE_DDA_GEOMETRY);
         return FALSE;
+    }
 
     // E4: DDA holds no pixels off-screen; an off-screen band would freeze.
     if (rect->left < 0 || rect->top < 0 ||
         rect->right > (LONG)fbWidth || rect->bottom > (LONG)fbHeight ||
         rect->right <= rect->left || rect->bottom <= rect->top)
+    {
+        PerfNotePwRefusal(PW_REFUSE_DDA_OFFSCREEN);
         return FALSE;
+    }
 
     // E5: a layered window is COMPOSITED into the desktop, so the screen shows the blended
     // result while PrintWindow shows unblended content - different pixels, not a shortcut.
     if (entry->ExStyle & WS_EX_LAYERED)
+    {
+        PerfNotePwRefusal(PW_REFUSE_DDA_LAYERED);
         return FALSE;
+    }
 
-    // E6: unoccluded. Same reasoning as PwScreenUnchanged: with a valid Z-order use it,
+    // E6: unoccluded.
+    //
+    // NOTE ON FOREGROUND, and why this counter matters more than it looks. The guest's
+    // foreground window follows DOM0's focus (MSG_FOCUS -> SetForegroundWindow). So if the
+    // operator clicks another qube while a benchmark runs, the guest window stops being
+    // foreground and this path refuses for the whole run. Measured: reps where DDA engaged
+    // typed at 5.2-6.2 %CPU, reps where it did not at 20.4 - and the cause was invisible
+    // because these refusals were not counted. Same reasoning as PwScreenUnchanged: with a valid Z-order use it,
     // otherwise "is the foreground window" plus "no other visible window overlaps".
     if (!g_ZOrderValid)
     {
         if (entry->Handle != foreground)
+        {
+            PerfNotePwRefusal(PW_REFUSE_DDA_NOTFG);
             return FALSE;
+        }
         if (PwAnyVisibleOverlap(entry, rect))
+        {
+            PerfNotePwRefusal(PW_REFUSE_DDA_OVERLAP);
             return FALSE;
+        }
     }
     return TRUE;
 }
