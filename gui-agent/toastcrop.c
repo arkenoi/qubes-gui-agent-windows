@@ -350,6 +350,27 @@ static void TcValidateInsets(IN HWND window, IN LONG rawWidth, IN LONG rawHeight
         return;
     }
 
+    // The ratio guard protects NORMAL-SIZE hosts (a toast banner whose UIA hit was some
+    // inner element). It must NOT apply to a workarea-sized host: 25H2's Start card is
+    // 858x874 inside a 5120x1384 window - 17% of the width - and rejecting that re-creates
+    // the fullscreen white Start window (measured 2026-08-12). For oversize hosts (>=90%
+    // of the guest screen in either dimension) the protection is the absolute floor above
+    // plus a stricter one: a card that small inside a huge host would be a mismeasure.
+    BOOL oversizeHost = (g_ScreenWidth > 0 && g_ScreenHeight > 0 &&
+        ((ULONG)rawWidth * 100 >= g_ScreenWidth * 90UL ||
+         (ULONG)rawHeight * 100 >= g_ScreenHeight * 90UL));
+
+    if (oversizeHost)
+    {
+        if (width < 300 || height < 200)
+        {
+            LogWarning("0x%x: card %dx%d too small for a %dx%d host - mismeasure, leaving uncropped",
+                window, width, height, rawWidth, rawHeight);
+            ZeroMemory(insets, sizeof(*insets));
+        }
+        return;
+    }
+
     if (width * 100 < rawWidth * TOAST_CROP_MIN_PERCENT ||
         height * 100 < rawHeight * TOAST_CROP_MIN_PERCENT)
     {
@@ -793,16 +814,14 @@ BOOL IsShellToastWindow(IN const WINDOW_DATA* data)
     if (data->Owner != NULL)
         return FALSE;
 
-    // No fixed size ceiling. It used to exclude the Action Center flyout, but (a) the 25H2 Start
-    // menu is 858x890 and would have been excluded with it, which is exactly the surface this
-    // has to fix, and (b) cropping the flyout to ITS card is correct too - the card-selection
-    // rule below picks the outermost card, never one notification inside a list. What must stay
-    // excluded is a surface so large it is not a popup at all; IsPopup's 90%-of-screen rule
-    // already demotes those, and a demoted window never reaches this classifier as a popup.
-    if (g_HostScreenWidth > 0 && g_HostScreenHeight > 0 &&
-        (ULONGLONG)data->Width * (ULONGLONG)data->Height * 100ULL >
-        (ULONGLONG)g_HostScreenWidth * (ULONGLONG)g_HostScreenHeight * 90ULL)
-        return FALSE;
+    // No size ceiling AT ALL any more. The old 90%-of-screen exclusion assumed an oversize
+    // CoreWindow is "not a popup" and safe to leave alone - measured wrong on 25H2 at
+    // 5120x1440: StartMenuExperienceHost hosts the Start CARD (858x874, found by the
+    // geometric search) inside a WORKAREA-SIZED 5120x1384 window, and leaving that host
+    // uncropped mapped an opaque near-fullscreen white window over the whole dom0 screen
+    // (fullshot 2026-08-12). The card search plus TcValidateInsets' guards (absolute floor,
+    // and the ratio guard for normal-size hosts) are the protection; a fullscreen surface
+    // with no card inside simply measures nothing and stays uncropped, as before.
 
     TcInit();
 
