@@ -457,12 +457,16 @@ static DWORD HandleButton(IN HWND window)
     inputEvent.mi.dwExtraInfo = 0;
     /* pointer coordinates must be 0..65535, which covers the whole screen -
     * regardless of resolution */
-    // VERIFIED in source 2026-08-11: dx/dy are dead at runtime. SendInput only reads them
-    // when dwFlags carries MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_MOVE, and the switch below never
-    // sets either - the click lands wherever HandleMotion last placed the cursor. The origin
-    // fix above is therefore coherence only, inert today; making dx/dy live by adding those
-    // flags is deliberately NOT done here, since it would change injection semantics for
-    // every click (drag, double-click) and needs its own interleaved regression run.
+    // dx/dy were dead here for years: SendInput only reads them when dwFlags carries
+    // MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_MOVE and the switch below never set either, so a
+    // click landed wherever the LAST processed MSG_MOTION put the cursor. Any dropped,
+    // stale or re-ordered motion made the click land elsewhere - the reported "toast is
+    // not clickable" (docs/TOAST-fix-plan.md). The daemon sends every button with the
+    // pointer position it fired at; carrying that position in the click itself makes the
+    // click land there by construction. g_ButtonAbsolute=0 (registry "ButtonAbsolute")
+    // restores the historic semantics; wheel events keep them unconditionally (a wheel
+    // goes to whatever is under the cursor, and yanking the cursor on scroll would be a
+    // behavior change nobody asked for).
     inputEvent.mi.dx = x * 65535 / g_ScreenWidth;
     inputEvent.mi.dy = y * 65535 / g_ScreenHeight;
     switch (buttonMsg.button)
@@ -486,6 +490,12 @@ static DWORD HandleButton(IN HWND window)
         break;
     default:
         LogWarning("unknown button pressed/released 0x%x", buttonMsg.button);
+    }
+
+    if (g_ButtonAbsolute &&
+        (buttonMsg.button == Button1 || buttonMsg.button == Button2 || buttonMsg.button == Button3))
+    {
+        inputEvent.mi.dwFlags |= MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
     }
 
     LogDebug("window 0x%x, (%d,%d), flags 0x%x", window, buttonMsg.x, buttonMsg.y, inputEvent.mi.dwFlags);

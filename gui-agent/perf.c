@@ -26,6 +26,8 @@
 
 BOOL     g_PerfEnabled = FALSE;
 BOOL     g_ProtoTrace  = FALSE;
+BOOL     g_ProtoTraceWobble = FALSE;
+BOOL     g_ButtonAbsolute = TRUE;
 BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
 BOOL     g_FrameDrop   = FALSE;
@@ -109,7 +111,17 @@ void PerfInit(void)
         if (GetEnvironmentVariable(PROTO_ENV_VALUE, env, RTL_NUMBER_OF(env)) > 0)
             proto = (env[0] != L'0');
         g_ProtoTrace = proto;
-        LogInfo("QGAPROTO %s", g_ProtoTrace ? "on" : "off");
+
+        // The per-rect live-rect (wobble) probe is opt-in on top of ProtoTrace: it costs a
+        // DWM query + lock per damage rect, which under a drag is a measured tail hazard.
+        BOOL wobble = FALSE;
+        DWORD wv = 0;
+        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
+            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PROTO_WOBBLE_VALUE, &wv, NULL))
+            wobble = (wv != 0);
+        g_ProtoTraceWobble = wobble;
+        LogInfo("QGAPROTO %s (wobble probe %s)", g_ProtoTrace ? "on" : "off",
+            g_ProtoTraceWobble ? "on" : "off");
     }
 
     // Z-order sync switch. Read here for the same reason as ProtoTrace: it is behaviour, not
@@ -124,6 +136,19 @@ void PerfInit(void)
             raise = (rv != 0);
         g_FocusRaise = raise;
         LogInfo("QGAFOCUSRAISE %s", g_FocusRaise ? "on" : "off");
+    }
+
+    // Button events carry their own absolute position (fixes clicks landing wherever the
+    // last motion happened to be - the unclickable-toast defect). Default ON; the registry
+    // switch exists as the escape hatch for the interleaved regression run.
+    {
+        BOOL btnAbs = TRUE;
+        DWORD bv = 1;
+        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
+            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_BUTTON_ABS_VALUE, &bv, NULL))
+            btnAbs = (bv != 0);
+        g_ButtonAbsolute = btnAbs;
+        LogInfo("QGABUTTONABS %s", g_ButtonAbsolute ? "on" : "off");
     }
 
     // Attribution switches - registry default, marker file overrides at runtime.

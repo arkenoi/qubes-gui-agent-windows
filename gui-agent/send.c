@@ -526,6 +526,14 @@ static ULONG SendWindowCreateInternal(IN const WINDOW_DATA *windowData, IN BOOL 
     // is absent from the set and creates normally.
     if (!allowDuplicate && (windowData ? IsWindowCreatedLocked(window) : g_ScreenCreated))
     {
+        // Created-set membership means the daemon still tracks this id, so damage for it is
+        // legitimate. Without this, a DESTROY that FAILED to send (degraded ring) leaves the
+        // hwnd in the created set AND the destroyed ring: this branch then suppresses the
+        // re-CREATE (correct) but the stale destroyed-ring mark keeps dropping the window's
+        // damage forever (adversarially verified 2026-08-12, send.c 626 vs 634-636).
+        if (windowData)
+            ClearWindowDestroyedLocked(windowData->Handle);
+
         // Released before the follow-up below, which takes the same lock.
         LeaveCriticalSection(&g_VchanCriticalSection);
 
@@ -901,8 +909,14 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
         // is the origin this damage was registered against (what dom0 will add back), `l*` is
         // where the window really is right now. A non-zero delta during motion IS the wobble,
         // measured with no cross-VM capture skew.
+        //
+        // The live-rect probe is a DWM query plus a g_csWatchedWindows acquisition PER RECT,
+        // and a drag emits hundreds of rects per second - measured as the dominant tail cost
+        // of ProtoTrace itself (tot max 580 ms vs 66 ms with it off, FINDINGS 2026-08-12).
+        // It is diagnostic-grade, so it hides behind its own switch; plain ProtoTrace keeps
+        // the cheap constant-cost line.
         RECT live;
-        if (window && GetRealWindowRect(window, &live) == ERROR_SUCCESS)
+        if (g_ProtoTraceWobble && window && GetRealWindowRect(window, &live) == ERROR_SUCCESS)
         {
             // Also called from the capture thread: the list walk must hold the lock, and
             // it must be RELEASED before the vchan lock is taken below (the main thread

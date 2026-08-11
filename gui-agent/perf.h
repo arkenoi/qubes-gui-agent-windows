@@ -56,6 +56,8 @@
 #define PERF_ENV_VALUE L"QUBES_GUI_PERF"
 #define PROTO_ENV_VALUE L"QUBES_GUI_PROTO"
 #define REG_CONFIG_PROTO_VALUE L"ProtoTrace"
+#define REG_CONFIG_PROTO_WOBBLE_VALUE L"ProtoTraceWobble"
+#define REG_CONFIG_BUTTON_ABS_VALUE L"ButtonAbsolute"
 // Z-order sync experiment: raise the window dom0 focused (see HandleFocus). DWORD 0/1.
 #define REG_CONFIG_FOCUS_RAISE_VALUE L"FocusRaise"
 // Attribution switches. The typing improvement was measured on a build carrying BOTH
@@ -87,6 +89,14 @@ extern BOOL     g_PerfEnabled;  // master switch
 // only ground truth for a protocol defect is the field that went out.
 // Off by default; registry DWORD "ProtoTrace" or env QUBES_GUI_PROTO=1.
 extern BOOL     g_ProtoTrace;
+
+// Per-damage-rect live-rect probe on top of ProtoTrace (DWM query + lock per rect - a
+// measured drag-time tail hazard, so diagnostic-only). Registry DWORD "ProtoTraceWobble".
+extern BOOL     g_ProtoTraceWobble;
+
+// Button events carry their own absolute position (default ON; "ButtonAbsolute"=0 restores
+// the historic click-at-last-motion semantics).
+extern BOOL     g_ButtonAbsolute;
 
 // Raise on MSG_FOCUS, making guest z-order agree with dom0 for the focused window.
 // Off by default = historic behaviour. Read once in PerfInit().
