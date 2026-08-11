@@ -58,7 +58,20 @@ ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs,
 // daemon. window==0 is the whole-screen dump (SendScreenGrants).
 ULONG SendWindowDump(IN HWND window, IN ULONG width, IN ULONG height,
     IN size_t numGrants, IN const ULONG* refs);
+// Announce a window to dom0. windowData == NULL is the screen pseudo-window.
+// Sends MSG_CREATE at most ONCE per hwnd lifetime: a repeat call for a window the daemon
+// already has is answered with MSG_CONFIGURE instead, because a second CREATE for a live id
+// makes gui-daemon exit(1) and takes the whole qube's GUI with it.
+// Returns ERROR_INVALID_DATA when the window's geometry was refused at the wire (send.c).
+// That is NOT a transport failure and must not be treated as one: the daemon has no CREATE
+// for this hwnd, so the caller must leave it unannounced (CreateSent FALSE) and let a later
+// pass retry, rather than sending dependent messages the daemon would exit on.
 ULONG SendWindowCreate(IN const WINDOW_DATA *windowData);
+
+// FI_DUP_CREATE only - emits MSG_CREATE even when the hwnd already has one, bypassing the
+// create-once rule that is the code under test. No legitimate caller exists; in a release
+// build its only call site is behind a FiShouldDupCreate() compiled to a constant FALSE.
+ULONG SendWindowCreateForced(IN const WINDOW_DATA *windowData);
 ULONG SendWindowDestroy(IN HWND window);
 
 // Forget which windows the daemon has been told about (see send.c). Must be called

@@ -14,6 +14,7 @@
     <ClCompile Include="..\..\gui-agent\capture.c" />
     <ClCompile Include="..\..\gui-agent\main.c" />
     <ClCompile Include="..\..\gui-agent\perf.c" />
+    <ClCompile Include="..\..\gui-agent\faultinject.c" />
     <ClCompile Include="..\..\gui-agent\resolution.c" />
     <ClCompile Include="..\..\gui-agent\send.c" />
     <ClCompile Include="..\..\gui-agent\util.c" />
@@ -37,6 +38,7 @@
     <ClInclude Include="..\..\gui-agent\capture.h" />
     <ClInclude Include="..\..\gui-agent\main.h" />
     <ClInclude Include="..\..\gui-agent\perf.h" />
+    <ClInclude Include="..\..\gui-agent\faultinject.h" />
     <ClInclude Include="..\..\gui-agent\resolution.h" />
     <ClInclude Include="..\..\gui-agent\resource.h" />
     <ClInclude Include="..\..\gui-agent\send.h" />
@@ -89,7 +91,15 @@
   <ImportGroup Label="PropertySheets" Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
     <Import Project="$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props" Condition="exists('$(UserRootDir)\Microsoft.Cpp.$(Platform).user.props')" Label="LocalAppDataPlatform" />
   </ImportGroup>
-  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup Label="UserMacros">
+    <!-- Fault injection (gui-agent\faultinject.h) is a TEST-BUILD-ONLY capability: the
+         module exists to break the agent on purpose, so a release artifact must not
+         contain any of it. Default 0 here means every ordinary build, including CI's,
+         compiles it out; a fault-capable build is requested explicitly with
+             msbuild ... -p:QgaFaultInjection=1
+         and identifies itself in the log and in the binary (g_FaultInjectionMarker). -->
+    <QgaFaultInjection Condition="'$(QgaFaultInjection)' == ''">0</QgaFaultInjection>
+  </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(ProjectDir)\..\..\include;$(QUBES_INCLUDES);$(QUBES_REPO)\vmm-xen-windows-pvdrivers\inc;$(QUBES_REPO)\core-vchan-xen\inc;$(QUBES_REPO)\windows-utils\inc;$(QUBES_REPO)\core-qubesdb\inc;$(ProjectDir)\..\..\..\gui-common\include;$(ProjectDir)\..\..\..\qubes-gui-common\include</IncludePath>
     <LibraryPath>$(VC_LibraryPath_x64);$(WindowsSDK_LibraryPath_x64);$(QUBES_LIBS);$(QUBES_REPO)\vmm-xen-windows-pvdrivers\lib;$(QUBES_REPO)\core-vchan-xen\lib;$(QUBES_REPO)\windows-utils\lib;$(QUBES_REPO)\core-qubesdb\lib</LibraryPath>
@@ -110,7 +120,7 @@
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;QGA_FAULT_INJECTION=$(QgaFaultInjection);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <DebugInformationFormat>ProgramDatabase</DebugInformationFormat>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
@@ -133,7 +143,7 @@
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <SDLCheck>true</SDLCheck>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;QGA_FAULT_INJECTION=$(QgaFaultInjection);%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard_C>stdc17</LanguageStandard_C>
       <TreatWarningAsError>true</TreatWarningAsError>

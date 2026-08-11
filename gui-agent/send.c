@@ -29,6 +29,7 @@
 #include "perf.h"
 #include "main.h"
 #include "vchan.h"
+#include "faultinject.h" // FI_NEG_CREATE / FI_DUP_CREATE aim at the two rules below
 #include "capture.h" // FRAMEBUFFER_PAGE_COUNT, for the A3CHECK instrumentation
 
 #include <qubes-gui-protocol.h>
@@ -43,12 +44,128 @@ static_assert(sizeof(ULONG) == sizeof(uint32_t), "ULONG has a different size tha
 // emitted above it and is just as fatal to the daemon when the window has no CREATE.
 static BOOL MaySendForWindowLocked(IN HWND window, IN const WCHAR *messageName);
 
+// --- wire geometry sanitizer ----------------------------------------------------------
+// dom0's gui-daemon is a CONTRACT, and its geometry contract is not "be reasonable" - it
+// is a specific set of comparisons in xside.c, each of which either clamps the value,
+// pops a modal dialog, or exits the process:
+//
+//   MSG_CREATE       xside.c:2937       VERIFY((int)width >= 0 && (int)height >= 0) -> DIALOG
+//                    xside.c:2939-2946  w=min(w,MAX_W); h=min(h,MAX_H);
+//                                       x=max(-MAX_W,min(x,MAX_W)); y likewise
+//   MSG_CONFIGURE    xside.c:2093-2103  the same clamps, then VERIFY(w > 0 && h > 0) -> DIALOG
+//   MSG_SHMIMAGE     xside.c:2261       any negative field -> the update is silently discarded
+//   MSG_WINDOW_DUMP  xside.c:3894       size above the protocol maximum -> errx(1), daemon dies
+//
+// WHY THE DIALOG IS THE POINT. While that modal dialog is up the daemon stops draining the
+// vchan. Measured 2026-08-11: the dialog preceded the vchan flood by ~6.5 s and the capture
+// thread died behind it. One suspicious message is therefore a display DoS for the entire
+// qube, so a message that would raise it must never be put on the wire at all - hoping the
+// user clicks Ignore is not a design.
+//
+// WHY HERE AND NOT AT INGESTION. The per-window capture crop origin is derived from the RAW
+// WINDOW_DATA X/Y (perwindow.c), so clamping there would move the crop and the pixels would
+// no longer match the rect we announce. The wire is the only place where the announced
+// value can be corrected without moving anything else.
+//
+// This never weakens a dom0-side check: it makes the agent satisfy the check that already
+// exists, and dom0 re-validates everything regardless.
+
+// Rate-limit counters for the two classes of refusal. Deliberately NOT atomic and
+// deliberately not taken under g_VchanCriticalSection: they only decide whether a line is
+// logged, a lost increment costs at most one duplicated or missing line, and holding the
+// send lock across log file I/O would add latency to every other sender. Two separate
+// counters so that a flood of dropped damage cannot consume the budget that would have made
+// a single dropped CREATE visible.
+static ULONG g_GeomDrops;    // MSG_CREATE / MSG_CONFIGURE / MSG_WINDOW_DUMP
+static ULONG g_GeomClamps;   // values rewritten rather than refused
+static ULONG g_DamageDrops;  // MSG_SHMIMAGE
+
+// The evidence hook. The 25H2 negative-geometry case has never been reproduced here (four
+// storm runs, zero occurrences), so when it does recur in the field this line is the only
+// thing that will say which message and which field went wrong.
+static void LogGeometryRefused(IN OUT ULONG *counter, IN HWND window,
+    IN const WCHAR *messageName, IN const WCHAR *rule,
+    IN int x, IN int y, IN int width, IN int height)
+{
+    ULONG count = ++(*counter);
+
+    // Same shape as the created-window gate below: loud while it is news, decimated after,
+    // so a stuck path cannot turn the log file into the next problem.
+    if (count <= 20 || (count % 1000) == 0)
+    {
+        LogWarning("GEOMDROP msg=%s hwnd=0x%x rule=%s x=%d y=%d w=%d h=%d - message not sent; "
+            "%u such drops so far", messageName, window, rule, x, y, width, height, count);
+    }
+}
+
+// Make x/y/width/height exactly what gui-daemon would have stored for MSG_CREATE and
+// MSG_CONFIGURE, or refuse the message outright. Returns FALSE when the caller must not
+// send anything at all.
+static BOOL SanitizeWireGeometry(IN HWND window, IN const WCHAR *messageName,
+    IN OUT int32_t *x, IN OUT int32_t *y, IN OUT uint32_t *width, IN OUT uint32_t *height)
+{
+    // Read SIGNED, which is the whole trick: the protocol fields are uint32_t, so an
+    // inverted rect arrives as a huge positive number and only the cast xside.c:2937 itself
+    // performs can see it. The old "configureMsg.width > 0" test was an unsigned comparison
+    // and a negative width sailed straight through it.
+    int32_t w = (int32_t)*width;
+    int32_t h = (int32_t)*height;
+    int32_t cx = *x;
+    int32_t cy = *y;
+
+    if (w <= 0 || h <= 0)
+    {
+        // CREATE dialogs on < 0 and CONFIGURE on <= 0; one rule for both, taken as the
+        // stricter of the two, because a zero-sized window is nothing dom0 can render.
+        LogGeometryRefused(&g_GeomDrops, window, messageName,
+            L"width/height not positive (dom0 VERIFY: modal dialog, stops draining the vchan)",
+            cx, cy, w, h);
+        return FALSE;
+    }
+
+    if (w > MAX_WINDOW_WIDTH)
+        w = MAX_WINDOW_WIDTH;
+    if (h > MAX_WINDOW_HEIGHT)
+        h = MAX_WINDOW_HEIGHT;
+    if (cx > MAX_WINDOW_WIDTH)
+        cx = MAX_WINDOW_WIDTH;
+    if (cx < -MAX_WINDOW_WIDTH)
+        cx = -MAX_WINDOW_WIDTH;
+    if (cy > MAX_WINDOW_HEIGHT)
+        cy = MAX_WINDOW_HEIGHT;
+    if (cy < -MAX_WINDOW_HEIGHT)
+        cy = -MAX_WINDOW_HEIGHT;
+
+    if (cx != *x || cy != *y || (uint32_t)w != *width || (uint32_t)h != *height)
+    {
+        // Not a failure: dom0 would have stored these values anyway. Sending the clamped
+        // ones is what keeps both sides' idea of the window identical - every later
+        // CONFIGURE and every damage rect is computed against it - instead of only the
+        // agent believing in a rect dom0 silently narrowed.
+        ULONG count = ++g_GeomClamps;
+        if (count <= 20 || (count % 1000) == 0)
+        {
+            LogWarning("GEOMCLAMP msg=%s hwnd=0x%x (%d,%d) %dx%d -> (%d,%d) %dx%d "
+                "(dom0 clamps to %dx%d, xside.c:2939-2946); %u so far",
+                messageName, window, *x, *y, (int)*width, (int)*height,
+                cx, cy, w, h, MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT, count);
+        }
+        *x = cx;
+        *y = cy;
+        *width = (uint32_t)w;
+        *height = (uint32_t)h;
+    }
+
+    return TRUE;
+}
+
 ULONG SendWindowDump(IN HWND window, IN ULONG width, IN ULONG height,
     IN size_t numGrants, IN const ULONG* refs)
 {
     ULONG status = ERROR_INVALID_PARAMETER;
     struct msg_hdr header;
     struct msg_window_dump_hdr dumpHdr;
+    VCHAN_IOV iov[3];
 
     LogVerbose("start, window 0x%x %ux%u", window, width, height);
 
@@ -61,6 +178,22 @@ ULONG SendWindowDump(IN HWND window, IN ULONG width, IN ULONG height,
     if (numGrants == 0 || numGrants > MAX_GRANT_REFS_COUNT)
     {
         LogError("invalid grant count: %lu", numGrants);
+        goto end;
+    }
+
+    // The one geometry dom0 does not merely dislike: xside.c:3894 calls errx(1) - the daemon
+    // dies and the whole qube's GUI dies with it - on a dump above the protocol maximum, and
+    // a zero-sized dump describes no image at all. NOT clamped, unlike CREATE/CONFIGURE: the
+    // header has to describe the buffer the grant refs actually cover, so a wrong-but-
+    // accepted header would put a corrupt image on the screen. Refusing leaves whatever dom0
+    // already has mapped, which is the better of the two failures.
+    if ((int)width <= 0 || (int)height <= 0 ||
+        width > MAX_WINDOW_WIDTH || height > MAX_WINDOW_HEIGHT)
+    {
+        LogGeometryRefused(&g_GeomDrops, window, L"MSG_WINDOW_DUMP",
+            L"size outside (0, protocol maximum] (dom0 xside.c:3894 errx(1)s on it)",
+            0, 0, (int)width, (int)height);
+        status = ERROR_INVALID_DATA;
         goto end;
     }
 
@@ -77,29 +210,31 @@ ULONG SendWindowDump(IN HWND window, IN ULONG width, IN ULONG height,
         status = ERROR_SUCCESS; // dropped on purpose; not an error the caller can act on
         goto end;
     }
-    if (!VCHAN_SEND(header, L"MSG_WINDOW_DUMP"))
-    {
-        LeaveCriticalSection(&g_VchanCriticalSection);
-        status = win_perror2(ERROR_UNIDENTIFIED_ERROR, "VCHAN_SEND(header)");
-        goto end;
-    }
 
     dumpHdr.type = WINDOW_DUMP_TYPE_GRANT_REFS;
     dumpHdr.bpp = 32;
     dumpHdr.width = width;
     dumpHdr.height = height;
 
-    if (!VCHAN_SEND(dumpHdr, L"dumpHdr"))
-    {
-        LeaveCriticalSection(&g_VchanCriticalSection);
-        status = win_perror2(ERROR_UNIDENTIFIED_ERROR, "VCHAN_SEND(dumpHdr)");
-        goto end;
-    }
+    // ONE message, ONE reservation. The daemon reads sizeof(msg_hdr) and then exactly
+    // untrusted_len further bytes, so these three buffers are a single indivisible unit on
+    // the wire. Sent as three independent writes (as this was), a send that gave up
+    // between them - which the bounded send in vchan.c can now do - would leave the daemon
+    // reading the NEXT message's bytes as this dump's grant refs, and there is no
+    // resynchronisation point in the protocol. VchanSendVectored either places all of it
+    // or none of it, and is also the only path that can carry a grant slab larger than the
+    // write ring (protocol maximum geometry = 384 KiB of refs).
+    iov[0].Data = &header;
+    iov[0].Size = sizeof(header);
+    iov[1].Data = &dumpHdr;
+    iov[1].Size = sizeof(dumpHdr);
+    iov[2].Data = refs;
+    iov[2].Size = numGrants * sizeof(ULONG);
 
     status = ERROR_SUCCESS;
-    if (!VchanSendBuffer(g_Vchan, refs, numGrants * sizeof(ULONG), L"refs"))
+    if (!VchanSendVectored(g_Vchan, iov, (int)RTL_NUMBER_OF(iov), L"MSG_WINDOW_DUMP"))
     {
-        status = win_perror2(ERROR_UNIDENTIFIED_ERROR, "VchanSendBuffer(grants)");
+        status = win_perror2(VchanLastSendError(), "VchanSendVectored(MSG_WINDOW_DUMP)");
     }
     LeaveCriticalSection(&g_VchanCriticalSection);
 
@@ -205,6 +340,16 @@ static ULONG g_CreatedCount;
 static ULONG g_CreatedCapacity;
 static ULONG64 g_GateDrops;
 
+// The screen pseudo-window (protocol window 0) has no HWND to key the set on, and it is the
+// one CREATE whose duplicate is documented to kill the daemon outright - handle_message
+// exit(1)s on a CREATE for an id it already tracks (xside.c:3943-3948). main.c tracks the
+// same fact as g_ScreenAnnounced for its own control flow; this is the copy held by the code
+// that actually emits the message, under the lock that orders it.
+static BOOL g_ScreenCreated;
+
+// Rate limit for suppressed duplicate CREATEs (see SendWindowCreateInternal).
+static ULONG g_DupCreates;
+
 static BOOL IsWindowCreatedLocked(IN HWND window)
 {
     for (ULONG i = 0; i < g_CreatedCount; i++)
@@ -264,6 +409,9 @@ void SendResetCreatedWindows(void)
     EnterCriticalSection(&g_VchanCriticalSection);
     g_CreatedCount = 0;
     g_GateDrops = 0;
+    // A new daemon has never been told about the screen either, so the create-once rule
+    // must let the next CREATE(0) through or the qube would render nothing at all.
+    g_ScreenCreated = FALSE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 }
 
@@ -284,12 +432,15 @@ static BOOL MaySendForWindowLocked(IN HWND window, IN const WCHAR *messageName)
     return FALSE;
 }
 
-ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)
+// allowDuplicate is TRUE for exactly one caller, SendWindowCreateForced, which exists only
+// so FI_DUP_CREATE can re-introduce the defect the create-once rule below removes.
+static ULONG SendWindowCreateInternal(IN const WINDOW_DATA *windowData, IN BOOL allowDuplicate)
 {
     WINDOWINFO wi;
     struct msg_hdr header;
     struct msg_create createMsg;
     ULONG status;
+    HWND window = windowData ? windowData->Handle : NULL; // NULL == the screen pseudo-window
 
     if (!g_VchanClientConnected)
         return ERROR_SUCCESS;
@@ -333,6 +484,28 @@ ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)
     createMsg.override_redirect = windowData ? windowData->IsOverrideRedirect : FALSE;
     LogDebug("(%d,%d) %ux%u", createMsg.x, createMsg.y, createMsg.width, createMsg.height);
 
+    // FAULT INJECTION (test builds only, rank 1). Puts the historical 25H2 rect on the wire
+    // so the sanitizer below can be SEEN to catch it, and so that with the sanitizer removed
+    // xside.c:2937's dialog can be seen to fire. It has to run before the sanitizer: the
+    // sanitizer is the code under test. Asked exactly once per CREATE, as the shot is
+    // consumed by the query.
+    if (FiShouldNegCreate(window))
+    {
+        createMsg.width = (uint32_t)(-(int32_t)createMsg.width);
+        createMsg.height = (uint32_t)(-(int32_t)createMsg.height);
+    }
+
+    // THE choke point. A refused CREATE is reported with a status no transport failure can
+    // produce, because the caller must react differently: AddWindow has to leave CreateSent
+    // FALSE so that the created-window gate quarantines every dependent message for this
+    // hwnd. Failure then degrades to "the window is invisible until a later pass re-creates
+    // it with a sane rect", never to agent and daemon disagreeing about what exists.
+    if (!SanitizeWireGeometry(window, L"MSG_CREATE", &createMsg.x, &createMsg.y,
+        &createMsg.width, &createMsg.height))
+    {
+        return ERROR_INVALID_DATA;
+    }
+
     if (g_ProtoTrace)
         LogInfo("QGAPROTO,msg=CREATE,hwnd=0x%x,x=%d,y=%d,w=%u,h=%u,ovr=%d,style=0x%08x,ex=0x%08x",
             windowData ? (uint32_t)(ULONG_PTR)windowData->Handle : 0,
@@ -341,18 +514,62 @@ ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)
             windowData ? windowData->Style : 0, windowData ? windowData->ExStyle : 0);
 
     EnterCriticalSection(&g_VchanCriticalSection);
+
+    // CREATE ONCE PER HWND LIFETIME. gui-daemon exit(1)s on a CREATE for an id it already
+    // tracks (xside.c:3943-3948), and a Start-menu flip storm emitted 13 CREATEs for one
+    // LIVE hwnd on 2026-08-11. What a repeat caller actually needs dom0 to learn is the
+    // window's current geometry, and for a window dom0 already has that is MSG_CONFIGURE.
+    // The test is the created-window set, not WINDOW_DATA.CreateSent, for the same reason
+    // the send gate uses it: this set records what the DAEMON was told, under the very lock
+    // that ordered the telling. HWND reuse is therefore handled for free - SendWindowDestroy
+    // calls ClearWindowCreatedLocked in the same hold as MSG_DESTROY, so a recycled handle
+    // is absent from the set and creates normally.
+    if (!allowDuplicate && (windowData ? IsWindowCreatedLocked(window) : g_ScreenCreated))
+    {
+        // Released before the follow-up below, which takes the same lock.
+        LeaveCriticalSection(&g_VchanCriticalSection);
+
+        ULONG count = ++g_DupCreates;
+        if (count <= 20 || (count % 1000) == 0)
+        {
+            LogWarning("CREATEDUP suppressing a second MSG_CREATE for 0x%x ((%d,%d) %ux%u): "
+                "dom0 exits on a CREATE for an id it already tracks; sending MSG_CONFIGURE "
+                "instead; %u suppressed so far",
+                window, createMsg.x, createMsg.y, createMsg.width, createMsg.height, count);
+        }
+
+        // The status deliberately ignores the follow-up's: the CREATE the caller asked for
+        // has been satisfied since the first one, and a lost CONFIGURE is a lost geometry
+        // update, not a failed announcement. Reporting failure here would make AddWindow
+        // leave CreateSent FALSE for a window the daemon does have, after which RemoveWindow
+        // would skip its MSG_DESTROY and strand the hwnd in the created set forever.
+        if (windowData)
+        {
+            (void)SendWindowConfigure(window, createMsg.x, createMsg.y,
+                (int)createMsg.width, (int)createMsg.height, createMsg.override_redirect);
+        }
+        return ERROR_SUCCESS;
+    }
+
     // The OS can reuse a destroyed hwnd: a fresh CREATE re-legitimizes it for damage.
     if (windowData)
         ClearWindowDestroyedLocked(windowData->Handle);
     if (!VCHAN_SEND_MSG(header, createMsg, L"MSG_CREATE"))
     {
+        // Distinguish the two failures rather than flattening both to
+        // ERROR_UNIDENTIFIED_ERROR: ERROR_VC_DISCONNECTED means the daemon is gone (the
+        // handshake and the other fatal callers may stop at once), ERROR_TIMEOUT means it
+        // is alive but wedged, which the never-exit paths treat as a lost message. Every
+        // caller only tests against ERROR_SUCCESS, so nothing changes for them.
         LeaveCriticalSection(&g_VchanCriticalSection);
-        return ERROR_UNIDENTIFIED_ERROR;
+        return VchanLastSendError();
     }
     // Recorded only after the CREATE is actually on the wire, so the set never claims more
     // than the daemon has been told.
     if (windowData)
         MarkWindowCreatedLocked(windowData->Handle);
+    else
+        g_ScreenCreated = TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     if (windowData)
@@ -365,10 +582,26 @@ ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)
     return ERROR_SUCCESS;
 }
 
+ULONG SendWindowCreate(IN const WINDOW_DATA *windowData)
+{
+    return SendWindowCreateInternal(windowData, FALSE);
+}
+
+// FI_DUP_CREATE ONLY. There is no legitimate caller: a second MSG_CREATE for a live id is
+// precisely what gui-daemon exit(1)s on. It exists so the create-once rule above can be
+// shown to FAIL when the defect is deliberately re-introduced, which is the only way its
+// PASS counts (CLAUDE.md). In a release build its single call site sits behind a
+// FiShouldDupCreate() that is compiled to a constant FALSE, so nothing can reach it.
+ULONG SendWindowCreateForced(IN const WINDOW_DATA *windowData)
+{
+    return SendWindowCreateInternal(windowData, TRUE);
+}
+
 ULONG SendWindowDestroy(IN HWND window)
 {
     struct msg_hdr header;
     BOOL status;
+    BOOL gated;
 
     if (!g_VchanClientConnected)
         return ERROR_SUCCESS;
@@ -383,14 +616,33 @@ ULONG SendWindowDestroy(IN HWND window)
     EnterCriticalSection(&g_VchanCriticalSection);
     // A DESTROY for a window the daemon never saw created is fatal to it just like any
     // other orphaned message, so it goes through the same gate.
-    status = MaySendForWindowLocked(window, L"MSG_DESTROY") ? VCHAN_SEND(header, L"MSG_DESTROY") : TRUE;
+    gated = MaySendForWindowLocked(window, L"MSG_DESTROY");
+    status = gated ? VCHAN_SEND(header, L"MSG_DESTROY") : TRUE;
+
     // In the same lock hold as the send: from here on, damage for this hwnd is dropped
-    // (see the destroyed-ring comment above SendWindowDamageEvent).
+    // (see the destroyed-ring comment above SendWindowDamageEvent). Unconditional - the
+    // window is gone on OUR side regardless of what reached the daemon, and damage for a
+    // dead hwnd must never be sent.
     MarkWindowDestroyedLocked(window);
-    ClearWindowCreatedLocked(window);
+
+    // But the created-set is our model of what the DAEMON knows, so it may only be cleared
+    // when the daemon has actually been told, or when the gate proved it never knew this
+    // window. Since a send can now fail while the connection SURVIVES (VCHANSLOW), clearing
+    // unconditionally would let a later CREATE for the same hwnd through to a daemon that
+    // still has it tracked - and an already-tracked id is one of the cases the daemon
+    // answers with exit(1), killing every window of this qube.
+    if (!gated || status)
+    {
+        ClearWindowCreatedLocked(window);
+        // The daemon forgets window 0 on DESTROY, so the create-once rule must let the next
+        // CREATE(0) through - StopFrameProcessing destroys and re-announces the screen on every
+        // capture restart, and blocking that would leave the qube with no screen window at all.
+        if (!window)
+            g_ScreenCreated = FALSE;
+    }
     LeaveCriticalSection(&g_VchanCriticalSection);
 
-    return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+    return status ? ERROR_SUCCESS : VchanLastSendError();
 }
 
 ULONG SendWindowFlags(IN HWND window, IN uint32_t flagsToSet, IN uint32_t flagsToUnset)
@@ -413,7 +665,7 @@ ULONG SendWindowFlags(IN HWND window, IN uint32_t flagsToSet, IN uint32_t flagsT
     status = MaySendForWindowLocked(window, L"MSG_WINDOW_FLAGS") ? VCHAN_SEND_MSG(header, flags, L"MSG_WINDOW_FLAGS") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
-    return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+    return status ? ERROR_SUCCESS : VchanLastSendError();
 }
 
 ULONG SendWindowHints(IN HWND window, IN uint32_t flags)
@@ -436,7 +688,7 @@ ULONG SendWindowHints(IN HWND window, IN uint32_t flags)
     status = MaySendForWindowLocked(window, L"MSG_WINDOW_HINTS") ? VCHAN_SEND_MSG(header, hintsMsg, L"MSG_WINDOW_HINTS") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
-    return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+    return status ? ERROR_SUCCESS : VchanLastSendError();
 }
 
 ULONG SendScreenHints(void)
@@ -460,7 +712,7 @@ ULONG SendScreenHints(void)
     status = VCHAN_SEND_MSG(header, hintsMsg, L"MSG_WINDOW_HINTS screen");
     LeaveCriticalSection(&g_VchanCriticalSection);
 
-    return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+    return status ? ERROR_SUCCESS : VchanLastSendError();
 }
 
 ULONG SendWindowUnmap(IN HWND window)
@@ -481,7 +733,7 @@ ULONG SendWindowUnmap(IN HWND window)
     status = MaySendForWindowLocked(window, L"MSG_UNMAP") ? VCHAN_SEND(header, L"MSG_UNMAP") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
-    return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+    return status ? ERROR_SUCCESS : VchanLastSendError();
 }
 
 // if windowData == 0, use the whole screen
@@ -540,7 +792,7 @@ ULONG SendWindowMap(IN const WINDOW_DATA *windowData OPTIONAL)
     if (!VCHAN_SEND_MSG(header, mapMsg, L"MSG_MAP"))
     {
         LeaveCriticalSection(&g_VchanCriticalSection);
-        return ERROR_UNIDENTIFIED_ERROR;
+        return VchanLastSendError();
     }
     LeaveCriticalSection(&g_VchanCriticalSection);
 
@@ -581,37 +833,67 @@ ULONG SendWindowConfigure(HANDLE window, int x, int y, int width, int height, BO
 
     header.type = MSG_CONFIGURE;
 
-    if (g_ProtoTrace)
-        LogInfo("QGAPROTO,msg=CONFIGURE,hwnd=0x%x,x=%d,y=%d,w=%d,h=%d,ovr=%d",
-            (uint32_t)(ULONG_PTR)window, x, y, width, height, popup);
-
     configureMsg.x = x;
     configureMsg.y = y;
     configureMsg.width = width;
     configureMsg.height = height;
     configureMsg.override_redirect = popup;
-    LogVerbose("0x%x: (%d,%d) %dx%d ovr=%d", window, configureMsg.x, configureMsg.y,
-        configureMsg.width, configureMsg.height, configureMsg.override_redirect);
 
-    BOOL status = TRUE;
-    EnterCriticalSection(&g_VchanCriticalSection);
+    // don't send resize to 0x0 - this window is just hiding itself, MSG_UNMAP will follow.
+    // Kept as its own QUIET case ahead of the sanitizer: zero is routine and expected, and
+    // it must not consume the GEOMDROP log budget that has to stay available for the rects
+    // that are actually anomalous.
+    if (width == 0 || height == 0)
+        return ERROR_SUCCESS;
 
-    // don't send resize to 0x0 - this window is just hiding itself, MSG_UNMAP will follow
-    if (configureMsg.width > 0 && configureMsg.height > 0)
+    // Only negatives can be refused here, and a negative CONFIGURE is genuinely anomalous:
+    // it is xside.c:2098's VERIFY(width > 0 && height > 0), the modal dialog that stops the
+    // daemon draining the vchan. Note that it was NOT caught before - the old test was
+    // "configureMsg.width > 0" on the uint32_t field, an UNSIGNED comparison that every
+    // negative width passed, after which dom0 clamped 0xFFFFFFFF up to MAX_WINDOW_WIDTH
+    // (xside.c:2093) and rendered a 16384 px wide window.
+    // A refusal returns success: unlike MSG_CREATE there is no registration state riding on
+    // this message, so dom0 simply keeps the rect it already has - which is the correct
+    // outcome - and no caller loop should abort over one bad geometry update.
+    if (!SanitizeWireGeometry(window, L"MSG_CONFIGURE", &configureMsg.x, &configureMsg.y,
+        &configureMsg.width, &configureMsg.height))
     {
-        status = MaySendForWindowLocked(window, L"MSG_CONFIGURE") ? VCHAN_SEND_MSG(header, configureMsg, L"MSG_CONFIGURE") : TRUE;
-        if (!status)
-            goto cleanup;
+        return ERROR_SUCCESS;
     }
 
-cleanup:
+    // Traced AFTER sanitizing, so the trace shows what actually went on the wire.
+    if (g_ProtoTrace)
+        LogInfo("QGAPROTO,msg=CONFIGURE,hwnd=0x%x,x=%d,y=%d,w=%u,h=%u,ovr=%d",
+            (uint32_t)(ULONG_PTR)window, configureMsg.x, configureMsg.y,
+            configureMsg.width, configureMsg.height, popup);
+
+    LogVerbose("0x%x: (%d,%d) %ux%u ovr=%d", window, configureMsg.x, configureMsg.y,
+        configureMsg.width, configureMsg.height, configureMsg.override_redirect);
+
+    BOOL status;
+    EnterCriticalSection(&g_VchanCriticalSection);
+    status = MaySendForWindowLocked(window, L"MSG_CONFIGURE") ? VCHAN_SEND_MSG(header, configureMsg, L"MSG_CONFIGURE") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
-    return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+    return status ? ERROR_SUCCESS : VchanLastSendError();
 }
 
 ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN int height)
 {
+    // dom0 discards any update with a negative field on the floor (xside.c:2261), so this
+    // one cannot hurt the daemon - but it is wire traffic that can never draw anything, and
+    // a negative value here means the damage was computed against an origin the window no
+    // longer has. Refuse it and record it: the log line is the only evidence that would
+    // otherwise exist. Zero-sized rects are deliberately left alone - dom0 accepts them and
+    // they are ordinary churn, not a defect. Placed before the trace block so a dropped rect
+    // does not pay for GetRealWindowRect.
+    if (x < 0 || y < 0 || width < 0 || height < 0)
+    {
+        LogGeometryRefused(&g_DamageDrops, window, L"MSG_SHMIMAGE",
+            L"negative damage rect (dom0 xside.c:2261 discards it unseen)", x, y, width, height);
+        return ERROR_SUCCESS; // dropped on purpose; not an error the caller can act on
+    }
+
     if (g_ProtoTrace)
     {
         // Wobble is a desync between the geometry dom0 believes and where the window actually
@@ -679,7 +961,7 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
     status = MaySendForWindowLocked(window, L"MSG_SHMIMAGE") ? VCHAN_SEND_MSG(header, shmMsg, L"MSG_SHMIMAGE") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
-    return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+    return status ? ERROR_SUCCESS : VchanLastSendError();
 }
 
 ULONG SendWindowName(IN HWND window, IN const WCHAR *caption OPTIONAL)
@@ -720,7 +1002,7 @@ ULONG SendWindowName(IN HWND window, IN const WCHAR *caption OPTIONAL)
     status = MaySendForWindowLocked(window, L"MSG_WMNAME") ? VCHAN_SEND_MSG(header, nameMsg, L"MSG_WMNAME") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
-    return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+    return status ? ERROR_SUCCESS : VchanLastSendError();
 }
 
 ULONG SendProtocolVersion(void)
@@ -731,5 +1013,18 @@ ULONG SendProtocolVersion(void)
     BOOL status = VCHAN_SEND(version, L"version");
     LeaveCriticalSection(&g_VchanCriticalSection);
 
-    return status ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+    if (!status)
+    {
+        // The handshake is the one caller that must fail fast rather than degrade - with
+        // no version exchanged there is no protocol to speak - and it is the one place
+        // where knowing WHICH failure happened changes the diagnosis. Both end in the same
+        // exit, so the distinction has to be in the log or it is lost.
+        LogError("could not send the protocol version: the daemon is %s",
+            VchanLastSendResult() == VCHAN_SEND_DEAD
+                ? L"gone (vchan closed)"
+                : L"connected but has not drained the vchan for seconds");
+        return VchanLastSendError();
+    }
+
+    return ERROR_SUCCESS;
 }

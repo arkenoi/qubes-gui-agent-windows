@@ -43,6 +43,7 @@
 #include "util.h"
 #include "debug.h"
 #include "perf.h"
+#include "faultinject.h"
 #include "qubes-io.h"
 
 // windows-utils
@@ -1298,12 +1299,42 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
     if (g_VchanClientConnected)
     {
         status = SendWindowCreate(entry);
+        if (ERROR_INVALID_DATA == status)
+        {
+            // The wire sanitizer refused this window's rect (send.c), so dom0 has no CREATE
+            // for it. CreateSent must stay FALSE: that is what makes the created-window gate
+            // quarantine every dependent message for this hwnd - MAP, WMNAME, CONFIGURE,
+            // damage - each of which the daemon exit(1)s on without a CREATE. DeletePending
+            // makes the next tracking pass re-examine the window from scratch, so a
+            // transient bad rect self-heals into a normal announcement.
+            // Reported as success on purpose: one bad window must not abort the EnumWindows
+            // pass that is announcing all the others (AddWindowsProc stops on any failure).
+            LogWarning("0x%x: geometry refused at the wire, leaving the window unannounced "
+                "(it stays invisible in dom0 until a later pass re-creates it)", entry->Handle);
+            entry->DeletePending = TRUE;
+            status = ERROR_SUCCESS;
+            goto end;
+        }
         if (ERROR_SUCCESS != status)
         {
             win_perror2(status, "SendWindowCreate");
             goto end;
         }
         entry->CreateSent = TRUE;
+
+        // FAULT INJECTION (test builds only, rank 1). Reproduces the 13 duplicate CREATEs
+        // observed for live HWNDs during a Start-menu flip storm. It has to sit AFTER
+        // CreateSent, because the defect is precisely a second CREATE for a window the
+        // agent already believes it announced. gui-daemon is documented to exit(1) on a
+        // CREATE for an id it already tracks (xside.c:3943-3948) yet demonstrably did not,
+        // and that contradiction is an open question rank 3 depends on
+        // (docs/PLAN-stability-overhaul.md) - this is how it gets answered on demand
+        // instead of by waiting for a storm to cooperate.
+        // It must be the FORCED variant: rank 3's create-once rule now answers an ordinary
+        // repeat CREATE with MSG_CONFIGURE, so calling SendWindowCreate here would exercise
+        // the fix instead of re-introducing the defect it removes.
+        if (FiShouldDupCreate(entry->Handle))
+            (void)SendWindowCreateForced(entry);
 
         // Per-window framebuffer: announce the window's own buffer BEFORE mapping so
         // the daemon never composites this window from the screen slice. On failure
@@ -4237,6 +4268,16 @@ static ULONG WINAPI WatchForEvents(void)
     {
         status = ERROR_SUCCESS;
 
+        // FAULT INJECTION (test builds only, rank 1). Before the wait, not after it: the
+        // fault must reproduce a pump that services NOTHING - not the vchan fd, not frames,
+        // not window events - which is the agent side of the proven H2 causality. Waiting
+        // first would make the stall depend on something happening to wake the loop.
+        {
+            DWORD fiStallMs = FiPumpStallMs();
+            if (fiStallMs != 0)
+                Sleep(fiStallMs);
+        }
+
         vchanIoInProgress = TRUE;
 
         // A7: while degraded, wake in time for the next capture-init retry; the
@@ -4470,6 +4511,23 @@ static ULONG WINAPI WatchForEvents(void)
         case 4: // vchan receive
             if (!g_VchanClientConnected)
             {
+                // KEEP-FATAL: this flag is also cleared by the bounded send (vchan.c) when
+                // it gives up, and that happens while the vchan itself can still be OPEN.
+                // Without this test the give-up would look exactly like "a new client
+                // connected" and re-run the handshake: a protocol version re-sent
+                // mid-stream to a daemon that is not expecting one, then a blocking wait
+                // for a version reply that will never come. That desync is strictly worse
+                // than the wedge that preceded it, and unlike the wedge it is silent.
+                // Exit instead and let the service respawn do the reconnect - a fresh
+                // agent is the only state from which the handshake is well defined.
+                if (VchanSendWedged())
+                {
+                    LogError("vchan send gave up on this connection (see VCHANWEDGE) - "
+                        "refusing to re-run the handshake, exiting for a clean respawn");
+                    exitLoop = TRUE;
+                    break;
+                }
+
                 vchanIoInProgress = FALSE;
                 libvchan_cleanup(g_Vchan); // needed to cleanup xenstore entry
 
@@ -4715,7 +4773,17 @@ static ULONG WINAPI WatchForEvents(void)
     // cannot succeed and can only lose the race (the single attempt wedged one
     // more OS shutdown, 2026-08-06). Daemon alive => leak by design: one staging
     // grant (~7200 pages) per agent exit, reboot-cleared, loudly logged.
-    if (!g_VchanClientConnected || !libvchan_is_open(g_Vchan))
+    // ...and "daemon gone" must not include "daemon merely unresponsive". The bounded send
+    // (vchan.c) clears g_VchanClientConnected for a daemon that stopped draining the ring,
+    // but such a daemon is still RUNNING and still mapping our grants - exactly the live
+    // mapper this branch must never revoke under. Only the vchan actually being closed, or
+    // a give-up that reported the peer DEAD, count as gone.
+    // Two ways to be "alive but not draining": the send layer is in its degraded state
+    // (connection kept, sends failing fast - the usual case now), or it gave up entirely
+    // but reported UNRESPONSIVE rather than DEAD. Both mean a live mapper.
+    BOOL daemonUnresponsive = VchanSendDegraded() ||
+        (VchanSendWedged() && VchanWedgeResult() == VCHAN_SEND_UNRESPONSIVE);
+    if ((!g_VchanClientConnected && !daemonUnresponsive) || !libvchan_is_open(g_Vchan))
     {
         Sleep(A6_EXIT_SETTLE_MS);
         PwRevokeTick();
@@ -4846,6 +4914,10 @@ static ULONG Init(void)
     }
 
     PerfInit();
+    // Same place and same reason as PerfInit: the switches must be resolved and logged
+    // before anything can consult them, and before any window or frame work starts.
+    // Compiles to nothing unless the build was made with -p:QgaFaultInjection=1.
+    FiInit();
     PwInit();
 
     EnableUIAccess();

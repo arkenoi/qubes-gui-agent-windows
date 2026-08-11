@@ -23,6 +23,7 @@
 #include "common.h"
 #include "main.h"
 #include "resolution.h" // M0BLINK obtain-start stamp (instrumentation only)
+#include "faultinject.h"
 
 #include <log.h>
 
@@ -1229,6 +1230,19 @@ static DWORD WINAPI CaptureThread(void* param)
         if (!InterlockedCompareExchange(&g_CaptureThreadEnable, FALSE, FALSE))
         {
             LogDebug("stopping (disabled)");
+            break;
+        }
+
+        // FAULT INJECTION (test builds only, rank 1). Leave WITHOUT SetEvent(error_event)
+        // and without clearing g_CaptureThreadEnable, so the enable flag keeps claiming a
+        // live capture thread. That combination is the signature the main loop currently
+        // has no way to notice - the thread is simply gone and dom0's pixels freeze while
+        // every log line still says the agent is healthy. Rank 4 and rank 7 are the code
+        // this is aimed at; until one of them catches this, the injection is expected to
+        // wedge the display, which is the point.
+        if (FiShouldCaptureExit())
+        {
+            status = ERROR_OPERATION_ABORTED;
             break;
         }
 
