@@ -915,6 +915,45 @@ BOOL ResolutionExactObtainInFlight(void)
     return g_ExactInFlight != 0;
 }
 
+// Re-read the mode Windows is ACTUALLY in and adopt it if the belief has drifted.
+//
+// The belief can rot out-of-band: measured live 2026-08-12, the agent applied and
+// verified 5120x1440 (RESAPPLIED readback confirmed it) and the mode later reverted
+// to 1920x1080 with no agent-initiated request - leaving g_ScreenWidth/Height stale
+// for the rest of the session. Every consumer then skews: absolute input injection
+// (S2 mouse offset, unclickable toasts), the work-area rect (SPI_SETWORKAREA 0x57
+// every 30 s), and the screen grant (A3CHECK g=5120x1440 ctx=1920x1080).
+//
+// Called from the WM_DISPLAYCHANGE listener, i.e. AFTER Windows already switched -
+// adopting here never asks Windows for anything (source-of-truth rule untouched).
+// Skipped while an exact obtain is in flight or inside its echo window: transit
+// modes flip rapidly there and the obtain's own bookkeeping records the outcome.
+void ResolutionAdoptCurrent(void)
+{
+    if (g_ExactInFlight)
+        return;
+    if (g_EchoWindowEnd != 0 && GetTickCount64() < g_EchoWindowEnd)
+        return;
+
+    DEVMODE current;
+    ZeroMemory(&current, sizeof(current));
+    current.dmSize = sizeof(current);
+    if (!EnumDisplaySettings(NULL, ENUM_CURRENT_SETTINGS, &current))
+        return;
+
+    if (current.dmPelsWidth == g_ScreenWidth && current.dmPelsHeight == g_ScreenHeight)
+        return;
+
+    LogWarning("RESDRIFT believed=%lux%lu actual=%lux%lu - adopting the actual mode",
+        g_ScreenWidth, g_ScreenHeight, current.dmPelsWidth, current.dmPelsHeight);
+    g_ScreenWidth = current.dmPelsWidth;
+    g_ScreenHeight = current.dmPelsHeight;
+    // Deliberately NOT persisted to the registry: the saved size is the last INTENDED
+    // one (dom0's), and a boot should aim there rather than at whatever a drift left
+    // behind. Only in-memory bookkeeping and its direct consumers are corrected here.
+    WorkAreaApply();
+}
+
 // May the recovery path announce this geometry to the daemon (MSG_CONFIGURE w0)?
 // The capture thread's recovery cycle LAGS the resolution thread's apply: a
 // transit mode observed during the replug can surface up to ~100 ms after the
@@ -938,6 +977,13 @@ BOOL ResolutionShouldAnnounceGeometry(IN ULONG width, IN ULONG height)
 #define ECHO_SUSPECT_MAX 6
 static ULONG g_EchoSuspectW[ECHO_SUSPECT_MAX], g_EchoSuspectH[ECHO_SUSPECT_MAX];
 static DWORD g_EchoSuspectCount;
+
+// Known-unappliable request memo (see SetVideoModeExact): the one request Windows last
+// answered with a different mode, valid until the TTL passes or an exact apply succeeds.
+#define MISMATCH_MEMO_TTL_MS 60000
+static ULONG g_LastMismatchReqW, g_LastMismatchReqH;
+static ULONG g_LastMismatchAppliedW, g_LastMismatchAppliedH;
+static ULONGLONG g_LastMismatchUntil;
 
 void ResolutionNoteTransitSize(IN ULONG width, IN ULONG height)
 {
@@ -978,6 +1024,21 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
     if (width == g_ScreenWidth && height == g_ScreenHeight)
     {
         LogInfo("RESNOOP %lux%lu", width, height);
+        return ERROR_SUCCESS;
+    }
+
+    // Known-unappliable memo. Since RESAPPLIED-MISMATCH now ADOPTS the applied size,
+    // a repeat of the same failed request no longer RESNOOPs (belief != request), and
+    // a daemon that keeps re-sending it would drive a full replug attempt every time.
+    // Remember the one (request -> applied) pair that last mismatched and skip its
+    // repeats for a bounded time; the TTL keeps a later-possible mode (fresh IDD mode
+    // set, monitor change) retryable, and any successful exact apply clears it.
+    if (g_LastMismatchReqW == width && g_LastMismatchReqH == height &&
+        g_LastMismatchAppliedW == g_ScreenWidth && g_LastMismatchAppliedH == g_ScreenHeight &&
+        GetTickCount64() < g_LastMismatchUntil)
+    {
+        LogInfo("RESKEEP %lux%lu known-unappliable (Windows applied %lux%lu last time)",
+            width, height, g_ScreenWidth, g_ScreenHeight);
         return ERROR_SUCCESS;
     }
 
@@ -1174,8 +1235,33 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
     }
     else if (appliedMode.dmPelsWidth != width || appliedMode.dmPelsHeight != height)
     {
-        LogWarning("RESAPPLIED-MISMATCH applied=%lux%lu expected=%lux%lu",
+        // ADOPT the applied size, do not just log it. Everything downstream keys off
+        // g_ScreenWidth/Height: HandleMotion/HandleButton normalize absolute input by it
+        // while Windows denormalizes over the mode ACTUALLY in effect, so recording the
+        // requested-but-not-applied size skews every injected pointer position by the
+        // ratio of the two - GWeck's S2 "mouse lands ~1 cm low" (verified root cause
+        // 2026-08-12). This does NOT resize anything and does not touch dom0's window -
+        // the source-of-truth rule governs what we ASK Windows for, never what we record
+        // as the outcome; bookkeeping a size Windows refused helps no one.
+        LogWarning("RESAPPLIED-MISMATCH applied=%lux%lu expected=%lux%lu - adopting the applied size",
             appliedMode.dmPelsWidth, appliedMode.dmPelsHeight, width, height);
+
+        // Arm the known-unappliable memo BEFORE overwriting width/height: a daemon that
+        // re-sends this exact request within the TTL gets a cheap RESKEEP instead of a
+        // fresh replug attempt.
+        g_LastMismatchReqW = width;
+        g_LastMismatchReqH = height;
+        g_LastMismatchAppliedW = appliedMode.dmPelsWidth;
+        g_LastMismatchAppliedH = appliedMode.dmPelsHeight;
+        g_LastMismatchUntil = GetTickCount64() + MISMATCH_MEMO_TTL_MS;
+
+        width = appliedMode.dmPelsWidth;
+        height = appliedMode.dmPelsHeight;
+    }
+    else
+    {
+        // Exact success invalidates the memo: modes evidently can change now.
+        g_LastMismatchUntil = 0;
     }
 
     LogInfo("RESEXACT %lux%lu replug=%d", width, height, replugged ? 1 : 0);
@@ -1268,8 +1354,11 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
     }
     else
     {
-        // instrumentation (log-only): re-read what Windows ACTUALLY applied.
-        // Do NOT feed this back into g_ScreenWidth/Height here (that is fix A2).
+        // Fix A2, implemented: re-read what Windows ACTUALLY applied and record THAT.
+        // g_ScreenWidth/Height feeds input normalization (HandleMotion/HandleButton),
+        // the work-area computation and the screen grant size; recording a size Windows
+        // did not keep skews all three (S2 mouse offset, SPI_SETWORKAREA 0x57, and the
+        // A3CHECK grant/context mismatch - all measured live 2026-08-12).
         DEVMODE appliedMode;
         ZeroMemory(&appliedMode, sizeof(appliedMode));
         appliedMode.dmSize = sizeof(appliedMode);
@@ -1277,8 +1366,12 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
         {
             LogInfo("RESAPPLIED %lux%lu", appliedMode.dmPelsWidth, appliedMode.dmPelsHeight);
             if (appliedMode.dmPelsWidth != width || appliedMode.dmPelsHeight != height)
-                LogInfo("RESAPPLIED-MISMATCH applied=%lux%lu expected=%lux%lu",
+            {
+                LogWarning("RESAPPLIED-MISMATCH applied=%lux%lu expected=%lux%lu - adopting the applied size",
                     appliedMode.dmPelsWidth, appliedMode.dmPelsHeight, width, height);
+                width = appliedMode.dmPelsWidth;
+                height = appliedMode.dmPelsHeight;
+            }
         }
         else
         {

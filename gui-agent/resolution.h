@@ -41,6 +41,11 @@ ULONG EnsureQubesIddSolo(void);
 
 DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* source);
 ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source);
+
+// Re-read the actual current display mode and adopt it into g_ScreenWidth/Height if the
+// belief drifted (out-of-band mode reversion - see RESDRIFT). Safe from the display-change
+// listener and the main loop; no display request is ever made.
+void ResolutionAdoptCurrent(void);
 // TRUE while an exact-obtain (replug+apply) is in flight on the resolution thread;
 // the recovery path must not tell the daemon about transitional geometries then.
 BOOL ResolutionExactObtainInFlight(void);

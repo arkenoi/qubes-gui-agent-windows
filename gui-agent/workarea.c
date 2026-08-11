@@ -381,6 +381,10 @@ static LRESULT CALLBACK WaWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DISPLAYCHANGE:
         LogDebug("WM_DISPLAYCHANGE %ux%u: re-asserting work area",
             (UINT)LOWORD(lp), (UINT)HIWORD(lp));
+        // The mode ALREADY changed (this is a notification, not a request); make the
+        // agent's believed size follow reality before the work area is recomputed, or
+        // WaCompute clamps against a stale screen and SPI_SETWORKAREA rejects the rect.
+        ResolutionAdoptCurrent();
         WorkAreaReassert();
         return 0;
     }
@@ -422,6 +426,11 @@ void WorkAreaEnsureApplied(void)
     if (now - lastCheck < interval)
         return;
     lastCheck = now;
+
+    // Same cadence, same thread: catch an out-of-band display-mode reversion even if
+    // the WM_DISPLAYCHANGE broadcast raced the belief update or the listener is down.
+    // One EnumDisplaySettings read per tick; no-op when belief and mode agree.
+    ResolutionAdoptCurrent();
 
     RECT applied;
     EnterCriticalSection(&g_WaLock);
