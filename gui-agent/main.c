@@ -1077,6 +1077,19 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 
     entry->IsOverrideRedirect = IsPopup(entry);
 
+    // WM-managed shell surfaces (user requirement 2026-08-11: Start and toasts must be
+    // movable). An override-redirect window is invisible to the dom0 WM - no frame, no
+    // drag, guest-authoritative placement. Announcing the classified shell surfaces as
+    // NORMAL windows gives them a dom0 frame and a WM drag; the dom0-initiated moves come
+    // back as MSG_CONFIGURE and HandleConfigure applies them crop-compensated. This
+    // deliberately deviates from Linux-agent parity (menus are OR there) - it is what the
+    // user asked for, and gui-agent\ShellManaged=0 restores parity.
+    if (entry->IsOverrideRedirect && g_ShellManaged && IsShellToastWindow(entry))
+    {
+        LogDebug("0x%x: shell surface announced WM-managed (ShellManaged)", entry->Handle);
+        entry->IsOverrideRedirect = FALSE;
+    }
+
     return ERROR_SUCCESS;
 }
 

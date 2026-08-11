@@ -58,6 +58,7 @@
 #define REG_CONFIG_PROTO_VALUE L"ProtoTrace"
 #define REG_CONFIG_PROTO_WOBBLE_VALUE L"ProtoTraceWobble"
 #define REG_CONFIG_BUTTON_ABS_VALUE L"ButtonAbsolute"
+#define REG_CONFIG_SHELL_MANAGED_VALUE L"ShellManaged"
 // Z-order sync experiment: raise the window dom0 focused (see HandleFocus). DWORD 0/1.
 #define REG_CONFIG_FOCUS_RAISE_VALUE L"FocusRaise"
 // Attribution switches. The typing improvement was measured on a build carrying BOTH
@@ -97,6 +98,10 @@ extern BOOL     g_ProtoTraceWobble;
 // Button events carry their own absolute position (default ON; "ButtonAbsolute"=0 restores
 // the historic click-at-last-motion semantics).
 extern BOOL     g_ButtonAbsolute;
+
+// Announce classified shell surfaces (toasts/Start/Search) as WM-managed windows instead
+// of override-redirect, so the dom0 WM can frame and move them ("ShellManaged", default on).
+extern BOOL     g_ShellManaged;
 
 // Raise on MSG_FOCUS, making guest z-order agree with dom0 for the focused window.
 // Off by default = historic behaviour. Read once in PerfInit().

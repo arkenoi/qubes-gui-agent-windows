@@ -28,6 +28,7 @@ BOOL     g_PerfEnabled = FALSE;
 BOOL     g_ProtoTrace  = FALSE;
 BOOL     g_ProtoTraceWobble = FALSE;
 BOOL     g_ButtonAbsolute = TRUE;
+BOOL     g_ShellManaged = TRUE;
 BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
 BOOL     g_FrameDrop   = FALSE;
@@ -149,6 +150,19 @@ void PerfInit(void)
             btnAbs = (bv != 0);
         g_ButtonAbsolute = btnAbs;
         LogInfo("QGABUTTONABS %s", g_ButtonAbsolute ? L"on" : L"off");
+    }
+
+    // Classified shell surfaces (toasts, Start, Search) are announced WM-managed so dom0
+    // can frame and move them. Default ON per the 2026-08-11 user requirement; =0 restores
+    // override-redirect (Linux-agent parity).
+    {
+        BOOL managed = TRUE;
+        DWORD mv = 1;
+        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
+            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SHELL_MANAGED_VALUE, &mv, NULL))
+            managed = (mv != 0);
+        g_ShellManaged = managed;
+        LogInfo("QGASHELLMANAGED %s", g_ShellManaged ? L"on" : L"off");
     }
 
     // Attribution switches - registry default, marker file overrides at runtime.

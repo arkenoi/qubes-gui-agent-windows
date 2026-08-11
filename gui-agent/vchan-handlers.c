@@ -31,6 +31,7 @@
 #include "xorg-keymap.h"
 #include "util.h" // AttachToInputDesktop (input-injection resilience)
 #include "resolution.h"
+#include "toastcrop.h" // IsShellToastWindow, for the shell-surface focus quarantine
 
 #include <config.h>
 #include <log.h>
@@ -646,19 +647,34 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                 data->CropRight != 0 || data->CropBottom != 0)
             {
                 // These coordinates are in CROPPED space - the rect the agent announced is
-                // the visible card, not the window (toastcrop.c). Feeding them to
-                // SetWindowPos would move the shell-owned toast HWND by the crop margin and
-                // shrink it to card size, corrupting ShellExperienceHost's own layout; the
-                // resulting geometry would then be re-cropped on the next tracking pass, so
-                // each dom0 configure would walk the toast further off its anchor. Placement
-                // of an override-redirect popup is guest-authoritative anyway. Ignore the
-                // request exactly like the maximized case above - the ACK below re-syncs the
-                // daemon to the geometry the guest actually reports. DaemonMax* stays
-                // untouched on purpose: it is the maximize ceiling, and a cropped popup is
-                // never maximized.
-                LogDebug("0x%x is cropped by %d/%d/%d/%d, ignoring dom0 configure (%d,%d) %dx%d",
-                    window, data->CropLeft, data->CropTop, data->CropRight, data->CropBottom,
-                    configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height);
+                // the visible card, not the window (toastcrop.c).
+                //
+                // POSITION is applied with the crop insets added back (raw origin = card
+                // origin - insets), so a dom0-WM drag of a managed shell surface moves the
+                // real HWND and the card lands exactly where dom0 put its frame - this is
+                // what makes toasts/Start movable (user requirement, 2026-08-11). SIZE is
+                // never applied: the announced size is card size, the HWND's is larger by
+                // the insets, and shell surfaces size themselves; SWP_NOSIZE keeps
+                // ShellExperienceHost's layout intact. The next tracking pass re-announces
+                // the moved card, converging the daemon on the applied position.
+                int rawX = configureMsg.x - data->CropLeft;
+                int rawY = configureMsg.y - data->CropTop;
+                if (data->X == configureMsg.x && data->Y == configureMsg.y)
+                {
+                    LogVerbose("0x%x cropped, position unchanged", window);
+                }
+                else if (SetWindowPos(window, NULL, rawX, rawY, 0, 0, flags | SWP_NOSIZE))
+                {
+                    LogDebug("0x%x cropped by %d/%d/%d/%d: dom0 configure (%d,%d) applied as raw (%d,%d)",
+                        window, data->CropLeft, data->CropTop, data->CropRight, data->CropBottom,
+                        configureMsg.x, configureMsg.y, rawX, rawY);
+                    data->X = configureMsg.x;
+                    data->Y = configureMsg.y;
+                }
+                else
+                {
+                    win_perror("SetWindowPos(cropped)");
+                }
             }
             else
             {
@@ -815,6 +831,19 @@ static DWORD HandleFocus(IN HWND window)
         if (!data)
         {
             LogWarning("window 0x%x not tracked", window);
+        }
+        else if (g_ShellManaged && (data->CropLeft || data->CropTop || data->CropRight ||
+                 data->CropBottom || IsShellToastWindow(data)))
+        {
+            // A WM-managed toast gets X focus the moment the dom0 WM maps or the user
+            // clicks its frame; forwarding that as SetForegroundWindow(ShellExperienceHost)
+            // would yank guest keyboard focus from whatever the user is typing in every
+            // time a notification pops - a regression the movability feature must not
+            // introduce. Clicks inside the toast still work: ButtonAbsolute positions each
+            // click, and toast buttons respond to mouse without foreground status. (The
+            // Start menu keeps focus normally: it is foreground already from opening, and
+            // this branch only skips the FORWARDING of dom0 focus, not guest focus itself.)
+            LogDebug("0x%x: shell surface, not forwarding dom0 focus", window);
         }
         else
         {
