@@ -235,3 +235,7 @@ ULONG SetSeamlessMode(
 // or teardown): synthesis paints from the window-event thread and would otherwise read a
 // pointer into an unmapped surface.
 void PwInvalidateFramebuffer(void);
+
+// Wake the main loop's window-tracking pass (thread-safe; used by the toastcrop worker
+// when an async crop measurement resolves).
+void PokeWindowTracking(void);

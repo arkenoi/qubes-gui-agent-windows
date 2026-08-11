@@ -93,6 +93,35 @@ static TOAST_CROP_ENTRY g_TcCache[TOAST_CROP_CACHE_SIZE];
 static TOAST_PID_ENTRY g_TcPidCache[TOAST_PID_CACHE_SIZE];
 static ULONGLONG g_TcClock = 0;
 
+// ---- async measurement worker ----
+//
+// Every UIA call is a synchronous cross-process RPC into a shell host process, bounded
+// only by the 500 ms connection timeout - and ToastCropLookup used to make it INLINE on
+// the single WatchForEvents thread, which also dispatches MSG_MOTION/MSG_BUTTON/
+// MSG_CONFIGURE. One busy shell process therefore stalled input and window tracking for
+// hundreds of ms per attempt (adversarially verified 2026-08-12), felt as "all windows
+// react weirdly to drag" whenever a toast/Start surface had an unresolved slot. The
+// measurement now runs on this dedicated thread, which owns its own IUIAutomation
+// instance and holds NO shared lock during the RPC; the tracking path only ever reads
+// the cache. Until the worker resolves a slot the window is announced uncropped - the
+// same fail-soft the module already had for a failed measurement.
+#define TC_QUEUE_SIZE 8
+typedef struct _TC_QUERY_REQ
+{
+    HWND  Window;
+    RECT  Raw;
+    DWORD RawWidth;
+    DWORD RawHeight;
+    BOOL  Valid;
+} TC_QUERY_REQ;
+
+static TC_QUERY_REQ g_TcQueue[TC_QUEUE_SIZE];   // guarded by g_TcLock
+static HANDLE g_TcWorkQueued = NULL;             // auto-reset, signaled on enqueue
+static HANDLE g_TcWorkerThread = NULL;
+static BOOL   g_TcWorkerOk = FALSE;              // FALSE -> fall back to the inline query
+
+static DWORD WINAPI TcWorkerThread(IN void* param);
+
 // COM is per thread, so this tracks the calling thread, not the module.
 static __declspec(thread) BOOL g_TcComReady = FALSE;
 
@@ -182,6 +211,20 @@ static BOOL WINAPI TcInitOnceCallback(PINIT_ONCE initOnce, PVOID parameter, PVOI
     else
         LogInfo("QGATOASTCROP on, measuring with UIA");
 
+    // The async measurement worker. If it cannot start, lookups fall back to the inline
+    // synchronous query - the crop still works, only with the old stall risk, and the log
+    // says so once.
+    if (!g_TcDisabled && !g_TcForced)
+    {
+        g_TcWorkQueued = CreateEvent(NULL, FALSE, FALSE, NULL);
+        if (g_TcWorkQueued)
+            g_TcWorkerThread = CreateThread(NULL, 0, TcWorkerThread, NULL, 0, NULL);
+        g_TcWorkerOk = (g_TcWorkerThread != NULL);
+        if (!g_TcWorkerOk)
+            LogWarning("QGATOASTCROP worker unavailable (%lu) - measurements stay inline",
+                GetLastError());
+    }
+
     return TRUE;
 }
 
@@ -211,11 +254,11 @@ static BOOL TcEnsureCom(void)
     return TRUE;
 }
 
-// g_TcLock must be held.
-static IUIAutomation* TcGetAutomation(void)
+// Creates a fresh automation object for the calling thread. No shared state touched, so
+// no lock is needed; the worker owns its instance outright.
+static IUIAutomation* TcCreateAutomation(void)
 {
-    if (g_TcUia)
-        return g_TcUia;
+    IUIAutomation* uia = NULL;
 
     // Preferred path: CUIAutomation8 gives an IUIAutomation2 whose connection/transaction
     // timeouts bound every later call. If anything about it fails, fall through to the plain
@@ -229,17 +272,17 @@ static IUIAutomation* TcGetAutomation(void)
         HRESULT hrConn = IUIAutomation2_put_ConnectionTimeout(uia2, TOAST_CROP_UIA_TIMEOUT_MS);
         HRESULT hrTx = IUIAutomation2_put_TransactionTimeout(uia2, TOAST_CROP_UIA_TIMEOUT_MS);
 
-        hr = IUIAutomation2_QueryInterface(uia2, &g_TcIidUIAutomation, (void**)&g_TcUia);
+        hr = IUIAutomation2_QueryInterface(uia2, &g_TcIidUIAutomation, (void**)&uia);
         IUIAutomation2_Release(uia2);
 
-        if (SUCCEEDED(hr) && g_TcUia)
+        if (SUCCEEDED(hr) && uia)
         {
             LogInfo("TOASTCROP UIA ready with %u ms timeouts (conn=0x%x, tx=0x%x)",
                 (unsigned)TOAST_CROP_UIA_TIMEOUT_MS, hrConn, hrTx);
-            return g_TcUia;
+            return uia;
         }
 
-        g_TcUia = NULL;
+        uia = NULL;
         LogWarning("TOASTCROP QueryInterface(IUIAutomation) failed: 0x%x, retrying untimed", hr);
     }
 
@@ -247,15 +290,23 @@ static IUIAutomation* TcGetAutomation(void)
     // that never happens is better than a toast that never appears.
     LogWarning("TOASTCROP CUIAutomation8 unavailable (0x%x) - falling back to untimed UIA", hr);
     hr = CoCreateInstance(&g_TcClsidUIAutomation, NULL, CLSCTX_INPROC_SERVER,
-        &g_TcIidUIAutomation, (void**)&g_TcUia);
-    if (FAILED(hr) || !g_TcUia)
+        &g_TcIidUIAutomation, (void**)&uia);
+    if (FAILED(hr) || !uia)
     {
         // Not an error for the agent: without UIA the toast is announced uncropped, which
         // is what it does today.
         LogWarning("CoCreateInstance(CUIAutomation) failed: 0x%x, toasts stay uncropped", hr);
-        g_TcUia = NULL;
+        uia = NULL;
     }
 
+    return uia;
+}
+
+// g_TcLock must be held.
+static IUIAutomation* TcGetAutomation(void)
+{
+    if (!g_TcUia)
+        g_TcUia = TcCreateAutomation();
     return g_TcUia;
 }
 
@@ -317,13 +368,20 @@ static void TcValidateInsets(IN HWND window, IN LONG rawWidth, IN LONG rawHeight
 // 4 levels deep, Start's is deeper but its card is near the root, and an unbounded walk on a
 // pathological tree would cost exactly the per-frame stall the timeouts exist to prevent.
 static BOOL TcFindCardRect(IN IUIAutomation* uia, IN IUIAutomationElement* element,
-    IN RECT raw, IN int depth, OUT RECT* best, IN OUT LONG* bestArea)
+    IN RECT raw, IN int depth, IN ULONGLONG deadline, OUT RECT* best, IN OUT LONG* bestArea)
 {
     IUIAutomationTreeWalker* walker = NULL;
     IUIAutomationElement* child = NULL;
     BOOL found = FALSE;
 
     if (depth > TOAST_CROP_MAX_DEPTH)
+        return FALSE;
+
+    // Whole-walk deadline: the depth cap bounds the tree SHAPE but not the RPC time - a
+    // busy shell host can take the full per-call timeout at every node. Past the deadline
+    // the walk stops taking new RPCs and reports whatever it has; the attempt then counts
+    // against the retry cap like any other miss.
+    if (GetTickCount64() > deadline)
         return FALSE;
 
     if (FAILED(IUIAutomation_get_RawViewWalker(uia, &walker)) || !walker)
@@ -357,7 +415,7 @@ static BOOL TcFindCardRect(IN IUIAutomation* uia, IN IUIAutomationElement* eleme
             }
         }
 
-        if (TcFindCardRect(uia, child, raw, depth + 1, best, bestArea))
+        if (TcFindCardRect(uia, child, raw, depth + 1, deadline, best, bestArea))
             found = TRUE;
 
         if (FAILED(IUIAutomationTreeWalker_GetNextSiblingElement(walker, child, &next)))
@@ -370,32 +428,18 @@ static BOOL TcFindCardRect(IN IUIAutomation* uia, IN IUIAutomationElement* eleme
     return found;
 }
 
-ULONG ToastCropQuery(IN HWND window, IN RECT raw, OUT RECT* insets)
+// The measurement itself, against a CALLER-OWNED automation object. Holds no module lock:
+// every call in here is a synchronous cross-process RPC that can take up to the UIA
+// timeout, and holding g_TcLock across it would stall the tracking path's cache reads for
+// exactly as long - the main-thread stall this module must never cause.
+static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, OUT RECT* insets)
 {
     IUIAutomationElement* windowElement = NULL;
-    IUIAutomation* uia = NULL;
     ULONG status = ERROR_NOT_FOUND;
     HRESULT hr;
     RECT cardRect;
 
-    if (!insets)
-        return ERROR_INVALID_PARAMETER;
-
     ZeroMemory(insets, sizeof(*insets));
-
-    TcInit();
-
-    if (!TcEnsureCom())
-        return ERROR_NOT_SUPPORTED;
-
-    EnterCriticalSection(&g_TcLock);
-
-    uia = TcGetAutomation();
-    if (!uia)
-    {
-        status = ERROR_NOT_SUPPORTED;
-        goto end;
-    }
 
     hr = IUIAutomation_ElementFromHandle(uia, window, &windowElement);
     if (FAILED(hr) || !windowElement)
@@ -419,7 +463,10 @@ ULONG ToastCropQuery(IN HWND window, IN RECT raw, OUT RECT* insets)
     // means a list flyout yields its outer card, never one item inside it.
     {
         LONG bestArea = 0;
-        if (!TcFindCardRect(uia, windowElement, raw, 0, &cardRect, &bestArea))
+        // 2 s covers a healthy walk (4-6 levels, tens of RPCs) many times over while
+        // bounding a pathological one to a small multiple of the per-call timeout.
+        ULONGLONG deadline = GetTickCount64() + 2000;
+        if (!TcFindCardRect(uia, windowElement, raw, 0, deadline, &cardRect, &bestArea))
         {
             // Expected while the XAML tree is still being built; the caller retries a bounded
             // number of times and then leaves the window uncropped.
@@ -493,8 +540,172 @@ ULONG ToastCropQuery(IN HWND window, IN RECT raw, OUT RECT* insets)
 end:
     if (windowElement)
         IUIAutomationElement_Release(windowElement);
+    return status;
+}
+
+// Public synchronous query - the fallback when the worker thread is unavailable, and the
+// entry point external callers keep. Uses the shared automation object under g_TcLock.
+ULONG ToastCropQuery(IN HWND window, IN RECT raw, OUT RECT* insets)
+{
+    IUIAutomation* uia = NULL;
+    ULONG status;
+
+    if (!insets)
+        return ERROR_INVALID_PARAMETER;
+
+    ZeroMemory(insets, sizeof(*insets));
+
+    TcInit();
+
+    if (!TcEnsureCom())
+        return ERROR_NOT_SUPPORTED;
+
+    EnterCriticalSection(&g_TcLock);
+    uia = TcGetAutomation();
+    if (!uia)
+    {
+        LeaveCriticalSection(&g_TcLock);
+        return ERROR_NOT_SUPPORTED;
+    }
+    status = TcQueryCore(uia, window, raw, insets);
     LeaveCriticalSection(&g_TcLock);
     return status;
+}
+
+// g_TcLock must be held. Find-only counterpart of TcGetSlot: the worker must never
+// resurrect a slot that ToastCropEvict cleared while its query was in flight.
+static TOAST_CROP_ENTRY* TcFindSlotLocked(IN HWND window, IN DWORD rawWidth, IN DWORD rawHeight)
+{
+    for (int i = 0; i < TOAST_CROP_CACHE_SIZE; i++)
+    {
+        if (g_TcCache[i].Window == window &&
+            g_TcCache[i].RawWidth == rawWidth &&
+            g_TcCache[i].RawHeight == rawHeight)
+            return &g_TcCache[i];
+    }
+    return NULL;
+}
+
+// Applies one finished measurement to its slot, with exactly the resolution semantics the
+// old inline path had. g_TcLock must NOT be held by the caller.
+static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
+{
+    BOOL resolvedNonZero = FALSE;
+
+    EnterCriticalSection(&g_TcLock);
+
+    TOAST_CROP_ENTRY* slot = TcFindSlotLocked(req->Window, req->RawWidth, req->RawHeight);
+    if (slot && !slot->Resolved)
+    {
+        slot->Insets = *insets;
+
+        if (insets->left || insets->top || insets->right || insets->bottom)
+        {
+            slot->Resolved = TRUE;
+            resolvedNonZero = TRUE;
+        }
+        else if (slot->Attempts >= TOAST_CROP_MAX_ATTEMPTS)
+        {
+            slot->Resolved = TRUE;
+            LogDebug("0x%x: no card measured for %ux%u after %u attempts, staying uncropped",
+                req->Window, req->RawWidth, req->RawHeight, slot->Attempts);
+        }
+
+        if (resolvedNonZero)
+        {
+            LogInfo("0x%x: toast card in %ux%u window, insets l=%d t=%d r=%d b=%d",
+                req->Window, req->RawWidth, req->RawHeight,
+                insets->left, insets->top, insets->right, insets->bottom);
+        }
+    }
+
+    LeaveCriticalSection(&g_TcLock);
+
+    // The window was announced UNCROPPED while the measurement ran; make the tracking pass
+    // re-read it now instead of waiting for the surface's next natural event, so the crop
+    // lands within one pass rather than one animation frame.
+    if (resolvedNonZero)
+        PokeWindowTracking();
+}
+
+static DWORD WINAPI TcWorkerThread(IN void* param)
+{
+    UNREFERENCED_PARAMETER(param);
+
+    if (!TcEnsureCom())
+        return 0;
+
+    // Worker-owned instance: never shared, so no lock is ever held across an RPC.
+    IUIAutomation* uia = TcCreateAutomation();
+    if (!uia)
+        return 0;
+
+    while (TRUE)
+    {
+        WaitForSingleObject(g_TcWorkQueued, INFINITE);
+
+        while (TRUE)
+        {
+            TC_QUERY_REQ req = { 0 };
+            BOOL have = FALSE;
+
+            EnterCriticalSection(&g_TcLock);
+            for (int i = 0; i < TC_QUEUE_SIZE; i++)
+            {
+                if (g_TcQueue[i].Valid)
+                {
+                    req = g_TcQueue[i];
+                    g_TcQueue[i].Valid = FALSE;
+                    have = TRUE;
+                    break;
+                }
+            }
+            LeaveCriticalSection(&g_TcLock);
+
+            if (!have)
+                break;
+
+            RECT insets;
+            TcQueryCore(uia, req.Window, req.Raw, &insets); // status is in the insets
+            TcApplyResult(&req, &insets);
+        }
+    }
+    // not reached: the worker lives for the process lifetime, like the agent's other threads
+}
+
+// g_TcLock must be held. Queues one measurement for the worker; a full queue or an
+// already-queued duplicate is dropped silently - the slot's RetryAt pacing re-requests it.
+static BOOL TcEnqueueQueryLocked(IN HWND window, IN const RECT* raw, IN DWORD rawWidth, IN DWORD rawHeight)
+{
+    int freeIdx = -1;
+
+    if (!g_TcWorkerOk)
+        return FALSE;
+
+    for (int i = 0; i < TC_QUEUE_SIZE; i++)
+    {
+        if (g_TcQueue[i].Valid)
+        {
+            if (g_TcQueue[i].Window == window &&
+                g_TcQueue[i].RawWidth == rawWidth && g_TcQueue[i].RawHeight == rawHeight)
+                return TRUE; // already pending
+        }
+        else if (freeIdx < 0)
+        {
+            freeIdx = i;
+        }
+    }
+
+    if (freeIdx < 0)
+        return FALSE;
+
+    g_TcQueue[freeIdx].Window = window;
+    g_TcQueue[freeIdx].Raw = *raw;
+    g_TcQueue[freeIdx].RawWidth = rawWidth;
+    g_TcQueue[freeIdx].RawHeight = rawHeight;
+    g_TcQueue[freeIdx].Valid = TRUE;
+    SetEvent(g_TcWorkQueued);
+    return TRUE;
 }
 
 // g_TcLock must be held.
@@ -648,6 +859,13 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
             slot->Insets = g_TcForcedInsets;
             TcValidateInsets(data->Handle, (LONG)data->Width, (LONG)data->Height, &slot->Insets);
             slot->Resolved = TRUE;
+
+            if (slot->Insets.left || slot->Insets.top || slot->Insets.right || slot->Insets.bottom)
+            {
+                LogInfo("0x%x: toast card in %ux%u window, insets l=%d t=%d r=%d b=%d",
+                    data->Handle, data->Width, data->Height,
+                    slot->Insets.left, slot->Insets.top, slot->Insets.right, slot->Insets.bottom);
+            }
         }
         else
         {
@@ -657,27 +875,52 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
             raw.right = data->X + (LONG)data->Width;
             raw.bottom = data->Y + (LONG)data->Height;
 
-            ToastCropQuery(data->Handle, raw, &slot->Insets);
-
-            // Resolved once something was measured, or once the retries are spent: after
-            // that a lookup is a pure array scan, which is what keeps COM out of the
-            // per-frame tracking pass.
-            if (slot->Insets.left || slot->Insets.top || slot->Insets.right || slot->Insets.bottom)
-                slot->Resolved = TRUE;
-            else if (slot->Attempts >= TOAST_CROP_MAX_ATTEMPTS)
+            // The measurement is a cross-process UIA RPC and this lookup sits on the
+            // window-tracking pass of the thread that also dispatches input, so it must
+            // never wait for one: hand the request to the worker and answer from the
+            // cache. Until the worker resolves the slot the window is announced
+            // UNCROPPED (the module's normal fail-soft), and TcApplyResult pokes the
+            // tracking pass so the crop lands within one pass of the answer. Attempt
+            // pacing (Attempts/RetryAt above) is unchanged: a lost or unanswered request
+            // is simply re-queued at the next retry tick.
+            if (!TcEnqueueQueryLocked(data->Handle, &raw, data->Width, data->Height))
             {
-                slot->Resolved = TRUE;
-                LogDebug("0x%x: no card measured for %ux%u after %u attempts, staying uncropped",
-                    data->Handle, data->Width, data->Height, slot->Attempts);
-            }
-        }
+                // Worker unavailable (thread failed to start, or the queue is full with
+                // other windows). Fall back to the old inline query rather than never
+                // measuring; the stall risk this reintroduces is bounded by the same
+                // attempt cap that always bounded it, and the common path never gets
+                // here.
+                LeaveCriticalSection(&g_TcLock);
 
-        if (slot->Resolved &&
-            (slot->Insets.left || slot->Insets.top || slot->Insets.right || slot->Insets.bottom))
-        {
-            LogInfo("0x%x: toast card in %ux%u window, insets l=%d t=%d r=%d b=%d",
-                data->Handle, data->Width, data->Height,
-                slot->Insets.left, slot->Insets.top, slot->Insets.right, slot->Insets.bottom);
+                RECT measured;
+                ToastCropQuery(data->Handle, raw, &measured);
+
+                EnterCriticalSection(&g_TcLock);
+                slot = TcFindSlotLocked(data->Handle, data->Width, data->Height);
+                if (slot && !slot->Resolved)
+                {
+                    slot->Insets = measured;
+                    if (measured.left || measured.top || measured.right || measured.bottom)
+                    {
+                        slot->Resolved = TRUE;
+                        LogInfo("0x%x: toast card in %ux%u window, insets l=%d t=%d r=%d b=%d",
+                            data->Handle, data->Width, data->Height,
+                            measured.left, measured.top, measured.right, measured.bottom);
+                    }
+                    else if (slot->Attempts >= TOAST_CROP_MAX_ATTEMPTS)
+                    {
+                        slot->Resolved = TRUE;
+                        LogDebug("0x%x: no card measured for %ux%u after %u attempts, staying uncropped",
+                            data->Handle, data->Width, data->Height, slot->Attempts);
+                    }
+                }
+                if (!slot)
+                {
+                    // Evicted while unlocked: report uncropped this pass.
+                    LeaveCriticalSection(&g_TcLock);
+                    return FALSE;
+                }
+            }
         }
     }
 
@@ -698,6 +941,14 @@ void ToastCropEvict(IN HWND window)
     {
         if (g_TcCache[i].Window == window)
             ZeroMemory(&g_TcCache[i], sizeof(g_TcCache[i]));
+    }
+
+    // Also drop any not-yet-run measurement request; a query already in flight is
+    // harmless (TcApplyResult only writes into a still-matching slot).
+    for (int i = 0; i < TC_QUEUE_SIZE; i++)
+    {
+        if (g_TcQueue[i].Valid && g_TcQueue[i].Window == window)
+            g_TcQueue[i].Valid = FALSE;
     }
 
     LeaveCriticalSection(&g_TcLock);

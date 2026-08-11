@@ -301,6 +301,16 @@ static void QueueWindowEvent(IN HWND window, IN DWORD event, IN BOOL resync)
         SetEvent(g_WindowEventSignal);
 }
 
+// Wake the main loop's window-tracking pass without queuing a specific window event.
+// Used by the toastcrop worker when an async measurement resolves, so the re-announce
+// with the cropped rect happens within one pass instead of waiting for the surface's
+// next natural event. Safe from any thread; a spurious signal costs one empty pass.
+void PokeWindowTracking(void)
+{
+    if (g_WindowEventSignal)
+        SetEvent(g_WindowEventSignal);
+}
+
 // Hand the queued window handles to the caller and tell it whether a full
 // enumeration is due. Called from the main loop only.
 static BOOL TakePendingWindows(OUT HWND* buffer, OUT DWORD* events, IN UINT capacity, OUT UINT* count)
