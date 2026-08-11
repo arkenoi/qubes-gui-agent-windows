@@ -121,6 +121,10 @@ LIST_ENTRY g_WatchedWindowsList;
 CRITICAL_SECTION g_csWatchedWindows;
 
 HWND g_DesktopWindow = NULL;
+
+// Last window the foreground re-raise in AddAllWindows acted on. Cleared by ResetWatch so
+// the corrective re-fires on the first pass after every mass re-announce.
+static HWND g_LastForeground = NULL;
 HWND g_TaskbarWindow = NULL;
 BOOL g_ShowTaskbar = FALSE;
 
@@ -1764,10 +1768,16 @@ static ULONG ExamineWindow(IN HWND window, IN OUT UINT* interrogated)
     return status;
 }
 
+// Enough for every top-level window a real session has (tens); overflow degrades to
+// announcing the tail in enumeration order, logged, never dropped.
+#define ADD_WINDOWS_PENDING_MAX 256
+
 typedef struct _ADD_WINDOWS_CONTEXT
 {
     UINT Interrogated; // windows whose state was actually queried
     ULONG Status;
+    HWND Pending[ADD_WINDOWS_PENDING_MAX]; // eligible windows in EnumWindows (top-first) order
+    UINT PendingCount;
 } ADD_WINDOWS_CONTEXT;
 
 // EnumWindows callback for adding all eligible top-level windows to the list.
@@ -1782,6 +1792,26 @@ static BOOL CALLBACK AddWindowsProc(IN HWND window, IN LPARAM lParam)
     if (IsWindowRejected(window)) // known to be ineligible, and unchanged since
         return TRUE;
 
+    // COLLECT ONLY - announced after enumeration, in REVERSE (bottom-first) order.
+    //
+    // EnumWindows walks top-first, and each MSG_CREATE makes X place the new window ON TOP,
+    // so announcing in enumeration order hands dom0 the guest's stacking INVERTED - after any
+    // mass re-announce (capture reset, resync) every window pair that overlaps is stacked
+    // wrongly and the composited-framebuffer slice bleeds the wrong window's pixels
+    // ("windows overlapping wrongly", adversarially verified 2026-08-12). Bottom-first
+    // announce reconstructs the guest's order with X's create-on-top semantics, and owners
+    // get announced before the popups they own for free (owners sit below in z-order),
+    // which is also what xside.c's transient_for lookup wants.
+    if (context->PendingCount < ADD_WINDOWS_PENDING_MAX)
+    {
+        context->Pending[context->PendingCount++] = window;
+        return TRUE;
+    }
+
+    // Overflow: announce inline (top-first) rather than drop; a session with >256 eligible
+    // top-level windows has bigger problems than stacking.
+    LogWarning("pending-window list full (%u), announcing 0x%x in enumeration order",
+        context->PendingCount, (unsigned)(ULONG_PTR)window);
     context->Status = ExamineWindow(window, &context->Interrogated);
     if (ERROR_SUCCESS != context->Status)
         return FALSE; // stop enumeration, fatal error occurred (should probably exit process at this point)
@@ -1841,28 +1871,6 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
 
     EnsureOnInputDesktop();
 
-    // Keep dom0's stacking in step with the guest's by re-mapping whatever is foreground.
-    //
-    // dom0 and the guest are otherwise free to disagree about z-order, and when they do, the
-    // window dom0 draws on top receives the pixels of whatever covers it in the guest's
-    // composited framebuffer - text sliced away mid-drag, see OVERLAP-IN-MOTION.md. The agent
-    // has no stacking message, but if the daemon raises a window on MSG_MAP then re-mapping
-    // the foreground window is enough, and costs one message per focus change.
-    {
-        static HWND lastForeground = NULL;
-        HWND fg = GetForegroundWindow();
-        if (fg && fg != lastForeground)
-        {
-            WINDOW_DATA* fgData = FindWindowByHandle(fg);
-            if (fgData && fgData->IsVisible && !fgData->IsIconic && !fgData->Synthesized)
-            {
-                lastForeground = fg;
-                LogInfo("foreground -> 0x%x, re-mapping to raise it in dom0", fg);
-                SendWindowMap(fgData);
-            }
-        }
-    }
-
     g_TaskbarWindow = FindWindow(L"Shell_TrayWnd", 0);
     g_ShowTaskbar = FALSE;
 
@@ -1888,6 +1896,43 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
             }
             LogInfo("QGADESK,event=enumfail,tid=%lu,threadDesktop=%s(ok=%d,h=0x%p),inputDesktop=%s",
                 GetCurrentThreadId(), name, got, cur, iname);
+        }
+    }
+
+    // Announce the collected windows BOTTOM-FIRST (see AddWindowsProc for why). A failure
+    // stops the pass exactly as the inline version did.
+    for (UINT i = context.PendingCount; i > 0 && status == ERROR_SUCCESS; i--)
+    {
+        HWND w = context.Pending[i - 1];
+        if (FindWindowByHandle(w)) // examined meanwhile (taskbar path, event races)
+            continue;
+        status = ExamineWindow(w, &context.Interrogated);
+    }
+
+    // Keep dom0's stacking in step with the guest's by re-mapping whatever is foreground.
+    //
+    // dom0 and the guest are otherwise free to disagree about z-order, and when they do, the
+    // window dom0 draws on top receives the pixels of whatever covers it in the guest's
+    // composited framebuffer - text sliced away mid-drag, see OVERLAP-IN-MOTION.md. The agent
+    // has no stacking message, but if the daemon raises a window on MSG_MAP then re-mapping
+    // the foreground window is enough, and costs one message per focus change.
+    //
+    // Runs AFTER the announce pass on purpose: it used to run before, where on the first
+    // pass after a reset the watched list was still empty, FindWindowByHandle(fg) missed,
+    // and the corrective provably no-oped exactly when a whole session's stacking had just
+    // been rebuilt. g_LastForeground (cleared by ResetWatch) re-arms it after every reset.
+    {
+        HWND fg = GetForegroundWindow();
+        if (fg && fg != g_LastForeground)
+        {
+            WINDOW_DATA* fgData = FindWindowByHandle(fg);
+            if (fgData && fgData->CreateSent && fgData->IsVisible && !fgData->IsIconic &&
+                !fgData->Synthesized)
+            {
+                g_LastForeground = fg;
+                LogInfo("foreground -> 0x%x, re-mapping to raise it in dom0", fg);
+                SendWindowMap(fgData);
+            }
         }
     }
 
@@ -1962,6 +2007,9 @@ static ULONG ResetWatch(BOOL seamlessMode)
     LeaveCriticalSection(&g_csWatchedWindows);
 
     g_DesktopWindow = NULL;
+    // Re-arm the foreground re-raise: everything was just destroyed, so whatever is
+    // foreground must be re-raised on the first announce pass after this reset.
+    g_LastForeground = NULL;
     status = ERROR_SUCCESS;
 
     // WatchForEvents will map the whole screen as one window.

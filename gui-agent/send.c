@@ -30,6 +30,7 @@
 #include "main.h"
 #include "vchan.h"
 #include "faultinject.h" // FI_NEG_CREATE / FI_DUP_CREATE aim at the two rules below
+#include "resolution.h" // ResolutionAdoptCurrent, for the A3CHECK self-heal
 #include "capture.h" // FRAMEBUFFER_PAGE_COUNT, for the A3CHECK instrumentation
 
 #include <qubes-gui-protocol.h>
@@ -267,6 +268,15 @@ ULONG SendScreenGrants(IN size_t numGrants, IN const ULONG* refs,
     size_t pagesCtx = FRAMEBUFFER_PAGE_COUNT(ctxWidth, ctxHeight);
     LogInfo("A3CHECK g=%lux%lu ctx=%ux%u pages_g=%lu pages_ctx=%lu",
         g_ScreenWidth, g_ScreenHeight, ctxWidth, ctxHeight, (ULONG)pagesG, (ULONG)pagesCtx);
+
+    // Self-heal, not just a log line: the capture context's DXGI desc IS the desktop
+    // Windows composits, so a divergent g_Screen* is stale belief (the live-proven case:
+    // an out-of-band mode reversion nobody re-read - FINDINGS 2026-08-12). Adopt reality
+    // via the same guarded path the drift tick uses; it no-ops during an exact obtain's
+    // settle window, so transit sizes cannot fight an in-flight resolution change.
+    if (ctxWidth != 0 && ctxHeight != 0 &&
+        (g_ScreenWidth != ctxWidth || g_ScreenHeight != ctxHeight))
+        ResolutionAdoptCurrent();
     // Count check is one-sided BY DESIGN: too small is the fatal direction - gui-daemon
     // exit(1)s when the dump's data size is below width*height*4 (xside.c:3903-3913) -
     // while a LARGER count is accepted. The staging grant (capture.c) intentionally

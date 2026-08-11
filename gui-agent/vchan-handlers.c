@@ -408,6 +408,13 @@ static DWORD HandleButton(IN HWND window)
     // the agent handling it - exactly the toast/menu case this coordinate change exists for.
     // HandleConfigure takes the same lock for the same reason. The two values are copied out and
     // the lock dropped at once; nothing below needs the entry itself.
+    // Whether the translated (x,y) is trustworthy enough to move the pointer to. Only the
+    // TRACKED origin speaks the same coordinate space as dom0 (the announced rect); the raw
+    // GetWindowRect fallback is off by the announced-rect adjustment (DWM trim, toast crop
+    // insets), so a positioned click through it would land measurably wrong - worse than
+    // the historic click-at-last-motion semantics it would replace.
+    BOOL positionTrusted = (window == NULL); // screen-relative coords need no translation
+
     if (window)
     {
         BOOL haveTracked = FALSE;
@@ -429,6 +436,7 @@ static DWORD HandleButton(IN HWND window)
         {
             x += trackedX;
             y += trackedY;
+            positionTrusted = TRUE;
         }
         else // edge case: window might have got destroyed before we received this message
         {
@@ -492,7 +500,7 @@ static DWORD HandleButton(IN HWND window)
         LogWarning("unknown button pressed/released 0x%x", buttonMsg.button);
     }
 
-    if (g_ButtonAbsolute &&
+    if (g_ButtonAbsolute && positionTrusted &&
         (buttonMsg.button == Button1 || buttonMsg.button == Button2 || buttonMsg.button == Button3))
     {
         inputEvent.mi.dwFlags |= MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
