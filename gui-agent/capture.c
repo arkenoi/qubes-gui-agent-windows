@@ -35,6 +35,11 @@
 // TODO: configure timeout through registry config (milliseconds)
 #define FRAME_TIMEOUT 1000
 
+// How long the capture thread lets the main loop chew on one frame before declaring it
+// wedged and forcing the full reinitialization (which destroys and re-announces every
+// window - user-visible, so this is a last resort, not a latency bound).
+#define CAPTURE_READY_WEDGE_MS 15000
+
 // A6: how long a superseded screen grant waits for dom0's MSG_WINDOW_DUMP_ACK before
 // the capture thread falls back to retrying the revocation on its own (design 2.1).
 #define A6_ACK_TIMEOUT_MS 5000
@@ -1325,16 +1330,56 @@ static DWORD WINAPI CaptureThread(void* param)
         capture->frame.perf.signal_qpc = PerfNow();
         SetEvent(capture->frame_event);
 
-        // wait until main loop processes the frame
-        // XXX arbitrary timeout
-        if (WaitForSingleObject(capture->ready_event, 1000) != WAIT_OBJECT_0)
+        // Wait until the main loop processes the frame.
+        //
+        // A slow main loop is NOT an error. Under drag-scale damage a single pass has been
+        // measured near or over 1 s (dmg p95 972 us*1000, FINDINGS 2026-08-12), and treating
+        // one slow pass as fatal is what produced the mass destroy/re-announce the user saw:
+        // error_event -> full reset -> XcOpen + re-grant + DESTROY/CREATE of every window.
+        // Only a genuinely wedged main loop (no signal for CAPTURE_READY_WEDGE_MS) warrants
+        // that reset; a stop request must also be honored here or StopFrameProcessing's
+        // thread-exit wait pays the full wedge budget.
         {
-            LogWarning("error/timeout waiting for frame processing");
-            // probably something bad happened, exit
-            status = ERROR_TIMEOUT;
-            ReleaseFrame(capture);
-            SetEvent(capture->error_event);
-            break;
+            DWORD waitedMs = 0;
+            DWORD wait;
+            while (TRUE)
+            {
+                wait = WaitForSingleObject(capture->ready_event, FRAME_TIMEOUT);
+                if (wait == WAIT_OBJECT_0)
+                    break;
+
+                if (wait != WAIT_TIMEOUT)
+                {
+                    LogWarning("error waiting for frame processing (%lu)", wait);
+                    status = ERROR_TIMEOUT;
+                    ReleaseFrame(capture);
+                    SetEvent(capture->error_event);
+                    goto exit_thread;
+                }
+
+                if (!InterlockedCompareExchange(&g_CaptureThreadEnable, FALSE, FALSE))
+                {
+                    LogDebug("stop requested while waiting for frame processing");
+                    ReleaseFrame(capture);
+                    goto exit_thread;
+                }
+
+                waitedMs += FRAME_TIMEOUT;
+                if (waitedMs >= CAPTURE_READY_WEDGE_MS)
+                {
+                    LogWarning("main loop wedged: frame not processed after %lu ms, reinitializing",
+                        waitedMs);
+                    status = ERROR_TIMEOUT;
+                    ReleaseFrame(capture);
+                    SetEvent(capture->error_event);
+                    goto exit_thread;
+                }
+
+                // Visible but bounded: one line per second of a slow pass, so a slow frame
+                // is diagnosable without the log itself becoming the next slowdown.
+                LogWarning("main loop slow: frame not processed after %lu ms (wedge at %u)",
+                    waitedMs, CAPTURE_READY_WEDGE_MS);
+            }
         }
 
 end_frame:
@@ -1361,6 +1406,7 @@ end_frame:
             break;
         }
     }
+exit_thread:
     LogDebug("exiting");
     return status;
 }
