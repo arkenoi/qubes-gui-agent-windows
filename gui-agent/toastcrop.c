@@ -27,14 +27,6 @@
 #define REG_CONFIG_TOASTCROP_RIGHT_VALUE   L"ToastCropR"
 #define REG_CONFIG_TOASTCROP_BOTTOM_VALUE  L"ToastCropB"
 
-// Only ShellExperienceHost banners are cropped. The Action Center flyout comes from the
-// same process with the same styles, so it is excluded by size: measured toasts are
-// 396 px wide and at most a few hundred tall (396x133 collapsed, 396x332 expanded), the
-// flyout is a full-height column. Generous on purpose - the ceiling only decides whether
-// UIA is asked, and a window that has no toast card measures no insets anyway.
-#define TOAST_MAX_RAW_WIDTH  1000u
-#define TOAST_MAX_RAW_HEIGHT 600u
-
 // Absolute floor for a cropped window, used with the SM_CXMIN/SM_CYMIN floor below. The
 // XAML card of a real toast is hundreds of px wide; anything this small is a mismeasure.
 #define TOAST_CROP_FLOOR_WIDTH  32
@@ -54,6 +46,10 @@
 // while keeping the cross-process calls off the input-rate path.
 #define TOAST_CROP_MAX_ATTEMPTS 3
 #define TOAST_CROP_RETRY_MS     150
+
+// XAML depth to search for the card. 4 covers the measured toast tree; Start's card sits
+// near its root. Deeper costs cross-process RPC for no gain.
+#define TOAST_CROP_MAX_DEPTH 6
 
 #define TOAST_CROP_CACHE_SIZE 16
 #define TOAST_PID_CACHE_SIZE  8
@@ -121,11 +117,21 @@ static const IID g_TcIidUIAutomation2 =
 // dead one cannot stall a frame for a human-visible time.
 #define TOAST_CROP_UIA_TIMEOUT_MS 500
 
-// The XAML element that IS the visible card. Both names are shipped by different Windows
-// builds; neither is documented, hence the registry escape hatch in toastcrop.h.
-static const WCHAR* const g_TcCardClasses[] = { L"FlexibleToastView", L"ToastView" };
+// NOTE: the card is no longer identified by class name. FlexibleToastView/ToastView were the
+// names on one build for one surface; TcFindCardRect finds the card geometrically instead, which
+// is what makes the same code fix the 25H2 Start menu. The registry escape hatch in toastcrop.h
+// remains for the case where even the geometric rule picks wrong on some future shell.
 
-static const WCHAR g_TcShellHostImage[] = L"ShellExperienceHost.exe";
+// Every shell surface that draws its own shadow INSIDE its window rect. Measured on the guests
+// 2026-08-11: a ShellExperienceHost toast announces 396x332 for a 364x289 card, and on 25H2 a
+// StartMenuExperienceHost Start menu announces 858x890 for an 832x874 card (13/3/13/13). On 24H2
+// the same Start menu had NO margin - which is the whole reason this cannot be a table of
+// constants: the same surface gains a shadow between Windows builds.
+static const WCHAR* const g_TcShellHostImages[] = {
+    L"ShellExperienceHost.exe",       // notification banners, Action Center
+    L"StartMenuExperienceHost.exe",   // Start menu (25H2 shadow margin)
+    L"SearchHost.exe",                // search flyout, same XAML shell
+};
 static const WCHAR g_TcToastWindowClass[] = L"Windows.UI.Core.CoreWindow";
 
 static BOOL WINAPI TcInitOnceCallback(PINIT_ONCE initOnce, PVOID parameter, PVOID* context)
@@ -304,6 +310,66 @@ static void TcValidateInsets(IN HWND window, IN LONG rawWidth, IN LONG rawHeight
     }
 }
 
+// Depth-limited search for the drawn card: the largest descendant fully inside `raw` and
+// strictly smaller than it in both dimensions. Returns TRUE and the winning rect in *best.
+//
+// Depth is capped because this walks a live XAML tree over cross-process RPC: the toast tree is
+// 4 levels deep, Start's is deeper but its card is near the root, and an unbounded walk on a
+// pathological tree would cost exactly the per-frame stall the timeouts exist to prevent.
+static BOOL TcFindCardRect(IN IUIAutomation* uia, IN IUIAutomationElement* element,
+    IN RECT raw, IN int depth, OUT RECT* best, IN OUT LONG* bestArea)
+{
+    IUIAutomationTreeWalker* walker = NULL;
+    IUIAutomationElement* child = NULL;
+    BOOL found = FALSE;
+
+    if (depth > TOAST_CROP_MAX_DEPTH)
+        return FALSE;
+
+    if (FAILED(IUIAutomation_get_RawViewWalker(uia, &walker)) || !walker)
+        return FALSE;
+
+    if (FAILED(IUIAutomationTreeWalker_GetFirstChildElement(walker, element, &child)) || !child)
+    {
+        IUIAutomationTreeWalker_Release(walker);
+        return FALSE;
+    }
+
+    while (child)
+    {
+        IUIAutomationElement* next = NULL;
+        RECT r;
+
+        if (SUCCEEDED(IUIAutomationElement_get_CurrentBoundingRectangle(child, &r)))
+        {
+            LONG w = r.right - r.left;
+            LONG h = r.bottom - r.top;
+
+            BOOL inside = (r.left >= raw.left && r.top >= raw.top &&
+                           r.right <= raw.right && r.bottom <= raw.bottom);
+            BOOL strictlySmaller = (w < (raw.right - raw.left)) && (h < (raw.bottom - raw.top));
+
+            if (inside && strictlySmaller && w > 0 && h > 0 && w * h > *bestArea)
+            {
+                *bestArea = w * h;
+                *best = r;
+                found = TRUE;
+            }
+        }
+
+        if (TcFindCardRect(uia, child, raw, depth + 1, best, bestArea))
+            found = TRUE;
+
+        if (FAILED(IUIAutomationTreeWalker_GetNextSiblingElement(walker, child, &next)))
+            next = NULL;
+        IUIAutomationElement_Release(child);
+        child = next;
+    }
+
+    IUIAutomationTreeWalker_Release(walker);
+    return found;
+}
+
 ULONG ToastCropQuery(IN HWND window, IN RECT raw, OUT RECT* insets)
 {
     IUIAutomationElement* windowElement = NULL;
@@ -340,73 +406,28 @@ ULONG ToastCropQuery(IN HWND window, IN RECT raw, OUT RECT* insets)
         goto end;
     }
 
-    for (int i = 0; i < (int)RTL_NUMBER_OF(g_TcCardClasses) && !card; i++)
+    // Find the card GEOMETRICALLY, not by class name. Class names are undocumented XAML
+    // internals that Microsoft renames and restructures between builds - keying on
+    // FlexibleToastView worked for a notification banner and would never have matched the 25H2
+    // Start menu, whose card has the identical problem (announced 858x890 for an 832x874 card,
+    // measured 2026-08-11; on 24H2 the same menu had no margin at all).
+    //
+    // The rule: among all descendants, take the LARGEST one that is fully inside the window and
+    // strictly smaller in BOTH dimensions. That is the drawn card by construction - the shadow
+    // is painted by the window itself and contains no elements, so nothing lives outside the
+    // card, while containers that span the full window width (the toast's ScrollViewer, 396 wide
+    // in a 396-wide window) are excluded by the strictness requirement. Picking the LARGEST also
+    // means a list flyout yields its outer card, never one item inside it.
     {
-        IUIAutomationCondition* condition = NULL;
-        VARIANT className;
-
-        VariantInit(&className);
-        className.vt = VT_BSTR;
-        className.bstrVal = SysAllocString(g_TcCardClasses[i]);
-        if (!className.bstrVal)
+        LONG bestArea = 0;
+        if (!TcFindCardRect(uia, windowElement, raw, 0, &cardRect, &bestArea))
         {
-            status = ERROR_NOT_ENOUGH_MEMORY;
-            goto end;
-        }
-
-        hr = IUIAutomation_CreatePropertyCondition(uia, UIA_ClassNamePropertyId, className, &condition);
-        VariantClear(&className);
-        if (FAILED(hr) || !condition)
-        {
-            LogDebug("0x%x: CreatePropertyCondition failed: 0x%x", window, hr);
-            continue;
-        }
-
-        // FindAll, not FindFirst: the count is the discriminator. A toast BANNER contains
-        // exactly one card, while the Action Center / notification-centre flyout is a LIST of
-        // them - and the size ceiling alone cannot separate the two, because the guest desktop
-        // follows dom0's viewport, so a small dom0 window yields a guest screen on which the
-        // flyout fits under the ceiling. Cropping the flyout to its first card would hide every
-        // other notification, so more than one card means "not a banner": leave it uncropped.
-        IUIAutomationElementArray* matches = NULL;
-        hr = IUIAutomationElement_FindAll(windowElement, TreeScope_Descendants, condition, &matches);
-        IUIAutomationCondition_Release(condition);
-        if (FAILED(hr) || !matches)
-        {
-            LogDebug("0x%x: FindAll(%s) failed: 0x%x", window, g_TcCardClasses[i], hr);
-            continue;
-        }
-
-        int found = 0;
-        hr = IUIAutomationElementArray_get_Length(matches, &found);
-        if (FAILED(hr))
-            found = 0;
-
-        if (found == 1)
-        {
-            hr = IUIAutomationElementArray_GetElement(matches, 0, &card);
-            if (FAILED(hr))
-                card = NULL;
-        }
-        else if (found > 1)
-        {
-            LogInfo("TOASTCROP 0x%x: %d '%s' cards - notification list, not a banner; left uncropped",
-                window, found, g_TcCardClasses[i]);
-            IUIAutomationElementArray_Release(matches);
+            // Expected while the XAML tree is still being built; the caller retries a bounded
+            // number of times and then leaves the window uncropped.
+            LogDebug("0x%x: no card element yet", window);
             status = ERROR_NOT_FOUND;
             goto end;
         }
-
-        IUIAutomationElementArray_Release(matches);
-    }
-
-    if (!card)
-    {
-        // Expected while the XAML tree is still being built; the caller retries a bounded
-        // number of times and then leaves the toast uncropped.
-        LogDebug("0x%x: no toast card element yet", window);
-        status = ERROR_NOT_FOUND;
-        goto end;
     }
 
     hr = IUIAutomationElement_get_CurrentBoundingRectangle(card, &cardRect);
@@ -508,7 +529,8 @@ static BOOL TcIsShellExperienceHost(IN DWORD processId)
         {
             const WCHAR* image = wcsrchr(path, L'\\');
             image = image ? image + 1 : path;
-            match = (0 == _wcsicmp(image, g_TcShellHostImage));
+            for (int i = 0; i < (int)RTL_NUMBER_OF(g_TcShellHostImages) && !match; i++)
+                match = (0 == _wcsicmp(image, g_TcShellHostImages[i]));
         }
         CloseHandle(process);
     }
@@ -554,7 +576,15 @@ BOOL IsShellToastWindow(IN const WINDOW_DATA* data)
     if (data->Owner != NULL)
         return FALSE;
 
-    if (data->Width > TOAST_MAX_RAW_WIDTH || data->Height > TOAST_MAX_RAW_HEIGHT)
+    // No fixed size ceiling. It used to exclude the Action Center flyout, but (a) the 25H2 Start
+    // menu is 858x890 and would have been excluded with it, which is exactly the surface this
+    // has to fix, and (b) cropping the flyout to ITS card is correct too - the card-selection
+    // rule below picks the outermost card, never one notification inside a list. What must stay
+    // excluded is a surface so large it is not a popup at all; IsPopup's 90%-of-screen rule
+    // already demotes those, and a demoted window never reaches this classifier as a popup.
+    if (g_HostScreenWidth > 0 && g_HostScreenHeight > 0 &&
+        (ULONGLONG)data->Width * (ULONGLONG)data->Height * 100ULL >
+        (ULONGLONG)g_HostScreenWidth * (ULONGLONG)g_HostScreenHeight * 90ULL)
         return FALSE;
 
     TcInit();
