@@ -120,8 +120,8 @@ void PerfInit(void)
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PROTO_WOBBLE_VALUE, &wv, NULL))
             wobble = (wv != 0);
         g_ProtoTraceWobble = wobble;
-        LogInfo("QGAPROTO %s (wobble probe %s)", g_ProtoTrace ? "on" : "off",
-            g_ProtoTraceWobble ? "on" : "off");
+        LogInfo("QGAPROTO %s (wobble probe %s)", g_ProtoTrace ? L"on" : L"off",
+            g_ProtoTraceWobble ? L"on" : L"off");
     }
 
     // Z-order sync switch. Read here for the same reason as ProtoTrace: it is behaviour, not
@@ -135,7 +135,7 @@ void PerfInit(void)
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_FOCUS_RAISE_VALUE, &rv, NULL))
             raise = (rv != 0);
         g_FocusRaise = raise;
-        LogInfo("QGAFOCUSRAISE %s", g_FocusRaise ? "on" : "off");
+        LogInfo("QGAFOCUSRAISE %s", g_FocusRaise ? L"on" : L"off");
     }
 
     // Button events carry their own absolute position (fixes clicks landing wherever the
@@ -148,7 +148,7 @@ void PerfInit(void)
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_BUTTON_ABS_VALUE, &bv, NULL))
             btnAbs = (bv != 0);
         g_ButtonAbsolute = btnAbs;
-        LogInfo("QGABUTTONABS %s", g_ButtonAbsolute ? "on" : "off");
+        LogInfo("QGABUTTONABS %s", g_ButtonAbsolute ? L"on" : L"off");
     }
 
     // Attribution switches - registry default, marker file overrides at runtime.
@@ -163,9 +163,9 @@ void PerfInit(void)
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SWEEP_EXEMPT_VALUE, &v, NULL))
                 g_SweepDdaExempt = (v != 0);
         }
-        LogInfo("QGADDACAPTURE %s", g_DdaCapture ? "on" : "off");
-        LogInfo("QGAFRAMEDROP %s", g_FrameDrop ? "on" : "off");
-        LogInfo("QGASWEEPEXEMPT %s", g_SweepDdaExempt ? "on" : "off");
+        LogInfo("QGADDACAPTURE %s", g_DdaCapture ? L"on" : L"off");
+        LogInfo("QGAFRAMEDROP %s", g_FrameDrop ? L"on" : L"off");
+        LogInfo("QGASWEEPEXEMPT %s", g_SweepDdaExempt ? L"on" : L"off");
     }
 
     if (!g_PerfEnabled)

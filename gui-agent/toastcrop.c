@@ -39,13 +39,15 @@
 #define TOAST_CROP_MIN_PERCENT 40
 
 // UIA attempts per (hwnd, raw size) key, and the quiet time between them. The XAML tree
-// is not always populated the first time the agent sees the window, but an unbounded
-// retry would put a COM call in the per-frame tracking pass for every toast that has no
-// card - and back-to-back retries would spend all of them inside two frames, before the
-// tree could possibly have appeared. Three attempts ~150 ms apart cover the slide-in
-// while keeping the cross-process calls off the input-rate path.
-#define TOAST_CROP_MAX_ATTEMPTS 3
-#define TOAST_CROP_RETRY_MS     150
+// is not always populated the first time the agent sees the window; the retry budget must
+// cover the slide-in animation (~0.5-1 s) end to end. With the async worker an attempt is
+// counted when a MEASUREMENT COMPLETES (TcApplyResult), not when a lookup fires - the old
+// inline design spent an attempt per lookup and only kept up with the animation because
+// the blocking RPC itself stretched the pacing; measured 2026-08-12, the async version
+// burned all three attempts in ~450 ms and every surface stayed uncropped. Six completed
+// no-card measurements at >=250 ms spacing give ~1.5 s of coverage at worker speed.
+#define TOAST_CROP_MAX_ATTEMPTS 6
+#define TOAST_CROP_RETRY_MS     250
 
 // XAML depth to search for the card. 4 covers the measured toast tree; Start's card sits
 // near its root. Deeper costs cross-process RPC for no gain.
@@ -599,6 +601,11 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
     {
         slot->Insets = *insets;
 
+        // The attempt is counted HERE, on a completed measurement - counting at lookup
+        // time let event-driven lookups burn the whole budget before the XAML tree
+        // could populate (see the constants above).
+        slot->Attempts++;
+
         if (insets->left || insets->top || insets->right || insets->bottom)
         {
             slot->Resolved = TRUE;
@@ -607,7 +614,10 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
         else if (slot->Attempts >= TOAST_CROP_MAX_ATTEMPTS)
         {
             slot->Resolved = TRUE;
-            LogDebug("0x%x: no card measured for %ux%u after %u attempts, staying uncropped",
+            // Info, not Debug: "measured N times and found no card" is the one line that
+            // distinguishes a dead worker from a genuinely card-less surface in a field
+            // log at default level.
+            LogInfo("0x%x: no card measured for %ux%u after %u attempts, staying uncropped",
                 req->Window, req->RawWidth, req->RawHeight, slot->Attempts);
         }
 
@@ -851,7 +861,8 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
 
     if (!slot->Resolved && GetTickCount64() >= slot->RetryAt)
     {
-        slot->Attempts++;
+        // RetryAt paces REQUESTS; Attempts counts completed MEASUREMENTS (worker side,
+        // TcApplyResult) so the budget spans real answers, not event bursts.
         slot->RetryAt = GetTickCount64() + TOAST_CROP_RETRY_MS;
 
         if (g_TcForced)
@@ -900,6 +911,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
                 if (slot && !slot->Resolved)
                 {
                     slot->Insets = measured;
+                    slot->Attempts++; // inline fallback measures right here, so count here
                     if (measured.left || measured.top || measured.right || measured.bottom)
                     {
                         slot->Resolved = TRUE;
