@@ -373,7 +373,6 @@ static BOOL TcFindCardRect(IN IUIAutomation* uia, IN IUIAutomationElement* eleme
 ULONG ToastCropQuery(IN HWND window, IN RECT raw, OUT RECT* insets)
 {
     IUIAutomationElement* windowElement = NULL;
-    IUIAutomationElement* card = NULL;
     IUIAutomation* uia = NULL;
     ULONG status = ERROR_NOT_FOUND;
     HRESULT hr;
@@ -430,13 +429,12 @@ ULONG ToastCropQuery(IN HWND window, IN RECT raw, OUT RECT* insets)
         }
     }
 
-    hr = IUIAutomationElement_get_CurrentBoundingRectangle(card, &cardRect);
-    if (FAILED(hr))
-    {
-        LogDebug("0x%x: get_CurrentBoundingRectangle failed: 0x%x", window, hr);
-        status = ERROR_NOT_FOUND;
-        goto end;
-    }
+    // NOTE: cardRect is filled by TcFindCardRect above. There is deliberately no
+    // get_CurrentBoundingRectangle call here: `card` is never assigned any more, and calling
+    // through it crashed the agent with an access violation at address 0 on every startup
+    // (measured on win11-fresh 2026-08-11 - the guest crash-looped, one agent log every ~6 s,
+    // and dom0 lost every window of the qube). It compiled cleanly, which is precisely why an
+    // artefact must be run on a guest before it is called working.
 
     // The card rect and `raw` were sampled at DIFFERENT times, and the toast slide-in is a
     // POSITION-ONLY animation - so the window may have moved between the two reads, and the
@@ -493,8 +491,6 @@ ULONG ToastCropQuery(IN HWND window, IN RECT raw, OUT RECT* insets)
         ? ERROR_SUCCESS : ERROR_NOT_FOUND;
 
 end:
-    if (card)
-        IUIAutomationElement_Release(card);
     if (windowElement)
         IUIAutomationElement_Release(windowElement);
     LeaveCriticalSection(&g_TcLock);
