@@ -43,6 +43,7 @@
 #include "util.h"
 #include "debug.h"
 #include "perf.h"
+#include "toastcrop.h"
 #include "faultinject.h"
 #include "qubes-io.h"
 
@@ -831,6 +832,27 @@ BOOL IsPopup(IN const WINDOW_DATA* entry)
         isPopup = FALSE;
     }
 
+    // Mirror of the daemon's MAX_OVERRIDE_REDIRECT_PERCENTAGE (xside.h, 90%): a rect
+    // between 90% and 100% passes the guard above, but the daemon strips its
+    // override_redirect while mapping it, and no later MSG_CONFIGURE can turn the flag back
+    // on. Without this the strip is invisible to the agent - it keeps believing the window
+    // is a popup, so the popup-state-flip path never fires and the window stays WM-placed
+    // forever. Agreeing with the daemon here is what lets the EXISTING flip machinery
+    // (UpdateWindowData -> ToggleMap, i.e. UNMAP+MAP) re-latch override_redirect once the
+    // window shrinks back under the threshold.
+    // The daemon measures against dom0's WORK area, which the guest cannot observe; the
+    // guest screen (driven to dom0's viewport) is the closest thing it has, so this is the
+    // same rule one panel's worth of area too generous, never too strict - it can only
+    // fail to demote, exactly as today, never demote a window dom0 would have accepted.
+    if (isPopup && g_HostScreenWidth > 0 && g_HostScreenHeight > 0 &&
+        (ULONGLONG)entry->Width * (ULONGLONG)entry->Height * 100ULL >
+        (ULONGLONG)g_HostScreenWidth * (ULONGLONG)g_HostScreenHeight * 90ULL)
+    {
+        LogDebug("0x%x: popup over 90%% of the screen: %ux%u, host screen %ux%u",
+            entry->Handle, entry->Width, entry->Height, g_HostScreenWidth, g_HostScreenHeight);
+        isPopup = FALSE;
+    }
+
     if (isPopup && entry->IsVisible)
     {
         LogVerbose("0x%x: popup %ux%u", entry->Handle, entry->Width, entry->Height);
@@ -965,6 +987,37 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
                 entry->ModalParent = owner;
             else
                 entry->ModalParent = NULL;
+        }
+    }
+
+    // A shell toast draws its drop shadow INSIDE its own window rect (probed on the guest:
+    // GetWindowRect == DWMWA_EXTENDED_FRAME_BOUNDS, delta zero), so the rect Windows
+    // reports is larger than the visible card - measured live 2026-08-11 at 396x332
+    // announced for a 377x287 card. Announced as-is, dom0 borders that margin and the
+    // slice copy fills it with composited desktop pixels.
+    //
+    // This is writer #1 of the canonical rect, so cropping here (and nowhere else) is what
+    // makes MSG_CREATE, MSG_CONFIGURE, the per-window grant and its slice copy, damage
+    // conversion and occlusion agree by construction - the same reason the WS_MAXIMIZE
+    // clamp below lives here. It runs BEFORE IsOverrideRedirect is evaluated on purpose:
+    // the cropped size is the one that has to clear the agent's own popup guard and the
+    // daemon's 90% strip.
+    //
+    // Toasts are REQUIRED-kept (CLAUDE.md 2A-chrome 3c): every failure inside toastcrop
+    // yields zero insets, which leaves the rect exactly as it is today.
+    if (IsShellToastWindow(entry))
+    {
+        RECT insets;
+        if (ToastCropLookup(entry, &insets))
+        {
+            entry->X += (int)insets.left;
+            entry->Y += (int)insets.top;
+            entry->Width -= (DWORD)(insets.left + insets.right);
+            entry->Height -= (DWORD)(insets.top + insets.bottom);
+            entry->CropLeft = (int)insets.left;
+            entry->CropTop = (int)insets.top;
+            entry->CropRight = (int)insets.right;
+            entry->CropBottom = (int)insets.bottom;
         }
     }
 
@@ -1441,6 +1494,10 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
         goto end;
 
     LogDebug("0x%x", entry->Handle);
+
+    // Windows recycles HWND values, so a slot left behind here would hand this window's
+    // crop to whatever unrelated popup gets the handle next.
+    ToastCropEvict(entry->Handle);
 
     RemoveEntryList(&entry->ListEntry);
 
@@ -2343,6 +2400,17 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     // function. Left stale, a window that turned into chrome - or one whose layered alpha
     // dropped to 0 - would keep being mapped.
     windowData->Owner = data.Owner;
+
+    // Insets the interrogation above already subtracted from data.X/Y/Width/Height
+    // (toastcrop.c). Copied UNCONDITIONALLY, unlike the coords below: those are gated on
+    // coordsChanged, while the frame-loop refresh re-applies these insets to a freshly
+    // sampled RAW rect on every damaged frame. Left at zero here, the live entry would
+    // un-crop itself the moment the toast is damaged, and the size flip would rebuild its
+    // grant on every pass.
+    windowData->CropLeft = data.CropLeft;
+    windowData->CropTop = data.CropTop;
+    windowData->CropRight = data.CropRight;
+    windowData->CropBottom = data.CropBottom;
 
     // caption
     if (0 != wcscmp(windowData->Caption, data.Caption))
@@ -3906,6 +3974,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             if (damagedNow && !(entry->Style & WS_MAXIMIZE) &&
                 GetRealWindowRect(entry->Handle, &fresh) == ERROR_SUCCESS)
             {
+                // Writer #2 of the canonical rect, and GetRealWindowRect hands back the RAW
+                // rect. A cropped toast would therefore be un-cropped here on every damaged
+                // frame, oscillating against GetWindowData's cropped value: an oversized
+                // MSG_CONFIGURE and a full per-window grant rebuild every pass. Re-apply the
+                // insets the tracking pass already measured - entry fields only, no UIA and
+                // no classification on the frame path. Zero for every window but a toast.
+                fresh.left += entry->CropLeft;
+                fresh.top += entry->CropTop;
+                fresh.right -= entry->CropRight;
+                fresh.bottom -= entry->CropBottom;
+
                 int freshW = fresh.right - fresh.left, freshH = fresh.bottom - fresh.top;
                 if ((fresh.left != entry->X || fresh.top != entry->Y ||
                      freshW != (int)entry->Width || freshH != (int)entry->Height) &&

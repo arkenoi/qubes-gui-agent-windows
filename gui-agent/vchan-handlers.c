@@ -385,7 +385,6 @@ static DWORD HandleButton(IN HWND window)
 {
     struct msg_button buttonMsg;
     INPUT inputEvent;
-    RECT rect = { 0 };
 
     LogVerbose("0x%x", window);
     if (!VchanReceiveBuffer(g_Vchan, &buttonMsg, sizeof(buttonMsg), L"msg_button"))
@@ -394,8 +393,60 @@ static DWORD HandleButton(IN HWND window)
         return ERROR_UNIDENTIFIED_ERROR;
     }
 
+    int32_t x = buttonMsg.x;
+    int32_t y = buttonMsg.y;
+
+    // Same origin as HandleMotion, and for the same reason: dom0's coordinates are relative
+    // to the rect the agent ANNOUNCED, which is the tracked X/Y - not GetWindowRect, which
+    // returns the raw rect. The two differ for every window whose announced rect was
+    // adjusted (DWM frame trim, and now the toast crop in toastcrop.c), and the two input
+    // paths must not disagree about which space dom0 is speaking in.
+    //
+    // The lookup AND the field read are under g_csWatchedWindows: RemoveWindow free()s these
+    // entries from the window-tracking thread, so touching data->X/Y outside the lock is a
+    // use-after-free whenever a popup closes in the instant between dom0 sending the click and
+    // the agent handling it - exactly the toast/menu case this coordinate change exists for.
+    // HandleConfigure takes the same lock for the same reason. The two values are copied out and
+    // the lock dropped at once; nothing below needs the entry itself.
     if (window)
-        GetWindowRect(window, &rect);
+    {
+        BOOL haveTracked = FALSE;
+        int32_t trackedX = 0, trackedY = 0;
+
+        EnterCriticalSection(&g_csWatchedWindows);
+        {
+            const WINDOW_DATA* data = FindWindowByHandle(window);
+            if (data)
+            {
+                haveTracked = TRUE;
+                trackedX = data->X;
+                trackedY = data->Y;
+            }
+        }
+        LeaveCriticalSection(&g_csWatchedWindows);
+
+        if (haveTracked)
+        {
+            x += trackedX;
+            y += trackedY;
+        }
+        else // edge case: window might have got destroyed before we received this message
+        {
+            RECT rect;
+            if (GetWindowRect(window, &rect))
+            {
+                x += rect.left;
+                y += rect.top;
+            }
+            else
+            {
+                // Unlike a motion event, a button event is never dropped: swallowing a
+                // release would leave the guest with a button held down forever. Inject at
+                // the unadjusted origin, exactly what the zero-initialized rect did before.
+                win_perror("GetWindowRect");
+            }
+        }
+    }
 
     /* TODO: send to correct window */
 
@@ -406,8 +457,14 @@ static DWORD HandleButton(IN HWND window)
     inputEvent.mi.dwExtraInfo = 0;
     /* pointer coordinates must be 0..65535, which covers the whole screen -
     * regardless of resolution */
-    inputEvent.mi.dx = (buttonMsg.x + rect.left) * 65535 / g_ScreenWidth;
-    inputEvent.mi.dy = (buttonMsg.y + rect.top) * 65535 / g_ScreenHeight;
+    // VERIFIED in source 2026-08-11: dx/dy are dead at runtime. SendInput only reads them
+    // when dwFlags carries MOUSEEVENTF_ABSOLUTE|MOUSEEVENTF_MOVE, and the switch below never
+    // sets either - the click lands wherever HandleMotion last placed the cursor. The origin
+    // fix above is therefore coherence only, inert today; making dx/dy live by adding those
+    // flags is deliberately NOT done here, since it would change injection semantics for
+    // every click (drag, double-click) and needs its own interleaved regression run.
+    inputEvent.mi.dx = x * 65535 / g_ScreenWidth;
+    inputEvent.mi.dy = y * 65535 / g_ScreenHeight;
     switch (buttonMsg.button)
     {
     case Button1:
@@ -458,13 +515,30 @@ static DWORD HandleMotion(IN HWND window)
         return ERROR_SUCCESS;
     }
 
+    // Same locking rule as HandleButton, and pre-existing here: FindWindowByHandle's result is
+    // owned by the window-tracking thread and free()d by RemoveWindow, so it may only be
+    // dereferenced under g_csWatchedWindows.
     if (window)
     {
-        const WINDOW_DATA* data = FindWindowByHandle(window);
-        if (data)
+        BOOL haveTracked = FALSE;
+        int32_t trackedX = 0, trackedY = 0;
+
+        EnterCriticalSection(&g_csWatchedWindows);
         {
-            x += data->X;
-            y += data->Y;
+            const WINDOW_DATA* data = FindWindowByHandle(window);
+            if (data)
+            {
+                haveTracked = TRUE;
+                trackedX = data->X;
+                trackedY = data->Y;
+            }
+        }
+        LeaveCriticalSection(&g_csWatchedWindows);
+
+        if (haveTracked)
+        {
+            x += trackedX;
+            y += trackedY;
         }
         else // edge case: window might have got destroyed before we received this message
         {
@@ -549,6 +623,24 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                     data->DaemonMaxW = configureMsg.width;
                     data->DaemonMaxH = configureMsg.height;
                 }
+            }
+            else if (data->CropLeft != 0 || data->CropTop != 0 ||
+                data->CropRight != 0 || data->CropBottom != 0)
+            {
+                // These coordinates are in CROPPED space - the rect the agent announced is
+                // the visible card, not the window (toastcrop.c). Feeding them to
+                // SetWindowPos would move the shell-owned toast HWND by the crop margin and
+                // shrink it to card size, corrupting ShellExperienceHost's own layout; the
+                // resulting geometry would then be re-cropped on the next tracking pass, so
+                // each dom0 configure would walk the toast further off its anchor. Placement
+                // of an override-redirect popup is guest-authoritative anyway. Ignore the
+                // request exactly like the maximized case above - the ACK below re-syncs the
+                // daemon to the geometry the guest actually reports. DaemonMax* stays
+                // untouched on purpose: it is the maximize ceiling, and a cropped popup is
+                // never maximized.
+                LogDebug("0x%x is cropped by %d/%d/%d/%d, ignoring dom0 configure (%d,%d) %dx%d",
+                    window, data->CropLeft, data->CropTop, data->CropRight, data->CropBottom,
+                    configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height);
             }
             else
             {

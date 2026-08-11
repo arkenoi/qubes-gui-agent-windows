@@ -60,6 +60,16 @@ typedef struct _WINDOW_DATA
     DWORD Width;
     DWORD Height;
 
+    // Insets already SUBTRACTED from the raw rect above (toastcrop.c): X/Y/Width/Height
+    // stay the single geometry source of truth and hold post-crop values, these record by
+    // how much, for the consumers that must reconstruct the raw rect (HandleConfigure) or
+    // re-apply the same crop to a freshly sampled one (the frame-loop refresh). All zero
+    // means the window is uncropped, which is every window but a shell toast banner.
+    int CropLeft;
+    int CropTop;
+    int CropRight;
+    int CropBottom;
+
     // Position as of the frame currently being processed. Dirty rects come from a frame
     // captured BEFORE this frame's tracking update ran, so converting them to
     // window-relative coordinates with the freshly-updated X/Y mis-registers the damage by

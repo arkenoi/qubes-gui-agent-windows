@@ -24,6 +24,7 @@
     <ClCompile Include="..\..\gui-agent\debug.c" />
     <ClCompile Include="..\..\gui-agent\xorg-keymap.c" />
     <ClCompile Include="..\..\gui-agent\perwindow.c" />
+    <ClCompile Include="..\..\gui-agent\toastcrop.c" />
     <!-- C++/WinRT capture engine: needs C++17 + exceptions; SDK headers are not
          /W4-clean, so warnings-as-errors is relaxed for this one TU only. -->
     <ClCompile Include="..\..\gui-agent\wincapture.cpp">
@@ -51,6 +52,7 @@
     <ClInclude Include="..\..\include\common.h" />
     <ClInclude Include="..\..\gui-agent\perwindow.h" />
     <ClInclude Include="..\..\gui-agent\wincapture.h" />
+    <ClInclude Include="..\..\gui-agent\toastcrop.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\gui-agent\blank.cur" />
@@ -131,7 +133,7 @@
     <Link>
       <SubSystem>Windows</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);ws2_32.lib;dxgi.lib;d3d11.lib;dxguid.lib;dwmapi.lib;sas.lib;xencontrol.lib;windows-utils.lib;libvchan.lib;qubesdb-client.lib;windowsapp.lib;setupapi.lib</AdditionalDependencies>
+      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);ws2_32.lib;dxgi.lib;d3d11.lib;dxguid.lib;dwmapi.lib;ole32.lib;oleaut32.lib;sas.lib;xencontrol.lib;windows-utils.lib;libvchan.lib;qubesdb-client.lib;windowsapp.lib;setupapi.lib</AdditionalDependencies>
     </Link>
     <PreBuildEvent>
       <Command>powershell $(QB_SCRIPTS)\local\prebuild.ps1 $(ProjectDir)\..\.. $(QUBES_REPO) &amp;&amp; powershell $(QB_SCRIPTS)\set-version.ps1 $(ProjectDir)\..\..\version $(ProjectDir)\..\..\include\qwt_version.h</Command>
@@ -155,7 +157,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);ws2_32.lib;dxgi.lib;d3d11.lib;dxguid.lib;dwmapi.lib;sas.lib;xencontrol.lib;windows-utils.lib;libvchan.lib;qubesdb-client.lib;windowsapp.lib;setupapi.lib</AdditionalDependencies>
+      <AdditionalDependencies>$(CoreLibraryDependencies);%(AdditionalDependencies);ws2_32.lib;dxgi.lib;d3d11.lib;dxguid.lib;dwmapi.lib;ole32.lib;oleaut32.lib;sas.lib;xencontrol.lib;windows-utils.lib;libvchan.lib;qubesdb-client.lib;windowsapp.lib;setupapi.lib</AdditionalDependencies>
     </Link>
     <PreBuildEvent>
       <Command>powershell $(QB_SCRIPTS)\local\prebuild.ps1 $(ProjectDir)\..\.. $(QUBES_REPO) &amp;&amp; powershell $(QB_SCRIPTS)\set-version.ps1 $(ProjectDir)\..\..\version $(ProjectDir)\..\..\include\qwt_version.h</Command>
