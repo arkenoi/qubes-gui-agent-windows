@@ -192,6 +192,17 @@ typedef struct _WINDOW_DATA
     // tracked anchor, which is where the surface really is.
     BOOL  DaemonOwnsPos;
 
+    // Sequence number of the geometry sample currently stored in X/Y/Width/Height.
+    // GetWindowData() reads the window rect BEFORE taking g_csWatchedWindows, and it runs
+    // on TWO threads (the WinEvent hook thread and the main pump - see toastcrop.c:84), so
+    // two samples can be committed out of order: thread A samples P1, is preempted while
+    // thread B samples the newer P2 and announces it, then A commits P1 and announces it
+    // too - a BACKWARD announce that leaves the real trajectory untouched. That is the
+    // measured drag wobble (2026-08-12: outliers 1452 -> 1407 -> 1382 -> 1485, the main
+    // track continuing as if the two backward values never happened). A sample older than
+    // what is already committed is dropped.
+    ULONGLONG GeomSeq;
+
     // Card size the dom0 size-lock hint was last sent for (WM-managed shell surfaces only).
     // -1 = never sent; re-sent when the announced card size changes.
     int SizeLockW;

@@ -134,6 +134,10 @@ static HWND g_LastForeground = NULL;
 // moving window's CONTENT does not change. The latch closes those gaps: while it is set the
 // window counts as moving regardless of event timing.
 volatile HWND g_InputDragWindow = NULL;
+
+// Monotonic stamp handed to every geometry sample, so a sample taken earlier can never be
+// committed after a later one (see WINDOW_DATA.GeomSeq).
+static volatile LONG64 g_GeomSampleClock = 0;
 HWND g_TaskbarWindow = NULL;
 BOOL g_ShowTaskbar = FALSE;
 
@@ -942,6 +946,9 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     if (windowData == NULL)
         return ERROR_INVALID_PARAMETER;
 
+    // Stamp BEFORE sampling: the stamp must order the READ, not the commit.
+    ULONGLONG geomSeq = (ULONGLONG)InterlockedIncrement64(&g_GeomSampleClock);
+
     RECT rect;
     status = GetRealWindowRect(window, &rect);
     if (!SUCCEEDED(status))
@@ -968,6 +975,7 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     entry->SizeLockW = -1; // never sent; distinguishes "locked to 0" impossible-state
     entry->SizeLockH = -1;
 
+    entry->GeomSeq = geomSeq;
     entry->X = rect.left;
     entry->Y = rect.top;
     // Seed the frame registration so a window seen for the first time converts its damage
@@ -2780,6 +2788,18 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         if (data.Height > windowData->DaemonMaxH)
             data.Height = windowData->DaemonMaxH;
     }
+
+    // STALE-SAMPLE GUARD: this sample was read before the one already committed (the two
+    // sampling threads raced), so applying it would move the tracked geometry BACKWARD and
+    // announce a position the window already left - the measured drag wobble. Drop it; the
+    // fresher data is already in place and a newer sample is on its way.
+    if (data.GeomSeq != 0 && windowData->GeomSeq > data.GeomSeq)
+    {
+        LogDebug("0x%x: stale geometry sample #%llu (committed #%llu), dropping",
+            windowData->Handle, data.GeomSeq, windowData->GeomSeq);
+        goto end;
+    }
+    windowData->GeomSeq = data.GeomSeq;
 
     if (windowData->IsVisible != data.IsVisible)
     {
