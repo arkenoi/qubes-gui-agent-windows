@@ -1489,11 +1489,6 @@ end:
 
 // Send MSG_CONFIGURE for a tracked window with its current geometry, unless it would be
 // byte-identical to the last one sent (drag processing produced bursts of 4+ duplicates).
-// Settle window after a dom0-commanded move during which the agent must not echo the
-// window's position back (see WINDOW_DATA.Dom0MoveAt). Covers the post-release drift the
-// user sees; a genuine guest-initiated move after this expires is announced normally.
-#define DOM0_MOVE_SETTLE_MS 600
-
 static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
 {
     if (entry->Synthesized)
@@ -1503,20 +1498,6 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
         entry->LastCfgOvr == entry->IsOverrideRedirect)
         return ERROR_SUCCESS;
-
-    // Position-only change inside the settle window after a dom0-commanded move: do NOT echo
-    // it. dom0 dictated the position (a drag), and the read-back differs by the frame offset,
-    // so announcing it makes dom0 move the window, which we read back offset again, ... =
-    // the window drifting on its own after release (traced 2026-08-12). Size/override changes
-    // (crop resolve etc.) are NOT suppressed - only a pure position echo is.
-    if (entry->CfgSentValid &&
-        entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
-        entry->LastCfgOvr == entry->IsOverrideRedirect &&
-        entry->Dom0MoveAt != 0 &&
-        (GetTickCount() - entry->Dom0MoveAt) < DOM0_MOVE_SETTLE_MS)
-    {
-        return ERROR_SUCCESS;
-    }
 
     ULONG status = SendWindowConfigure(entry->Handle, entry->X, entry->Y,
         entry->Width, entry->Height, entry->IsOverrideRedirect);

@@ -670,7 +670,6 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                         configureMsg.x, configureMsg.y, rawX, rawY);
                     data->X = configureMsg.x;
                     data->Y = configureMsg.y;
-                    data->Dom0MoveAt = GetTickCount(); // open the no-echo settle window
 
                     // CRITICAL: record this as last-sent so the tracking pass does NOT echo
                     // it back. The daemon dictated this position; re-announcing it makes the
@@ -704,28 +703,7 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                     LogVerbose("SWP_NOSIZE");
                 }
 
-                // COORDINATE-SPACE CONVERSION. dom0 speaks the ANNOUNCED rect, which the agent
-                // derives from GetRealWindowRect (DWMWA_EXTENDED_FRAME_BOUNDS - the visible
-                // frame, INSIDE the window rect). SetWindowPos speaks GetWindowRect space,
-                // which is larger by the invisible resize border (~7 px). Feeding dom0's
-                // coordinates straight to SetWindowPos therefore places the window off by that
-                // border; the next tracking read is off by the same amount, gets announced,
-                // dom0 moves the window, ... = the window drifting on its own after a drag
-                // (traced 2026-08-12: continuous SendWindowConfigure with a walking position).
-                // Convert by the current window-vs-frame delta so the RESULTING
-                // GetRealWindowRect equals what dom0 asked for, and the echo self-cancels.
-                int posX = configureMsg.x, posY = configureMsg.y;
-                if (!(flags & SWP_NOMOVE))
-                {
-                    RECT wr, rr;
-                    if (GetWindowRect(window, &wr) && GetRealWindowRect(window, &rr) == ERROR_SUCCESS)
-                    {
-                        posX = configureMsg.x + (wr.left - rr.left);
-                        posY = configureMsg.y + (wr.top - rr.top);
-                    }
-                }
-
-                if (SetWindowPos(window, NULL, posX, posY, configureMsg.width, configureMsg.height, flags))
+                if (SetWindowPos(window, NULL, configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height, flags))
                 {
                     // update expected pos/size of the tracked window without waiting for actual change
                     // since we use SWP_ASYNCWINDOWPOS
@@ -738,7 +716,6 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                             configureMsg.x, configureMsg.y);
                         data->X = configureMsg.x;
                         data->Y = configureMsg.y;
-                        data->Dom0MoveAt = GetTickCount(); // open the no-echo settle window (see SendWindowConfigureIfChanged)
                     }
 
                     if (!(flags & SWP_NOSIZE))
