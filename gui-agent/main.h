@@ -181,6 +181,17 @@ typedef struct _WINDOW_DATA
     // fires when the drive ends.
     BOOL  DaemonDamageHeld;
 
+    // FROZEN ANCHOR (WM-managed shell surfaces, ShellManaged != none). dom0 owns this
+    // window's PLACEMENT: the guest HWND is never moved (it must keep painting at its
+    // natural anchor, which is the only place a DirectComposition shell surface renders),
+    // and the agent stops announcing position so dom0 cannot be snapped back to the
+    // anchor. Correctness rests on slice-fed surfaces being copied into a PER-WINDOW
+    // buffer (PwSliceCopyAndDamage): what dom0 displays is position-independent, so the
+    // card renders correctly wherever the user drags the frame. Input stays correct too -
+    // HandleButton/HandleMotion translate dom0's window-RELATIVE coords against the
+    // tracked anchor, which is where the surface really is.
+    BOOL  DaemonOwnsPos;
+
     // Card size the dom0 size-lock hint was last sent for (WM-managed shell surfaces only).
     // -1 = never sent; re-sent when the announced card size changes.
     int SizeLockW;

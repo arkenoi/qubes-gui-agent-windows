@@ -1609,6 +1609,16 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
             entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
             entry->LastCfgOvr == entry->IsOverrideRedirect;
         DWORD now = GetTickCount();
+        // FROZEN ANCHOR: dom0 owns this shell surface's placement (see DaemonOwnsPos).
+        // Re-announcing the guest anchor would make the daemon snap its window back from
+        // wherever the user dragged it. Size / override-redirect changes still go out -
+        // only the position is dom0's to keep.
+        if (posOnly && entry->DaemonOwnsPos)
+        {
+            entry->CfgPendingPos = FALSE;
+            return ERROR_SUCCESS;
+        }
+
         // DAEMON-DRIVE SUPPRESSION. While the daemon streams MSG_CONFIGURE for this window
         // (a dom0 WM title-bar drag), the guest window chases the dictated positions with a
         // lag of one-to-many frames. Announcing each lagging step back made the daemon move

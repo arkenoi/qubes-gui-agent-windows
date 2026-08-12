@@ -756,36 +756,32 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                 }
                 else
                 {
+                    // FROZEN ANCHOR. dom0 has placed this shell surface; from now on dom0
+                    // OWNS its position. The guest HWND is deliberately NOT moved and
+                    // data->X/Y deliberately NOT updated: X/Y is the slice source (the
+                    // window's real position, where the shell actually paints its card)
+                    // and the origin every damage rect and injected click is translated
+                    // against. Moving it - or merely pretending it moved - is what made a
+                    // dragged Start slice bare wallpaper (user-reported 2026-08-12).
+                    // Because slice-fed surfaces are copied into their own per-window
+                    // buffer, dom0 renders the card correctly at whatever position the
+                    // user dragged the frame to.
                     geometryDriven = TRUE;
-                    data->DaemonMovePending = TRUE;
-                    data->DaemonMoveX = configureMsg.x;
-                    data->DaemonMoveY = configureMsg.y;
-                    data->DaemonMoveW = (int)data->Width;   // ignored: NoSize
-                    data->DaemonMoveH = (int)data->Height;
-                    data->DaemonMoveNoMove = FALSE;
-                    data->DaemonMoveNoSize = TRUE;
+                    data->DaemonOwnsPos = TRUE;
 
-                    LogDebug("0x%x cropped by %d/%d/%d/%d: dom0 configure (%d,%d) stashed (card space)",
+                    LogDebug("0x%x cropped by %d/%d/%d/%d: dom0 placed it at (%d,%d); "
+                        "keeping guest anchor (%d,%d), dom0 owns position",
                         window, data->CropLeft, data->CropTop, data->CropRight, data->CropBottom,
-                        configureMsg.x, configureMsg.y);
-                    data->X = configureMsg.x;
-                    data->Y = configureMsg.y;
+                        configureMsg.x, configureMsg.y, data->X, data->Y);
 
-                    // CRITICAL: record this as last-sent so the tracking pass does NOT echo
-                    // it back. The daemon dictated this position; re-announcing it makes the
-                    // daemon move its window, which re-announces, ... = the window jumping
-                    // around on its own during a drag (user-reported 2026-08-12). The normal
-                    // (non-crop) branch below has always done this; the crop branch omitting
-                    // it was the bug.
+                    // Record the daemon's own values as last-sent so nothing echoes them
+                    // back at it (the normal branch does the same for its dictated move).
                     data->CfgSentValid = TRUE;
-                    data->LastCfgX = data->X;
-                    data->LastCfgY = data->Y;
+                    data->LastCfgX = configureMsg.x;
+                    data->LastCfgY = configureMsg.y;
                     data->LastCfgW = (int)data->Width;
                     data->LastCfgH = (int)data->Height;
                     data->LastCfgOvr = data->IsOverrideRedirect;
-
-                    // Apply now if nothing is in flight (single-configure case).
-                    ApplyPendingDaemonMove(data);
                 }
             }
             else
