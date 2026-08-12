@@ -1503,6 +1503,21 @@ end:
 // consumption and build a backlog that replays after the drag.
 #define CFG_POS_MIN_INTERVAL_MS 16
 
+// How long after the last daemon MSG_CONFIGURE the daemon is considered to be actively
+// dictating this window's geometry (dom0 WM drag). Position-only announces are withheld
+// for this long; the settle announce (if any is still needed) comes from
+// CfgFlushPendingMove once the drive ends.
+#define DAEMON_DRIVE_ACTIVE_MS 300
+
+// How long a posted async SetWindowPos is presumed in flight before a newer daemon
+// geometry may be posted anyway (the window may legitimately never reach the target,
+// e.g. a guest-side snap; without the timeout one lost move would wedge the drive).
+#define DAEMON_MOVE_INFLIGHT_MS 200
+
+// Minimum spacing between refreshes of the announce-space/SetWindowPos-space delta
+// (one DwmGetWindowAttribute + GetMonitorInfo + EnumDisplaySettings per refresh).
+#define DAEMON_OFF_TTL_MS 500
+
 // Send a position the rate limiter withheld, once the window has stopped moving. Called from
 // the tracking pass for every window; cheap no-op when nothing is pending.
 static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
@@ -1511,15 +1526,30 @@ static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
         return;
     if (GetTickCount() - entry->CfgLastSentTick < CFG_POS_MIN_INTERVAL_MS)
         return; // still inside the window; the next pass will flush it
+    // While the daemon is dictating this window's geometry, dom0 already knows where its
+    // window is - hold the flush until the drive ends, then announce the true resting
+    // place below (or nothing, if the window landed exactly where the daemon put it).
+    if (entry->DaemonDriveTick != 0 &&
+        GetTickCount() - entry->DaemonDriveTick < DAEMON_DRIVE_ACTIVE_MS)
+        return;
 
+    // Flush the CURRENT canonical position, not the coordinates that were withheld: the
+    // window may have moved again since the limiter (or the daemon-drive hold) recorded
+    // them, and announcing a stale intermediate is exactly the replay this exists to stop.
     entry->CfgPendingPos = FALSE;
+    if (entry->CfgSentValid &&
+        entry->LastCfgX == entry->X && entry->LastCfgY == entry->Y &&
+        entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
+        entry->LastCfgOvr == entry->IsOverrideRedirect)
+        return; // already exactly what the daemon knows - announcing it again would echo
+
     entry->CfgLastSentTick = GetTickCount();
-    if (SendWindowConfigure(entry->Handle, entry->CfgPendingX, entry->CfgPendingY,
+    if (SendWindowConfigure(entry->Handle, entry->X, entry->Y,
             entry->Width, entry->Height, entry->IsOverrideRedirect) == ERROR_SUCCESS)
     {
         entry->CfgSentValid = TRUE;
-        entry->LastCfgX = entry->CfgPendingX;
-        entry->LastCfgY = entry->CfgPendingY;
+        entry->LastCfgX = entry->X;
+        entry->LastCfgY = entry->Y;
         entry->LastCfgW = (int)entry->Width;
         entry->LastCfgH = (int)entry->Height;
         entry->LastCfgOvr = entry->IsOverrideRedirect;
@@ -1556,6 +1586,23 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
             entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
             entry->LastCfgOvr == entry->IsOverrideRedirect;
         DWORD now = GetTickCount();
+        // DAEMON-DRIVE SUPPRESSION. While the daemon streams MSG_CONFIGURE for this window
+        // (a dom0 WM title-bar drag), the guest window chases the dictated positions with a
+        // lag of one-to-many frames. Announcing each lagging step back made the daemon move
+        // its window there - fighting the WM during the drag and, after release, walking the
+        // dom0 window through every queued stale position (THE drag replay, user-reproduced
+        // 2026-08-12 with a 1:1 trace). dom0 knows where its own window is; say nothing
+        // about position until the drive ends. The withheld-coords slot keeps the flush
+        // path armed so the resting position is verified (and only announced if it differs
+        // from what the daemon itself dictated). Size/override changes still go through.
+        if (posOnly && entry->DaemonDriveTick != 0 &&
+            (now - entry->DaemonDriveTick) < DAEMON_DRIVE_ACTIVE_MS)
+        {
+            entry->CfgPendingPos = TRUE;
+            entry->CfgPendingX = entry->X;
+            entry->CfgPendingY = entry->Y;
+            return ERROR_SUCCESS;
+        }
         if (posOnly && entry->CfgLastSentTick != 0 &&
             (now - entry->CfgLastSentTick) < CFG_POS_MIN_INTERVAL_MS)
         {
@@ -1597,6 +1644,91 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         }
     }
     return status;
+}
+
+// Apply the newest daemon-dictated geometry (HandleConfigure stashes it; see DaemonMove*
+// in main.h). Latest-wins with at most ONE async SetWindowPos in flight per window: a
+// daemon configure flood (dom0 WM drag at input rate) used to queue dozens of async moves
+// the guest window played back over seconds after release - the drag replay. Call with
+// g_csWatchedWindows held.
+void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry)
+{
+    if (!entry->DaemonMovePending)
+        return;
+
+    DWORD now = GetTickCount();
+
+    // Is the previously posted async move still in flight? Compare the window's actual
+    // GetWindowRect origin (SetWindowPos space) to the last posted target. A move-less
+    // post (size-only) never gates. Timeout so a target the window can never reach (guest
+    // WM snap, clamped coordinates) cannot wedge the drive.
+    if (entry->DaemonPostedValid &&
+        (now - entry->DaemonPostedTick) < DAEMON_MOVE_INFLIGHT_MS)
+    {
+        RECT wr;
+        if (GetWindowRect(entry->Handle, &wr) &&
+            (wr.left != entry->DaemonPostedX || wr.top != entry->DaemonPostedY))
+            return; // still traveling; keep only the newest pending geometry
+    }
+
+    // Refresh the announce-space -> SetWindowPos-space delta if stale. GetRealWindowRect
+    // is the expensive trio (DWM + monitor + display settings); the TTL keeps it off the
+    // per-configure path, which is what killed the reverted 95492ed.
+    if (!entry->DaemonOffValid || (now - entry->DaemonOffTick) >= DAEMON_OFF_TTL_MS)
+    {
+        RECT wr, real;
+        if (GetWindowRect(entry->Handle, &wr) &&
+            GetRealWindowRect(entry->Handle, &real) == ERROR_SUCCESS)
+        {
+            entry->DaemonOffX = real.left - wr.left;
+            entry->DaemonOffY = real.top - wr.top;
+            entry->DaemonOffValid = TRUE;
+        }
+        // On failure keep whatever we had (0/0 initially = the old behavior).
+        entry->DaemonOffTick = now;
+    }
+
+    UINT flags = SWP_ASYNCWINDOWPOS | SWP_NOZORDER;
+    if (entry->DaemonMoveNoMove)
+        flags |= SWP_NOMOVE;
+    if (entry->DaemonMoveNoSize)
+        flags |= SWP_NOSIZE;
+
+    // The daemon dictates in announce space (what MSG_CONFIGURE carries); SetWindowPos
+    // takes GetWindowRect space. Convert, or the window lands off by the invisible-border
+    // delta, the frame path announces the shifted position, and the daemon applies it as
+    // a real move - the guaranteed post-drop hop.
+    int tx = entry->DaemonMoveX - entry->DaemonOffX;
+    int ty = entry->DaemonMoveY - entry->DaemonOffY;
+
+    entry->DaemonMovePending = FALSE;
+    if (SetWindowPos(entry->Handle, NULL, tx, ty,
+            entry->DaemonMoveW, entry->DaemonMoveH, flags))
+    {
+        if (!(flags & SWP_NOMOVE))
+        {
+            entry->DaemonPostedValid = TRUE;
+            entry->DaemonPostedX = tx;
+            entry->DaemonPostedY = ty;
+            entry->DaemonPostedTick = now;
+        }
+    }
+    else
+    {
+        win_perror("SetWindowPos(daemon move)");
+    }
+}
+
+void ApplyAllPendingDaemonMoves(void)
+{
+    EnterCriticalSection(&g_csWatchedWindows);
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
+         e != &g_WatchedWindowsList; e = e->Flink)
+    {
+        WINDOW_DATA* entry = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        ApplyPendingDaemonMove(entry);
+    }
+    LeaveCriticalSection(&g_csWatchedWindows);
 }
 
 // Remove window from the list and free memory.
@@ -4099,6 +4231,13 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     }
                 }
             }
+            // Per-window-path windows leave the loop here, so they need the same two
+            // settle steps the legacy path runs below: flush a withheld position once
+            // the window is quiet, and apply the newest daemon-dictated geometry if one
+            // is still waiting (see the legacy-path call sites for the full rationale).
+            CfgFlushPendingMove(entry);
+            ApplyPendingDaemonMove(entry);
+
             SetRectRgn(rgnWindow, entry->X, entry->Y,
                 entry->X + (int)entry->Width, entry->Y + (int)entry->Height);
             if (g_ZOrderValid && entry->IsOverrideRedirect)
@@ -4180,6 +4319,12 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         // window's resting place.
         CfgFlushPendingMove(entry);
 
+        // And the mirror image: if the DAEMON's newest dictated geometry is still waiting
+        // (a prior async move was in flight when it arrived), apply it now - this is the
+        // guaranteed per-frame progress point that lands the window on the final dictated
+        // position once the flood stops, even if the vchan goes quiet.
+        ApplyPendingDaemonMove(entry);
+
         windowRect.left = entry->X;
         windowRect.top = entry->Y;
         windowRect.right = entry->X + (int)entry->Width;
@@ -4193,7 +4338,36 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         SetRectRgn(rgnWindow, windowRect.left, windowRect.top, windowRect.right, windowRect.bottom);
         CombineRgn(rgnVisible, rgnWindow, rgnCovered, RGN_DIFF);
 
+        // DAEMON-DRIVE DAMAGE HOLD. While the daemon dictates this window's geometry (dom0
+        // WM drag), position announces are suppressed (SendWindowConfigureIfChanged), so the
+        // daemon's framebuffer read origin for this slice-fed window is frozen - damage sent
+        // now would make dom0 paint pixels from the window's OLD screen region into it.
+        // Hold the window's damage instead: its dom0 content freezes for the duration of the
+        // drag (the same trade the g_InputDragWindow latch makes for guest-native drags, and
+        // what most WMs degrade to under load), and the drive-end settle below repaints the
+        // whole window once, right after CfgFlushPendingMove has announced the true resting
+        // origin. Occlusion claims are unaffected - only the sends are held.
+        BOOL daemonHoldDamage = FALSE;
+        if (entry->DaemonDriveTick != 0 &&
+            (GetTickCount() - entry->DaemonDriveTick) < DAEMON_DRIVE_ACTIVE_MS)
+        {
+            daemonHoldDamage = TRUE;
+            entry->DaemonDamageHeld = TRUE;
+        }
+        else if (entry->DaemonDamageHeld)
+        {
+            entry->DaemonDamageHeld = FALSE;
+            status = SendWindowDamageEvent(entry->Handle, 0, 0,
+                (int)entry->Width, (int)entry->Height);
+            if (ERROR_SUCCESS != status)
+            {
+                win_perror2(status, "SendWindowDamageEvent (daemon-drive settle)");
+                goto cleanup;
+            }
+        }
+
         // skip windows that aren't in the changed area
+        if (!daemonHoldDamage)
         for (UINT i = 0; i < frame->dirty_rects_count; i++)
         {
             if (IntersectRect(&changedArea, &frame->dirty_rects[i], &windowRect))
@@ -4506,6 +4680,12 @@ static BOOL DrainVchanInput(IN OUT struct _CAPTURE_CONTEXT* capture, OUT BOOL* e
             return FALSE;
         }
     }
+
+    // A drain batch may have carried many MSG_CONFIGUREs per window (dom0 WM drag at
+    // input rate); each handler only stashed the newest geometry. Apply once per window
+    // now - latest-wins - instead of the per-message async SetWindowPos flood the guest
+    // window used to play back for seconds after the drag ended.
+    ApplyAllPendingDaemonMoves();
 
     LeaveCriticalSection(&g_VchanCriticalSection);
     return TRUE;

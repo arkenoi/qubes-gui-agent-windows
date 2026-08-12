@@ -132,6 +132,50 @@ typedef struct _WINDOW_DATA
     int   CfgPendingX;
     int   CfgPendingY;
 
+    // Daemon-driven geometry (HandleConfigure). During a dom0 title-bar drag the daemon
+    // streams MSG_CONFIGURE at input rate; applying each one as its own async SetWindowPos
+    // queued dozens of moves the guest window then played back over seconds (the window
+    // applies them at frame cadence), and the frame path re-announced every lagging step -
+    // dom0 replayed the whole trajectory after release (user-reproduced 2026-08-12, trace:
+    // the same walk re-sent at ~10 Hz offset by the DWM border delta). Latest-wins instead:
+    // the newest daemon geometry is stashed here and at most ONE async SetWindowPos is in
+    // flight per window (ApplyPendingDaemonMove).
+    BOOL  DaemonMovePending;   // a daemon-dictated geometry is waiting to be applied
+    int   DaemonMoveX;         // latest daemon geometry, announce space
+    int   DaemonMoveY;
+    int   DaemonMoveW;
+    int   DaemonMoveH;
+    BOOL  DaemonMoveNoMove;    // position unchanged at receive time (SWP_NOMOVE)
+    BOOL  DaemonMoveNoSize;    // size unchanged at receive time (SWP_NOSIZE)
+    BOOL  DaemonPostedValid;   // an async SetWindowPos was posted and may still be in flight
+    int   DaemonPostedX;       // its target, SetWindowPos (GetWindowRect) space
+    int   DaemonPostedY;
+    DWORD DaemonPostedTick;
+    // Announce space (GetRealWindowRect: DWM extended frame bounds) minus SetWindowPos space
+    // (GetWindowRect): the invisible-border delta, +7px for a themed Win11 window. The old
+    // code passed daemon coords (announce space) straight to SetWindowPos, so every applied
+    // move landed off by this delta, the frame path announced the shifted position, and the
+    // daemon treated it as a real move - one guaranteed post-drop hop, and during a drag a
+    // continuous fight with the dom0 WM. Cached per window; refreshed at most every 500 ms
+    // (95492ed recomputed per configure - three DWM/display calls at input rate - and was
+    // reverted for making the symptom worse).
+    BOOL  DaemonOffValid;
+    int   DaemonOffX;
+    int   DaemonOffY;
+    DWORD DaemonOffTick;
+    // Tick of the last daemon MSG_CONFIGURE for this window. While recent, the daemon is
+    // dictating this window's geometry (dom0 WM drag): position-only announces from the
+    // tracking/frame paths are withheld (SendWindowConfigureIfChanged) - dom0 already knows
+    // where its own window is, and echoing the guest's lagging position back is what made
+    // the dom0 window fight the WM and replay the drag path.
+    DWORD DaemonDriveTick;
+    // Damage for this window was withheld during a daemon drive (the announced origin is
+    // the daemon's framebuffer read origin for slice-fed windows, and it is frozen while
+    // announces are suppressed - sending damage against it would paint pixels from the
+    // window's OLD screen region). Cleared by the one full-window settle repaint that
+    // fires when the drive ends.
+    BOOL  DaemonDamageHeld;
+
     // Card size the dom0 size-lock hint was last sent for (WM-managed shell surfaces only).
     // -1 = never sent; re-sent when the announced card size changes.
     int SizeLockW;
@@ -227,6 +271,15 @@ BOOL ShouldAcceptWindow(
 // Visible window rect as managed by DWM (GetWindowRect includes invisible resize grips), DPI
 // adjusted. This is the geometry announced to the daemon, so dom0's frame hugs the window.
 ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect);
+
+// Apply the newest daemon-dictated geometry for this window if no earlier async
+// SetWindowPos is still in flight (latest-wins; see DaemonMove* in WINDOW_DATA).
+// Call with g_csWatchedWindows held.
+void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry);
+
+// ApplyPendingDaemonMove for every watched window; takes g_csWatchedWindows itself.
+// Called after a vchan drain so a configure flood collapses to one move per window.
+void ApplyAllPendingDaemonMoves(void);
 
 WINDOW_DATA *FindWindowByHandle(
     IN HWND window

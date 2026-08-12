@@ -699,26 +699,36 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
             }
             else
             {
-                if (data->X == configureMsg.x && data->Y == configureMsg.y)
-                {
-                    flags |= SWP_NOMOVE;
-                    LogVerbose("SWP_NOMOVE");
-                }
+                BOOL noMove = (data->X == configureMsg.x && data->Y == configureMsg.y);
+                BOOL noSize = (data->Width == configureMsg.width && data->Height == configureMsg.height);
 
-                if (data->Width == configureMsg.width && data->Height == configureMsg.height)
+                if (noMove && noSize)
                 {
-                    flags |= SWP_NOSIZE;
-                    LogVerbose("SWP_NOSIZE");
+                    LogVerbose("0x%x: geometry unchanged", window);
                 }
-
-                if (SetWindowPos(window, NULL, configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height, flags))
+                else
                 {
-                    // update expected pos/size of the tracked window without waiting for actual change
-                    // since we use SWP_ASYNCWINDOWPOS
-                    // TODO: improve further, somehow window data via UpdateWindowData() later after SetWindowPos below
-                    // is still different from what was passed via configureMsg - DWM API needs a while to properly update
-                    // the window state after changes?
-                    if (!(flags & SWP_NOMOVE))
+                    // LATEST-WINS: stash the newest daemon geometry instead of issuing a
+                    // per-message async SetWindowPos. During a dom0 WM title-bar drag the
+                    // daemon streams these at input rate; the per-message flood queued
+                    // dozens of async moves the guest window then played back over
+                    // seconds after release, and the frame path re-announced every
+                    // lagging step - dom0 replayed the whole drag path (user-reproduced
+                    // 2026-08-12, 1:1 trace in FINDINGS.md). ApplyPendingDaemonMove posts
+                    // at most one in-flight move per window and converts announce-space
+                    // coords to SetWindowPos space (the old direct call landed every
+                    // move off by the DWM invisible-border delta).
+                    data->DaemonMovePending = TRUE;
+                    data->DaemonMoveX = configureMsg.x;
+                    data->DaemonMoveY = configureMsg.y;
+                    data->DaemonMoveW = configureMsg.width;
+                    data->DaemonMoveH = configureMsg.height;
+                    data->DaemonMoveNoMove = noMove;
+                    data->DaemonMoveNoSize = noSize;
+
+                    // Expected pos/size updated without waiting for the actual change,
+                    // as before (the tracking pass self-corrects if the apply diverges).
+                    if (!noMove)
                     {
                         LogVerbose("Updating position of 0x%x: (%d,%d) -> (%d,%d)", window, data->X, data->Y,
                             configureMsg.x, configureMsg.y);
@@ -726,7 +736,7 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                         data->Y = configureMsg.y;
                     }
 
-                    if (!(flags & SWP_NOSIZE))
+                    if (!noSize)
                     {
                         LogVerbose("Updating size of 0x%x: %dx%d -> %dx%d", window, data->Width, data->Height,
                             configureMsg.width, configureMsg.height);
@@ -746,12 +756,20 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                     data->LastCfgW = (int)data->Width;
                     data->LastCfgH = (int)data->Height;
                     data->LastCfgOvr = data->IsOverrideRedirect;
-                }
-                else
-                {
-                    win_perror("SetWindowPos");
+
+                    // Apply immediately if nothing is in flight (the common non-drag
+                    // case: exactly one configure -> exactly one SetWindowPos, applied
+                    // here); during a flood the drain-end/per-frame pass picks it up.
+                    ApplyPendingDaemonMove(data);
                 }
             }
+
+            // The daemon is actively dictating this window's geometry: hold the
+            // tracking/frame paths' position-only announces (see DAEMON-DRIVE
+            // SUPPRESSION in SendWindowConfigureIfChanged) - echoing the guest
+            // window's lagging position at the daemon is what fought the dom0 WM
+            // during drags and replayed the trajectory after release.
+            data->DaemonDriveTick = GetTickCount();
         }
         else
         {
