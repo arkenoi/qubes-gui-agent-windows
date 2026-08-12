@@ -66,14 +66,14 @@ SHELL_SURFACE_KIND ShellSurfaceKind(
     IN const WINDOW_DATA* data
     );
 
-// TRUE when this window IS a classified shell surface whose card measurement has FINISHED
-// and found NOTHING (attempts exhausted, no sticky last-good). On 25H2 that is the
-// signature of a shell host window that is not actually presenting a menu - the persistent
-// StartMenuExperienceHost surface that exists while Start is CLOSED. Mapping it announces
-// a window with no menu in it, which dom0 renders as a slice of bare desktop at whatever
-// (often bogus, even off-screen) rect the surface reports (user-reported 2026-08-12:
-// "maximized window, then dead", "window at random position"). FALSE while a measurement
-// is still in flight, so a genuinely-opening Start is never dropped mid-measure.
+// TRUE when this window is the START surface and we do NOT know where its card is
+// (never measured, or the measurement finished finding nothing, and no sticky last-good).
+// StartMenuExperienceHost keeps a top-level surface alive while Start is CLOSED; announcing
+// that phantom puts a menu-less window on the dom0 screen at whatever rect it reports
+// (measured 1201x919, and x=6050 on a 5120-wide screen), which then vanishes - the
+// user-reported "window at random position, then dead". Callers refuse to map it.
+// TOASTS ARE EXEMPT BY DESIGN: notifications are REQUIRED-kept, so a toast whose card
+// cannot be measured is still announced, just uncropped.
 BOOL ShellSurfaceCardless(
     IN const WINDOW_DATA* data
     );

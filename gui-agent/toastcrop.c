@@ -1047,24 +1047,32 @@ BOOL ShellSurfaceCardless(IN const WINDOW_DATA* data)
     if (g_TcDisabled || g_TcForced)
         return FALSE;                       // measurement disabled/forced: never gate on it
 
-    if (ShellSurfaceKind(data) == ShellSurfaceNone)
-        return FALSE;                       // not a shell surface - not ours to judge
+    // START ONLY. StartMenuExperienceHost keeps a top-level surface alive while Start is
+    // CLOSED, and that phantom has no card - announcing it puts a window with no menu in
+    // it on the dom0 screen, at whatever rect the surface reports (measured 1201x919, and
+    // x=6050 on a 5120-wide screen), which then vanishes: the user's "window at random
+    // position, then dead". Gating Start on "we know where its card is" removes the
+    // phantom AND the uncropped flash before the crop resolves.
+    //
+    // TOASTS ARE DELIBERATELY EXEMPT: CLAUDE.md makes notifications REQUIRED-kept, and the
+    // module's contract is that any measurement failure yields zero insets and the toast is
+    // announced UNCROPPED rather than lost. A toast we cannot measure must still be seen.
+    if (ShellSurfaceKind(data) != ShellSurfaceStart)
+        return FALSE;
 
-    BOOL cardless = FALSE;
+    BOOL noCard = TRUE;
     EnterCriticalSection(&g_TcLock);
     {
         RECT lastGood;
         TOAST_CROP_ENTRY* slot = TcFindSlotLocked(data->Handle, data->Width, data->Height);
-        // Only a FINISHED measurement counts: Resolved with zero insets and no remembered
-        // card for this window. A slot that does not exist yet, or is still retrying, is
-        // "unknown", never "cardless" - dropping a surface mid-measure would lose the
-        // genuinely-opening menu.
-        cardless = slot && slot->Resolved &&
-            !(slot->Insets.left || slot->Insets.top || slot->Insets.right || slot->Insets.bottom) &&
-            !TcRecallLastGood(data->Handle, &lastGood);
+        if (slot && (slot->Insets.left || slot->Insets.top ||
+                     slot->Insets.right || slot->Insets.bottom))
+            noCard = FALSE;                 // measured, card known
+        else if (TcRecallLastGood(data->Handle, &lastGood))
+            noCard = FALSE;                 // sticky card from an earlier open
     }
     LeaveCriticalSection(&g_TcLock);
-    return cardless;
+    return noCard;
 }
 
 void ToastCropEvict(IN HWND window)
