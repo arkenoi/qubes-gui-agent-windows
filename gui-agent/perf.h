@@ -67,12 +67,34 @@
 // to either. These allow each to be disabled independently.
 #define REG_CONFIG_DDA_CAPTURE_VALUE L"DdaCapture"     // DWORD 0/1, default 1
 #define REG_CONFIG_FRAME_DROP_VALUE  L"FrameDrop"      // DWORD 0/1, default 0 - see below
-// Guest-native drag wobble fix (DWORD 0/1, default 1 = fix active). While the left
-// button is held on a window, the input handlers translate dom0's window-relative
-// coordinates against the origin FROZEN at button-down, and position-only announces
-// for that window are withheld until release (one final announce + settle repaint).
-// 0 restores the historic live-origin behaviour for the interleaved regression run.
-#define REG_CONFIG_INPUT_DRAG_FREEZE_VALUE L"InputDragFreeze" // DWORD 0/1, default 1
+// Guest-native drag wobble FREEZE fallback (DWORD 0/1, default 0 - superseded by the
+// live servo below, kept as the operator escape hatch; freeze=1 takes precedence over
+// the servo). While the left button is held on a window, the input handlers translate
+// dom0's window-relative coordinates against the origin FROZEN at button-down, and
+// position-only announces for that window are withheld until release (one final
+// announce + settle repaint). Exact, but the dom0 window does not move until release -
+// rejected as the default by the user 2026-08-12.
+#define REG_CONFIG_INPUT_DRAG_FREEZE_VALUE L"InputDragFreeze" // DWORD 0/1, default 0
+// LIVE-FEEDBACK drag servo (D1 drag wobble, second iteration - the default fix; full
+// mechanism comment at g_DragAnnounces in main.c). Announces stay LIVE during a
+// guest-native drag; the input translation reconstructs dom0's applied origin from the
+// agent's own timestamped announce ring and servos the window toward the reconstructed
+// cursor at a fractional gain. All constants are registry-tunable so the guest can be
+// tuned WITHOUT a rebuild:
+//   InputDragServo           0/1, default 1 - master switch (InputDragFreeze=1 wins).
+//   InputDragServoGainPct    1..100, default 60 - beta*100. Analysis: under a
+//       deliberate +/-46 ms lag-estimate mismatch the worst closed-loop root is 0.881
+//       at 60 but 1.060 at 70 - values above ~65 are NOT a tuning range, they are the
+//       built-in falsifier (100 + a timing error must reproduce the wobble; the
+//       defect-reintroduction proof CLAUDE.md requires of the acceptance metric).
+//   InputDragServoTauMs      default 25 - assumed announce transit+apply time,
+//       clamped to 250 (the max measured apply lag).
+//   InputDragServoDeadbandPx default 3 - per-axis deviation deadband; absorbs announce
+//       quantization so a stationary hand produces a stationary window.
+#define REG_CONFIG_INPUT_DRAG_SERVO_VALUE L"InputDragServo"
+#define REG_CONFIG_INPUT_DRAG_SERVO_GAIN_VALUE L"InputDragServoGainPct"
+#define REG_CONFIG_INPUT_DRAG_SERVO_TAU_VALUE L"InputDragServoTauMs"
+#define REG_CONFIG_INPUT_DRAG_SERVO_DEADBAND_VALUE L"InputDragServoDeadbandPx"
 // Mis-render fix (DWORD 0/1, default 1 = fix active): drop DDA ownership of a
 // per-window channel the moment the frame loop observes the window's position
 // changed, so the move-settle recapture reaches the engine instead of being
@@ -164,10 +186,18 @@ extern BOOL     g_FrameDrop;
 extern BOOL     g_SweepDdaExempt;
 
 // Freeze the input translation origin + withhold position announces during a
-// guest-native drag (D1 drag wobble; see g_InputDragOrigin* in main.c). Default ON:
-// the live-origin loop is divergent for the measured announce-apply lag (66-250 ms
-// against a ~10 ms event rate), saturating at 40-168 px oscillations.
+// guest-native drag (D1 drag wobble; see g_InputDragOrigin* in main.c). Default OFF
+// since the live servo landed: exact but motionless-until-release, which the user
+// rejected. Kept as the first-tier fallback; when ON it takes precedence over the
+// servo. Both off = the historic live-origin behaviour (divergent for the measured
+// 66-250 ms announce-apply lag, saturating at 40-168 px oscillations).
 extern BOOL     g_InputDragFreeze;
+
+// Live-feedback drag servo (see the knob block above and g_DragAnnounces in main.c).
+extern BOOL     g_InputDragServo;
+extern DWORD    g_InputDragServoGainPct;
+extern DWORD    g_InputDragServoTauMs;
+extern DWORD    g_InputDragServoDeadband;
 
 // Drop DDA ownership when the frame loop sees a window move (D2 mis-render). Default
 // ON: without it the move-settle recapture is a no-op for a DDA-active window and the

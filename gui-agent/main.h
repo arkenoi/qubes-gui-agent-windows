@@ -51,6 +51,19 @@ extern DWORD g_InputDragLastEventTick;
 extern int g_InputDragOriginX;
 extern int g_InputDragOriginY;
 extern BOOL g_InputDragOriginValid;
+// Live-feedback drag servo (D1, second iteration; mechanism comment at g_DragAnnounces
+// in main.c): grab offset captured at the Button1 press, plus the timestamped ring of
+// position announces sent for the latched window from which the input path reconstructs
+// dom0's applied origin. Pump-thread-only, like the frozen-origin state above.
+extern int g_DragLastInjectedX;
+extern int g_DragLastInjectedY;
+extern int g_InputDragGrabX;
+extern int g_InputDragGrabY;
+void DragAnnounceReset(IN int x, IN int y);
+void DragAnnounceClear(void);
+void DragAnnounceRecord(IN int x, IN int y);
+BOOL DragAnnounceMoved(void);
+BOOL DragAnnounceOriginAt(IN DWORD atTick, OUT int* x, OUT int* y);
 extern char g_DomainName[256];
 extern USHORT g_GuiDomainId;
 extern CRITICAL_SECTION g_csWatchedWindows;

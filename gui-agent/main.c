@@ -160,6 +160,174 @@ DWORD g_InputDragLastEventTick = 0;
 int g_InputDragOriginX = 0;
 int g_InputDragOriginY = 0;
 BOOL g_InputDragOriginValid = FALSE;
+
+// LIVE-FEEDBACK drag servo (D1 drag wobble, second iteration; default path - the freeze
+// above remains as the InputDragFreeze=1 fallback). The freeze is exact but was rejected:
+// the dom0 window must keep FOLLOWING the cursor during the drag. So announces stay live
+// and the loop stays closed - but the control law is restructured. With the LIVE origin
+// the injection is A = r + W_live and the app's modal move loop applies W' = A - g: a
+// gain-1 servo through the announce->apply->next-motion transport lag (measured 66-250 ms
+// against a ~46 ms move-loop cadence, i.e. 1-5 samples of delay). Its characteristic
+// roots are |z| = 1.00 at one sample and 1.15-1.19 at 2-5 - structurally oscillatory
+// across the WHOLE measured lag range, which is the observed 40-163 px forth-and-back
+// with 16-19% of announces reversing direction.
+//
+// The fix removes the delay from the loop equation instead of detuning around it
+// (a plain gain reduction stable to 250 ms needs beta <= 0.285 and then trails the
+// cursor by v*T/beta ~ 250 px - rejected): dom0's applied origin D is RECONSTRUCTED
+// from the agent's own timestamped announce history. D can only ever take values this
+// agent announced, in order (measured drift announced-vs-applied: 0,0 in 240/240
+// samples), so estimating it is a pure timing problem, and the announce send times are
+// known exactly - only the small transit+apply time tau must be assumed. The injection
+// then servos the window toward the reconstructed cursor C_hat = r + D_hat at a
+// fractional gain: with the history exact the closed loop is z^m * (z - (1-beta)) - a
+// single real pole INDEPENDENT of the transport lag m, so it cannot oscillate for any
+// measured lag; a deliberate +/-46 ms timing mismatch (twice the plausible tau error)
+// keeps the worst root at 0.881 for beta = 0.6, while beta = 0.7 breaks at 1.060 (do
+// not raise the default). Full-jitter simulation against the measured distributions:
+// 1.6% residual reversals (at announce-quantization amplitude) vs 43% for the live
+// origin, 11 px stop-overshoot, ~150 ms step settling.
+//
+// All state below is pump-thread-only, the same invariant as the frozen-origin globals
+// above: HandleButton/HandleMotion (HandleServerData), the frame walk and the settle
+// sweep all run on WatchForEvents' thread.
+
+// Grab offset: dom0's window-relative cursor position at the Button1 press that armed
+// the latch. The press injection lands the guest cursor at (origin + grab), so the
+// modal move loop's own grab offset equals this by construction.
+// The cursor position the servo last injected for the latched window. The drag law walks
+// THIS toward the reconstructed dom0 cursor, so the modal loop's grab offset never enters
+// the loop and cannot poison it when Windows re-anchors it mid-drag (review finding).
+int g_DragLastInjectedX = 0;
+int g_DragLastInjectedY = 0;
+int g_InputDragGrabX = 0;
+int g_InputDragGrabY = 0;
+
+// Ring of position announces SENT for the latched window: what dom0 was told, and when.
+// 16 entries x the 66 ms measured announce gap covers >1 s of history against the
+// 250 ms max observed apply lag - 4x headroom.
+#define DRAG_ANNOUNCE_RING 16
+static struct
+{
+    DWORD Tick;
+    int X;
+    int Y;
+} g_DragAnnounces[DRAG_ANNOUNCE_RING];
+static UINT g_DragAnnounceHead = 0;  // next write slot
+static UINT g_DragAnnounceCount = 0; // 0 = no drag armed, ring must not be read
+
+// Seed the ring at the Button1 press with the origin the press translated against:
+// until the first mid-drag announce is applied dom0's origin CANNOT differ from it, so
+// the first ~66 ms of every drag reconstruct exactly by construction.
+void DragAnnounceReset(IN int x, IN int y)
+{
+    g_DragAnnounces[0].Tick = GetTickCount();
+    g_DragAnnounces[0].X = x;
+    g_DragAnnounces[0].Y = y;
+    g_DragAnnounceHead = 1;
+    g_DragAnnounceCount = 1;
+}
+
+void DragAnnounceClear(void)
+{
+    g_DragAnnounceHead = 0;
+    g_DragAnnounceCount = 0;
+}
+
+// Record one sent position announce for the latched window. Callers gate on the latch;
+// the count gate here additionally refuses to grow a ring no press has seeded.
+void DragAnnounceRecord(IN int x, IN int y)
+{
+    if (g_DragAnnounceCount == 0)
+        return;
+    // A same-position announce (size-only change) does not move dom0's origin: skip it,
+    // so the ring stays a strict position history and DragAnnounceMoved() below keeps
+    // meaning "this window has MOVED during this drag" - the discriminator that keeps
+    // client-area drags out of the damped law.
+    {
+        UINT newest = (g_DragAnnounceHead + DRAG_ANNOUNCE_RING - 1) % DRAG_ANNOUNCE_RING;
+        if (g_DragAnnounces[newest].X == x && g_DragAnnounces[newest].Y == y)
+            return;
+    }
+    g_DragAnnounces[g_DragAnnounceHead].Tick = GetTickCount();
+    g_DragAnnounces[g_DragAnnounceHead].X = x;
+    g_DragAnnounces[g_DragAnnounceHead].Y = y;
+    g_DragAnnounceHead = (g_DragAnnounceHead + 1) % DRAG_ANNOUNCE_RING;
+    if (g_DragAnnounceCount < DRAG_ANNOUNCE_RING)
+        g_DragAnnounceCount++;
+}
+
+// TRUE once at least one position announce for the latched window has gone out since
+// the press: the window demonstrably moves with this drag, so the feedback loop
+// (announce -> dom0 apply -> window-relative coordinates) is closed and the damped
+// law applies. Until then - which covers EVERY client-area drag (text selection,
+// scrollbars, sliders: the window never moves, so this never trips) and the first
+// ~66 ms of every title-bar drag - dom0's applied origin cannot differ from the press
+// origin, the reconstruction is exact, and damping would be pure harm: it would make
+// a selection drag's cursor undershoot by (1-beta) of its pull from the grab point.
+BOOL DragAnnounceMoved(void)
+{
+    return g_DragAnnounceCount > 1;
+}
+
+// dom0's origin at absolute tick atTick, linearly interpolated between the two
+// bracketing announces. D really moves stepwise at unobservable apply times;
+// interpolation smooths the announce quantization instead of guessing each step edge,
+// and the servo's stability margin (worst root 0.881 under a +/-46 ms mismatch, a full
+// announce interval) covers the difference. Clamped to the oldest entry before the
+// recorded range (the exact press origin) and to the newest after it.
+BOOL DragAnnounceOriginAt(IN DWORD atTick, OUT int* x, OUT int* y)
+{
+    if (g_DragAnnounceCount == 0)
+        return FALSE;
+
+    UINT oldest = (g_DragAnnounceHead + DRAG_ANNOUNCE_RING - g_DragAnnounceCount) % DRAG_ANNOUNCE_RING;
+    BOOL haveBelow = FALSE;
+    UINT below = 0; // logical index (0..count-1) of the newest entry with Tick <= atTick
+    for (UINT i = 0; i < g_DragAnnounceCount; i++)
+    {
+        UINT idx = (oldest + i) % DRAG_ANNOUNCE_RING;
+        // Signed wraparound-safe compare: entry tick <= atTick?
+        if ((LONG)(g_DragAnnounces[idx].Tick - atTick) <= 0)
+        {
+            haveBelow = TRUE;
+            below = i;
+        }
+        else
+            break; // ticks are monotone; the first future entry ends the scan
+    }
+
+    if (!haveBelow) // atTick predates the whole ring: the seed (press origin) is exact
+    {
+        *x = g_DragAnnounces[oldest].X;
+        *y = g_DragAnnounces[oldest].Y;
+        return TRUE;
+    }
+
+    UINT prevIdx = (oldest + below) % DRAG_ANNOUNCE_RING;
+    if (below + 1 >= g_DragAnnounceCount) // nothing newer recorded: clamp to the last announce
+    {
+        *x = g_DragAnnounces[prevIdx].X;
+        *y = g_DragAnnounces[prevIdx].Y;
+        return TRUE;
+    }
+
+    UINT nextIdx = (oldest + below + 1) % DRAG_ANNOUNCE_RING;
+    DWORD span = g_DragAnnounces[nextIdx].Tick - g_DragAnnounces[prevIdx].Tick;
+    DWORD frac = atTick - g_DragAnnounces[prevIdx].Tick;
+    if (span == 0)
+    {
+        *x = g_DragAnnounces[nextIdx].X;
+        *y = g_DragAnnounces[nextIdx].Y;
+        return TRUE;
+    }
+    *x = g_DragAnnounces[prevIdx].X + (int)(((LONGLONG)(g_DragAnnounces[nextIdx].X -
+        g_DragAnnounces[prevIdx].X) * (LONGLONG)frac) / (LONGLONG)span);
+    *y = g_DragAnnounces[prevIdx].Y + (int)(((LONGLONG)(g_DragAnnounces[nextIdx].Y -
+        g_DragAnnounces[prevIdx].Y) * (LONGLONG)frac) / (LONGLONG)span);
+    return TRUE;
+}
+
 HWND g_TaskbarWindow = NULL;
 BOOL g_ShowTaskbar = FALSE;
 
@@ -1692,6 +1860,11 @@ static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
         entry->LastCfgW = (int)entry->Width;
         entry->LastCfgH = (int)entry->Height;
         entry->LastCfgOvr = entry->IsOverrideRedirect;
+        // Live drag servo: the reconstruction of dom0's applied origin is only as
+        // complete as this history - every position the daemon will apply for the
+        // latched window must be recorded at its send tick.
+        if (entry->Handle == g_InputDragWindow && g_InputDragOriginValid)
+            DragAnnounceRecord(entry->X, entry->Y);
     }
 }
 
@@ -1793,6 +1966,11 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         entry->LastCfgW = (int)entry->Width;
         entry->LastCfgH = (int)entry->Height;
         entry->LastCfgOvr = entry->IsOverrideRedirect;
+
+        // Live drag servo: mirror of the record in CfgFlushPendingMove - this is the
+        // path a mid-drag position announce normally takes (through the 16 ms limiter).
+        if (entry->Handle == g_InputDragWindow && g_InputDragOriginValid)
+            DragAnnounceRecord(entry->X, entry->Y);
 
         // A WM-managed shell surface (or=0 with a crop) must be DRAGGABLE but not
         // RESIZEABLE. The size-lock hint (PMinSize==PMaxSize) is sent HERE, on the
@@ -1952,6 +2130,7 @@ void DaemonSettleSweep(void)
             (uint32_t)(ULONG_PTR)g_InputDragWindow, INPUT_DRAG_STUCK_MS);
         g_InputDragWindow = NULL;
         g_InputDragOriginValid = FALSE;
+        DragAnnounceClear(); // the servo's history dies with the latch it belongs to
     }
 
     EnterCriticalSection(&g_csWatchedWindows);
@@ -2014,6 +2193,7 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
     {
         g_InputDragWindow = NULL;
         g_InputDragOriginValid = FALSE;
+        DragAnnounceClear(); // recycled HWND must not inherit the dead drag's history
     }
 
     // Never announced (synthesized, or announce failed): the daemon has no CREATE for

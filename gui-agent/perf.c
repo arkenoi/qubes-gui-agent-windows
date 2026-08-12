@@ -43,7 +43,11 @@ BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
 BOOL     g_FrameDrop   = FALSE;
 BOOL     g_SweepDdaExempt = TRUE;
-BOOL     g_InputDragFreeze = TRUE;
+BOOL     g_InputDragFreeze = FALSE; // fallback tier only; the servo below is the default fix
+BOOL     g_InputDragServo = TRUE;
+DWORD    g_InputDragServoGainPct = 60; // beta*100; 70 is already unstable under a 46 ms mismatch
+DWORD    g_InputDragServoTauMs = 25;   // assumed announce transit+apply time
+DWORD    g_InputDragServoDeadband = 3; // px per axis
 BOOL     g_DdaMoveInvalidate = TRUE;
 BOOL     g_MonInfoCache = FALSE;
 BOOL     g_ResyncDragDefer = FALSE;
@@ -219,6 +223,31 @@ void PerfInit(void)
         {
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_FREEZE_VALUE, &v, NULL))
                 g_InputDragFreeze = (v != 0);
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_VALUE, &v, NULL))
+                g_InputDragServo = (v != 0);
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_GAIN_VALUE, &v, NULL))
+            {
+                // 0 would inject a constant (a freeze that still announces - nonsense);
+                // >100 would overshoot every event. The unstable 66..100 range stays
+                // reachable ON PURPOSE: gain=100 is the defect-reintroduction falsifier.
+                if (v < 1)
+                    v = 1;
+                if (v > 100)
+                    v = 100;
+                g_InputDragServoGainPct = v;
+            }
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_TAU_VALUE, &v, NULL))
+            {
+                if (v > 250) // beyond the max measured apply lag: a misconfiguration
+                    v = 250;
+                g_InputDragServoTauMs = v;
+            }
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_DEADBAND_VALUE, &v, NULL))
+            {
+                if (v > 50) // larger than the smallest measured oscillation (40 px):
+                    v = 50; // past that the dead zone is itself a visible defect
+                g_InputDragServoDeadband = v;
+            }
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_DDA_MOVE_INVALIDATE_VALUE, &v, NULL))
                 g_DdaMoveInvalidate = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_MON_INFO_CACHE_VALUE, &v, NULL))
@@ -227,6 +256,9 @@ void PerfInit(void)
                 g_ResyncDragDefer = (v != 0);
         }
         LogInfo("QGADRAGFREEZE %s", g_InputDragFreeze ? L"on" : L"off");
+        LogInfo("QGADRAGSERVO %s gain=%u%% tau=%ums deadband=%upx",
+            g_InputDragServo ? L"on" : L"off", g_InputDragServoGainPct,
+            g_InputDragServoTauMs, g_InputDragServoDeadband);
         LogInfo("QGADDAMOVEINV %s", g_DdaMoveInvalidate ? L"on" : L"off");
         LogInfo("QGAMONCACHE %s", g_MonInfoCache ? L"on" : L"off");
         LogInfo("QGARESYNCDEFER %s", g_ResyncDragDefer ? L"on" : L"off");

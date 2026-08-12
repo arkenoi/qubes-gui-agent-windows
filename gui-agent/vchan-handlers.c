@@ -464,6 +464,23 @@ static DWORD HandleButton(IN HWND window)
             trackedX = g_InputDragOriginX;
             trackedY = g_InputDragOriginY;
         }
+        // LIVE SERVO (D1, live-feedback fix; mechanism comment at g_DragAnnounces in
+        // main.c): translate buttons - critically the Button1 RELEASE - against dom0's
+        // RECONSTRUCTED applied origin, not the live tracked one. The live origin leads
+        // dom0's by the announce round-trip (66-250 ms measured), so a release through
+        // it would land up to the in-flight displacement away from where dom0 aimed;
+        // the reconstruction is dom0's own applied value to within the transit-time
+        // estimate. Full deviation here, unlike the damped motion path: the release
+        // must land exactly, and no further motion exists for a damped step to
+        // converge through. A Button1 PRESS never takes this path (it anchors a NEW
+        // drag; stale state from a lost release must not leak in), and a failed
+        // reconstruction falls through to the historic live lookup.
+        else if (g_InputDragServo && window == g_InputDragWindow && g_InputDragOriginValid &&
+                 !(buttonMsg.button == Button1 && buttonMsg.type == ButtonPress) &&
+                 DragAnnounceOriginAt(GetTickCount() - g_InputDragServoTauMs, &trackedX, &trackedY))
+        {
+            haveTracked = TRUE;
+        }
         else
         {
             EnterCriticalSection(&g_csWatchedWindows);
@@ -571,6 +588,25 @@ static DWORD HandleButton(IN HWND window)
         g_InputDragOriginValid = (buttonMsg.type == ButtonPress) && haveTracked;
         g_InputDragOriginX = trackedX;
         g_InputDragOriginY = trackedY;
+        // Live-servo state (see g_DragAnnounces in main.c). The grab offset is dom0's
+        // window-relative press position: this press injects the guest cursor at
+        // (origin + grab), so the modal move loop's own grab offset equals it by
+        // construction. The announce ring is seeded with the origin THIS press
+        // translated against - dom0's applied origin cannot differ from it until the
+        // first mid-drag announce lands, so early reconstructions are exact. A release
+        // (or an untracked press) clears the ring instead: reads are gated on the
+        // latch, and a stale history must never survive into the next drag.
+        // Seed the cursor servo with the position this press itself injects, so the
+        // first motion event walks from a known-exact point (the press translation is
+        // exact: no announce has moved dom0's origin yet).
+        g_DragLastInjectedX = buttonMsg.x + trackedX;
+        g_DragLastInjectedY = buttonMsg.y + trackedY;
+        g_InputDragGrabX = buttonMsg.x;
+        g_InputDragGrabY = buttonMsg.y;
+        if (g_InputDragOriginValid)
+            DragAnnounceReset(trackedX, trackedY);
+        else
+            DragAnnounceClear();
     }
 
     LogDebug("window 0x%x, (%d,%d), flags 0x%x", window, buttonMsg.x, buttonMsg.y, inputEvent.mi.dwFlags);
@@ -636,6 +672,77 @@ static DWORD HandleMotion(IN HWND window)
                 }
             }
             LeaveCriticalSection(&g_csWatchedWindows);
+
+            // LIVE SERVO (D1 drag wobble, live-feedback fix; mechanism comment at
+            // g_DragAnnounces in main.c). The plain live translation below this branch
+            // is A = r + W_live; the app's modal move loop applies W' = A - g, closing
+            // a gain-1 servo through the 66-250 ms announce-apply transport lag -
+            // structurally oscillatory over the whole measured lag range (roots
+            // |z| = 1.00-1.19), the observed 40-163 px forth-and-back. Restructure the
+            // law instead of freezing the window: reconstruct the dom0 cursor
+            // C_hat = r + D_hat from our own announce history (which removes the lag
+            // from the loop equation - single real pole at 1-beta, stable for ANY
+            // transport lag), then move the window a FRACTION beta of the remaining
+            // deviation per event. The 3 px default deadband absorbs announce
+            // quantization so a stationary hand yields a stationary window. Cost of
+            // the detune: ~33 px of extra cursor trail at the measured p50 hand speed,
+            // on top of the ~83 px irreducible pipeline lag even a perfect estimator
+            // shows. A failed reconstruction (no seeded ring) leaves the historic
+            // live-origin translation untouched.
+            if (haveTracked && g_InputDragServo &&
+                window == g_InputDragWindow && g_InputDragOriginValid)
+            {
+                int dhatX, dhatY;
+                if (DragAnnounceOriginAt(GetTickCount() - g_InputDragServoTauMs, &dhatX, &dhatY))
+                {
+                    if (!DragAnnounceMoved())
+                    {
+                        // No position announce since the press: dom0's applied origin
+                        // IS the press origin, the reconstruction is exact and no
+                        // feedback loop exists to damp. This is every client-area drag
+                        // (selection, scrollbars - the window never moves, so this
+                        // branch carries the whole gesture) and the first ~66 ms of a
+                        // title-bar drag. Damping here would be pure harm: a selection
+                        // cursor would undershoot by (1-beta) of its pull.
+                        trackedX = dhatX;
+                        trackedY = dhatY;
+                    }
+                    else
+                    {
+                        // SERVO THE CURSOR, NOT THE WINDOW. Deviation between the
+                        // reconstructed dom0 cursor and the cursor we last injected;
+                        // the injected cursor then walks toward the real one by beta.
+                        //
+                        // Deliberately NOT expressed against the grab offset: Windows
+                        // RE-ANCHORS the modal loop's grab mid-drag (dragging a
+                        // maximized or snapped window to restore it re-anchors it
+                        // proportionally under the cursor), and a law written against a
+                        // grab captured at the press then has a fixed point offset by
+                        // (grab - grab_new)*(1/beta - 1) - a constant several-hundred-px
+                        // tracking error for a restore gesture (review finding, with an
+                        // analytic fixed point and a simulation agreeing at ~390px).
+                        // Servoing the cursor removes the grab from the loop entirely,
+                        // so whatever grab the modal loop currently holds is applied by
+                        // Windows itself and cancels. It also fixes left/top
+                        // resize-border drags, which re-anchor the same way.
+                        int cHatX = x + dhatX;
+                        int cHatY = y + dhatY;
+                        int devX = cHatX - g_DragLastInjectedX;
+                        int devY = cHatY - g_DragLastInjectedY;
+                        int db = (int)g_InputDragServoDeadband;
+                        if (devX <= db && devX >= -db)
+                            devX = 0;
+                        if (devY <= db && devY >= -db)
+                            devY = 0;
+                        g_DragLastInjectedX += devX * (int)g_InputDragServoGainPct / 100;
+                        g_DragLastInjectedY += devY * (int)g_InputDragServoGainPct / 100;
+                        // Express the target as the addend the shared translation below
+                        // applies to the window-relative (x,y).
+                        trackedX = g_DragLastInjectedX - x;
+                        trackedY = g_DragLastInjectedY - y;
+                    }
+                }
+            }
         }
 
         if (haveTracked)
