@@ -595,19 +595,10 @@ static ULONG SendWindowCreateInternal(IN const WINDOW_DATA *windowData, IN BOOL 
         status = SendWindowHints(windowData->Handle, PPosition); // program-specified position
         if (ERROR_SUCCESS != status)
             return status;
-
-        // A WM-managed shell surface (Start/toast: or=0 with a crop) is draggable but must
-        // NOT be resizeable - lock its size so the dom0 WM shows no resize handles. A resize
-        // would stretch the frame past the fixed-size guest card and expose desktop behind
-        // it. Keyed on the crop, so ordinary windows are unaffected.
-        if (!windowData->IsOverrideRedirect &&
-            (windowData->CropLeft || windowData->CropTop ||
-             windowData->CropRight || windowData->CropBottom))
-        {
-            status = SendWindowSizeLock(windowData->Handle, windowData->Width, windowData->Height);
-            if (ERROR_SUCCESS != status)
-                return status;
-        }
+        // NOTE: the shell-surface size-lock is NOT sent here. At CREATE the toast crop has
+        // not resolved yet (it is measured asynchronously), so the insets are zero and the
+        // window is not yet WM-managed. It is sent from SendWindowConfigureIfChanged once
+        // the crop lands and the card size is announced.
     }
 
     return ERROR_SUCCESS;

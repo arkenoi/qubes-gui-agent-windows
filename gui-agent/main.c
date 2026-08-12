@@ -934,6 +934,8 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     }
 
     ZeroMemory(entry, sizeof(*entry));
+    entry->SizeLockW = -1; // never sent; distinguishes "locked to 0" impossible-state
+    entry->SizeLockH = -1;
 
     entry->X = rect.left;
     entry->Y = rect.top;
@@ -1084,9 +1086,16 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     // back as MSG_CONFIGURE and HandleConfigure applies them crop-compensated. This
     // deliberately deviates from Linux-agent parity (menus are OR there) - it is what the
     // user asked for, and gui-agent\ShellManaged=0 restores parity.
-    if (entry->IsOverrideRedirect && g_ShellManaged && IsShellToastWindow(entry))
+    // ...but ONLY once the toast crop has resolved (insets are set just above). Before that
+    // the surface's announced size is the full/host rect - making THAT a WM-managed window
+    // would flash a giant resizable frame until the crop lands (measured 2026-08-12: a shell
+    // CoreWindow announced or=0 at 5120x1336). Staying an override-redirect popup until the
+    // card is known avoids that; the crop-resolve re-announce then flips it to or=0 via the
+    // usual UpdateWindowData->ToggleMap path, and the size-lock hint goes out with it.
+    if (entry->IsOverrideRedirect && g_ShellManaged && IsShellToastWindow(entry) &&
+        (entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom))
     {
-        LogDebug("0x%x: shell surface announced WM-managed (ShellManaged)", entry->Handle);
+        LogDebug("0x%x: cropped shell surface announced WM-managed (ShellManaged)", entry->Handle);
         entry->IsOverrideRedirect = FALSE;
     }
 
@@ -1500,6 +1509,23 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         entry->LastCfgW = (int)entry->Width;
         entry->LastCfgH = (int)entry->Height;
         entry->LastCfgOvr = entry->IsOverrideRedirect;
+
+        // A WM-managed shell surface (or=0 with a crop) must be DRAGGABLE but not
+        // RESIZEABLE. The size-lock hint (PMinSize==PMaxSize) is sent HERE, on the
+        // announce path, because the crop that identifies these as cards resolves
+        // asynchronously AFTER the window is created - sending it at CREATE (as first
+        // tried) always ran with zero insets and never fired. Re-sent only when the
+        // announced card size actually changes.
+        if (!entry->IsOverrideRedirect &&
+            (entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom) &&
+            (entry->SizeLockW != (int)entry->Width || entry->SizeLockH != (int)entry->Height))
+        {
+            if (SendWindowSizeLock(entry->Handle, entry->Width, entry->Height) == ERROR_SUCCESS)
+            {
+                entry->SizeLockW = (int)entry->Width;
+                entry->SizeLockH = (int)entry->Height;
+            }
+        }
     }
     return status;
 }

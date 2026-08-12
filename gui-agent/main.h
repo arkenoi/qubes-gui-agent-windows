@@ -121,6 +121,11 @@ typedef struct _WINDOW_DATA
     int LastCfgH;
     BOOL LastCfgOvr;
 
+    // Card size the dom0 size-lock hint was last sent for (WM-managed shell surfaces only).
+    // -1 = never sent; re-sent when the announced card size changes.
+    int SizeLockW;
+    int SizeLockH;
+
     // Size the dom0 WM settled on for this window while maximized (from the daemon's
     // MSG_CONFIGURE): its decorations eat into the screen, so it can display slightly
     // less than the guest work area. While maximized, the reported/granted geometry is
