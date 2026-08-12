@@ -49,6 +49,23 @@ BOOL IsShellToastWindow(
     IN const WINDOW_DATA* data
     );
 
+// Which shell-host process a classified surface belongs to. The per-surface ShellManaged
+// policy needs the distinction: the GWeck goal state makes START WM-managed (movable,
+// size-locked) while toasts stay override-redirect corner popups (user spec 2026-08-12).
+typedef enum _SHELL_SURFACE_KIND
+{
+    ShellSurfaceNone = 0,
+    ShellSurfaceToast,    // ShellExperienceHost.exe (banners, Action Center)
+    ShellSurfaceStart,    // StartMenuExperienceHost.exe
+    ShellSurfaceSearch,   // SearchHost.exe
+} SHELL_SURFACE_KIND;
+
+// ShellSurfaceNone unless the window passes the full toast-window classifier; then the
+// kind of the owning shell host. IsShellToastWindow(data) == (kind != None).
+SHELL_SURFACE_KIND ShellSurfaceKind(
+    IN const WINDOW_DATA* data
+    );
+
 // Insets to subtract from this window's raw rect, from the (hwnd, raw size) cache;
 // measures via UIA on a miss. Always writes *insets (all zero = do not crop) and returns
 // TRUE only when a nonzero, validated crop applies. Safe to call for any window.

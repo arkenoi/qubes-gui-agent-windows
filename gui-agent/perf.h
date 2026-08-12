@@ -59,6 +59,7 @@
 #define REG_CONFIG_PROTO_WOBBLE_VALUE L"ProtoTraceWobble"
 #define REG_CONFIG_BUTTON_ABS_VALUE L"ButtonAbsolute"
 #define REG_CONFIG_SHELL_MANAGED_VALUE L"ShellManaged"
+#define REG_CONFIG_BLOCK_MENU_KEY_VALUE L"BlockMenuKey"
 // Z-order sync experiment: raise the window dom0 focused (see HandleFocus). DWORD 0/1.
 #define REG_CONFIG_FOCUS_RAISE_VALUE L"FocusRaise"
 // Attribution switches. The typing improvement was measured on a build carrying BOTH
@@ -100,8 +101,21 @@ extern BOOL     g_ProtoTraceWobble;
 extern BOOL     g_ButtonAbsolute;
 
 // Announce classified shell surfaces (toasts/Start/Search) as WM-managed windows instead
-// of override-redirect, so the dom0 WM can frame and move them ("ShellManaged", default on).
-extern BOOL     g_ShellManaged;
+// of override-redirect, so the dom0 WM can frame and move them. Three-valued policy
+// ("ShellManaged"): 0 = none (every shell surface stays an override-redirect popup,
+// Linux-agent parity), 1 = all classified surfaces, 2 = START ONLY (the GWeck goal state,
+// default: Start is movable + size-locked, toasts stay corner popups per the 2026-08-12
+// user spec).
+#define SHELL_MANAGED_NONE  0
+#define SHELL_MANAGED_ALL   1
+#define SHELL_MANAGED_START 2
+extern DWORD    g_ShellManaged;
+
+// Drop the forwarded Super/Windows key (and whole Mod4 chords) in seamless mode
+// ("BlockMenuKey", default on): dom0 owns that key, a stray forward pops the guest Start
+// over the seamless desktop (GWeck #44), and the sanctioned way to open Start is the
+// dom0 appmenu shortcut, which injects guest-side and never crosses this filter.
+extern BOOL     g_BlockMenuKey;
 
 // Raise on MSG_FOCUS, making guest z-order agree with dom0 for the focused window.
 // Off by default = historic behaviour. Read once in PerfInit().

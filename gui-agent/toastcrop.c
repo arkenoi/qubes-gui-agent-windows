@@ -75,7 +75,7 @@ typedef struct _TOAST_CROP_ENTRY
 typedef struct _TOAST_PID_ENTRY
 {
     DWORD     ProcessId;
-    BOOL      IsShellExperienceHost;
+    SHELL_SURFACE_KIND Kind;   // which g_TcShellHostImages entry matched (None = no match)
     ULONGLONG LastUse;
 } TOAST_PID_ENTRY;
 
@@ -739,18 +739,22 @@ static BOOL TcEnqueueQueryLocked(IN HWND window, IN const RECT* raw, IN DWORD ra
     return TRUE;
 }
 
-// g_TcLock must be held.
-static BOOL TcIsShellExperienceHost(IN DWORD processId)
+// g_TcLock must be held. The order of g_TcShellHostImages defines the kind mapping:
+// [0] -> Toast, [1] -> Start, [2] -> Search.
+static SHELL_SURFACE_KIND TcShellHostKind(IN DWORD processId)
 {
+    static const SHELL_SURFACE_KIND kindByImage[] =
+        { ShellSurfaceToast, ShellSurfaceStart, ShellSurfaceSearch };
+
     if (processId == 0)
-        return FALSE;
+        return ShellSurfaceNone;
 
     for (int i = 0; i < TOAST_PID_CACHE_SIZE; i++)
     {
         if (g_TcPidCache[i].ProcessId == processId)
         {
             g_TcPidCache[i].LastUse = ++g_TcClock;
-            return g_TcPidCache[i].IsShellExperienceHost;
+            return g_TcPidCache[i].Kind;
         }
     }
 
@@ -758,7 +762,7 @@ static BOOL TcIsShellExperienceHost(IN DWORD processId)
     // longer one simply fails the query and the window is left uncropped.
     WCHAR path[MAX_PATH];
     DWORD size = RTL_NUMBER_OF(path);
-    BOOL match = FALSE;
+    SHELL_SURFACE_KIND match = ShellSurfaceNone;
 
     HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, processId);
     if (process)
@@ -767,8 +771,12 @@ static BOOL TcIsShellExperienceHost(IN DWORD processId)
         {
             const WCHAR* image = wcsrchr(path, L'\\');
             image = image ? image + 1 : path;
-            for (int i = 0; i < (int)RTL_NUMBER_OF(g_TcShellHostImages) && !match; i++)
-                match = (0 == _wcsicmp(image, g_TcShellHostImages[i]));
+            for (int i = 0; i < (int)RTL_NUMBER_OF(g_TcShellHostImages); i++)
+                if (0 == _wcsicmp(image, g_TcShellHostImages[i]))
+                {
+                    match = kindByImage[i];
+                    break;
+                }
         }
         CloseHandle(process);
     }
@@ -783,36 +791,41 @@ static BOOL TcIsShellExperienceHost(IN DWORD processId)
     }
 
     g_TcPidCache[victim].ProcessId = processId;
-    g_TcPidCache[victim].IsShellExperienceHost = match;
+    g_TcPidCache[victim].Kind = match;
     g_TcPidCache[victim].LastUse = ++g_TcClock;
     return match;
 }
 
 BOOL IsShellToastWindow(IN const WINDOW_DATA* data)
 {
+    return ShellSurfaceKind(data) != ShellSurfaceNone;
+}
+
+SHELL_SURFACE_KIND ShellSurfaceKind(IN const WINDOW_DATA* data)
+{
     if (!data || !data->IsVisible)
-        return FALSE;
+        return ShellSurfaceNone;
 
     // GetWindowData() folds DWM cloaking into IsVisible, so an uncloaked check is implied
     // by the test above.
     if (0 != wcscmp(data->Class, g_TcToastWindowClass))
-        return FALSE;
+        return ShellSurfaceNone;
 
     if (!HasFlags(data->Style, WS_POPUP))
-        return FALSE;
+        return ShellSurfaceNone;
 
     if (!HasFlags(data->ExStyle, WS_EX_TOPMOST | WS_EX_NOREDIRECTIONBITMAP))
-        return FALSE;
+        return ShellSurfaceNone;
 
     // Both would make this one of the windows ShouldAcceptWindow() REJECTS (shell drag
     // overlays, Office shadow strips). Requiring their absence is what keeps this
     // classifier provably disjoint from those rules.
     if (data->ExStyle & (WS_EX_TRANSPARENT | WS_EX_TOOLWINDOW))
-        return FALSE;
+        return ShellSurfaceNone;
 
     // The banner belongs to no other window; owned CoreWindows are somebody's real UI.
     if (data->Owner != NULL)
-        return FALSE;
+        return ShellSurfaceNone;
 
     // No size ceiling AT ALL any more. The old 90%-of-screen exclusion assumed an oversize
     // CoreWindow is "not a popup" and safe to leave alone - measured wrong on 25H2 at
@@ -826,10 +839,10 @@ BOOL IsShellToastWindow(IN const WINDOW_DATA* data)
     TcInit();
 
     EnterCriticalSection(&g_TcLock);
-    BOOL isToast = TcIsShellExperienceHost(data->ProcessId);
+    SHELL_SURFACE_KIND kind = TcShellHostKind(data->ProcessId);
     LeaveCriticalSection(&g_TcLock);
 
-    return isToast;
+    return kind;
 }
 
 // g_TcLock must be held.

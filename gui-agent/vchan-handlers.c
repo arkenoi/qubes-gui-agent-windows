@@ -355,6 +355,31 @@ static DWORD HandleKeypress(IN HWND window)
     /* ignore x, y */
     /* TODO: send to correct window */
 
+    // MENU-KEY BLOCK (seamless only). dom0 owns the Super/Windows key; a forwarded press
+    // pops the guest Start over the seamless desktop (GWeck #44 'weird pictures') and on
+    // 25H2 triggered the whole S1 garble class. Scancode-matched (keymap-independent of X
+    // keycode numbering): drop Super KEY PRESSES, and swallow any key event carrying the
+    // Mod4 state bit so whole Win+X chords die statelessly (the 'r' of Win+R arrives with
+    // Mod4 set; dropping only the Super events would leak a bare 'r'). Super RELEASES
+    // always pass, so a stuck modifier is structurally impossible. The dom0 appmenu
+    // shortcut opens Start via guest-local injection and never crosses this path.
+    if (g_BlockMenuKey && g_SeamlessMode)
+    {
+        WORD scan = g_KeycodeToScancode[keyMsg.keycode & 0xff];
+        BOOL super = (scan == 0xe05b || scan == 0xe05c);
+        if (super && keyMsg.type == KeyPress)
+        {
+            LogDebug("QGABLOCKWIN dropped Super press (keycode 0x%x)", keyMsg.keycode);
+            return ERROR_SUCCESS;
+        }
+        if (!super && (keyMsg.state & (1u << Mod4MapIndex)))
+        {
+            LogDebug("QGABLOCKWIN swallowed Mod4 chord key (keycode 0x%x type %u)",
+                keyMsg.keycode, keyMsg.type);
+            return ERROR_SUCCESS;
+        }
+    }
+
     inputEvent.type = INPUT_KEYBOARD;
     inputEvent.ki.time = 0;
     inputEvent.ki.wScan = 0;
@@ -922,7 +947,8 @@ static DWORD HandleFocus(IN HWND window)
         {
             LogWarning("window 0x%x not tracked", window);
         }
-        else if (g_ShellManaged && (data->CropLeft || data->CropTop || data->CropRight ||
+        else if (g_ShellManaged != SHELL_MANAGED_NONE &&
+                 (data->CropLeft || data->CropTop || data->CropRight ||
                  data->CropBottom || IsShellToastWindow(data)))
         {
             // A WM-managed toast gets X focus the moment the dom0 WM maps or the user

@@ -28,7 +28,8 @@ BOOL     g_PerfEnabled = FALSE;
 BOOL     g_ProtoTrace  = FALSE;
 BOOL     g_ProtoTraceWobble = FALSE;
 BOOL     g_ButtonAbsolute = TRUE;
-BOOL     g_ShellManaged = FALSE;  // default OFF: shell surfaces stay headerless override-redirect popups (user spec 2026-08-12)
+DWORD    g_ShellManaged = SHELL_MANAGED_START; // Start movable+size-locked, toasts stay or=1 (GWeck goal state 2026-08-12)
+BOOL     g_BlockMenuKey = TRUE;
 BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
 BOOL     g_FrameDrop   = FALSE;
@@ -152,17 +153,31 @@ void PerfInit(void)
         LogInfo("QGABUTTONABS %s", g_ButtonAbsolute ? L"on" : L"off");
     }
 
-    // Classified shell surfaces (toasts, Start, Search) are announced WM-managed so dom0
-    // can frame and move them. Default ON per the 2026-08-11 user requirement; =0 restores
-    // override-redirect (Linux-agent parity).
+    // Shell-surface policy: 0 = none (all or=1), 1 = all managed, 2 = Start-only managed
+    // (default - the GWeck goal state: movable+size-locked Start, corner-popup toasts).
     {
-        BOOL managed = FALSE;
-        DWORD mv = 0;
+        DWORD mv = SHELL_MANAGED_START;
         if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SHELL_MANAGED_VALUE, &mv, NULL))
-            managed = (mv != 0);
-        g_ShellManaged = managed;
-        LogInfo("QGASHELLMANAGED %s", g_ShellManaged ? L"on" : L"off");
+        {
+            if (mv > SHELL_MANAGED_START)
+                mv = SHELL_MANAGED_START;
+        }
+        else
+            mv = SHELL_MANAGED_START;
+        g_ShellManaged = mv;
+        LogInfo("QGASHELLMANAGED policy=%u (0=none 1=all 2=start-only)", g_ShellManaged);
+    }
+
+    // Menu-key block (seamless only; see perf.h).
+    {
+        DWORD bv = 1;
+        BOOL blk = TRUE;
+        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
+            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_BLOCK_MENU_KEY_VALUE, &bv, NULL))
+            blk = (bv != 0);
+        g_BlockMenuKey = blk;
+        LogInfo("QGABLOCKWIN %s", g_BlockMenuKey ? L"on" : L"off");
     }
 
     // Attribution switches - registry default, marker file overrides at runtime.

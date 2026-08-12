@@ -1101,11 +1101,18 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     // CoreWindow announced or=0 at 5120x1336). Staying an override-redirect popup until the
     // card is known avoids that; the crop-resolve re-announce then flips it to or=0 via the
     // usual UpdateWindowData->ToggleMap path, and the size-lock hint goes out with it.
-    if (entry->IsOverrideRedirect && g_ShellManaged && IsShellToastWindow(entry) &&
+    if (entry->IsOverrideRedirect &&
         (entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom))
     {
-        LogDebug("0x%x: cropped shell surface announced WM-managed (ShellManaged)", entry->Handle);
-        entry->IsOverrideRedirect = FALSE;
+        SHELL_SURFACE_KIND kind = ShellSurfaceKind(entry);
+        if (kind != ShellSurfaceNone &&
+            (g_ShellManaged == SHELL_MANAGED_ALL ||
+             (g_ShellManaged == SHELL_MANAGED_START && kind == ShellSurfaceStart)))
+        {
+            LogDebug("0x%x: cropped shell surface kind=%d announced WM-managed (policy %u)",
+                entry->Handle, kind, g_ShellManaged);
+            entry->IsOverrideRedirect = FALSE;
+        }
     }
 
     return ERROR_SUCCESS;
@@ -3179,6 +3186,21 @@ static BOOL CALLBACK ZOrderProc(HWND window, LPARAM lParam)
 }
 
 // Order the watched list topmost-first into `sorted`, returning how many were placed.
+// A window whose area must be withheld from the windows STACKED BELOW it: every
+// override-redirect popup (menus, tooltips, or=1 shell surfaces - on top in both the
+// guest and dom0 by construction), and equally a WM-MANAGED cropped shell surface
+// (TOPMOST in the guest; without this the ShellManaged flip would bleed Start's
+// composited pixels into the slice-fed windows beneath it - review finding). Arbitrary
+// dom0 restacking above a managed Start can still show bleed; full correctness needs the
+// Phase 3 daemon-learns-z-order protocol change.
+static BOOL ClaimsOcclusionArea(IN const WINDOW_DATA* entry)
+{
+    if (entry->IsOverrideRedirect)
+        return TRUE;
+    return (entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom) &&
+        IsShellToastWindow(entry);
+}
+
 static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
 {
     WINDOW_DATA* entry = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
@@ -3198,7 +3220,7 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
     while (scan != (WINDOW_DATA*)&g_WatchedWindowsList)
     {
         scan = CONTAINING_RECORD(scan, WINDOW_DATA, ListEntry);
-        if (scan->IsOverrideRedirect && scan->IsVisible)
+        if (scan->IsVisible && ClaimsOcclusionArea(scan))
         {
             anyPopup = TRUE;
             break;
@@ -4281,7 +4303,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
 
             SetRectRgn(rgnWindow, entry->X, entry->Y,
                 entry->X + (int)entry->Width, entry->Y + (int)entry->Height);
-            if (g_ZOrderValid && entry->IsOverrideRedirect)
+            if (g_ZOrderValid && ClaimsOcclusionArea(entry))
                 CombineRgn(rgnCovered, rgnCovered, rgnWindow, RGN_OR);
             continue;
         }
@@ -4513,7 +4535,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         //
         // Fixing the general case needs the daemon to learn z-order: a protocol change,
         // Phase 3, not something to smuggle in here.
-        if (g_ZOrderValid && entry->IsOverrideRedirect)
+        if (g_ZOrderValid && ClaimsOcclusionArea(entry))
             CombineRgn(rgnCovered, rgnCovered, rgnWindow, RGN_OR);
     }
 
