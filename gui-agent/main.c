@@ -762,6 +762,28 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
     if (hresult != S_OK)
         return hresult;
 
+    // DWM hands back GARBAGE for a cloaked / mid-transition shell surface: measured -666 x
+    // -750 for a StartMenuExperienceHost CoreWindow (2026-08-12), which then poisoned
+    // entry->X/Y, the toast-crop query key (logged as 4294966630x4294966546) and the slice
+    // rect. S_OK is not a validity check - verify the rect is a rect.
+    if (dwmRect.right <= dwmRect.left || dwmRect.bottom <= dwmRect.top)
+    {
+        RECT fallback;
+        if (GetWindowRect(window, &fallback) &&
+            fallback.right > fallback.left && fallback.bottom > fallback.top)
+        {
+            LogDebug("0x%x: inverted DWM bounds (%d,%d)-(%d,%d), using GetWindowRect",
+                window, dwmRect.left, dwmRect.top, dwmRect.right, dwmRect.bottom);
+            dwmRect = fallback;
+        }
+        else
+        {
+            LogWarning("0x%x: inverted DWM bounds (%d,%d)-(%d,%d) and no usable GetWindowRect - rejecting",
+                window, dwmRect.left, dwmRect.top, dwmRect.right, dwmRect.bottom);
+            return ERROR_INVALID_DATA;
+        }
+    }
+
     // monitor info is needed to adjust for DPI scaling
     HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
     MONITORINFOEX monInfo;
@@ -1664,6 +1686,20 @@ void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->DaemonMovePending)
         return;
+
+    // NEVER move a classified shell surface (Start/toast/search). Its content is slice-fed
+    // from the composited desktop at the window's rect, and DirectComposition keeps
+    // painting the card at the surface's NATURAL anchor - so a moved HWND is announced at a
+    // rect containing bare wallpaper (user-reported 2026-08-12: "a peek into the underlying
+    // desktop"). Slice-feed is only correct at the anchor; refusing the move keeps the
+    // announced rect and the painted pixels the same region.
+    if (entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom ||
+        IsShellToastWindow(entry))
+    {
+        entry->DaemonMovePending = FALSE;
+        LogDebug("0x%x: daemon move refused for a shell surface (slice anchor)", entry->Handle);
+        return;
+    }
 
     DWORD now = GetTickCount();
 

@@ -28,7 +28,16 @@ BOOL     g_PerfEnabled = FALSE;
 BOOL     g_ProtoTrace  = FALSE;
 BOOL     g_ProtoTraceWobble = FALSE;
 BOOL     g_ButtonAbsolute = TRUE;
-DWORD    g_ShellManaged = SHELL_MANAGED_START; // Start movable+size-locked, toasts stay or=1 (GWeck goal state 2026-08-12)
+// DEFAULT NONE (2026-08-12 verdict, wf_82456c4a): every classified shell surface stays an
+// override-redirect corner popup. A WM-managed Start is announced at a MOVED rect, but its
+// content is slice-fed from the composited desktop at that rect - and a DirectComposition
+// Start does not paint its card at the moved HWND position, so the user saw bare wallpaper.
+// Slice-feed is only correct at the surface's NATURAL anchor, and no alternative capture
+// path exists for these surfaces (PrintWindow/WGC of the XAML host is blank from our
+// context). The OR corner Start is the one configuration ever confirmed to render
+// correctly. Movable Start needs a frozen-anchor architecture (capture window-relative at
+// the natural anchor, let dom0 move only the frame) - a separate future experiment.
+DWORD    g_ShellManaged = SHELL_MANAGED_NONE;
 BOOL     g_BlockMenuKey = TRUE;
 BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
@@ -156,7 +165,7 @@ void PerfInit(void)
     // Shell-surface policy: 0 = none (all or=1), 1 = all managed, 2 = Start-only managed
     // (default - the GWeck goal state: movable+size-locked Start, corner-popup toasts).
     {
-        DWORD mv = SHELL_MANAGED_START;
+        DWORD mv = SHELL_MANAGED_NONE;
         if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SHELL_MANAGED_VALUE, &mv, NULL))
         {
@@ -164,7 +173,7 @@ void PerfInit(void)
                 mv = SHELL_MANAGED_START;
         }
         else
-            mv = SHELL_MANAGED_START;
+            mv = SHELL_MANAGED_NONE;
         g_ShellManaged = mv;
         LogInfo("QGASHELLMANAGED policy=%u (0=none 1=all 2=start-only)", g_ShellManaged);
     }
