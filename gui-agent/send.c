@@ -733,6 +733,8 @@ ULONG SendWindowSizeLock(IN HWND window, IN uint32_t width, IN uint32_t height)
     hintsMsg.max_width = width;
     hintsMsg.max_height = height;
 
+    LogInfo("QGAPROTO,msg=HINTS,hwnd=0x%x,sizelock=%ux%u", (uint32_t)(ULONG_PTR)window, width, height);
+
 #pragma warning(suppress:4311)
     header.window = (uint32_t)window;
     header.type = MSG_WINDOW_HINTS;
