@@ -1060,6 +1060,20 @@ BOOL ShellSurfaceCardless(IN const WINDOW_DATA* data)
     if (ShellSurfaceKind(data) != ShellSurfaceStart)
         return FALSE;
 
+    // PARKED OFF-SCREEN = CLOSED. Windows keeps the Start menu's window alive and parks it
+    // OUTSIDE the desktop while it is closed - measured on this guest: announced at
+    // x=6063 on a 5120-wide screen (the user's "window at random position"; its content is
+    // whatever the slice reads there, i.e. nothing). A surface with no pixel on the desktop
+    // is not presenting a menu, whatever its card cache says.
+    {
+        RECT screen = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
+        RECT win = { data->X, data->Y,
+                     data->X + (LONG)data->Width, data->Y + (LONG)data->Height };
+        RECT hit;
+        if (!IntersectRect(&hit, &screen, &win))
+            return TRUE;    // entirely off-screen: parked, not open
+    }
+
     BOOL noCard = TRUE;
     EnterCriticalSection(&g_TcLock);
     {
