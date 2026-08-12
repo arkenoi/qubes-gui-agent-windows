@@ -30,6 +30,9 @@
 #include "perwindow.h"
 #include "xorg-keymap.h"
 #include "util.h" // AttachToInputDesktop (input-injection resilience)
+#include "perf.h" // g_ProtoTrace: tag configure ACKs in the trace (they are otherwise
+                  // indistinguishable from genuine announces, which cost this project a
+                  // whole day of misattributed evidence on the drag replay)
 #include "resolution.h"
 #include "toastcrop.h" // IsShellToastWindow, for the shell-surface focus quarantine
 
@@ -792,6 +795,9 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
             // KEEP-FATAL (propagated): SendWindowConfigure only fails when the vchan
             // write fails (VchanSendBuffer blocks rather than failing on a full
             // ring), i.e. the vchan is broken - case (a).
+            if (g_ProtoTrace)
+                LogInfo("QGAPROTO,msg=CONFIGURE-ACK,hwnd=0x%x,x=%d,y=%d",
+                    (uint32_t)(ULONG_PTR)window, configureMsg.x, configureMsg.y);
             ULONG ackStatus = SendWindowConfigure(window,
                 configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height,
                 configureMsg.override_redirect);
@@ -845,6 +851,9 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
     // per-window ACK above.
     if (replyToMessages)
     {
+        if (g_ProtoTrace)
+            LogInfo("QGAPROTO,msg=CONFIGURE-ACK,hwnd=0x%x,x=%d,y=%d",
+                (uint32_t)(ULONG_PTR)window, configureMsg.x, configureMsg.y);
         return SendWindowConfigure(window,
             configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height, configureMsg.override_redirect);
     }
