@@ -549,26 +549,14 @@ static DWORD HandleButton(IN HWND window)
     return ERROR_SUCCESS;
 }
 
-static DWORD HandleMotion(IN HWND window)
+// Inject one (already-received) motion message. Split out of HandleMotion so the
+// pending-motion slot below can defer the injection without re-reading the vchan.
+static DWORD InjectMotion(IN HWND window, IN const struct msg_motion* motionMsg)
 {
-    struct msg_motion motionMsg;
     INPUT inputEvent;
 
-    LogVerbose("0x%x", window);
-    if (!VchanReceiveBuffer(g_Vchan, &motionMsg, sizeof(motionMsg), L"msg_motion"))
-    {
-        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
-        return ERROR_UNIDENTIFIED_ERROR;
-    }
-
-    int32_t x = motionMsg.x;
-    int32_t y = motionMsg.y;
-
-    if (motionMsg.is_hint)
-    {
-        LogDebug("0x%x: ignoring motion hint (%d,%d)", window, x, y);
-        return ERROR_SUCCESS;
-    }
+    int32_t x = motionMsg->x;
+    int32_t y = motionMsg->y;
 
     // Same locking rule as HandleButton, and pre-existing here: FindWindowByHandle's result is
     // owned by the window-tracking thread and free()d by RemoveWindow, so it may only be
@@ -628,6 +616,58 @@ static DWORD HandleMotion(IN HWND window)
     return ERROR_SUCCESS;
 }
 
+// PENDING-MOTION SLOT (drain-scope coalescing, w9r3irkhc design). Motion coords are
+// ABSOLUTE window-relative positions, so latest-wins drops no information - a backlog of
+// stale motions re-injected 1:1 after a pump stall used to make the modal move loop
+// replay the whole stale trajectory (the drag-wobble amplifier). Ordering is preserved
+// by construction: HandleServerData flushes the slot before dispatching ANY non-motion
+// message (a click always lands after the motion that positioned it), before a motion
+// for a DIFFERENT window, and at every drain end.
+static struct
+{
+    BOOL valid;
+    HWND window;
+    struct msg_motion m;
+} g_PendingMotion;
+
+DWORD FlushPendingMotion(void)
+{
+    if (!g_PendingMotion.valid)
+        return ERROR_SUCCESS;
+    g_PendingMotion.valid = FALSE;
+    return InjectMotion(g_PendingMotion.window, &g_PendingMotion.m);
+}
+
+static DWORD HandleMotion(IN HWND window)
+{
+    struct msg_motion motionMsg;
+
+    LogVerbose("0x%x", window);
+    if (!VchanReceiveBuffer(g_Vchan, &motionMsg, sizeof(motionMsg), L"msg_motion"))
+    {
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
+        return ERROR_UNIDENTIFIED_ERROR;
+    }
+
+    if (motionMsg.is_hint)
+    {
+        LogDebug("0x%x: ignoring motion hint (%d,%d)", window, motionMsg.x, motionMsg.y);
+        return ERROR_SUCCESS;
+    }
+
+    if (g_PendingMotion.valid && g_PendingMotion.window != window)
+    {
+        DWORD status = FlushPendingMotion();
+        if (ERROR_SUCCESS != status)
+            return status;
+    }
+
+    g_PendingMotion.valid = TRUE;
+    g_PendingMotion.window = window;
+    g_PendingMotion.m = motionMsg;
+    return ERROR_SUCCESS;
+}
+
 static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 {
     struct msg_configure configureMsg;
@@ -642,8 +682,6 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 
     if (window != 0) // 0 is full screen
     {
-        // post request without waiting to not block and don't change the Z-order
-        UINT flags = SWP_ASYNCWINDOWPOS | SWP_NOZORDER;
         // TRUE only when this configure actually carried geometry we act on. Ignored
         // configures (iconic, maximized, byte-identical geometry) must not arm the
         // daemon-drive machinery: holding damage for a window whose configures we ignore
@@ -661,7 +699,18 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 
         if (data != NULL)
         {
-            if (data->IsIconic)
+            if (window == g_InputDragWindow)
+            {
+                // The USER's hand (dom0 button held, motion forwarded) is moving this
+                // window right now - the guest is the geometry authority. Applying a
+                // daemon configure here would SetWindowPos the window backward against
+                // the live drag, and two such bounces <300ms would arm the drive
+                // suppression and freeze announces mid-drag (wobble investigation
+                // 2026-08-12). ACK below still byte-echoes so the daemon keeps talking;
+                // geometry converges through the normal announce path once the drag ends.
+                LogDebug("0x%x: daemon configure ignored mid-drag (input latch)", window);
+            }
+            else if (data->IsIconic)
             {
                 LogVerbose("0x%x is minimized, ignoring", window);
             }
@@ -1046,6 +1095,15 @@ DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* cap
     }
 
     LogVerbose("received message type %d for 0x%x", header.type, header.window);
+
+    // Coalescing boundary: anything that is not a motion must observe every motion that
+    // came before it (see the pending-motion slot above).
+    if (header.type != MSG_MOTION)
+    {
+        status = FlushPendingMotion();
+        if (ERROR_SUCCESS != status)
+            return status;
+    }
 
 #pragma warning(push)
 #pragma warning(disable:4312)

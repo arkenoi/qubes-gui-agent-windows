@@ -1605,8 +1605,16 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
             return ERROR_SUCCESS;
         }
         if (posOnly && entry->CfgLastSentTick != 0 &&
-            (now - entry->CfgLastSentTick) < CFG_POS_MIN_INTERVAL_MS)
+            (now - entry->CfgLastSentTick) < CFG_POS_MIN_INTERVAL_MS &&
+            entry->Handle != g_InputDragWindow)
         {
+            // The latched (user-dragged) window is EXEMPT from the limiter: withheld
+            // positions only flush at frame boundaries or the 100ms sweep, so limiting
+            // the drag stream made dom0 receive positions at beating 16-vs-frame-cadence
+            // intervals = velocity pulsing (wobble investigation 2026-08-12). Announce
+            // values are live canonical X/Y - latest-wins - so the replay cannot return;
+            // the limiter's real target (announce floods dom0 cannot drain) does not
+            // apply to the ~40Hz tracking cadence of one dragged window.
             entry->CfgPendingPos = TRUE;
             entry->CfgPendingX = entry->X;
             entry->CfgPendingY = entry->Y;
@@ -4112,7 +4120,20 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // Moving. A stale PwLastMoveCapTick makes the throttled refresh
                     // fire on the FIRST moving frame, so one-shot programmatic moves
                     // still capture immediately, as before.
-                    if (pwNow - entry->PwLastMoveCapTick >= PW_MOVE_RECAPTURE_MS)
+                    if (entry->Handle == g_InputDragWindow)
+                    {
+                        // COMPLETE the drag-latch suppression: the throttled mid-drag
+                        // refresh was the one PrintWindow still firing during a real
+                        // drag, a 15-50ms SYNCHRONOUS stall injected into the dragged
+                        // app's own modal move loop every 150ms - the rhythmic
+                        // freeze-then-snap the user feels as wobble (investigation
+                        // 2026-08-12). Content freezes for the drag's duration; the
+                        // settle recapture below repaints once on release - the same
+                        // trade the daemon-drive damage hold makes.
+                        LogDebug("QGADRAG,ev=suppress-latched,hwnd=0x%x",
+                            (uint32_t)(ULONG_PTR)entry->Handle);
+                    }
+                    else if (pwNow - entry->PwLastMoveCapTick >= PW_MOVE_RECAPTURE_MS)
                     {
                         entry->PwLastMoveCapTick = pwNow;
                         LogDebug("QGADRAG,ev=refresh,hwnd=0x%x",
@@ -4775,10 +4796,10 @@ static BOOL DrainVchanInput(IN OUT struct _CAPTURE_CONTEXT* capture, OUT BOOL* e
         }
     }
 
-    // A drain batch may have carried many MSG_CONFIGUREs per window (dom0 WM drag at
-    // input rate); each handler only stashed the newest geometry. Apply once per window
-    // now - latest-wins - instead of the per-message async SetWindowPos flood the guest
-    // window used to play back for seconds after the drag ended.
+    // Drain end: inject the newest coalesced motion first (input before geometry),
+    // then apply the newest daemon geometry per window - latest-wins on both paths,
+    // instead of the per-message floods that replayed stale trajectories.
+    (void)FlushPendingMotion();
     ApplyAllPendingDaemonMoves();
 
     LeaveCriticalSection(&g_VchanCriticalSection);
@@ -5244,12 +5265,15 @@ static ULONG WINAPI WatchForEvents(void)
                     break;
                 }
             }
-            // Same latest-wins apply as DrainVchanInput's drain: this is the OTHER
-            // steady-state drain (vchan event with no frame pending), and without the
-            // apply here a configure batch arriving frameless would wait for the next
-            // frame or the 100ms settle sweep (review finding).
+            // Same latest-wins flush/apply as DrainVchanInput's drain: this is the
+            // OTHER steady-state drain (vchan event with no frame pending); without
+            // this a coalesced motion or configure batch arriving frameless would wait
+            // for the next frame or the 100ms settle sweep (review finding).
             if (ERROR_SUCCESS == status)
+            {
+                (void)FlushPendingMotion();
                 ApplyAllPendingDaemonMoves();
+            }
             LeaveCriticalSection(&g_VchanCriticalSection);
 
             if (screenDestroyed)

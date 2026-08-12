@@ -28,5 +28,10 @@ DWORD HandleVersion(void);
 DWORD HandleXconf(void);
 // capture may be NULL (no active capture context); it is only used to revoke parked
 // screen grants when the daemon acks the window-0 MSG_WINDOW_DUMP (A6).
+// Inject the coalesced pending motion, if any (see the pending-motion slot in
+// vchan-handlers.c). Called at every drain end so a quiet ring never strands the
+// final pointer position.
+DWORD FlushPendingMotion(void);
+
 DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* capture OPTIONAL,
     OUT BOOL* screenDestroyed);
