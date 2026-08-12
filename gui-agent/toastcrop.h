@@ -66,6 +66,18 @@ SHELL_SURFACE_KIND ShellSurfaceKind(
     IN const WINDOW_DATA* data
     );
 
+// TRUE when this window IS a classified shell surface whose card measurement has FINISHED
+// and found NOTHING (attempts exhausted, no sticky last-good). On 25H2 that is the
+// signature of a shell host window that is not actually presenting a menu - the persistent
+// StartMenuExperienceHost surface that exists while Start is CLOSED. Mapping it announces
+// a window with no menu in it, which dom0 renders as a slice of bare desktop at whatever
+// (often bogus, even off-screen) rect the surface reports (user-reported 2026-08-12:
+// "maximized window, then dead", "window at random position"). FALSE while a measurement
+// is still in flight, so a genuinely-opening Start is never dropped mid-measure.
+BOOL ShellSurfaceCardless(
+    IN const WINDOW_DATA* data
+    );
+
 // Insets to subtract from this window's raw rect, from the (hwnd, raw size) cache;
 // measures via UIA on a miss. Always writes *insets (all zero = do not crop) and returns
 // TRUE only when a nonzero, validated crop applies. Safe to call for any window.

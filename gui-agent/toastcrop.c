@@ -1038,6 +1038,35 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
     return (insets->left || insets->top || insets->right || insets->bottom);
 }
 
+BOOL ShellSurfaceCardless(IN const WINDOW_DATA* data)
+{
+    if (!data)
+        return FALSE;
+
+    TcInit();
+    if (g_TcDisabled || g_TcForced)
+        return FALSE;                       // measurement disabled/forced: never gate on it
+
+    if (ShellSurfaceKind(data) == ShellSurfaceNone)
+        return FALSE;                       // not a shell surface - not ours to judge
+
+    BOOL cardless = FALSE;
+    EnterCriticalSection(&g_TcLock);
+    {
+        RECT lastGood;
+        TOAST_CROP_ENTRY* slot = TcFindSlotLocked(data->Handle, data->Width, data->Height);
+        // Only a FINISHED measurement counts: Resolved with zero insets and no remembered
+        // card for this window. A slot that does not exist yet, or is still retrying, is
+        // "unknown", never "cardless" - dropping a surface mid-measure would lose the
+        // genuinely-opening menu.
+        cardless = slot && slot->Resolved &&
+            !(slot->Insets.left || slot->Insets.top || slot->Insets.right || slot->Insets.bottom) &&
+            !TcRecallLastGood(data->Handle, &lastGood);
+    }
+    LeaveCriticalSection(&g_TcLock);
+    return cardless;
+}
+
 void ToastCropEvict(IN HWND window)
 {
     TcInit();

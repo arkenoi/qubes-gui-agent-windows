@@ -2515,6 +2515,22 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     if (data->Handle == GetShellWindow())
         return FALSE;
 
+    // GENUINE-OPEN GATE. A shell host (StartMenuExperienceHost / ShellExperienceHost /
+    // SearchHost) keeps a top-level surface alive while its menu is CLOSED. Mapping that
+    // phantom announces a window with no menu inside it - dom0 then shows a slice of bare
+    // desktop, at whatever rect the surface happens to report (measured: a 1201x919 window
+    // full of wallpaper, and one at x=6063 on a 5120-wide screen). The card measurement is
+    // the only reliable "is it actually presenting something" signal we have, so a shell
+    // surface whose measurement FINISHED and found no card is not a window. In-flight
+    // measurements are never rejected, so an opening menu still maps as soon as its card
+    // resolves (toastcrop pokes the tracking pass when it does).
+    if (ShellSurfaceCardless(data))
+    {
+        LogDebug("0x%x: shell surface with no card - not presenting a menu, rejecting",
+            data->Handle);
+        return FALSE;
+    }
+
     // hide search regardless of its state if start is being shown
     // FIXME: this is a workaround for search being detected as visible and not DWM-cloaked
     // even if it's really invisible/transparent
