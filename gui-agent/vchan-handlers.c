@@ -681,7 +681,12 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                 }
                 else if (SetWindowPos(window, NULL, rawX, rawY, 0, 0, flags | SWP_NOSIZE))
                 {
-                    geometryDriven = TRUE;
+                    // Deliberately NOT geometryDriven: the crop branch's convergence
+                    // mechanism IS the tracking pass re-announcing the moved card (see
+                    // the branch comment above) - arming the announce suppression here
+                    // would block exactly that (review finding: "suppression without
+                    // the cure"). Its per-message SetWindowPos flood is pre-existing,
+                    // reachable only under ShellManaged=1, and stays as-is for now.
                     LogDebug("0x%x cropped by %d/%d/%d/%d: dom0 configure (%d,%d) applied as raw (%d,%d)",
                         window, data->CropLeft, data->CropTop, data->CropRight, data->CropBottom,
                         configureMsg.x, configureMsg.y, rawX, rawY);

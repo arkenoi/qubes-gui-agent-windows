@@ -5220,6 +5220,12 @@ static ULONG WINAPI WatchForEvents(void)
                     break;
                 }
             }
+            // Same latest-wins apply as DrainVchanInput's drain: this is the OTHER
+            // steady-state drain (vchan event with no frame pending), and without the
+            // apply here a configure batch arriving frameless would wait for the next
+            // frame or the 100ms settle sweep (review finding).
+            if (ERROR_SUCCESS == status)
+                ApplyAllPendingDaemonMoves();
             LeaveCriticalSection(&g_VchanCriticalSection);
 
             if (screenDestroyed)
