@@ -90,6 +90,46 @@ static BOOL g_TcDisabled = FALSE;
 static BOOL g_TcForced = FALSE;         // registry insets replace the UIA measurement
 static RECT g_TcForcedInsets;
 
+// Last-good insets per window (STICKY CROP). A shell surface's card margins are stable
+// across moves and minor size changes, but the async UIA measurement is flaky (pre-XAML
+// timing, cross-process RPC races) and a fresh measure can spuriously find no card - which
+// used to drop an ALREADY-CROPPED, now WM-managed Start back to uncropped, announcing its
+// full transparent-shadow-margined window whose margins composite the desktop behind it
+// (user-reported 2026-08-12: "a peek into the underlying desktop"). Once we have seen a
+// card for a window we keep those insets and fall back to them whenever a later measure
+// yields nothing, so a managed shell surface is never announced uncropped. Keyed by hwnd,
+// LRU like the slot cache. g_TcLock held.
+static struct { HWND Window; RECT Insets; ULONGLONG LastUse; } g_TcLastGood[TOAST_PID_CACHE_SIZE];
+
+static void TcRememberLastGood(IN HWND window, IN const RECT* insets)
+{
+    int victim = 0;
+    for (int i = 0; i < (int)RTL_NUMBER_OF(g_TcLastGood); i++)
+    {
+        if (g_TcLastGood[i].Window == window)  { victim = i; goto set; }
+        if (g_TcLastGood[i].LastUse < g_TcLastGood[victim].LastUse) victim = i;
+    }
+set:
+    g_TcLastGood[victim].Window = window;
+    g_TcLastGood[victim].Insets = *insets;
+    g_TcLastGood[victim].LastUse = ++g_TcClock;
+}
+
+// TRUE and fills *insets if we have a remembered card for this window. g_TcLock held.
+static BOOL TcRecallLastGood(IN HWND window, OUT RECT* insets)
+{
+    for (int i = 0; i < (int)RTL_NUMBER_OF(g_TcLastGood); i++)
+        if (g_TcLastGood[i].Window == window &&
+            (g_TcLastGood[i].Insets.left || g_TcLastGood[i].Insets.top ||
+             g_TcLastGood[i].Insets.right || g_TcLastGood[i].Insets.bottom))
+        {
+            *insets = g_TcLastGood[i].Insets;
+            g_TcLastGood[i].LastUse = ++g_TcClock;
+            return TRUE;
+        }
+    return FALSE;
+}
+
 static IUIAutomation* g_TcUia = NULL;   // created on first use, kept for the process life
 static TOAST_CROP_ENTRY g_TcCache[TOAST_CROP_CACHE_SIZE];
 static TOAST_PID_ENTRY g_TcPidCache[TOAST_PID_CACHE_SIZE];
@@ -644,6 +684,7 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
 
         if (resolvedNonZero)
         {
+            TcRememberLastGood(req->Window, insets);
             LogInfo("0x%x: toast card in %ux%u window, insets l=%d t=%d r=%d b=%d",
                 req->Window, req->RawWidth, req->RawHeight,
                 insets->left, insets->top, insets->right, insets->bottom);
@@ -905,6 +946,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
 
             if (slot->Insets.left || slot->Insets.top || slot->Insets.right || slot->Insets.bottom)
             {
+                TcRememberLastGood(data->Handle, &slot->Insets);
                 LogInfo("0x%x: toast card in %ux%u window, insets l=%d t=%d r=%d b=%d",
                     data->Handle, data->Width, data->Height,
                     slot->Insets.left, slot->Insets.top, slot->Insets.right, slot->Insets.bottom);
@@ -947,6 +989,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
                     if (measured.left || measured.top || measured.right || measured.bottom)
                     {
                         slot->Resolved = TRUE;
+                        TcRememberLastGood(data->Handle, &slot->Insets);
                         LogInfo("0x%x: toast card in %ux%u window, insets l=%d t=%d r=%d b=%d",
                             data->Handle, data->Width, data->Height,
                             measured.left, measured.top, measured.right, measured.bottom);
@@ -970,6 +1013,25 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
 
     *insets = slot->Insets;
 
+    // STICKY CROP: a fresh measure found no card, but we have cropped this window before -
+    // reuse the remembered insets rather than announcing a WM-managed shell surface
+    // uncropped (which shows the desktop through its transparent margins). Re-validate
+    // against the CURRENT size so a genuinely-resized surface cannot get an oversize crop.
+    if (!(insets->left || insets->top || insets->right || insets->bottom))
+    {
+        RECT lastGood;
+        if (TcRecallLastGood(data->Handle, &lastGood))
+        {
+            TcValidateInsets(data->Handle, (LONG)data->Width, (LONG)data->Height, &lastGood);
+            if (lastGood.left || lastGood.top || lastGood.right || lastGood.bottom)
+            {
+                *insets = lastGood;
+                LogDebug("0x%x: fresh measure found no card, using last-good insets l=%d t=%d r=%d b=%d",
+                    data->Handle, lastGood.left, lastGood.top, lastGood.right, lastGood.bottom);
+            }
+        }
+    }
+
     LeaveCriticalSection(&g_TcLock);
 
     return (insets->left || insets->top || insets->right || insets->bottom);
@@ -985,6 +1047,11 @@ void ToastCropEvict(IN HWND window)
     {
         if (g_TcCache[i].Window == window)
             ZeroMemory(&g_TcCache[i], sizeof(g_TcCache[i]));
+    }
+    for (int i = 0; i < (int)RTL_NUMBER_OF(g_TcLastGood); i++)
+    {
+        if (g_TcLastGood[i].Window == window)
+            ZeroMemory(&g_TcLastGood[i], sizeof(g_TcLastGood[i]));
     }
 
     // Also drop any not-yet-run measurement request; a query already in flight is
