@@ -448,8 +448,6 @@ static DWORD HandleButton(IN HWND window)
     {
         BOOL haveTracked = FALSE;
         int32_t trackedX = 0, trackedY = 0;
-        int32_t liveX = 0, liveY = 0;
-        BOOL usedAnnounced = FALSE;
 
         EnterCriticalSection(&g_csWatchedWindows);
         {
@@ -457,33 +455,8 @@ static DWORD HandleButton(IN HWND window)
             if (data)
             {
                 haveTracked = TRUE;
-                liveX = data->X;
-                liveY = data->Y;
-                usedAnnounced = data->CfgSentValid;
-                // THE ANNOUNCED ORIGIN, NOT THE LIVE ONE. dom0 computed these relative
-                // coordinates against the rect it was last TOLD about, so that is the only
-                // origin they can be added back to. Using the live X/Y closes a positive
-                // feedback loop on the guest-native drag path: the injected cursor picks up
-                // (live - announced), the app's modal move loop moves the window by that
-                // error, which changes the live origin again. While announces are starved
-                // (a slow frame holds the tracking lock, or the daemon defers a queued
-                // configure) the error accumulates and the window RUNS AHEAD of the hand;
-                // when the backlog flushes and dom0 adopts the newest position, the next
-                // injected sample is short by the whole accumulated gap and the window is
-                // yanked BACKWARD - the forth-and-back the user reported 2026-08-12
-                // (measured: 23 direction reversals in 143 genuine announces, amplitude =
-                // drag velocity x announce dead time, horizontal-only on a horizontal drag).
-                // The comment above always stated this rule; only the field was wrong.
-                if (data->CfgSentValid)
-                {
-                    trackedX = data->LastCfgX;
-                    trackedY = data->LastCfgY;
-                }
-                else
-                {
-                    trackedX = data->X;
-                    trackedY = data->Y;
-                }
+                trackedX = data->X;
+                trackedY = data->Y;
             }
         }
         LeaveCriticalSection(&g_csWatchedWindows);
@@ -576,14 +549,26 @@ static DWORD HandleButton(IN HWND window)
     return ERROR_SUCCESS;
 }
 
-// Inject one (already-received) motion message. Split out of HandleMotion so the
-// pending-motion slot below can defer the injection without re-reading the vchan.
-static DWORD InjectMotion(IN HWND window, IN const struct msg_motion* motionMsg)
+static DWORD HandleMotion(IN HWND window)
 {
+    struct msg_motion motionMsg;
     INPUT inputEvent;
 
-    int32_t x = motionMsg->x;
-    int32_t y = motionMsg->y;
+    LogVerbose("0x%x", window);
+    if (!VchanReceiveBuffer(g_Vchan, &motionMsg, sizeof(motionMsg), L"msg_motion"))
+    {
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
+        return ERROR_UNIDENTIFIED_ERROR;
+    }
+
+    int32_t x = motionMsg.x;
+    int32_t y = motionMsg.y;
+
+    if (motionMsg.is_hint)
+    {
+        LogDebug("0x%x: ignoring motion hint (%d,%d)", window, x, y);
+        return ERROR_SUCCESS;
+    }
 
     // Same locking rule as HandleButton, and pre-existing here: FindWindowByHandle's result is
     // owned by the window-tracking thread and free()d by RemoveWindow, so it may only be
@@ -592,8 +577,6 @@ static DWORD InjectMotion(IN HWND window, IN const struct msg_motion* motionMsg)
     {
         BOOL haveTracked = FALSE;
         int32_t trackedX = 0, trackedY = 0;
-        int32_t liveX = 0, liveY = 0;
-        BOOL usedAnnounced = FALSE;
 
         EnterCriticalSection(&g_csWatchedWindows);
         {
@@ -601,47 +584,14 @@ static DWORD InjectMotion(IN HWND window, IN const struct msg_motion* motionMsg)
             if (data)
             {
                 haveTracked = TRUE;
-                liveX = data->X;
-                liveY = data->Y;
-                usedAnnounced = data->CfgSentValid;
-                // THE ANNOUNCED ORIGIN, NOT THE LIVE ONE. dom0 computed these relative
-                // coordinates against the rect it was last TOLD about, so that is the only
-                // origin they can be added back to. Using the live X/Y closes a positive
-                // feedback loop on the guest-native drag path: the injected cursor picks up
-                // (live - announced), the app's modal move loop moves the window by that
-                // error, which changes the live origin again. While announces are starved
-                // (a slow frame holds the tracking lock, or the daemon defers a queued
-                // configure) the error accumulates and the window RUNS AHEAD of the hand;
-                // when the backlog flushes and dom0 adopts the newest position, the next
-                // injected sample is short by the whole accumulated gap and the window is
-                // yanked BACKWARD - the forth-and-back the user reported 2026-08-12
-                // (measured: 23 direction reversals in 143 genuine announces, amplitude =
-                // drag velocity x announce dead time, horizontal-only on a horizontal drag).
-                // The comment above always stated this rule; only the field was wrong.
-                if (data->CfgSentValid)
-                {
-                    trackedX = data->LastCfgX;
-                    trackedY = data->LastCfgY;
-                }
-                else
-                {
-                    trackedX = data->X;
-                    trackedY = data->Y;
-                }
+                trackedX = data->X;
+                trackedY = data->Y;
             }
         }
         LeaveCriticalSection(&g_csWatchedWindows);
 
         if (haveTracked)
         {
-            // QGAORIGIN: the instrument for the wobble fix. Logs the origin actually used
-            // and how far the LIVE origin had drifted from it - the drift is exactly the
-            // error the old code injected into the cursor (and therefore into the window
-            // position). Zero drift = nothing to fix on this sample; growing drift during a
-            // drag = the feedback loop this fix removes.
-            LogDebug("QGAORIGIN,hwnd=0x%x,used=%d,%d,live=%d,%d,drift=%d,%d,announced=%d",
-                (uint32_t)(ULONG_PTR)window, trackedX, trackedY, liveX, liveY,
-                liveX - trackedX, liveY - trackedY, usedAnnounced);
             x += trackedX;
             y += trackedY;
         }
@@ -678,58 +628,6 @@ static DWORD InjectMotion(IN HWND window, IN const struct msg_motion* motionMsg)
     return ERROR_SUCCESS;
 }
 
-// PENDING-MOTION SLOT (drain-scope coalescing, w9r3irkhc design). Motion coords are
-// ABSOLUTE window-relative positions, so latest-wins drops no information - a backlog of
-// stale motions re-injected 1:1 after a pump stall used to make the modal move loop
-// replay the whole stale trajectory (the drag-wobble amplifier). Ordering is preserved
-// by construction: HandleServerData flushes the slot before dispatching ANY non-motion
-// message (a click always lands after the motion that positioned it), before a motion
-// for a DIFFERENT window, and at every drain end.
-static struct
-{
-    BOOL valid;
-    HWND window;
-    struct msg_motion m;
-} g_PendingMotion;
-
-DWORD FlushPendingMotion(void)
-{
-    if (!g_PendingMotion.valid)
-        return ERROR_SUCCESS;
-    g_PendingMotion.valid = FALSE;
-    return InjectMotion(g_PendingMotion.window, &g_PendingMotion.m);
-}
-
-static DWORD HandleMotion(IN HWND window)
-{
-    struct msg_motion motionMsg;
-
-    LogVerbose("0x%x", window);
-    if (!VchanReceiveBuffer(g_Vchan, &motionMsg, sizeof(motionMsg), L"msg_motion"))
-    {
-        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
-        return ERROR_UNIDENTIFIED_ERROR;
-    }
-
-    if (motionMsg.is_hint)
-    {
-        LogDebug("0x%x: ignoring motion hint (%d,%d)", window, motionMsg.x, motionMsg.y);
-        return ERROR_SUCCESS;
-    }
-
-    if (g_PendingMotion.valid && g_PendingMotion.window != window)
-    {
-        DWORD status = FlushPendingMotion();
-        if (ERROR_SUCCESS != status)
-            return status;
-    }
-
-    g_PendingMotion.valid = TRUE;
-    g_PendingMotion.window = window;
-    g_PendingMotion.m = motionMsg;
-    return ERROR_SUCCESS;
-}
-
 static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 {
     struct msg_configure configureMsg;
@@ -761,18 +659,7 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 
         if (data != NULL)
         {
-            if (window == g_InputDragWindow)
-            {
-                // The USER's hand (dom0 button held, motion forwarded) is moving this
-                // window right now - the guest is the geometry authority. Applying a
-                // daemon configure here would SetWindowPos the window backward against
-                // the live drag, and two such bounces <300ms would arm the drive
-                // suppression and freeze announces mid-drag (wobble investigation
-                // 2026-08-12). ACK below still byte-echoes so the daemon keeps talking;
-                // geometry converges through the normal announce path once the drag ends.
-                LogDebug("0x%x: daemon configure ignored mid-drag (input latch)", window);
-            }
-            else if (data->IsIconic)
+            if (data->IsIconic)
             {
                 LogVerbose("0x%x is minimized, ignoring", window);
             }
@@ -1153,15 +1040,6 @@ DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* cap
     }
 
     LogVerbose("received message type %d for 0x%x", header.type, header.window);
-
-    // Coalescing boundary: anything that is not a motion must observe every motion that
-    // came before it (see the pending-motion slot above).
-    if (header.type != MSG_MOTION)
-    {
-        status = FlushPendingMotion();
-        if (ERROR_SUCCESS != status)
-            return status;
-    }
 
 #pragma warning(push)
 #pragma warning(disable:4312)
