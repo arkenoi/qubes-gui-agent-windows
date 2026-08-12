@@ -1691,9 +1691,11 @@ void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry)
     // The daemon dictates in announce space (what MSG_CONFIGURE carries); SetWindowPos
     // takes GetWindowRect space. Convert, or the window lands off by the invisible-border
     // delta, the frame path announces the shifted position, and the daemon applies it as
-    // a real move - the guaranteed post-drop hop.
-    int tx = entry->DaemonMoveX - entry->DaemonOffX;
-    int ty = entry->DaemonMoveY - entry->DaemonOffY;
+    // a real move - the guaranteed post-drop hop. For cropped shell surfaces the announce
+    // space is the visible CARD (raw origin = card origin - insets, toastcrop.c); the
+    // insets are zero for every other window, so this is a no-op on the normal path.
+    int tx = entry->DaemonMoveX - entry->CropLeft - entry->DaemonOffX;
+    int ty = entry->DaemonMoveY - entry->CropTop - entry->DaemonOffY;
 
     entry->DaemonMovePending = FALSE;
     if (SetWindowPos(entry->Handle, NULL, tx, ty,

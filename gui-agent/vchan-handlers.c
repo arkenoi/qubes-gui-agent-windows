@@ -665,31 +665,35 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                 // These coordinates are in CROPPED space - the rect the agent announced is
                 // the visible card, not the window (toastcrop.c).
                 //
-                // POSITION is applied with the crop insets added back (raw origin = card
-                // origin - insets), so a dom0-WM drag of a managed shell surface moves the
-                // real HWND and the card lands exactly where dom0 put its frame - this is
-                // what makes toasts/Start movable (user requirement, 2026-08-11). SIZE is
-                // never applied: the announced size is card size, the HWND's is larger by
-                // the insets, and shell surfaces size themselves; SWP_NOSIZE keeps
-                // ShellExperienceHost's layout intact. The next tracking pass re-announces
-                // the moved card, converging the daemon on the applied position.
-                int rawX = configureMsg.x - data->CropLeft;
-                int rawY = configureMsg.y - data->CropTop;
+                // LATEST-WINS, same as the normal branch below: the newest card-space
+                // geometry is stashed and ApplyPendingDaemonMove posts at most one async
+                // SetWindowPos per window (it adds the crop insets back itself - raw
+                // origin = card origin - insets - on top of the announce/SetWindowPos
+                // delta, which is zero for frameless shell CoreWindows). A dom0-WM drag
+                // of a managed shell surface used to issue one SetWindowPos per configure
+                // - the same queued-moves replay the normal branch was cured of (review
+                // finding, closed 2026-08-12). SIZE is never applied: the announced size
+                // is card size, the HWND's is larger by the insets, and shell surfaces
+                // size themselves; the NoSize stash flag keeps ShellExperienceHost's
+                // layout intact.
                 if (data->X == configureMsg.x && data->Y == configureMsg.y)
                 {
                     LogVerbose("0x%x cropped, position unchanged", window);
                 }
-                else if (SetWindowPos(window, NULL, rawX, rawY, 0, 0, flags | SWP_NOSIZE))
+                else
                 {
-                    // Deliberately NOT geometryDriven: the crop branch's convergence
-                    // mechanism IS the tracking pass re-announcing the moved card (see
-                    // the branch comment above) - arming the announce suppression here
-                    // would block exactly that (review finding: "suppression without
-                    // the cure"). Its per-message SetWindowPos flood is pre-existing,
-                    // reachable only under ShellManaged=1, and stays as-is for now.
-                    LogDebug("0x%x cropped by %d/%d/%d/%d: dom0 configure (%d,%d) applied as raw (%d,%d)",
+                    geometryDriven = TRUE;
+                    data->DaemonMovePending = TRUE;
+                    data->DaemonMoveX = configureMsg.x;
+                    data->DaemonMoveY = configureMsg.y;
+                    data->DaemonMoveW = (int)data->Width;   // ignored: NoSize
+                    data->DaemonMoveH = (int)data->Height;
+                    data->DaemonMoveNoMove = FALSE;
+                    data->DaemonMoveNoSize = TRUE;
+
+                    LogDebug("0x%x cropped by %d/%d/%d/%d: dom0 configure (%d,%d) stashed (card space)",
                         window, data->CropLeft, data->CropTop, data->CropRight, data->CropBottom,
-                        configureMsg.x, configureMsg.y, rawX, rawY);
+                        configureMsg.x, configureMsg.y);
                     data->X = configureMsg.x;
                     data->Y = configureMsg.y;
 
@@ -705,10 +709,9 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                     data->LastCfgW = (int)data->Width;
                     data->LastCfgH = (int)data->Height;
                     data->LastCfgOvr = data->IsOverrideRedirect;
-                }
-                else
-                {
-                    win_perror("SetWindowPos(cropped)");
+
+                    // Apply now if nothing is in flight (single-configure case).
+                    ApplyPendingDaemonMove(data);
                 }
             }
             else
