@@ -163,12 +163,17 @@ typedef struct _WINDOW_DATA
     int   DaemonOffX;
     int   DaemonOffY;
     DWORD DaemonOffTick;
-    // Tick of the last daemon MSG_CONFIGURE for this window. While recent, the daemon is
-    // dictating this window's geometry (dom0 WM drag): position-only announces from the
-    // tracking/frame paths are withheld (SendWindowConfigureIfChanged) - dom0 already knows
-    // where its own window is, and echoing the guest's lagging position back is what made
-    // the dom0 window fight the WM and replay the drag path.
+    // Tick of the last daemon MSG_CONFIGURE for this window (DriveTick), and of the last
+    // one that had a predecessor within DAEMON_DRIVE_ACTIVE_MS (StreamTick - i.e. a dom0
+    // WM drag arriving at input rate, vs a LONE placement configure when a window is first
+    // mapped). While the STREAM is recent, the daemon is dictating this window's geometry:
+    // position-only announces from the tracking/frame paths are withheld
+    // (SendWindowConfigureIfChanged) - dom0 already knows where its own window is, and
+    // echoing the guest's lagging position back is what made the dom0 window fight the WM
+    // and replay the drag path. A lone configure must NOT suppress or hold anything: that
+    // would delay a freshly-placed window's first paint by the whole hold window.
     DWORD DaemonDriveTick;
+    DWORD DaemonStreamTick;
     // Damage for this window was withheld during a daemon drive (the announced origin is
     // the daemon's framebuffer read origin for slice-fed windows, and it is frozen while
     // announces are suppressed - sending damage against it would paint pixels from the
@@ -270,6 +275,12 @@ BOOL ShouldAcceptWindow(
 
 // Visible window rect as managed by DWM (GetWindowRect includes invisible resize grips), DPI
 // adjusted. This is the geometry announced to the daemon, so dom0's frame hugs the window.
+// How long after the last daemon MSG_CONFIGURE *stream* the daemon is considered to be
+// actively dictating a window's geometry (dom0 WM drag). Shared with HandleConfigure,
+// which uses it to tell a stream (two configures this close together) from a lone
+// placement configure.
+#define DAEMON_DRIVE_ACTIVE_MS 300
+
 ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect);
 
 // Apply the newest daemon-dictated geometry for this window if no earlier async

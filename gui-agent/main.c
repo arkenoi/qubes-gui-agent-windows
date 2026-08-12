@@ -1503,12 +1503,6 @@ end:
 // consumption and build a backlog that replays after the drag.
 #define CFG_POS_MIN_INTERVAL_MS 16
 
-// How long after the last daemon MSG_CONFIGURE the daemon is considered to be actively
-// dictating this window's geometry (dom0 WM drag). Position-only announces are withheld
-// for this long; the settle announce (if any is still needed) comes from
-// CfgFlushPendingMove once the drive ends.
-#define DAEMON_DRIVE_ACTIVE_MS 300
-
 // How long a posted async SetWindowPos is presumed in flight before a newer daemon
 // geometry may be posted anyway (the window may legitimately never reach the target,
 // e.g. a guest-side snap; without the timeout one lost move would wedge the drive).
@@ -1529,8 +1523,8 @@ static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
     // While the daemon is dictating this window's geometry, dom0 already knows where its
     // window is - hold the flush until the drive ends, then announce the true resting
     // place below (or nothing, if the window landed exactly where the daemon put it).
-    if (entry->DaemonDriveTick != 0 &&
-        GetTickCount() - entry->DaemonDriveTick < DAEMON_DRIVE_ACTIVE_MS)
+    if (entry->DaemonStreamTick != 0 &&
+        GetTickCount() - entry->DaemonStreamTick < DAEMON_DRIVE_ACTIVE_MS)
         return;
 
     // Flush the CURRENT canonical position, not the coordinates that were withheld: the
@@ -1595,8 +1589,8 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         // about position until the drive ends. The withheld-coords slot keeps the flush
         // path armed so the resting position is verified (and only announced if it differs
         // from what the daemon itself dictated). Size/override changes still go through.
-        if (posOnly && entry->DaemonDriveTick != 0 &&
-            (now - entry->DaemonDriveTick) < DAEMON_DRIVE_ACTIVE_MS)
+        if (posOnly && entry->DaemonStreamTick != 0 &&
+            (now - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS)
         {
             entry->CfgPendingPos = TRUE;
             entry->CfgPendingX = entry->X;
@@ -4348,8 +4342,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         // whole window once, right after CfgFlushPendingMove has announced the true resting
         // origin. Occlusion claims are unaffected - only the sends are held.
         BOOL daemonHoldDamage = FALSE;
-        if (entry->DaemonDriveTick != 0 &&
-            (GetTickCount() - entry->DaemonDriveTick) < DAEMON_DRIVE_ACTIVE_MS)
+        if (entry->DaemonStreamTick != 0 &&
+            (GetTickCount() - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS)
         {
             daemonHoldDamage = TRUE;
             entry->DaemonDamageHeld = TRUE;

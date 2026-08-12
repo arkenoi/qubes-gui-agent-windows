@@ -772,7 +772,17 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
             // SUPPRESSION in SendWindowConfigureIfChanged) - echoing the guest
             // window's lagging position at the daemon is what fought the dom0 WM
             // during drags and replayed the trajectory after release.
-            data->DaemonDriveTick = GetTickCount();
+            {
+                DWORD driveNow = GetTickCount();
+                // Two configures within the window = a stream (dom0 WM drag at input
+                // rate); only a stream suppresses announces and holds damage. A lone
+                // placement configure stamps DriveTick only, so a freshly-mapped
+                // window's first paint is never delayed.
+                if (data->DaemonDriveTick != 0 &&
+                    (driveNow - data->DaemonDriveTick) < DAEMON_DRIVE_ACTIVE_MS)
+                    data->DaemonStreamTick = driveNow;
+                data->DaemonDriveTick = driveNow;
+            }
         }
         else
         {
