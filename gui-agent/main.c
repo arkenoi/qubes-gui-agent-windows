@@ -1725,6 +1725,51 @@ void ApplyAllPendingDaemonMoves(void)
     LeaveCriticalSection(&g_csWatchedWindows);
 }
 
+// Does any window still owe daemon-settle work (a withheld announce, an unapplied daemon
+// move, or held damage)? Decides whether the pump may sleep forever or must wake to sweep.
+BOOL DaemonSettleWorkPending(void)
+{
+    BOOL pending = FALSE;
+    EnterCriticalSection(&g_csWatchedWindows);
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
+         e != &g_WatchedWindowsList && !pending; e = e->Flink)
+    {
+        WINDOW_DATA* entry = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        pending = entry->DaemonMovePending || entry->CfgPendingPos || entry->DaemonDamageHeld;
+    }
+    LeaveCriticalSection(&g_csWatchedWindows);
+    return pending;
+}
+
+// Timer-driven settle: everything the frame loop would do for a window once a daemon drive
+// ends, for the case where NO frame ever arrives to do it (a fully static desktop after a
+// drag - review finding: the settle was frame-gated, so held damage and the resting-place
+// announce could starve indefinitely). The held-damage release here sends the FULL window
+// without occlusion clipping - off-frame there are no regions to clip with, and a one-shot
+// overdraw beats indefinite staleness in this rare no-frames path.
+void DaemonSettleSweep(void)
+{
+    EnterCriticalSection(&g_csWatchedWindows);
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
+         e != &g_WatchedWindowsList; e = e->Flink)
+    {
+        WINDOW_DATA* entry = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (entry->Synthesized || entry->DeletePending)
+            continue;
+        CfgFlushPendingMove(entry);
+        ApplyPendingDaemonMove(entry);
+        if (entry->DaemonDamageHeld &&
+            (entry->DaemonStreamTick == 0 ||
+             GetTickCount() - entry->DaemonStreamTick >= DAEMON_DRIVE_ACTIVE_MS))
+        {
+            entry->DaemonDamageHeld = FALSE;
+            SendWindowDamageEvent(entry->Handle, 0, 0,
+                (int)entry->Width, (int)entry->Height);
+        }
+    }
+    LeaveCriticalSection(&g_csWatchedWindows);
+}
+
 // Remove window from the list and free memory.
 // Watched windows list critical section must be entered.
 ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
@@ -4350,13 +4395,44 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         }
         else if (entry->DaemonDamageHeld)
         {
+            // Drive ended: repaint what was withheld - but only the VISIBLE part.
+            // A full-window send here would hand this window the pixels of anything
+            // stacked above it (the occlusion bleed the region arithmetic below
+            // exists to prevent; review finding). rgnVisible is already this window
+            // minus the area claimed by higher windows.
             entry->DaemonDamageHeld = FALSE;
-            status = SendWindowDamageEvent(entry->Handle, 0, 0,
-                (int)entry->Width, (int)entry->Height);
-            if (ERROR_SUCCESS != status)
+            DWORD needed = GetRegionData(rgnVisible, 0, NULL);
+            if (needed > rgnDataSize)
             {
-                win_perror2(status, "SendWindowDamageEvent (daemon-drive settle)");
-                goto cleanup;
+                RGNDATA* grown = (RGNDATA*)realloc(rgnData, needed);
+                if (grown) { rgnData = grown; rgnDataSize = needed; }
+            }
+            if (needed != 0 && needed <= rgnDataSize &&
+                GetRegionData(rgnVisible, rgnDataSize, rgnData) != 0)
+            {
+                const RECT* parts = (const RECT*)rgnData->Buffer;
+                for (DWORD p = 0; p < rgnData->rdh.nCount; p++)
+                {
+                    status = SendWindowDamageEvent(entry->Handle,
+                        parts[p].left - entry->X, parts[p].top - entry->Y,
+                        parts[p].right - parts[p].left, parts[p].bottom - parts[p].top);
+                    if (ERROR_SUCCESS != status)
+                    {
+                        win_perror2(status, "SendWindowDamageEvent (daemon-drive settle)");
+                        goto cleanup;
+                    }
+                }
+            }
+            else
+            {
+                // Region read failed: full-window fallback - staleness would be worse.
+                status = SendWindowDamageEvent(entry->Handle, 0, 0,
+                    (int)entry->Width, (int)entry->Height);
+                if (ERROR_SUCCESS != status)
+                {
+                    win_perror2(status, "SendWindowDamageEvent (daemon-drive settle)");
+                    goto cleanup;
+                }
             }
         }
 
@@ -4767,6 +4843,13 @@ static ULONG WINAPI WatchForEvents(void)
             waitTimeout = (captureRetryDue > now64) ? (DWORD)(captureRetryDue - now64) : 0;
         }
 
+        // Daemon-settle work must not depend on another frame or vchan message ever
+        // arriving (a static desktop after a drag produces neither): bound the wait so
+        // the WAIT_TIMEOUT sweep below can flush the resting announce, apply the last
+        // dictated move, and release held damage.
+        if (waitTimeout == INFINITE && g_VchanClientConnected && DaemonSettleWorkPending())
+            waitTimeout = 100;
+
         // Wait for events.
         signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, waitTimeout);
         if (signaledEvent != WAIT_TIMEOUT && signaledEvent >= MAXIMUM_WAIT_OBJECTS)
@@ -4804,6 +4887,11 @@ static ULONG WINAPI WatchForEvents(void)
             exitLoop = TRUE;
             break;
         }
+
+        // No event fired within the bounded wait: run the settle sweep armed above (and
+        // fall through - the capture-retry logic after the switch also keys on timeouts).
+        if (WAIT_TIMEOUT == signaledEvent && g_VchanClientConnected)
+            DaemonSettleSweep();
 
         switch (signaledEvent)
         {

@@ -619,6 +619,11 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
     {
         // post request without waiting to not block and don't change the Z-order
         UINT flags = SWP_ASYNCWINDOWPOS | SWP_NOZORDER;
+        // TRUE only when this configure actually carried geometry we act on. Ignored
+        // configures (iconic, maximized, byte-identical geometry) must not arm the
+        // daemon-drive machinery: holding damage for a window whose configures we ignore
+        // buys nothing and costs full-window settle repaints (review finding).
+        BOOL geometryDriven = FALSE;
         EnterCriticalSection(&g_csWatchedWindows);
         WINDOW_DATA* data = FindWindowByHandle(window);
         if (data && data->Synthesized)
@@ -676,6 +681,7 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                 }
                 else if (SetWindowPos(window, NULL, rawX, rawY, 0, 0, flags | SWP_NOSIZE))
                 {
+                    geometryDriven = TRUE;
                     LogDebug("0x%x cropped by %d/%d/%d/%d: dom0 configure (%d,%d) applied as raw (%d,%d)",
                         window, data->CropLeft, data->CropTop, data->CropRight, data->CropBottom,
                         configureMsg.x, configureMsg.y, rawX, rawY);
@@ -721,13 +727,29 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                     // at most one in-flight move per window and converts announce-space
                     // coords to SetWindowPos space (the old direct call landed every
                     // move off by the DWM invisible-border delta).
-                    data->DaemonMovePending = TRUE;
-                    data->DaemonMoveX = configureMsg.x;
-                    data->DaemonMoveY = configureMsg.y;
-                    data->DaemonMoveW = configureMsg.width;
-                    data->DaemonMoveH = configureMsg.height;
-                    data->DaemonMoveNoMove = noMove;
-                    data->DaemonMoveNoSize = noSize;
+                    geometryDriven = TRUE;
+                    if (noMove && data->DaemonMovePending && !data->DaemonMoveNoMove)
+                    {
+                        // A dictated position is still waiting (in-flight gated, never
+                        // posted). noMove was computed against the OPTIMISTIC data->X/Y
+                        // (already equal to that pending position), so overwriting the
+                        // stash with NoMove would silently drop the un-applied move and
+                        // leave the window at its old origin (review finding). Keep the
+                        // pending position and its move flag; merge in the newer size.
+                        data->DaemonMoveW = configureMsg.width;
+                        data->DaemonMoveH = configureMsg.height;
+                        data->DaemonMoveNoSize = noSize;
+                    }
+                    else
+                    {
+                        data->DaemonMovePending = TRUE;
+                        data->DaemonMoveX = configureMsg.x;
+                        data->DaemonMoveY = configureMsg.y;
+                        data->DaemonMoveW = configureMsg.width;
+                        data->DaemonMoveH = configureMsg.height;
+                        data->DaemonMoveNoMove = noMove;
+                        data->DaemonMoveNoSize = noSize;
+                    }
 
                     // Expected pos/size updated without waiting for the actual change,
                     // as before (the tracking pass self-corrects if the apply diverges).
@@ -772,12 +794,14 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
             // SUPPRESSION in SendWindowConfigureIfChanged) - echoing the guest
             // window's lagging position at the daemon is what fought the dom0 WM
             // during drags and replayed the trajectory after release.
+            if (geometryDriven)
             {
                 DWORD driveNow = GetTickCount();
-                // Two configures within the window = a stream (dom0 WM drag at input
-                // rate); only a stream suppresses announces and holds damage. A lone
-                // placement configure stamps DriveTick only, so a freshly-mapped
-                // window's first paint is never delayed.
+                // Two geometry-carrying configures within the window = a stream (dom0 WM
+                // drag at input rate); only a stream suppresses announces and holds
+                // damage. A lone placement configure stamps DriveTick only, so a
+                // freshly-mapped window's first paint is never delayed - and ignored
+                // configures (iconic/maximized/unchanged) stamp nothing at all.
                 if (data->DaemonDriveTick != 0 &&
                     (driveNow - data->DaemonDriveTick) < DAEMON_DRIVE_ACTIVE_MS)
                     data->DaemonStreamTick = driveNow;

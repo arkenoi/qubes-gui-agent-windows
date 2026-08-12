@@ -292,6 +292,14 @@ void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry);
 // Called after a vchan drain so a configure flood collapses to one move per window.
 void ApplyAllPendingDaemonMoves(void);
 
+// TRUE while any window owes daemon-settle work (withheld announce, unapplied daemon
+// move, held damage) - the pump then bounds its wait instead of sleeping forever.
+BOOL DaemonSettleWorkPending(void);
+
+// Timer-driven settle for the no-frames case (static desktop after a drag): flush,
+// apply, and release held damage for every window. Takes g_csWatchedWindows itself.
+void DaemonSettleSweep(void);
+
 WINDOW_DATA *FindWindowByHandle(
     IN HWND window
     );
