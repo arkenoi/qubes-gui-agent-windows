@@ -124,6 +124,14 @@ typedef struct _WINDOW_DATA
     int LastCfgH;
     BOOL LastCfgOvr;
 
+    // Rate limit for position-only announces (see SendWindowConfigureIfChanged): tick of the
+    // last one sent, and the coordinates withheld by the limiter so the FINAL position is
+    // always flushed when motion stops.
+    DWORD CfgLastSentTick;
+    BOOL  CfgPendingPos;
+    int   CfgPendingX;
+    int   CfgPendingY;
+
     // Card size the dom0 size-lock hint was last sent for (WM-managed shell surfaces only).
     // -1 = never sent; re-sent when the announced card size changes.
     int SizeLockW;

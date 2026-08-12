@@ -1498,6 +1498,34 @@ end:
 
 // Send MSG_CONFIGURE for a tracked window with its current geometry, unless it would be
 // byte-identical to the last one sent (drag processing produced bursts of 4+ duplicates).
+// Minimum spacing between position-only MSG_CONFIGUREs for one window (~60/s). Fast enough
+// that a drag looks continuous in dom0, slow enough that we cannot outrun the daemon's
+// consumption and build a backlog that replays after the drag.
+#define CFG_POS_MIN_INTERVAL_MS 16
+
+// Send a position the rate limiter withheld, once the window has stopped moving. Called from
+// the tracking pass for every window; cheap no-op when nothing is pending.
+static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
+{
+    if (!entry->CfgPendingPos)
+        return;
+    if (GetTickCount() - entry->CfgLastSentTick < CFG_POS_MIN_INTERVAL_MS)
+        return; // still inside the window; the next pass will flush it
+
+    entry->CfgPendingPos = FALSE;
+    entry->CfgLastSentTick = GetTickCount();
+    if (SendWindowConfigure(entry->Handle, entry->CfgPendingX, entry->CfgPendingY,
+            entry->Width, entry->Height, entry->IsOverrideRedirect) == ERROR_SUCCESS)
+    {
+        entry->CfgSentValid = TRUE;
+        entry->LastCfgX = entry->CfgPendingX;
+        entry->LastCfgY = entry->CfgPendingY;
+        entry->LastCfgW = (int)entry->Width;
+        entry->LastCfgH = (int)entry->Height;
+        entry->LastCfgOvr = entry->IsOverrideRedirect;
+    }
+}
+
 static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
 {
     if (entry->Synthesized)
@@ -1507,6 +1535,38 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
         entry->LastCfgOvr == entry->IsOverrideRedirect)
         return ERROR_SUCCESS;
+
+    // OUTGOING RATE LIMIT for position-only changes.
+    //
+    // A guest-native drag moves the window at input rate, and every step used to be
+    // announced. If the daemon drains MSG_CONFIGURE slower than we produce them, the ring
+    // becomes a QUEUE OF STALE POSITIONS: the guest window is already at rest while dom0 is
+    // still working through the backlog, so the dom0 window walks the whole drag path after
+    // the user let go - the "jump back and replay the trajectory" (user-reported 2026-08-12;
+    // the guest window was sampled STATIC while the agent was still announcing motion, which
+    // is exactly this producer/consumer mismatch, and it is why nothing on the INBOUND path
+    // explained it - the daemon sends no configures during such a drag at all).
+    //
+    // Latest-wins: at most one position-only announce per window per CFG_POS_MIN_INTERVAL_MS,
+    // with the withheld coordinates remembered so the FINAL resting position is always sent
+    // (below, and by the next non-position change which is never rate-limited). Size /
+    // override-redirect changes are never delayed - only pure moves.
+    {
+        BOOL posOnly = entry->CfgSentValid &&
+            entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
+            entry->LastCfgOvr == entry->IsOverrideRedirect;
+        DWORD now = GetTickCount();
+        if (posOnly && entry->CfgLastSentTick != 0 &&
+            (now - entry->CfgLastSentTick) < CFG_POS_MIN_INTERVAL_MS)
+        {
+            entry->CfgPendingPos = TRUE;
+            entry->CfgPendingX = entry->X;
+            entry->CfgPendingY = entry->Y;
+            return ERROR_SUCCESS; // withheld; flushed by CfgFlushPendingMove or the next change
+        }
+        entry->CfgLastSentTick = now;
+        entry->CfgPendingPos = FALSE;
+    }
 
     ULONG status = SendWindowConfigure(entry->Handle, entry->X, entry->Y,
         entry->Width, entry->Height, entry->IsOverrideRedirect);
@@ -4114,6 +4174,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 }
             }
         }
+
+        // If the rate limiter withheld this window's last move, send it now that the
+        // window has gone quiet - otherwise dom0 would be left one step behind the
+        // window's resting place.
+        CfgFlushPendingMove(entry);
 
         windowRect.left = entry->X;
         windowRect.top = entry->Y;
