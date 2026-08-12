@@ -455,8 +455,30 @@ static DWORD HandleButton(IN HWND window)
             if (data)
             {
                 haveTracked = TRUE;
-                trackedX = data->X;
-                trackedY = data->Y;
+                // THE ANNOUNCED ORIGIN, NOT THE LIVE ONE. dom0 computed these relative
+                // coordinates against the rect it was last TOLD about, so that is the only
+                // origin they can be added back to. Using the live X/Y closes a positive
+                // feedback loop on the guest-native drag path: the injected cursor picks up
+                // (live - announced), the app's modal move loop moves the window by that
+                // error, which changes the live origin again. While announces are starved
+                // (a slow frame holds the tracking lock, or the daemon defers a queued
+                // configure) the error accumulates and the window RUNS AHEAD of the hand;
+                // when the backlog flushes and dom0 adopts the newest position, the next
+                // injected sample is short by the whole accumulated gap and the window is
+                // yanked BACKWARD - the forth-and-back the user reported 2026-08-12
+                // (measured: 23 direction reversals in 143 genuine announces, amplitude =
+                // drag velocity x announce dead time, horizontal-only on a horizontal drag).
+                // The comment above always stated this rule; only the field was wrong.
+                if (data->CfgSentValid)
+                {
+                    trackedX = data->LastCfgX;
+                    trackedY = data->LastCfgY;
+                }
+                else
+                {
+                    trackedX = data->X;
+                    trackedY = data->Y;
+                }
             }
         }
         LeaveCriticalSection(&g_csWatchedWindows);
@@ -572,8 +594,30 @@ static DWORD InjectMotion(IN HWND window, IN const struct msg_motion* motionMsg)
             if (data)
             {
                 haveTracked = TRUE;
-                trackedX = data->X;
-                trackedY = data->Y;
+                // THE ANNOUNCED ORIGIN, NOT THE LIVE ONE. dom0 computed these relative
+                // coordinates against the rect it was last TOLD about, so that is the only
+                // origin they can be added back to. Using the live X/Y closes a positive
+                // feedback loop on the guest-native drag path: the injected cursor picks up
+                // (live - announced), the app's modal move loop moves the window by that
+                // error, which changes the live origin again. While announces are starved
+                // (a slow frame holds the tracking lock, or the daemon defers a queued
+                // configure) the error accumulates and the window RUNS AHEAD of the hand;
+                // when the backlog flushes and dom0 adopts the newest position, the next
+                // injected sample is short by the whole accumulated gap and the window is
+                // yanked BACKWARD - the forth-and-back the user reported 2026-08-12
+                // (measured: 23 direction reversals in 143 genuine announces, amplitude =
+                // drag velocity x announce dead time, horizontal-only on a horizontal drag).
+                // The comment above always stated this rule; only the field was wrong.
+                if (data->CfgSentValid)
+                {
+                    trackedX = data->LastCfgX;
+                    trackedY = data->LastCfgY;
+                }
+                else
+                {
+                    trackedX = data->X;
+                    trackedY = data->Y;
+                }
             }
         }
         LeaveCriticalSection(&g_csWatchedWindows);
