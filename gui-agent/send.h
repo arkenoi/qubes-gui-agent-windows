@@ -79,6 +79,7 @@ ULONG SendWindowDestroy(IN HWND window);
 void SendResetCreatedWindows(void);
 ULONG SendWindowFlags(IN HWND window, IN uint32_t flagsToSet, IN uint32_t flagsToUnset);
 ULONG SendWindowHints(IN HWND window, IN uint32_t flags);
+ULONG SendWindowSizeLock(IN HWND window, IN uint32_t width, IN uint32_t height);
 ULONG SendScreenHints(void);
 ULONG SendWindowUnmap(IN HWND window);
 ULONG SendWindowMap(IN const WINDOW_DATA *windowData OPTIONAL); // if windowData == 0, use the whole screen

@@ -670,6 +670,19 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                         configureMsg.x, configureMsg.y, rawX, rawY);
                     data->X = configureMsg.x;
                     data->Y = configureMsg.y;
+
+                    // CRITICAL: record this as last-sent so the tracking pass does NOT echo
+                    // it back. The daemon dictated this position; re-announcing it makes the
+                    // daemon move its window, which re-announces, ... = the window jumping
+                    // around on its own during a drag (user-reported 2026-08-12). The normal
+                    // (non-crop) branch below has always done this; the crop branch omitting
+                    // it was the bug.
+                    data->CfgSentValid = TRUE;
+                    data->LastCfgX = data->X;
+                    data->LastCfgY = data->Y;
+                    data->LastCfgW = (int)data->Width;
+                    data->LastCfgH = (int)data->Height;
+                    data->LastCfgOvr = data->IsOverrideRedirect;
                 }
                 else
                 {

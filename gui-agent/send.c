@@ -595,6 +595,19 @@ static ULONG SendWindowCreateInternal(IN const WINDOW_DATA *windowData, IN BOOL 
         status = SendWindowHints(windowData->Handle, PPosition); // program-specified position
         if (ERROR_SUCCESS != status)
             return status;
+
+        // A WM-managed shell surface (Start/toast: or=0 with a crop) is draggable but must
+        // NOT be resizeable - lock its size so the dom0 WM shows no resize handles. A resize
+        // would stretch the frame past the fixed-size guest card and expose desktop behind
+        // it. Keyed on the crop, so ordinary windows are unaffected.
+        if (!windowData->IsOverrideRedirect &&
+            (windowData->CropLeft || windowData->CropTop ||
+             windowData->CropRight || windowData->CropBottom))
+        {
+            status = SendWindowSizeLock(windowData->Handle, windowData->Width, windowData->Height);
+            if (ERROR_SUCCESS != status)
+                return status;
+        }
     }
 
     return ERROR_SUCCESS;
@@ -704,6 +717,38 @@ ULONG SendWindowHints(IN HWND window, IN uint32_t flags)
 
     EnterCriticalSection(&g_VchanCriticalSection);
     status = MaySendForWindowLocked(window, L"MSG_WINDOW_HINTS") ? VCHAN_SEND_MSG(header, hintsMsg, L"MSG_WINDOW_HINTS") : TRUE;
+    LeaveCriticalSection(&g_VchanCriticalSection);
+
+    return status ? ERROR_SUCCESS : VchanLastSendError();
+}
+
+// Lock a window's size on the dom0 side: PMinSize == PMaxSize means the WM offers no resize
+// handles at all. Used for WM-managed shell surfaces (Start/toasts) - they are DRAGGABLE but
+// must not be RESIZEABLE: the guest card is a fixed size, and a dom0 resize would stretch the
+// frame past the card, exposing desktop behind it (user-reported 2026-08-12). width/height are
+// the ANNOUNCED (cropped) size.
+ULONG SendWindowSizeLock(IN HWND window, IN uint32_t width, IN uint32_t height)
+{
+    struct msg_hdr header;
+    struct msg_window_hints hintsMsg = { 0 };
+    BOOL status;
+
+    if (!g_VchanClientConnected)
+        return ERROR_SUCCESS;
+
+    hintsMsg.flags = PMinSize | PMaxSize;
+    hintsMsg.min_width = width;
+    hintsMsg.min_height = height;
+    hintsMsg.max_width = width;
+    hintsMsg.max_height = height;
+
+#pragma warning(suppress:4311)
+    header.window = (uint32_t)window;
+    header.type = MSG_WINDOW_HINTS;
+
+    EnterCriticalSection(&g_VchanCriticalSection);
+    status = MaySendForWindowLocked(window, L"MSG_WINDOW_HINTS sizelock")
+        ? VCHAN_SEND_MSG(header, hintsMsg, L"MSG_WINDOW_HINTS sizelock") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     return status ? ERROR_SUCCESS : VchanLastSendError();
