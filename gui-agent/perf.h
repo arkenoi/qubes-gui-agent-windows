@@ -67,6 +67,24 @@
 // to either. These allow each to be disabled independently.
 #define REG_CONFIG_DDA_CAPTURE_VALUE L"DdaCapture"     // DWORD 0/1, default 1
 #define REG_CONFIG_FRAME_DROP_VALUE  L"FrameDrop"      // DWORD 0/1, default 0 - see below
+// Guest-native drag wobble fix (DWORD 0/1, default 1 = fix active). While the left
+// button is held on a window, the input handlers translate dom0's window-relative
+// coordinates against the origin FROZEN at button-down, and position-only announces
+// for that window are withheld until release (one final announce + settle repaint).
+// 0 restores the historic live-origin behaviour for the interleaved regression run.
+#define REG_CONFIG_INPUT_DRAG_FREEZE_VALUE L"InputDragFreeze" // DWORD 0/1, default 1
+// Mis-render fix (DWORD 0/1, default 1 = fix active): drop DDA ownership of a
+// per-window channel the moment the frame loop observes the window's position
+// changed, so the move-settle recapture reaches the engine instead of being
+// swallowed by the ddaOwned latch. 0 restores the latch-across-moves behaviour.
+#define REG_CONFIG_DDA_MOVE_INVALIDATE_VALUE L"DdaMoveInvalidate" // DWORD 0/1, default 1
+// upd-spike reduction R1 (DWORD 0/1, default 0 = off): cache MONITORINFOEX+DEVMODE
+// per HMONITOR inside GetRealWindowRect, invalidated by WM_DISPLAYCHANGE + a 2 s TTL.
+#define REG_CONFIG_MON_INFO_CACHE_VALUE L"MonInfoCache" // DWORD 0/1, default 0
+// upd-spike reduction R2 (DWORD 0/1, default 0 = off): defer the periodic full-resync
+// backstop while an input drag is latched, capped at 3x the normal interval; never
+// deferred in hook-dead fallback mode (the resync IS the tracking there).
+#define REG_CONFIG_RESYNC_DRAG_DEFER_VALUE L"ResyncDragDefer" // DWORD 0/1, default 0
 // Exempt DDA-active windows from the wincapture engine's 250ms round-robin sweep.
 // The sweep exists so guest-occluded windows (invisible to DDA) still converge, but a
 // DDA-active window is by definition foreground and unoccluded - sweeping it runs a full
@@ -144,6 +162,22 @@ extern BOOL     g_FocusRaise;
 extern BOOL     g_DdaCapture;
 extern BOOL     g_FrameDrop;
 extern BOOL     g_SweepDdaExempt;
+
+// Freeze the input translation origin + withhold position announces during a
+// guest-native drag (D1 drag wobble; see g_InputDragOrigin* in main.c). Default ON:
+// the live-origin loop is divergent for the measured announce-apply lag (66-250 ms
+// against a ~10 ms event rate), saturating at 40-168 px oscillations.
+extern BOOL     g_InputDragFreeze;
+
+// Drop DDA ownership when the frame loop sees a window move (D2 mis-render). Default
+// ON: without it the move-settle recapture is a no-op for a DDA-active window and the
+// last stale-origin slice copy is the final content dom0 ever receives.
+extern BOOL     g_DdaMoveInvalidate;
+
+// upd-spike experiments, default OFF (old behaviour) until measured: R1 monitor-info
+// cache in GetRealWindowRect, R2 drag-time deferral of the resync backstop.
+extern BOOL     g_MonInfoCache;
+extern BOOL     g_ResyncDragDefer;
 extern LONGLONG g_PerfFreq;     // QueryPerformanceFrequency, ticks per second
 extern DWORD    g_PerfEveryN;   // emit one line per this many processed frames
 

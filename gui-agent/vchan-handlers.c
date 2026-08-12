@@ -443,23 +443,41 @@ static DWORD HandleButton(IN HWND window)
     // insets), so a positioned click through it would land measurably wrong - worse than
     // the historic click-at-last-motion semantics it would replace.
     BOOL positionTrusted = (window == NULL); // screen-relative coords need no translation
+    // Function scope: the latch arm below records the exact addend this event used.
+    BOOL haveTracked = FALSE;
+    int32_t trackedX = 0, trackedY = 0;
 
     if (window)
     {
-        BOOL haveTracked = FALSE;
-        int32_t trackedX = 0, trackedY = 0;
-
-        EnterCriticalSection(&g_csWatchedWindows);
+        // FROZEN ORIGIN (D1 drag wobble; see g_InputDragOrigin* in main.c). While the
+        // latch holds this window every event - critically the RELEASE - translates in
+        // the frame the PRESS used: with position announces withheld, dom0's applied
+        // origin cannot move mid-drag, so the frozen addend is the exact one, while the
+        // live tracked X/Y advances with the dragged window and would land the release
+        // up to the in-flight displacement away from where dom0 aimed. A Button1 PRESS
+        // never takes this path: the press is what anchors a new drag, and a stale
+        // frozen origin from a lost release must not leak into it.
+        if (g_InputDragFreeze && window == g_InputDragWindow && g_InputDragOriginValid &&
+            !(buttonMsg.button == Button1 && buttonMsg.type == ButtonPress))
         {
-            const WINDOW_DATA* data = FindWindowByHandle(window);
-            if (data)
-            {
-                haveTracked = TRUE;
-                trackedX = data->X;
-                trackedY = data->Y;
-            }
+            haveTracked = TRUE;
+            trackedX = g_InputDragOriginX;
+            trackedY = g_InputDragOriginY;
         }
-        LeaveCriticalSection(&g_csWatchedWindows);
+        else
+        {
+            EnterCriticalSection(&g_csWatchedWindows);
+            {
+                const WINDOW_DATA* data = FindWindowByHandle(window);
+                if (data)
+                {
+                    haveTracked = TRUE;
+                    trackedX = data->X;
+                    trackedY = data->Y;
+                }
+            }
+            LeaveCriticalSection(&g_csWatchedWindows);
+        }
 
         if (haveTracked)
         {
@@ -540,8 +558,20 @@ static DWORD HandleButton(IN HWND window)
     // 15-18 ms PrintWindow per frame re-capturing content that cannot have changed. Set on
     // press, cleared on ANY release so the latch can never stick if the press and release
     // land on different windows.
+    g_InputDragLastEventTick = GetTickCount();
     if (buttonMsg.button == Button1)
+    {
         g_InputDragWindow = (buttonMsg.type == ButtonPress) ? window : NULL;
+        // Freeze the origin at the addend THIS press just used: the shared translation
+        // makes the grab offset g = r_press cancel exactly, so even a pre-drag announce
+        // still in flight only shifts the transient, never the final position. Valid
+        // only when the press found the window tracked - the GetWindowRect fallback
+        // speaks a different space (missing DWM trim / crop insets) and must not be
+        // frozen into a whole drag.
+        g_InputDragOriginValid = (buttonMsg.type == ButtonPress) && haveTracked;
+        g_InputDragOriginX = trackedX;
+        g_InputDragOriginY = trackedY;
+    }
 
     LogDebug("window 0x%x, (%d,%d), flags 0x%x", window, buttonMsg.x, buttonMsg.y, inputEvent.mi.dwFlags);
     InjectInput(&inputEvent, "SendInput");
@@ -564,6 +594,7 @@ static DWORD HandleMotion(IN HWND window)
     int32_t x = motionMsg.x;
     int32_t y = motionMsg.y;
 
+    g_InputDragLastEventTick = GetTickCount();
     if (motionMsg.is_hint)
     {
         LogDebug("0x%x: ignoring motion hint (%d,%d)", window, x, y);
@@ -578,17 +609,34 @@ static DWORD HandleMotion(IN HWND window)
         BOOL haveTracked = FALSE;
         int32_t trackedX = 0, trackedY = 0;
 
-        EnterCriticalSection(&g_csWatchedWindows);
+        // FROZEN ORIGIN (D1 drag wobble, see HandleButton): while the latch holds this
+        // window, translate against the origin captured at button-down instead of the
+        // live tracked X/Y. The live origin follows the dragged window, and with the
+        // measured announce-apply lag (66-250 ms vs a ~10 ms event rate) feeding it
+        // back through the guest's modal move loop is a divergent oscillator - the
+        // measured 40-163 px forth-and-back with 16-19% of announces reversing. With
+        // announces withheld dom0's origin equals the frozen one for the whole drag,
+        // so the reconstruction is exact, not damped.
+        if (g_InputDragFreeze && window == g_InputDragWindow && g_InputDragOriginValid)
         {
-            const WINDOW_DATA* data = FindWindowByHandle(window);
-            if (data)
-            {
-                haveTracked = TRUE;
-                trackedX = data->X;
-                trackedY = data->Y;
-            }
+            haveTracked = TRUE;
+            trackedX = g_InputDragOriginX;
+            trackedY = g_InputDragOriginY;
         }
-        LeaveCriticalSection(&g_csWatchedWindows);
+        else
+        {
+            EnterCriticalSection(&g_csWatchedWindows);
+            {
+                const WINDOW_DATA* data = FindWindowByHandle(window);
+                if (data)
+                {
+                    haveTracked = TRUE;
+                    trackedX = data->X;
+                    trackedY = data->Y;
+                }
+            }
+            LeaveCriticalSection(&g_csWatchedWindows);
+        }
 
         if (haveTracked)
         {

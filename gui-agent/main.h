@@ -41,6 +41,16 @@ extern HWND g_DesktopWindow;
 // Window currently being dragged with a held mouse button (input path); NULL when none.
 // Suppresses per-window PrintWindow recapture for that window - see its definition.
 extern volatile HWND g_InputDragWindow;
+// Tick of the last input event for the latched window; the pump sweep disarms a latch that
+// has seen no input for INPUT_DRAG_STUCK_MS (a lost Button1 release must not freeze a
+// window's announces and content indefinitely).
+extern DWORD g_InputDragLastEventTick;
+// Translation origin FROZEN at the Button1 press that armed the latch (drag-wobble
+// fix; see the definitions in main.c). Valid only while g_InputDragWindow is set and
+// the press found the window tracked.
+extern int g_InputDragOriginX;
+extern int g_InputDragOriginY;
+extern BOOL g_InputDragOriginValid;
 extern char g_DomainName[256];
 extern USHORT g_GuiDomainId;
 extern CRITICAL_SECTION g_csWatchedWindows;
@@ -293,6 +303,11 @@ BOOL ShouldAcceptWindow(
 #define DAEMON_DRIVE_ACTIVE_MS 300
 
 ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect);
+
+// Invalidate GetRealWindowRect's per-HMONITOR monitor/display-mode cache (R1,
+// "MonInfoCache"). Called from the WM_DISPLAYCHANGE listener (workarea.c) - the one
+// event on which the cached values can actually change. Safe from any thread.
+void MonitorCacheInvalidate(void);
 
 // Apply the newest daemon-dictated geometry for this window if no earlier async
 // SetWindowPos is still in flight (latest-wins; see DaemonMove* in WINDOW_DATA).

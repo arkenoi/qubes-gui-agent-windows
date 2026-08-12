@@ -381,6 +381,10 @@ static LRESULT CALLBACK WaWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_DISPLAYCHANGE:
         LogDebug("WM_DISPLAYCHANGE %ux%u: re-asserting work area",
             (UINT)LOWORD(lp), (UINT)HIWORD(lp));
+        // The monitor rect / display mode GetRealWindowRect caches per HMONITOR
+        // ("MonInfoCache") can only change on this event; drop the cache before
+        // anything recomputes geometry from it.
+        MonitorCacheInvalidate();
         // The mode ALREADY changed (this is a notification, not a request); make the
         // agent's believed size follow reality before the work area is recomputed, or
         // WaCompute clamps against a stale screen and SPI_SETWORKAREA rejects the rect.

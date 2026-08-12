@@ -43,6 +43,10 @@ BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
 BOOL     g_FrameDrop   = FALSE;
 BOOL     g_SweepDdaExempt = TRUE;
+BOOL     g_InputDragFreeze = TRUE;
+BOOL     g_DdaMoveInvalidate = TRUE;
+BOOL     g_MonInfoCache = FALSE;
+BOOL     g_ResyncDragDefer = FALSE;
 LONGLONG g_PerfFreq = 0;
 DWORD    g_PerfEveryN = 1;
 
@@ -204,6 +208,28 @@ void PerfInit(void)
         LogInfo("QGADDACAPTURE %s", g_DdaCapture ? L"on" : L"off");
         LogInfo("QGAFRAMEDROP %s", g_FrameDrop ? L"on" : L"off");
         LogInfo("QGASWEEPEXEMPT %s", g_SweepDdaExempt ? L"on" : L"off");
+    }
+
+    // Drag-wobble / mis-render fixes and upd-spike experiments. Logged unconditionally,
+    // like the switches above: an acceptance run is meaningless without knowing which
+    // condition the deployed binary ran under.
+    {
+        DWORD v = 0;
+        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)))
+        {
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_FREEZE_VALUE, &v, NULL))
+                g_InputDragFreeze = (v != 0);
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_DDA_MOVE_INVALIDATE_VALUE, &v, NULL))
+                g_DdaMoveInvalidate = (v != 0);
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_MON_INFO_CACHE_VALUE, &v, NULL))
+                g_MonInfoCache = (v != 0);
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_RESYNC_DRAG_DEFER_VALUE, &v, NULL))
+                g_ResyncDragDefer = (v != 0);
+        }
+        LogInfo("QGADRAGFREEZE %s", g_InputDragFreeze ? L"on" : L"off");
+        LogInfo("QGADDAMOVEINV %s", g_DdaMoveInvalidate ? L"on" : L"off");
+        LogInfo("QGAMONCACHE %s", g_MonInfoCache ? L"on" : L"off");
+        LogInfo("QGARESYNCDEFER %s", g_ResyncDragDefer ? L"on" : L"off");
     }
 
     if (!g_PerfEnabled)

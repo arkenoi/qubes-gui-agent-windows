@@ -134,6 +134,32 @@ static HWND g_LastForeground = NULL;
 // moving window's CONTENT does not change. The latch closes those gaps: while it is set the
 // window counts as moving regardless of event timing.
 volatile HWND g_InputDragWindow = NULL;
+
+// Tick of the last input event seen for the latched window. A Button1 release can be lost
+// (agent restart mid-click, secure desktop, a click that lands on another qube), and with
+// the drag freeze in force a stuck latch would hold that window's position announces - and
+// its legacy-path content - frozen until the next Button1 event anywhere. The pump's
+// existing WAIT_TIMEOUT sweep disarms it after this long without input (review finding).
+DWORD g_InputDragLastEventTick = 0;
+#define INPUT_DRAG_STUCK_MS 10000
+
+// Translation origin FROZEN at the Button1 press that armed the latch (D1 drag
+// wobble). dom0 sends WINDOW-RELATIVE input coordinates; the agent reconstructs an
+// absolute by adding a guest-side origin, but the true addend is dom0's APPLIED
+// window origin, which lags our announces and is unobservable during a guest-native
+// drag (measured: ZERO inbound MSG_CONFIGURE inside a 5.85 s drag). With the LIVE
+// tracked origin the guest's modal move loop closes a feedback loop that is
+// divergent for the measured announce-apply lag (66-250 ms against a ~10 ms event
+// rate), saturating at cursor-re-anchor amplitude v*lag = 40-168 px - the measured
+// 40-163 px back-and-forth with 16-19% of announces reversing direction. Injection
+// is EXACT if and only if dom0's origin is held constant for the whole drag, so:
+// translate against the origin captured at press, and withhold position-only
+// announces for the latched window until release (SendWindowConfigureIfChanged).
+// All writers/readers run on the WatchForEvents pump thread (HandleServerData is
+// dispatched from the same loop), so no synchronization is needed.
+int g_InputDragOriginX = 0;
+int g_InputDragOriginY = 0;
+BOOL g_InputDragOriginValid = FALSE;
 HWND g_TaskbarWindow = NULL;
 BOOL g_ShowTaskbar = FALSE;
 
@@ -358,7 +384,22 @@ static BOOL TakePendingWindows(OUT HWND* buffer, OUT DWORD* events, IN UINT capa
             ? WINDOW_RESYNC_FALLBACK_MS : WINDOW_RESYNC_INTERVAL_MS;
 
         if (!resync && (now - g_LastResyncTime) >= interval)
-            resync = TRUE;
+        {
+            // R2 ("ResyncDragDefer", default off): the resync interrogates EVERY tracked
+            // window in one burst, and concurrent with a drag's throttled PrintWindow
+            // recapture each interrogation stalls ~8 ms - the measured 24-53 ms upd
+            // spikes land squarely inside the p95=140 ms announce-gap tail. Defer the
+            // burst while an input drag is latched, capped at 3x the interval so a lost
+            // release cannot starve the safety net. Never deferred in fallback mode:
+            // with the hook thread dead the resync IS the tracking.
+            BOOL deferred = g_ResyncDragDefer &&
+                interval == WINDOW_RESYNC_INTERVAL_MS &&
+                g_InputDragWindow != NULL &&
+                (now - g_LastResyncTime) < 3 * WINDOW_RESYNC_INTERVAL_MS;
+
+            if (!deferred)
+                resync = TRUE;
+        }
     }
 
     if (resync)
@@ -749,6 +790,82 @@ end:
 }
 #endif // DEBUG_DUMP_WINDOWS
 
+// R1 ("MonInfoCache", default off): generation counter for the per-HMONITOR cache
+// below, bumped by the WM_DISPLAYCHANGE listener - the only event on which the cached
+// monitor rect / display mode can change. Interlocked because the listener runs on the
+// work-area broadcast thread while the cache itself lives on the pump thread.
+static volatile LONG g_MonCacheGen = 1;
+
+// Belt-and-braces bound on cache staleness if the broadcast listener is down: worst
+// case degrades to today's per-call cost for one interval, never to wrong-forever.
+#define MON_CACHE_TTL_MS 2000
+
+void MonitorCacheInvalidate(void)
+{
+    InterlockedIncrement(&g_MonCacheGen);
+}
+
+// The GetMonitorInfo + EnumDisplaySettings pair costs ~340 us per interrogation in the
+// best case, and EnumDisplaySettings serializes into the display path the IDD present
+// loop saturates during a drag (42 ms p50 present cadence) - it is the one call here
+// that can independently block for tens of ms. The inputs change only on a mode
+// change, which WM_DISPLAYCHANGE observes, so a cached copy returns byte-identical
+// values. The cache needs its own lock: besides the pump thread, GetRealWindowRect
+// runs on the toastcrop worker (measurement recheck) and the capture thread (the
+// ProtoTraceWobble probe in send.c). The lock is only ever held for struct copies -
+// the system calls stay outside it.
+static SRWLOCK g_MonCacheLock = SRWLOCK_INIT;
+
+static BOOL GetMonitorSettings(IN HMONITOR monitor, OUT MONITORINFOEX* monInfo, OUT DEVMODE* devMode)
+{
+    static HMONITOR cachedMonitor = NULL; // all statics guarded by g_MonCacheLock
+    static LONG cachedGen = 0;
+    static DWORD cachedTick = 0;
+    static MONITORINFOEX cachedInfo;
+    static DEVMODE cachedMode;
+
+    LONG gen = InterlockedCompareExchange(&g_MonCacheGen, 0, 0);
+    if (g_MonInfoCache)
+    {
+        BOOL hit = FALSE;
+        AcquireSRWLockShared(&g_MonCacheLock);
+        if (monitor == cachedMonitor && gen == cachedGen &&
+            GetTickCount() - cachedTick < MON_CACHE_TTL_MS)
+        {
+            *monInfo = cachedInfo;
+            *devMode = cachedMode;
+            hit = TRUE;
+        }
+        ReleaseSRWLockShared(&g_MonCacheLock);
+        if (hit)
+            return TRUE;
+    }
+
+    monInfo->cbSize = sizeof(*monInfo);
+    if (!GetMonitorInfo(monitor, (LPMONITORINFO)monInfo))
+        return FALSE;
+
+    devMode->dmSize = sizeof(DEVMODE);
+    devMode->dmDriverExtra = 0;
+    // Return value deliberately unchecked, as it always was on this path - but a
+    // failed read must not be CACHED, or one glitch would be replayed for a TTL.
+    if (EnumDisplaySettings(monInfo->szDevice, ENUM_CURRENT_SETTINGS, devMode) && g_MonInfoCache)
+    {
+        // Only WRITE the cache when caching is enabled: with the knob off (the shipped
+        // default) this path must stay byte-identical to the old code, and in particular
+        // must not take a new cross-thread exclusive lock on the per-window hot path that
+        // the pump, capture and toastcrop threads all walk (review finding).
+        AcquireSRWLockExclusive(&g_MonCacheLock);
+        cachedMonitor = monitor;
+        cachedGen = gen;
+        cachedTick = GetTickCount();
+        cachedInfo = *monInfo;
+        cachedMode = *devMode;
+        ReleaseSRWLockExclusive(&g_MonCacheLock);
+    }
+    return TRUE;
+}
+
 // When DWM compositing is enabled (normally always on), most windows are actually smaller
 // than their size reported by winuser functions. This is because their edges contain
 // invisible grip handles managed by DWM. This function returns actual visible window size.
@@ -787,16 +904,9 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
     // monitor info is needed to adjust for DPI scaling
     HMONITOR monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
     MONITORINFOEX monInfo;
-    monInfo.cbSize = sizeof(monInfo);
-#pragma warning(push)
-#pragma warning(disable:4133) // incompatible types - from 'MONITORINFOEX *' to 'LPMONITORINFO' (the function accepts both)
-    if (!GetMonitorInfo(monitor, &monInfo))
-        return win_perror("GetMonitorInfo failed");
-#pragma warning(pop)
-
     DEVMODE devMode;
-    devMode.dmSize = sizeof(DEVMODE);
-    EnumDisplaySettings(monInfo.szDevice, ENUM_CURRENT_SETTINGS, &devMode);
+    if (!GetMonitorSettings(monitor, &monInfo, &devMode))
+        return win_perror("GetMonitorInfo failed");
 
     // adjust for DPI scaling
     double scale = (monInfo.rcMonitor.right - monInfo.rcMonitor.left) / (double)devMode.dmPelsWidth;
@@ -1555,6 +1665,12 @@ static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
     if (entry->DaemonStreamTick != 0 &&
         GetTickCount() - entry->DaemonStreamTick < DAEMON_DRIVE_ACTIVE_MS)
         return;
+    // Mirror hold for a guest-native drag (D1 drag wobble): a withheld position that
+    // leaks mid-drag moves dom0's applied origin and re-opens the feedback loop the
+    // frozen translation origin closed. On release the latch clears and the next pass
+    // (frame loop or settle sweep) flushes exactly one final announce.
+    if (g_InputDragFreeze && g_InputDragOriginValid && entry->Handle == g_InputDragWindow)
+        return;
 
     // Flush the CURRENT canonical position, not the coordinates that were withheld: the
     // window may have moved again since the limiter (or the daemon-drive hold) recorded
@@ -1616,6 +1732,25 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         if (posOnly && entry->DaemonOwnsPos)
         {
             entry->CfgPendingPos = FALSE;
+            return ERROR_SUCCESS;
+        }
+
+        // INPUT-DRAG SUPPRESSION (D1 drag wobble, mirror image of the daemon-drive
+        // branch below). During a guest-native drag the input handlers translate
+        // against the origin frozen at button-down; that is EXACT precisely as long
+        // as dom0's applied origin does not move, i.e. as long as we announce no
+        // positions. Announcing mid-drag would re-open the divergent feedback loop
+        // (measured saturation 40-168 px, 16-19% of announces reversing direction).
+        // The withheld-coords slot keeps the flush path armed: on release the latch
+        // clears and exactly one final announce carries the resting position. Size /
+        // override-redirect changes still go out (a mid-drag snap escapes here), and
+        // the dom0 window's content freeze is the same trade the daemon-drive hold
+        // makes for dom0 WM drags.
+        if (posOnly && g_InputDragFreeze && g_InputDragOriginValid && entry->Handle == g_InputDragWindow)
+        {
+            entry->CfgPendingPos = TRUE;
+            entry->CfgPendingX = entry->X;
+            entry->CfgPendingY = entry->Y;
             return ERROR_SUCCESS;
         }
 
@@ -1810,6 +1945,15 @@ BOOL DaemonSettleWorkPending(void)
 // overdraw beats indefinite staleness in this rare no-frames path.
 void DaemonSettleSweep(void)
 {
+    if (g_InputDragWindow && g_InputDragLastEventTick != 0 &&
+        GetTickCount() - g_InputDragLastEventTick > INPUT_DRAG_STUCK_MS)
+    {
+        LogWarning("input drag latch stuck on 0x%x for >%u ms with no input - disarming",
+            (uint32_t)(ULONG_PTR)g_InputDragWindow, INPUT_DRAG_STUCK_MS);
+        g_InputDragWindow = NULL;
+        g_InputDragOriginValid = FALSE;
+    }
+
     EnterCriticalSection(&g_csWatchedWindows);
     for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
          e != &g_WatchedWindowsList; e = e->Flink)
@@ -1819,6 +1963,11 @@ void DaemonSettleSweep(void)
             continue;
         CfgFlushPendingMove(entry);
         ApplyPendingDaemonMove(entry);
+        // The latched window's hold (D1) must survive this off-frame sweep too: its
+        // announced origin is frozen, so a damage release here would paint the
+        // window's OLD screen region - the exact mis-paint the hold prevents.
+        if (g_InputDragFreeze && g_InputDragOriginValid && entry->Handle == g_InputDragWindow)
+            continue;
         if (entry->DaemonDamageHeld &&
             (entry->DaemonStreamTick == 0 ||
              GetTickCount() - entry->DaemonStreamTick >= DAEMON_DRIVE_ACTIVE_MS))
@@ -1857,6 +2006,15 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
 
     if (entry->Handle == g_StartWindow)
         g_StartVisible = FALSE;
+
+    // Destroyed mid-drag: Windows recycles HWND values, so a latch left behind would
+    // freeze the translation origin and suppress announces for whatever unrelated
+    // window gets the handle next (same hazard as the toast-crop slot above).
+    if (entry->Handle == g_InputDragWindow)
+    {
+        g_InputDragWindow = NULL;
+        g_InputDragOriginValid = FALSE;
+    }
 
     // Never announced (synthesized, or announce failed): the daemon has no CREATE for
     // this hwnd, and UNMAP/DESTROY naming it is the documented daemon-killer (send.c).
@@ -4160,6 +4318,32 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 {
                     entry->PwLastMoveTick = pwNow;
                     entry->PwSettleDue = TRUE;
+
+                    // D2 MIS-RENDER FIX. A DDA-active window that moves can get one
+                    // slice copy with a one-move-step-stale entry->X/Y against the
+                    // post-move screen (captured live 2026-08-12: dom0 showed the
+                    // desktop sampled at (953,541) for a window announced at
+                    // (979,545) - wallpaper strips left/top, right/bottom clipped).
+                    // That would be a one-frame glitch, except the ddaOwned latch
+                    // swallows every recapture this settle machinery fires: WcMarkDirty
+                    // only stores the dirty bit, the engine defers it while ddaOwned,
+                    // and ownership is dropped only inside the pwDamaged branch an
+                    // idle window never re-enters - so the stale copy was the FINAL
+                    // content dom0 ever received. Dropping ownership on the first
+                    // observed move lets the throttled refresh and the settle
+                    // recapture reach the engine; DDA mode re-establishes through
+                    // WcPrefill (authoritative source) once the window is still and
+                    // eligible again. Deliberately keyed on an actual position change,
+                    // never on the g_InputDragWindow latch alone: a plain click on a
+                    // DDA-active window must not pay a 15-65 ms re-establish.
+                    if (g_DdaMoveInvalidate && entry->PwDdaActive)
+                    {
+                        LogInfo("QGADDAMOVE hwnd=0x%x (%d,%d)->(%d,%d): dropping DDA ownership",
+                            (uint32_t)(ULONG_PTR)entry->Handle,
+                            entry->PwFrameX, entry->PwFrameY, entry->X, entry->Y);
+                        entry->PwDdaActive = FALSE;
+                        WcSetDdaOwned(entry->Handle, FALSE);
+                    }
                 }
                 entry->PwFrameX = entry->X;
                 entry->PwFrameY = entry->Y;
@@ -4482,6 +4666,18 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         if (entry->DaemonStreamTick != 0 &&
             (GetTickCount() - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS)
         {
+            daemonHoldDamage = TRUE;
+            entry->DaemonDamageHeld = TRUE;
+        }
+        else if (g_InputDragFreeze && g_InputDragOriginValid && entry->Handle == g_InputDragWindow &&
+                 entry->CfgPendingPos)
+        {
+            // Same hold for a guest-native drag (D1): position announces for the
+            // latched window are withheld, so the daemon's framebuffer read origin is
+            // frozen at the pre-drag position - damage sent now would paint the
+            // window's OLD screen region. Gated on CfgPendingPos: until the first
+            // withheld announce the frozen origin still matches the window, and a
+            // click that never moves anything must not hold damage at all.
             daemonHoldDamage = TRUE;
             entry->DaemonDamageHeld = TRUE;
         }
