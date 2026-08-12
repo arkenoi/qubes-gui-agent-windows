@@ -126,6 +126,13 @@ typedef struct _WINDOW_DATA
     int SizeLockW;
     int SizeLockH;
 
+    // GetTickCount() of the last dom0-commanded move (HandleConfigure). During the settle
+    // window after it, the tracking pass must NOT echo this window's position back to the
+    // daemon: dom0 is authoritative during/just after a drag, and the read-back position
+    // differs from the commanded one by the frame offset, so echoing it starts an
+    // oscillation that drifts the window after release (traced 2026-08-12).
+    DWORD Dom0MoveAt;
+
     // Size the dom0 WM settled on for this window while maximized (from the daemon's
     // MSG_CONFIGURE): its decorations eat into the screen, so it can display slightly
     // less than the guest work area. While maximized, the reported/granted geometry is
