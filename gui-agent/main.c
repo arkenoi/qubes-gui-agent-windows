@@ -1697,7 +1697,13 @@ void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry)
         entry->DaemonOffTick = now;
     }
 
-    UINT flags = SWP_ASYNCWINDOWPOS | SWP_NOZORDER;
+    // SWP_NOACTIVATE: a dom0-driven move is geometry only - it must never change guest
+    // activation. Guest foreground is driven exclusively by MSG_FOCUS (HandleFocus);
+    // letting a move activate would, for a WM-managed Start, be a foreground change that
+    // dismisses the menu the instant the user grabs its frame to drag it (the protocol
+    // has no focus-LOSS message, so nothing else here can dismiss Start - a move is the
+    // only guest-foreground-adjacent action a dom0 drag produces).
+    UINT flags = SWP_ASYNCWINDOWPOS | SWP_NOZORDER | SWP_NOACTIVATE;
     if (entry->DaemonMoveNoMove)
         flags |= SWP_NOMOVE;
     if (entry->DaemonMoveNoSize)
