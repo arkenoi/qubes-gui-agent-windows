@@ -448,6 +448,8 @@ static DWORD HandleButton(IN HWND window)
     {
         BOOL haveTracked = FALSE;
         int32_t trackedX = 0, trackedY = 0;
+        int32_t liveX = 0, liveY = 0;
+        BOOL usedAnnounced = FALSE;
 
         EnterCriticalSection(&g_csWatchedWindows);
         {
@@ -455,6 +457,9 @@ static DWORD HandleButton(IN HWND window)
             if (data)
             {
                 haveTracked = TRUE;
+                liveX = data->X;
+                liveY = data->Y;
+                usedAnnounced = data->CfgSentValid;
                 // THE ANNOUNCED ORIGIN, NOT THE LIVE ONE. dom0 computed these relative
                 // coordinates against the rect it was last TOLD about, so that is the only
                 // origin they can be added back to. Using the live X/Y closes a positive
@@ -587,6 +592,8 @@ static DWORD InjectMotion(IN HWND window, IN const struct msg_motion* motionMsg)
     {
         BOOL haveTracked = FALSE;
         int32_t trackedX = 0, trackedY = 0;
+        int32_t liveX = 0, liveY = 0;
+        BOOL usedAnnounced = FALSE;
 
         EnterCriticalSection(&g_csWatchedWindows);
         {
@@ -594,6 +601,9 @@ static DWORD InjectMotion(IN HWND window, IN const struct msg_motion* motionMsg)
             if (data)
             {
                 haveTracked = TRUE;
+                liveX = data->X;
+                liveY = data->Y;
+                usedAnnounced = data->CfgSentValid;
                 // THE ANNOUNCED ORIGIN, NOT THE LIVE ONE. dom0 computed these relative
                 // coordinates against the rect it was last TOLD about, so that is the only
                 // origin they can be added back to. Using the live X/Y closes a positive
@@ -624,6 +634,14 @@ static DWORD InjectMotion(IN HWND window, IN const struct msg_motion* motionMsg)
 
         if (haveTracked)
         {
+            // QGAORIGIN: the instrument for the wobble fix. Logs the origin actually used
+            // and how far the LIVE origin had drifted from it - the drift is exactly the
+            // error the old code injected into the cursor (and therefore into the window
+            // position). Zero drift = nothing to fix on this sample; growing drift during a
+            // drag = the feedback loop this fix removes.
+            LogDebug("QGAORIGIN,hwnd=0x%x,used=%d,%d,live=%d,%d,drift=%d,%d,announced=%d",
+                (uint32_t)(ULONG_PTR)window, trackedX, trackedY, liveX, liveY,
+                liveX - trackedX, liveY - trackedY, usedAnnounced);
             x += trackedX;
             y += trackedY;
         }
