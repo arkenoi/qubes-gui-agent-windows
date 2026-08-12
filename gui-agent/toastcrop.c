@@ -90,6 +90,9 @@ static BOOL g_TcDisabled = FALSE;
 static BOOL g_TcForced = FALSE;         // registry insets replace the UIA measurement
 static RECT g_TcForcedInsets;
 
+// LRU clock, shared by the slot cache and the last-good table below.
+static ULONGLONG g_TcClock = 0;
+
 // Last-good insets per window (STICKY CROP). A shell surface's card margins are stable
 // across moves and minor size changes, but the async UIA measurement is flaky (pre-XAML
 // timing, cross-process RPC races) and a fresh measure can spuriously find no card - which
@@ -133,8 +136,6 @@ static BOOL TcRecallLastGood(IN HWND window, OUT RECT* insets)
 static IUIAutomation* g_TcUia = NULL;   // created on first use, kept for the process life
 static TOAST_CROP_ENTRY g_TcCache[TOAST_CROP_CACHE_SIZE];
 static TOAST_PID_ENTRY g_TcPidCache[TOAST_PID_CACHE_SIZE];
-static ULONGLONG g_TcClock = 0;
-
 // ---- async measurement worker ----
 //
 // Every UIA call is a synchronous cross-process RPC into a shell host process, bounded
