@@ -125,6 +125,15 @@ HWND g_DesktopWindow = NULL;
 // Last window the foreground re-raise in AddAllWindows acted on. Cleared by ResetWatch so
 // the corrective re-fires on the first pass after every mass re-announce.
 static HWND g_LastForeground = NULL;
+
+// Window the user is currently dragging with a held mouse button, as seen on the INPUT path
+// (set by HandleButton on press, cleared on release). The frame path's move detection keys
+// off LOCATIONCHANGE events, which lapse on ~5% of drag frames and after PW_MOVE_SETTLE_MS
+// of a slow drag - and every lapsed frame pays a full PrintWindow recapture (15-18 ms on
+// this GPU-less guest), which is both the measured drag-time cost and pure waste, since a
+// moving window's CONTENT does not change. The latch closes those gaps: while it is set the
+// window counts as moving regardless of event timing.
+volatile HWND g_InputDragWindow = NULL;
 HWND g_TaskbarWindow = NULL;
 BOOL g_ShowTaskbar = FALSE;
 
@@ -3304,6 +3313,7 @@ static BOOL PwDdaEligible(IN const WINDOW_DATA* entry, IN const RECT* rect,
     // events (about 5% of drag frames apply none), so without a quiet period the DDA path
     // still runs during a drag on those frames and pays the full-window copy.
     if (entry->PwSettleDue ||
+        entry->Handle == g_InputDragWindow || // held-button drag: see g_InputDragWindow
         GetTickCount() - entry->PwLastMoveTick < PW_DDA_MOVE_QUIET_MS)
     {
         PerfNotePwRefusal(PW_REFUSE_DDA_MOVING);
@@ -3831,6 +3841,15 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 entry->PwFrameX = entry->X;
                 entry->PwFrameY = entry->Y;
                 entry->PwFrameXYValid = TRUE;
+
+                // The latch keeps the suppression alive across frames where no
+                // LOCATIONCHANGE landed and across a drag slower than the settle window;
+                // without it those frames each pay a full PrintWindow.
+                if (entry->Handle == g_InputDragWindow)
+                {
+                    entry->PwSettleDue = TRUE;
+                    entry->PwLastMoveTick = pwNow;
+                }
 
                 if (entry->PwSettleDue &&
                     pwNow - entry->PwLastMoveTick < PW_MOVE_SETTLE_MS)
@@ -4383,6 +4402,50 @@ static void EnterCaptureDegraded(IN ULONG failStatus, IN OUT CAPTURE_CONTEXT** c
 
 // main event loop
 // TODO: refactor into smaller parts
+// Apply every message currently queued on the vchan. Factored out of the vchan case of
+// WatchForEvents so the FRAME case can drain first (see the comment there: the frame event
+// outranks the vchan event, so without this a slow frame lets input pile up and the backlog
+// replays the user's whole drag).
+//
+// Returns FALSE when the caller must break out of the event loop; *exitLoop is set then.
+// Screen-destroyed handling deliberately stays in the vchan case: it is a teardown decision
+// for the loop, and reaching it one iteration later is harmless.
+static BOOL DrainVchanInput(IN OUT struct _CAPTURE_CONTEXT* capture, OUT BOOL* exitLoop)
+{
+    if (!g_Vchan)
+        return TRUE;
+
+    EnterCriticalSection(&g_VchanCriticalSection);
+
+    if (!libvchan_is_open(g_Vchan))
+    {
+        // KEEP-FATAL, same rule as the vchan case: the daemon is gone (case (a)).
+        LogError("vchan disconnected");
+        *exitLoop = TRUE;
+        LeaveCriticalSection(&g_VchanCriticalSection);
+        return FALSE;
+    }
+
+    BOOL screenDestroyed = FALSE;
+    while (VchanGetReadBufferSize(g_Vchan) > 0)
+    {
+        ULONG status = HandleServerData(!g_LocalScreenDestroyed, capture, &screenDestroyed);
+        if (ERROR_SUCCESS != status)
+        {
+            // KEEP-FATAL for the same reason as the vchan case: a partially consumed
+            // body means the stream is desynced and later bytes could be parsed as
+            // synthesized input.
+            *exitLoop = TRUE;
+            LogError("HandleServerData failed: 0x%x", status);
+            LeaveCriticalSection(&g_VchanCriticalSection);
+            return FALSE;
+        }
+    }
+
+    LeaveCriticalSection(&g_VchanCriticalSection);
+    return TRUE;
+}
+
 static ULONG WINAPI WatchForEvents(void)
 {
     ULONG eventCount;
@@ -4507,6 +4570,26 @@ static ULONG WINAPI WatchForEvents(void)
         {
         case 1: // new frame available
             LogVerbose("new frame");
+
+            // APPLY QUEUED INPUT BEFORE THE FRAME. This one loop runs both the frame
+            // work and the vchan drain, and WaitForMultipleObjects prefers the lower
+            // index - so the frame (1) always wins over vchan (4). A slow frame (a
+            // PrintWindow recapture on this GPU-less guest is 15-18 ms, and damage
+            // frames of 45 ms were measured) therefore applies NO motion while it runs;
+            // dom0 keeps forwarding MSG_MOTION into the ring, and after the user
+            // releases, the whole backlog is drained in one burst - re-injecting the
+            // entire stale drag trajectory through SendInput, which Windows performs as
+            // the window JUMPING BACK AND REPLAYING THE DRAG (user-reported 2026-08-12;
+            // root-caused to this serialization, not to any coordinate/echo bug).
+            //
+            // Draining here bounds input latency to one frame instead of one drag.
+            // Safe: HandleServerData already runs only on this thread, the vchan lock is
+            // released before ProcessNewFrame takes g_csWatchedWindows (no inversion),
+            // and input injection touches neither capture content nor the geometry/CREATE
+            // contract. FIFO order is preserved (single thread, in-order drain).
+            if (g_VchanClientConnected && !DrainVchanInput(capture, &exitLoop))
+                break;
+
             // NEVEREXIT: capture can legitimately be NULL here - in the A7 degraded
             // state a stale frame event set by the torn-down capture generation can
             // still be signaled once; dereferencing it was a crash (= an exit).

@@ -28,7 +28,7 @@ BOOL     g_PerfEnabled = FALSE;
 BOOL     g_ProtoTrace  = FALSE;
 BOOL     g_ProtoTraceWobble = FALSE;
 BOOL     g_ButtonAbsolute = TRUE;
-BOOL     g_ShellManaged = TRUE;
+BOOL     g_ShellManaged = FALSE;  // default OFF: shell surfaces stay headerless override-redirect popups (user spec 2026-08-12)
 BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
 BOOL     g_FrameDrop   = FALSE;
@@ -156,8 +156,8 @@ void PerfInit(void)
     // can frame and move them. Default ON per the 2026-08-11 user requirement; =0 restores
     // override-redirect (Linux-agent parity).
     {
-        BOOL managed = TRUE;
-        DWORD mv = 1;
+        BOOL managed = FALSE;
+        DWORD mv = 0;
         if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SHELL_MANAGED_VALUE, &mv, NULL))
             managed = (mv != 0);

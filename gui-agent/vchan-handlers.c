@@ -507,6 +507,14 @@ static DWORD HandleButton(IN HWND window)
         inputEvent.mi.dwFlags |= MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE;
     }
 
+    // DRAG LATCH (see g_InputDragWindow in main.c): a held left button on a window means
+    // the user may be dragging it, and while that lasts the frame path must not spend a
+    // 15-18 ms PrintWindow per frame re-capturing content that cannot have changed. Set on
+    // press, cleared on ANY release so the latch can never stick if the press and release
+    // land on different windows.
+    if (buttonMsg.button == Button1)
+        g_InputDragWindow = (buttonMsg.type == ButtonPress) ? window : NULL;
+
     LogDebug("window 0x%x, (%d,%d), flags 0x%x", window, buttonMsg.x, buttonMsg.y, inputEvent.mi.dwFlags);
     InjectInput(&inputEvent, "SendInput");
 

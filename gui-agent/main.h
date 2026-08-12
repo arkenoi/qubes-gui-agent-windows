@@ -38,6 +38,9 @@ extern DWORD g_HostScreenHeight;
 extern BOOL g_VchanClientConnected;
 extern BOOL g_StagingGrant;
 extern HWND g_DesktopWindow;
+// Window currently being dragged with a held mouse button (input path); NULL when none.
+// Suppresses per-window PrintWindow recapture for that window - see its definition.
+extern volatile HWND g_InputDragWindow;
 extern char g_DomainName[256];
 extern USHORT g_GuiDomainId;
 extern CRITICAL_SECTION g_csWatchedWindows;
