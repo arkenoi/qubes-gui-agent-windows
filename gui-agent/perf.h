@@ -100,6 +100,20 @@
 // changed, so the move-settle recapture reaches the engine instead of being
 // swallowed by the ddaOwned latch. 0 restores the latch-across-moves behaviour.
 #define REG_CONFIG_DDA_MOVE_INVALIDATE_VALUE L"DdaMoveInvalidate" // DWORD 0/1, default 1
+// Drag-start latency fix (DWORD 0/1, default 1 = fix active): while an input drag is
+// latched (g_InputDragWindow), feed the dragged window's per-window buffer from the
+// composited desktop framebuffer (row-diffed slice copy, PwDragSliceRefresh) instead of
+// PrintWindow. WHY: PrintWindow(PW_RENDERFULLCONTENT) executes synchronously on the
+// dragged APP'S UI thread (p50 49.4 ms at 2.6 Mpx idle, 150-250 ms under drag-time DWM
+// contention at 5120x1440); the throttled mid-drag refresh + press-frame recapture froze
+// the app's modal move loop, measured as 193/211 ms cold (221 px of cursor travel before
+// the window moved) / 30-40 ms warm drag-start dead time and 193-277 ms stair-steps for
+// the whole drag. Content CANNOT freeze under this mode: every processed frame verifies
+// the buffer against the live screen and sends damage for any changed rows; the only
+// held state is while a TOPMOST guest surface overlaps the dragged window (bounded, and
+// repaired by the unconditional settle recapture) - which is why default ON is allowed.
+// 0 restores the throttled-PrintWindow drag path.
+#define REG_CONFIG_INPUT_DRAG_SLICE_VALUE L"InputDragSlice" // DWORD 0/1, default 1
 // upd-spike reduction R1 (DWORD 0/1, default 0 = off): cache MONITORINFOEX+DEVMODE
 // per HMONITOR inside GetRealWindowRect, invalidated by WM_DISPLAYCHANGE + a 2 s TTL.
 #define REG_CONFIG_MON_INFO_CACHE_VALUE L"MonInfoCache" // DWORD 0/1, default 0
@@ -203,6 +217,10 @@ extern DWORD    g_InputDragServoDeadband;
 // ON: without it the move-settle recapture is a no-op for a DDA-active window and the
 // last stale-origin slice copy is the final content dom0 ever receives.
 extern BOOL     g_DdaMoveInvalidate;
+
+// Slice-feed the input-dragged window from the composited desktop instead of
+// PrintWindow (drag-start latency fix; see the knob block above). Default ON.
+extern BOOL     g_InputDragSlice;
 
 // upd-spike experiments, default OFF (old behaviour) until measured: R1 monitor-info
 // cache in GetRealWindowRect, R2 drag-time deferral of the resync backstop.

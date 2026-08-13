@@ -3763,6 +3763,73 @@ static BOOL PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRA
     return TRUE;
 }
 
+// DRAG-SLICE refresh (InputDragSlice): full-rect, ROW-DIFFED copy of the dragged
+// window's on-screen region out of the composited desktop into its per-window buffer.
+//
+// Same clipping and buffer-geometry contract as PwSliceCopyAndDamage above, with two
+// deliberate differences:
+//  - every row is memcmp'd before it is copied, and damage covers only the changed row
+//    band. During a title-bar drag the window's OWN (window-relative) pixels are
+//    identical frame to frame, so the steady-state cost is a read-only scan and ~zero
+//    vchan/dom0 traffic - without the diff, a per-frame full-extent copy is the
+//    measured +68% drag CPU (11.1 -> 18.6) plus a 10 MB dom0 blit at 45 Hz for the
+//    2573x1013 target window.
+//  - it is called EVERY processed frame while the drag-slice is engaged (no throttle).
+//    Registration skew - entry->X/Y one motion step stale/fresh against the
+//    framebuffer's pixels (captured live 2026-08-12: desktop sampled at (953,541) for a
+//    window announced at (979,545)) - then self-corrects within one frame instead of
+//    persisting: the skewed rows differ, are re-copied, and converge as soon as
+//    announce and screen agree.
+//
+// Off-screen bands are clipped and simply keep their previous content (repaired by the
+// settle recapture). Returns FALSE only when no copy could run at all (no framebuffer,
+// fully off-screen, geometry changed underneath); the caller holds the last content in
+// that case - it must NOT fall back to PrintWindow mid-drag, which is the app-thread
+// stall this mode exists to remove.
+static BOOL PwDragSliceRefresh(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRAME* frame,
+                               IN const BYTE* fb)
+{
+    if (!fb || frame->rect.Pitch <= 0 || !entry->PwBuffer)
+        return FALSE;
+
+    RECT screenR = { 0, 0, (LONG)min(g_ScreenWidth, g_FbWidth), (LONG)min(g_ScreenHeight, g_FbHeight) };
+    RECT winR = { entry->X, entry->Y,
+                  entry->X + (int)entry->PwWidth, entry->Y + (int)entry->PwHeight };
+    RECT r;
+    if (!IntersectRect(&r, &winR, &screenR))
+        return FALSE;
+
+    int relX = r.left - entry->X;
+    int relY = r.top - entry->Y;
+    int w = r.right - r.left;
+    int h = r.bottom - r.top;
+    if (relX < 0 || relY < 0 || w <= 0 || h <= 0)
+        return FALSE;
+    if ((ULONG)(relX + w) > entry->PwWidth || (ULONG)(relY + h) > entry->PwHeight)
+        return FALSE; // buffer geometry changed underneath; settle repaints
+
+    const BYTE* src = fb + (size_t)r.top * frame->rect.Pitch + (size_t)r.left * 4;
+    BYTE* dst = (BYTE*)entry->PwBuffer +
+        ((size_t)relY * entry->PwWidth + (size_t)relX) * 4;
+    int y0 = -1, y1 = -1;
+    for (int row = 0; row < h; row++)
+    {
+        if (memcmp(dst, src, (size_t)w * 4) != 0)
+        {
+            memcpy(dst, src, (size_t)w * 4);
+            if (y0 < 0)
+                y0 = row;
+            y1 = row;
+        }
+        src += frame->rect.Pitch;
+        dst += (size_t)entry->PwWidth * 4;
+    }
+
+    if (y0 >= 0)
+        (void)SendWindowDamageEvent(entry->Handle, relX, relY + y0, w, y1 - y0 + 1);
+    return TRUE;
+}
+
 // Paint this owner's synthesized children into its buffer from the composited
 // desktop image and report the damage. The owner's capture masks these rects (see
 // SynthUpdateMask), so nothing overwrites them afterwards. Called per frame for
@@ -3879,6 +3946,42 @@ static BOOL PwAnyVisibleOverlap(IN const WINDOW_DATA* self, IN const RECT* rect)
         e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
         if (e != self && e->IsVisible && !e->IsIconic && !e->DeletePending &&
             e->Width > 0 && e->Height > 0)
+        {
+            RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
+            if (IntersectRect(&hit, &other, rect))
+                return TRUE;
+        }
+        e = (WINDOW_DATA*)e->ListEntry.Flink;
+    }
+    return FALSE;
+}
+
+// Occlusion gate for the DRAG-SLICE (InputDragSlice): can anything be composited ON TOP
+// of the dragged window inside `rect`, making the screen an invalid source for it?
+//
+// PwAnyVisibleOverlap above tests ALL visible windows, including ones stacked BELOW -
+// on any busy desktop that refuses constantly and would starve the drag-slice on the
+// exact workload it exists for. But the dragged window is a special case: an input drag
+// means the user pressed and holds Button1 on it, which activates and raises it, so the
+// only surfaces that can sit ABOVE it are TOPMOST ones (taskbar, toasts, Start/shell
+// popups) - normal windows it is dragged across are BELOW it and their pixels are not
+// in its screen region. The z-order-based rgnCovered machinery cannot answer this
+// (CollectZOrder skips its EnumWindows pass unless an override-redirect popup is on
+// screen, so g_ZOrderValid is FALSE in ordinary workloads), hence this order-free test:
+// only override-redirect popups (topmost by construction) and WS_EX_TOPMOST windows
+// count as occluders. The dragged window's OWN synthesized children are excluded: their
+// pixels belong in its buffer (the same screen source PwPatchSynthChildren uses).
+static BOOL PwTopmostOverlap(IN const WINDOW_DATA* self, IN const RECT* rect)
+{
+    RECT hit;
+    WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
+    {
+        e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (e != self && e->IsVisible && !e->IsIconic && !e->DeletePending &&
+            e->Width > 0 && e->Height > 0 &&
+            !(e->Synthesized && e->SynthOwner == self->Handle) &&
+            (e->IsOverrideRedirect || (e->ExStyle & WS_EX_TOPMOST)))
         {
             RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
             if (IntersectRect(&hit, &other, rect))
@@ -4493,6 +4596,51 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // comes from the composited screen and IS position-dependent
                 // (PwSliceNeedsFull on move stays required).
                 DWORD pwNow = GetTickCount();
+
+                // DRAG-SLICE ELIGIBILITY (InputDragSlice), decided BEFORE the D2 block
+                // below so ownership can be TRANSFERRED instead of dropped when the
+                // slice takes over. While an input drag is latched on this window (or a
+                // previous frame already engaged the slice), its content is served by a
+                // row-diffed copy from the composited desktop (PwDragSliceRefresh)
+                // instead of PrintWindow.
+                //
+                // WHY (measured on win11-fresh, 25H2, 5120x1440, in-guest 10 ms
+                // sampler): PrintWindow(PW_RENDERFULLCONTENT) executes synchronously on
+                // the dragged APP'S UI thread - the thread running the modal move loop.
+                // p50 49.4 ms per call at 2.6 Mpx idle, 150-250 ms under drag-time DWM
+                // contention. The press-frame recapture + the 150 ms throttled refresh
+                // produced 193/211 ms COLD drag-start dead time (the cursor travelled
+                // 221 px before the window first moved), 30-40 ms warm, and metronomic
+                // 193-277 ms stair-steps for the whole drag - one window step per
+                // PrintWindow block. The desktop framebuffer already contains the
+                // dragged window's live pixels (it is foreground and on-screen by
+                // definition of an input drag), so the slice keeps content live with
+                // ZERO cross-process calls.
+                //
+                // Eligibility mirrors the DDA predicates, minus the moving/foreground
+                // refusals (the drag IS the moving case; the press that latched the
+                // drag also activates/raises the window):
+                //  - buffer geometry must match (E2: a dump claiming more pixels than
+                //    granted makes gui-daemon exit(1); a mid-drag resize rebuilds the
+                //    channel and re-engages next frame);
+                //  - not WS_EX_LAYERED (E5: the screen shows the blended result, not
+                //    the window's own content) - those keep the throttled PrintWindow
+                //    path unchanged;
+                //  - no TOPMOST surface overlaps it (order-free PwTopmostOverlap; the
+                //    full PwAnyVisibleOverlap would refuse on any busy desktop since
+                //    windows BELOW the dragged one overlap it constantly).
+                // When eligibility fails MID-drag (dragged under the taskbar/a toast),
+                // the refresh is SKIPPED and the last content is held - never a
+                // PrintWindow, which would reintroduce the stall - and the settle
+                // recapture repairs any staleness when the drag ends.
+                BOOL dragSliceReady =
+                    g_InputDragSlice &&
+                    (entry->PwDragSlice || entry->Handle == g_InputDragWindow) &&
+                    framebuffer != NULL && frame->rect.Pitch > 0 &&
+                    entry->PwWidth == entry->Width && entry->PwHeight == entry->Height &&
+                    !(entry->ExStyle & WS_EX_LAYERED) &&
+                    !PwTopmostOverlap(entry, &pwRect);
+
                 if (entry->PwFrameXYValid &&
                     (entry->X != entry->PwFrameX || entry->Y != entry->PwFrameY))
                 {
@@ -4516,7 +4664,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // eligible again. Deliberately keyed on an actual position change,
                     // never on the g_InputDragWindow latch alone: a plain click on a
                     // DDA-active window must not pay a 15-65 ms re-establish.
-                    if (g_DdaMoveInvalidate && entry->PwDdaActive)
+                    //
+                    // EXCEPT when the drag-slice is about to take over this frame
+                    // (dragSliceReady): then ownership is TRANSFERRED, not dropped.
+                    // Dropping it here releases the deferred press-frame dirty to the
+                    // engine, which lands one PrintWindow on the app's UI thread at the
+                    // exact moment the drag starts - a direct contributor to the
+                    // measured 193-211 ms cold drag-start dead time.
+                    if (g_DdaMoveInvalidate && entry->PwDdaActive && !dragSliceReady)
                     {
                         LogInfo("QGADDAMOVE hwnd=0x%x (%d,%d)->(%d,%d): dropping DDA ownership",
                             (uint32_t)(ULONG_PTR)entry->Handle,
@@ -4541,10 +4696,81 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 if (entry->PwSettleDue &&
                     pwNow - entry->PwLastMoveTick < PW_MOVE_SETTLE_MS)
                 {
-                    // Moving. A stale PwLastMoveCapTick makes the throttled refresh
+                    if (dragSliceReady)
+                    {
+                        // DRAG-SLICE (see the eligibility comment above). Engages on
+                        // the PRESS frame itself - the g_InputDragWindow latch forces
+                        // this branch from button-down on - which is exactly when the
+                        // old path fired its first PrintWindow into the app thread.
+                        if (!entry->PwDragSlice)
+                        {
+                            // Claim the buffer BEFORE the first write: from here on
+                            // the engine neither sweeps nor async-captures this
+                            // channel, and a pending dirty (e.g. the press-frame mark
+                            // of an earlier ineligible frame) stays pending until the
+                            // settle branch drops ownership. If the window was
+                            // DDA-active, ownership is already held and simply carries
+                            // over (the D2 drop above is skipped when dragSliceReady).
+                            WcSetDdaOwned(entry->Handle, TRUE);
+                            entry->PwDdaActive = FALSE; // drag-slice, not DDA steady state
+                            entry->PwDragSlice = TRUE;
+                        entry->PwDragHoldFrames = 0;
+                            // INFO so the engage tick is visible at the guest's
+                            // default LogLevel=3 - this is the timestamp the
+                            // drag-start acceptance measurement correlates with the
+                            // in-guest sampler.
+                            LogInfo("QGADRAGSLICE,ev=engage,hwnd=0x%x",
+                                (uint32_t)(ULONG_PTR)entry->Handle);
+                        }
+                        // Row-diffed full-rect refresh, EVERY processed frame: content
+                        // stays live (changed rows are copied and damaged within one
+                        // frame) and registration skew self-corrects instead of
+                        // persisting. A FALSE return (fully off-screen, geometry
+                        // changed underneath) holds the last content; the settle
+                        // recapture repairs it.
+                        (void)PwDragSliceRefresh(entry, frame, framebuffer);
+                    }
+                    else if (entry->PwDragSlice)
+                    {
+                        // Engaged, but this frame is ineligible (TOPMOST overlap, or
+                        // the framebuffer went away). Hold the last content briefly -
+                        // falling back to PrintWindow immediately would reintroduce the
+                        // 49-250 ms app-thread stall mid-drag.
+                        //
+                        // BUT THE HOLD IS BOUNDED. An unbounded hold is the exact defect
+                        // that shipped and was reverted today: a window whose content
+                        // changes while it is dragged under a toast or Start would show
+                        // dom0 a frozen bitmap for the whole overlap (review finding).
+                        // Once the hold reaches the historic refresh interval, fall back
+                        // to the throttled PrintWindow for this frame - byte-identical
+                        // to the behaviour of the build the user has been running, so
+                        // this case cannot be worse than today, only better.
+                        entry->PwDragHoldFrames++;
+                        if (pwNow - entry->PwLastMoveCapTick >= PW_MOVE_RECAPTURE_MS)
+                        {
+                            entry->PwLastMoveCapTick = pwNow;
+                            entry->PwDragSlice = FALSE;   // re-engages when eligible again
+                            if (entry->PwDdaActive)
+                            {
+                                WcSetDdaOwned(entry->Handle, FALSE);
+                                entry->PwDdaActive = FALSE;
+                            }
+                            LogDebug("QGADRAGSLICE,ev=hold-expired,hwnd=0x%x",
+                                (uint32_t)(ULONG_PTR)entry->Handle);
+                            WcMarkDirty(entry->Handle);
+                        }
+                        else
+                        {
+                            LogDebug("QGADRAGSLICE,ev=hold,hwnd=0x%x",
+                                (uint32_t)(ULONG_PTR)entry->Handle);
+                        }
+                    }
+                    // Moving, no drag-slice (programmatic move, layered window,
+                    // geometry mismatch, or InputDragSlice=0): historic behaviour.
+                    // A stale PwLastMoveCapTick makes the throttled refresh
                     // fire on the FIRST moving frame, so one-shot programmatic moves
                     // still capture immediately, as before.
-                    if (pwNow - entry->PwLastMoveCapTick >= PW_MOVE_RECAPTURE_MS)
+                    else if (pwNow - entry->PwLastMoveCapTick >= PW_MOVE_RECAPTURE_MS)
                     {
                         entry->PwLastMoveCapTick = pwNow;
                         LogDebug("QGADRAG,ev=refresh,hwnd=0x%x",
@@ -4562,6 +4788,23 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // Quiet for PW_MOVE_SETTLE_MS: motion is over. Recapture once,
                     // regardless of where this frame's damage landed.
                     entry->PwSettleDue = FALSE;
+                    if (entry->PwDragSlice)
+                    {
+                        // Release the drag-slice BEFORE the settle mark, or the
+                        // ddaOwned latch swallows it and the last slice copy becomes
+                        // the FINAL content dom0 ever receives - the exact D2 failure
+                        // mode. The one authoritative off-drag PrintWindow below also
+                        // absorbs any slice-vs-PrintWindow source difference (alpha
+                        // byte, Win11 rounded corners) as a one-time transition, and
+                        // its row-diff sends only what actually differs. DDA steady
+                        // state then re-establishes through its own WcPrefill path
+                        // once the window is quiet and eligible again.
+                        entry->PwDragSlice = FALSE;
+                        entry->PwDdaActive = FALSE;
+                        WcSetDdaOwned(entry->Handle, FALSE);
+                        LogInfo("QGADRAGSLICE,ev=settle,hwnd=0x%x,holds=%u",
+                            (uint32_t)(ULONG_PTR)entry->Handle, entry->PwDragHoldFrames);
+                    }
                     LogDebug("QGADRAG,ev=settle,hwnd=0x%x",
                         (uint32_t)(ULONG_PTR)entry->Handle);
                     WcMarkDirty(entry->Handle);

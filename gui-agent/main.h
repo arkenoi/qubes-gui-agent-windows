@@ -255,6 +255,26 @@ typedef struct _WINDOW_DATA
     DWORD PwLastMoveTick;
     DWORD PwLastMoveCapTick;
 
+    // INPUT-DRAG SLICE MODE (InputDragSlice knob; ProcessNewFrame moving branch). While
+    // the user drags this window, its content is refreshed by a row-diffed copy out of
+    // the composited desktop framebuffer instead of PrintWindow. WHY: PrintWindow is a
+    // synchronous cross-process render (WM_PRINT-class) that executes on the DRAGGED
+    // APP'S UI THREAD - the very thread running the modal move loop - measured p50
+    // 49.4 ms per call at 2.6 Mpx and 150-250 ms under concurrent DWM compositing at
+    // 5120x1440. The in-guest sampler showed the injected cursor travelling up to 221 px
+    // while the window stayed frozen 193-211 ms at drag start (30-40 ms warm), and the
+    // whole drag advanced in metronomic 193-277 ms stair-steps: one window step per
+    // PrintWindow block. The drag-slice removes every cross-process call from the drag
+    // path. While TRUE the frame loop owns the engine buffer (WcSetDdaOwned, same
+    // contract as PwDdaActive); cleared by the settle branch (which drops ownership so
+    // the settle WcMarkDirty can reach the engine - the D2 lesson) and on channel
+    // attach/detach. Accessed under g_csWatchedWindows.
+    BOOL PwDragSlice;
+    // Frames this drag spent HOLDING content because the slice was ineligible (a TOPMOST
+    // surface overlapped the window). Reported in the settle line so a hold is visible at
+    // the shipped LogLevel=3 - an invisible content hold is the defect that shipped today.
+    UINT PwDragHoldFrames;
+
     // Hash of the SCREEN pixels over this window's rect at the last recapture trigger.
     // Windows 11 presents ~1.9x more frames than Windows 10 for identical input (measured
     // with agent, display path and resolution held constant: 488 vs 259 frames over the same

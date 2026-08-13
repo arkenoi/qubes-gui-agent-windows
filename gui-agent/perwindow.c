@@ -357,6 +357,9 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwSettleDue = FALSE;
     entry->PwLastMoveTick = 0;
     entry->PwLastMoveCapTick = 0;
+    // Fresh channel starts un-owned in the engine, so the drag-slice must re-engage
+    // (re-claim ownership) before its next copy - a mid-drag resize lands here.
+    entry->PwDragSlice = FALSE;
     LogInfo("0x%x: per-window buffer %ux%u (%lu pages) attached%s",
              entry->Handle, entry->Width, entry->Height, pageCount,
              sliceFed ? L" (slice-fed)" : L"");
@@ -395,6 +398,9 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
     // buffer holds no established content, so DDA mode must re-enter via prefill.
     // Left stale, the steady-state branch would slice-copy into an unestablished buffer.
     entry->PwDdaActive = FALSE;
+    // Same reasoning for the drag-slice: its engine-buffer ownership died with the
+    // channel, and a stale flag would make the moving branch skip re-engagement.
+    entry->PwDragSlice = FALSE;
 }
 
 // Drop an attached window back to the legacy screen-slice path at runtime. The daemon
