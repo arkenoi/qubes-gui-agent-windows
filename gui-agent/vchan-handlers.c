@@ -734,8 +734,25 @@ static DWORD HandleMotion(IN HWND window)
                             devX = 0;
                         if (devY <= db && devY >= -db)
                             devY = 0;
-                        g_DragLastInjectedX += devX * (int)g_InputDragServoGainPct / 100;
-                        g_DragLastInjectedY += devY * (int)g_InputDragServoGainPct / 100;
+                        // GAIN SCHEDULING (user request 2026-08-13: "first jump
+                        // immediately and then adapt to the speed"). The damping exists
+                        // only to absorb prediction error near the settling point, where
+                        // an over-correction would ring. A LARGE deviation is not a
+                        // prediction error - it is the hand genuinely moving fast, and
+                        // damping it just makes the window trail ("slow moves fine, fast
+                        // ones look off"). So: apply a large deviation in FULL and reserve
+                        // the damped gain for the small ones. Per axis, because a drag is
+                        // usually fast on one axis and settling on the other.
+                        int gainX = (devX >= (int)g_InputDragServoFastPx ||
+                                     devX <= -(int)g_InputDragServoFastPx)
+                                    ? (int)g_InputDragServoFastGainPct
+                                    : (int)g_InputDragServoGainPct;
+                        int gainY = (devY >= (int)g_InputDragServoFastPx ||
+                                     devY <= -(int)g_InputDragServoFastPx)
+                                    ? (int)g_InputDragServoFastGainPct
+                                    : (int)g_InputDragServoGainPct;
+                        g_DragLastInjectedX += devX * gainX / 100;
+                        g_DragLastInjectedY += devY * gainY / 100;
                         // Express the target as the addend the shared translation below
                         // applies to the window-relative (x,y).
                         trackedX = g_DragLastInjectedX - x;

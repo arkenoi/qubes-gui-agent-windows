@@ -47,7 +47,9 @@ BOOL     g_InputDragFreeze = FALSE; // fallback tier only; the servo below is th
 BOOL     g_InputDragServo = TRUE;
 DWORD    g_InputDragServoGainPct = 60; // beta*100; 70 is already unstable under a 46 ms mismatch
 DWORD    g_InputDragServoTauMs = 25;   // assumed announce transit+apply time
-DWORD    g_InputDragServoDeadband = 3; // px per axis
+DWORD    g_InputDragServoDeadband = 3;
+DWORD    g_InputDragServoFastPx = 24;
+DWORD    g_InputDragServoFastGainPct = 100; // px per axis
 BOOL     g_DdaMoveInvalidate = TRUE;
 BOOL     g_InputDragSlice = TRUE;
 BOOL     g_InputDragFreezeContent = TRUE;
@@ -265,9 +267,10 @@ void PerfInit(void)
                 g_ResyncDragDefer = (v != 0);
         }
         LogInfo("QGADRAGFREEZE %s", g_InputDragFreeze ? L"on" : L"off");
-        LogInfo("QGADRAGSERVO %s gain=%u%% tau=%ums deadband=%upx",
+        LogInfo("QGADRAGSERVO %s gain=%u%% tau=%ums deadband=%upx fast>=%upx@%u%%",
             g_InputDragServo ? L"on" : L"off", g_InputDragServoGainPct,
-            g_InputDragServoTauMs, g_InputDragServoDeadband);
+            g_InputDragServoTauMs, g_InputDragServoDeadband,
+            g_InputDragServoFastPx, g_InputDragServoFastGainPct);
         LogInfo("QGADDAMOVEINV %s", g_DdaMoveInvalidate ? L"on" : L"off");
         LogInfo("QGADRAGSLICE %s", g_InputDragSlice ? L"on" : L"off");
         LogInfo("QGADRAGFREEZECONTENT %s", g_InputDragFreezeContent ? L"on" : L"off");

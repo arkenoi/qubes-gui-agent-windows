@@ -94,6 +94,8 @@
 #define REG_CONFIG_INPUT_DRAG_SERVO_VALUE L"InputDragServo"
 #define REG_CONFIG_INPUT_DRAG_SERVO_GAIN_VALUE L"InputDragServoGainPct"
 #define REG_CONFIG_INPUT_DRAG_SERVO_TAU_VALUE L"InputDragServoTauMs"
+#define REG_CONFIG_INPUT_DRAG_SERVO_FASTPX_VALUE L"InputDragServoFastPx"     // deviation at/above which the full gain is used
+#define REG_CONFIG_INPUT_DRAG_SERVO_FASTGAIN_VALUE L"InputDragServoFastGainPct"
 #define REG_CONFIG_INPUT_DRAG_SERVO_DEADBAND_VALUE L"InputDragServoDeadbandPx"
 // Mis-render fix (DWORD 0/1, default 1 = fix active): drop DDA ownership of a
 // per-window channel the moment the frame loop observes the window's position
@@ -214,6 +216,11 @@ extern BOOL     g_InputDragServo;
 extern DWORD    g_InputDragServoGainPct;
 extern DWORD    g_InputDragServoTauMs;
 extern DWORD    g_InputDragServoDeadband;
+// Above this per-axis deviation the servo applies g_InputDragServoFastGainPct (default
+// 100%) instead of the damped gain: a big deviation means the hand is moving fast, not
+// that the predictor is wrong, and damping it only makes the window trail.
+extern DWORD    g_InputDragServoFastPx;
+extern DWORD    g_InputDragServoFastGainPct;
 
 // Drop DDA ownership when the frame loop sees a window move (D2 mis-render). Default
 // ON: without it the move-settle recapture is a no-op for a DDA-active window and the
