@@ -4720,10 +4720,21 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // artifacts'. The servo fixed the position side first.
                         if (entry->PwDragSlice)
                         {
-                            // Was slice-feeding (knob flipped mid-drag): hand the buffer
-                            // back so the settle recapture takes the normal path.
+                            // Was slice-feeding (knob flipped mid-drag): keep ownership,
+                            // just stop refreshing - the settle below hands it back.
                             entry->PwDragSlice = FALSE;
-                            WcSetDdaOwned(entry->Handle, FALSE);
+                        }
+                        if (!entry->PwDragFrozen)
+                        {
+                            // CLAIM THE CHANNEL. Suppressing our own recapture is not
+                            // enough: the capture engine sweeps live channels on its own
+                            // timer and services pending dirty marks, and each of those is
+                            // a PrintWindow into the DRAGGED APP'S thread - the very stall
+                            // this freeze exists to remove (measured 156-259 ms on a cold
+                            // first drag, 0 ms once warm). Owning the channel for the
+                            // duration is what makes the freeze actually quiet.
+                            WcSetDdaOwned(entry->Handle, TRUE);
+                            entry->PwDdaActive = FALSE;
                         }
                         entry->PwDragFrozen = TRUE;
                         LogDebug("QGADRAGFREEZE,ev=hold,hwnd=0x%x",
@@ -4830,6 +4841,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // window rather than a diff against a buffer that never moved.
                         entry->PwDragFrozen = FALSE;
                         entry->PwSliceNeedsFull = TRUE;
+                        // Hand the channel back BEFORE the settle mark, or the ownership
+                        // latch swallows it and dom0 keeps the pre-drag bitmap forever.
+                        WcSetDdaOwned(entry->Handle, FALSE);
                         LogInfo("QGADRAGFREEZE,ev=settle,hwnd=0x%x",
                             (uint32_t)(ULONG_PTR)entry->Handle);
                     }
