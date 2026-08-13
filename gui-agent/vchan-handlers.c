@@ -814,8 +814,8 @@ static DWORD HandleMotion(IN HWND window)
     }
 
     // Relative coordinates of THIS motion, for the next event's clamp bound.
-    g_DragLastRelX = motionMsg->x;
-    g_DragLastRelY = motionMsg->y;
+    g_DragLastRelX = motionMsg.x;
+    g_DragLastRelY = motionMsg.y;
 
     inputEvent.type = INPUT_MOUSE;
     inputEvent.mi.time = 0;
