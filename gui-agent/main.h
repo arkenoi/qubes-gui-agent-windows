@@ -55,6 +55,8 @@ extern BOOL g_InputDragOriginValid;
 // in main.c): grab offset captured at the Button1 press, plus the timestamped ring of
 // position announces sent for the latched window from which the input path reconstructs
 // dom0's applied origin. Pump-thread-only, like the frozen-origin state above.
+extern int g_DragLastRelX;
+extern int g_DragLastRelY;
 extern int g_DragLastInjectedX;
 extern int g_DragLastInjectedY;
 extern int g_InputDragGrabX;

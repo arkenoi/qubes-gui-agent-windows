@@ -96,6 +96,7 @@
 #define REG_CONFIG_INPUT_DRAG_SERVO_TAU_VALUE L"InputDragServoTauMs"
 #define REG_CONFIG_INPUT_DRAG_SERVO_FASTPX_VALUE L"InputDragServoFastPx"     // deviation at/above which the full gain is used
 #define REG_CONFIG_INPUT_DRAG_SERVO_FASTGAIN_VALUE L"InputDragServoFastGainPct"
+#define REG_CONFIG_INPUT_DRAG_SERVO_CLAMP_VALUE L"InputDragServoClamp" // DWORD 0/1, default 1
 #define REG_CONFIG_INPUT_DRAG_SERVO_DEADBAND_VALUE L"InputDragServoDeadbandPx"
 // Mis-render fix (DWORD 0/1, default 1 = fix active): drop DDA ownership of a
 // per-window channel the moment the frame loop observes the window's position
@@ -219,6 +220,11 @@ extern DWORD    g_InputDragServoDeadband;
 // Above this per-axis deviation the servo applies g_InputDragServoFastGainPct (default
 // 100%) instead of the damped gain: a big deviation means the hand is moving fast, not
 // that the predictor is wrong, and damping it only makes the window trail.
+// Never let the injected cursor move FURTHER in one event than the hand actually moved
+// (dom0's own relative delta bounds legitimate motion). A wrong origin reconstruction can
+// then only make the window lag, never extrapolate - the failure the user saw as 'crazy
+// extrapolated jumps' when the full gain applied a bad estimate.
+extern BOOL     g_InputDragServoClamp;
 extern DWORD    g_InputDragServoFastPx;
 extern DWORD    g_InputDragServoFastGainPct;
 

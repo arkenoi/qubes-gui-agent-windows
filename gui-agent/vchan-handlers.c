@@ -601,6 +601,8 @@ static DWORD HandleButton(IN HWND window)
         // exact: no announce has moved dom0's origin yet).
         g_DragLastInjectedX = buttonMsg.x + trackedX;
         g_DragLastInjectedY = buttonMsg.y + trackedY;
+        g_DragLastRelX = buttonMsg.x;
+        g_DragLastRelY = buttonMsg.y;
         g_InputDragGrabX = buttonMsg.x;
         g_InputDragGrabY = buttonMsg.y;
         if (g_InputDragOriginValid)
@@ -751,8 +753,34 @@ static DWORD HandleMotion(IN HWND window)
                                      devY <= -(int)g_InputDragServoFastPx)
                                     ? (int)g_InputDragServoFastGainPct
                                     : (int)g_InputDragServoGainPct;
-                        g_DragLastInjectedX += devX * gainX / 100;
-                        g_DragLastInjectedY += devY * gainY / 100;
+                        int stepX = devX * gainX / 100;
+                        int stepY = devY * gainY / 100;
+                        if (g_InputDragServoClamp)
+                        {
+                            // NEVER MOVE FURTHER THAN THE HAND DID. dom0's relative
+                            // coordinate moved by (x,y) minus the previous relative
+                            // position, and no legitimate cursor motion can exceed that
+                            // plus the window's own travel since the last event. A wrong
+                            // origin reconstruction can therefore make the injected
+                            // cursor LAG, but never overshoot - which is what produced
+                            // the 'crazy extrapolated jumps' when a bad estimate was
+                            // applied at full gain (user, 2026-08-13). The bound is
+                            // deliberately generous (2x + 32px) so it never throttles a
+                            // genuinely fast hand; it exists to cap nonsense, not to
+                            // shape normal motion.
+                            int dRelX = x - g_DragLastRelX;
+                            int dRelY = y - g_DragLastRelY;
+                            if (dRelX < 0) dRelX = -dRelX;
+                            if (dRelY < 0) dRelY = -dRelY;
+                            int limX = 2 * dRelX + 32;
+                            int limY = 2 * dRelY + 32;
+                            if (stepX >  limX) stepX =  limX;
+                            if (stepX < -limX) stepX = -limX;
+                            if (stepY >  limY) stepY =  limY;
+                            if (stepY < -limY) stepY = -limY;
+                        }
+                        g_DragLastInjectedX += stepX;
+                        g_DragLastInjectedY += stepY;
                         // Express the target as the addend the shared translation below
                         // applies to the window-relative (x,y).
                         trackedX = g_DragLastInjectedX - x;
@@ -784,6 +812,10 @@ static DWORD HandleMotion(IN HWND window)
 
         LogVerbose("0x%x: (%d,%d)", window, x, y);
     }
+
+    // Relative coordinates of THIS motion, for the next event's clamp bound.
+    g_DragLastRelX = motionMsg->x;
+    g_DragLastRelY = motionMsg->y;
 
     inputEvent.type = INPUT_MOUSE;
     inputEvent.mi.time = 0;

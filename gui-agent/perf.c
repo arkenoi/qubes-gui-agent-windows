@@ -45,16 +45,24 @@ BOOL     g_FrameDrop   = FALSE;
 BOOL     g_SweepDdaExempt = TRUE;
 BOOL     g_InputDragFreeze = FALSE; // fallback tier only; the servo below is the default fix
 BOOL     g_InputDragServo = TRUE;
-DWORD    g_InputDragServoGainPct = 60; // beta*100; 70 is already unstable under a 46 ms mismatch
+DWORD    g_InputDragServoGainPct = 85;  // user-accepted on the guest 2026-08-13 (was 60):
+                                       // damped enough to absorb predictor error, snappy
+                                       // enough that slow drags track cleanly
 DWORD    g_InputDragServoTauMs = 25;   // assumed announce transit+apply time
 DWORD    g_InputDragServoDeadband = 3;
 DWORD    g_InputDragServoFastPx = 24;
-DWORD    g_InputDragServoFastGainPct = 100; // px per axis
+BOOL     g_InputDragServoClamp = TRUE;
+// Gain scheduling is NEUTRAL by default (fast gain == base gain). At 100% a mis-reconstructed
+// dom0 origin was applied in full and produced 'crazy extrapolated jumps' on fast drags
+// (user, 2026-08-13); the damping had been absorbing those prediction errors. Re-enable per
+// guest via InputDragServoFastGainPct once the clamp below is proven in the field.
+DWORD    g_InputDragServoFastGainPct = 85;
 BOOL     g_DdaMoveInvalidate = TRUE;
 BOOL     g_InputDragSlice = TRUE;
 BOOL     g_InputDragFreezeContent = TRUE;
 BOOL     g_DragEventPriority = TRUE; // default ON: announces at input rate while dragging
-BOOL     g_MonInfoCache = FALSE;
+BOOL     g_MonInfoCache = TRUE;   // measured 3x interleaved: upd p95 3457->1631us,
+                                  // upd max 40.2->14.6ms (the announce-blocking stalls)
 BOOL     g_ResyncDragDefer = FALSE;
 LONGLONG g_PerfFreq = 0;
 DWORD    g_PerfEveryN = 1;
@@ -247,6 +255,12 @@ void PerfInit(void)
                     v = 250;
                 g_InputDragServoTauMs = v;
             }
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_FASTPX_VALUE, &v, NULL))
+                g_InputDragServoFastPx = v;
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_FASTGAIN_VALUE, &v, NULL) && v <= 100)
+                g_InputDragServoFastGainPct = v;
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_CLAMP_VALUE, &v, NULL))
+                g_InputDragServoClamp = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_DEADBAND_VALUE, &v, NULL))
             {
                 if (v > 50) // larger than the smallest measured oscillation (40 px):
@@ -267,10 +281,11 @@ void PerfInit(void)
                 g_ResyncDragDefer = (v != 0);
         }
         LogInfo("QGADRAGFREEZE %s", g_InputDragFreeze ? L"on" : L"off");
-        LogInfo("QGADRAGSERVO %s gain=%u%% tau=%ums deadband=%upx fast>=%upx@%u%%",
+        LogInfo("QGADRAGSERVO %s gain=%u%% tau=%ums deadband=%upx fast>=%upx@%u%% clamp=%s",
             g_InputDragServo ? L"on" : L"off", g_InputDragServoGainPct,
             g_InputDragServoTauMs, g_InputDragServoDeadband,
-            g_InputDragServoFastPx, g_InputDragServoFastGainPct);
+            g_InputDragServoFastPx, g_InputDragServoFastGainPct,
+            g_InputDragServoClamp ? L"on" : L"off");
         LogInfo("QGADDAMOVEINV %s", g_DdaMoveInvalidate ? L"on" : L"off");
         LogInfo("QGADRAGSLICE %s", g_InputDragSlice ? L"on" : L"off");
         LogInfo("QGADRAGFREEZECONTENT %s", g_InputDragFreezeContent ? L"on" : L"off");

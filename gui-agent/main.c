@@ -198,6 +198,10 @@ BOOL g_InputDragOriginValid = FALSE;
 // The cursor position the servo last injected for the latched window. The drag law walks
 // THIS toward the reconstructed dom0 cursor, so the modal loop's grab offset never enters
 // the loop and cannot poison it when Windows re-anchors it mid-drag (review finding).
+// Relative coordinates of the previous drag motion, used to bound how far one injected
+// step may move (see the clamp in InjectMotion).
+int g_DragLastRelX = 0;
+int g_DragLastRelY = 0;
 int g_DragLastInjectedX = 0;
 int g_DragLastInjectedY = 0;
 int g_InputDragGrabX = 0;
