@@ -5602,6 +5602,22 @@ static ULONG WINAPI WatchForEvents(void)
         if (waitTimeout == INFINITE && g_VchanClientConnected && DaemonSettleWorkPending())
             waitTimeout = 100;
 
+        // DRAG SMOOTHNESS. While the user drags a window, its POSITION is the only thing
+        // that matters (its content is frozen for the duration), yet g_WindowEventSignal
+        // sits LAST in the wait array so a pending frame always wins. Announces are then
+        // quantised to the capture-frame clock - measured ~46 ms at 5120x1440, i.e. dom0
+        // receives the window in 40-80 px steps, which is exactly the "jumpy" motion the
+        // user reports. Drain pending window events FIRST while the latch is armed, so
+        // announces flow at input rate (~45 Hz) instead of frame rate (~21 Hz).
+        // This cannot starve frames: ProcessWindowEvents drains the queue and returns,
+        // the frame event stays signalled, and the wait below services it immediately.
+        if (g_DragEventPriority && g_InputDragWindow &&
+            g_VchanClientConnected && g_SeamlessMode && !g_LocalScreenDestroyed &&
+            WaitForSingleObject(g_WindowEventSignal, 0) == WAIT_OBJECT_0)
+        {
+            ProcessWindowEvents();
+        }
+
         // Wait for events.
         signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, waitTimeout);
         if (signaledEvent != WAIT_TIMEOUT && signaledEvent >= MAXIMUM_WAIT_OBJECTS)

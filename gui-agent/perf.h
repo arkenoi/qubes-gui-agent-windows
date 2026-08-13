@@ -113,6 +113,7 @@
 // held state is while a TOPMOST guest surface overlaps the dragged window (bounded, and
 // repaired by the unconditional settle recapture) - which is why default ON is allowed.
 // 0 restores the throttled-PrintWindow drag path.
+#define REG_CONFIG_DRAG_EVENT_PRIORITY_VALUE L"DragEventPriority" // DWORD 0/1, default 1
 #define REG_CONFIG_INPUT_DRAG_FREEZE_CONTENT_VALUE L"InputDragFreezeContent" // DWORD 0/1, default 1
 #define REG_CONFIG_INPUT_DRAG_SLICE_VALUE L"InputDragSlice" // DWORD 0/1, default 1
 // upd-spike reduction R1 (DWORD 0/1, default 0 = off): cache MONITORINFOEX+DEVMODE
@@ -228,6 +229,11 @@ extern BOOL     g_InputDragSlice;
 // ms of dead time before the window even starts moving) and the framebuffer copy's
 // one-step-stale edge strip (moving artifacts). Default ON (user request 2026-08-13).
 extern BOOL     g_InputDragFreezeContent;
+// Service window events (and therefore position announces) BEFORE frames while a drag is
+// in progress, so dom0 receives the dragged window at input rate instead of the capture
+// frame rate. Without it announces quantise to ~46 ms at 5120x1440 and the motion looks
+// jumpy. Default ON.
+extern BOOL     g_DragEventPriority;
 
 // upd-spike experiments, default OFF (old behaviour) until measured: R1 monitor-info
 // cache in GetRealWindowRect, R2 drag-time deferral of the resync backstop.
