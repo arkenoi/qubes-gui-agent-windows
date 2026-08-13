@@ -5612,10 +5612,21 @@ static ULONG WINAPI WatchForEvents(void)
         // This cannot starve frames: ProcessWindowEvents drains the queue and returns,
         // the frame event stays signalled, and the wait below services it immediately.
         if (g_DragEventPriority && g_InputDragWindow &&
-            g_VchanClientConnected && g_SeamlessMode && !g_LocalScreenDestroyed &&
-            WaitForSingleObject(g_WindowEventSignal, 0) == WAIT_OBJECT_0)
+            g_VchanClientConnected && g_SeamlessMode && !g_LocalScreenDestroyed)
         {
-            ProcessWindowEvents();
+            // Input FIRST. The mouse motion that drives the app's own modal move loop
+            // arrives on the vchan, which the pump only drains on its own event or at the
+            // top of a frame - so during a drag the motion is delivered in clumps at frame
+            // cadence and the application moves its window ONCE PER CLUMP. Measured in the
+            // guest on the previous build: the window's own rect advanced only every
+            // 54-70 ms in 12-68 px hops (~16 Hz) while dom0 was sending motion far faster.
+            // That is the jumpiness; announcing more often cannot fix it, because the
+            // window genuinely is not moving in between.
+            if (VchanGetReadBufferSize(g_Vchan) > 0 && !DrainVchanInput(capture, &exitLoop))
+                break;
+            // Then the position announce for whatever that input just moved.
+            if (WaitForSingleObject(g_WindowEventSignal, 0) == WAIT_OBJECT_0)
+                ProcessWindowEvents();
         }
 
         // Wait for events.
