@@ -2849,6 +2849,22 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     if (data->Handle == GetShellWindow())
         return FALSE;
 
+    // START IS DISABLED IN SEAMLESS MODE (user decision 2026-08-13, shipped state).
+    // On 25H2 the Start surface has never rendered acceptably through the seamless path:
+    // it parks off-screen while closed, morphs between a card-sized and a workarea-sized
+    // window, and its content is a DirectComposition surface that neither PrintWindow nor
+    // a framebuffer slice reproduces correctly once it is moved. Rather than ship a menu
+    // that shows wallpaper or a phantom at a random position, do not present it at all -
+    // the Super key is already dropped in seamless (BlockMenuKey), so the usual way to
+    // summon it is closed too. Toasts are NOT affected: they render correctly and stay.
+    // Re-enable with SeamlessStart=1 to work on it; see docs/PLAN-start-menu.md.
+    if (g_SeamlessMode && !g_SeamlessStart && ShellSurfaceKind(data) == ShellSurfaceStart)
+    {
+        LogDebug("0x%x: Start surface not presented in seamless mode (SeamlessStart=0)",
+            data->Handle);
+        return FALSE;
+    }
+
     // GENUINE-OPEN GATE. A shell host (StartMenuExperienceHost / ShellExperienceHost /
     // SearchHost) keeps a top-level surface alive while its menu is CLOSED. Mapping that
     // phantom announces a window with no menu inside it - dom0 then shows a slice of bare

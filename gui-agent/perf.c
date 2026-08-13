@@ -38,13 +38,23 @@ BOOL     g_ButtonAbsolute = TRUE;
 // correctly. Movable Start needs a frozen-anchor architecture (capture window-relative at
 // the natural anchor, let dom0 move only the frame) - a separate future experiment.
 DWORD    g_ShellManaged = SHELL_MANAGED_NONE;
+BOOL     g_SeamlessStart = FALSE;
 BOOL     g_BlockMenuKey = TRUE;
 BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
 BOOL     g_FrameDrop   = FALSE;
 BOOL     g_SweepDdaExempt = TRUE;
 BOOL     g_InputDragFreeze = FALSE; // fallback tier only; the servo below is the default fix
-BOOL     g_InputDragServo = TRUE;
+// DEFAULT OFF (2026-08-13). The Smith-predictor servo is an EXPERIMENT, not a shipped
+// fix: side-by-side on the guest the user judged servo-on vs servo-off "marginal, both
+// suck in a way". It also misbehaved in both directions while being tuned - extrapolated
+// jumps when the reconstructed origin was applied at full gain, and stalls when that
+// reconstruction ran ahead so the deviation collapsed to zero. Shipping the historic
+// translation keeps the drag path predictable and free of a mechanism that can fail in two
+// modes; the residual ~16% announce wobble is the SAME one present in the build the user
+// called "works well", and its real fix is structural (see docs/PLAN-drag-quality.md).
+// Set InputDragServo=1 to re-enable for further experiments.
+BOOL     g_InputDragServo = FALSE;
 DWORD    g_InputDragServoGainPct = 85;  // user-accepted on the guest 2026-08-13 (was 60):
                                        // damped enough to absorb predictor error, snappy
                                        // enough that slow drags track cleanly
@@ -277,6 +287,8 @@ void PerfInit(void)
                 g_DragEventPriority = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_MON_INFO_CACHE_VALUE, &v, NULL))
                 g_MonInfoCache = (v != 0);
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SEAMLESS_START_VALUE, &v, NULL))
+                g_SeamlessStart = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_RESYNC_DRAG_DEFER_VALUE, &v, NULL))
                 g_ResyncDragDefer = (v != 0);
         }
@@ -291,6 +303,7 @@ void PerfInit(void)
         LogInfo("QGADRAGFREEZECONTENT %s", g_InputDragFreezeContent ? L"on" : L"off");
         LogInfo("QGADRAGEVTPRIO %s", g_DragEventPriority ? L"on" : L"off");
         LogInfo("QGAMONCACHE %s", g_MonInfoCache ? L"on" : L"off");
+        LogInfo("QGASEAMLESSSTART %s", g_SeamlessStart ? L"on" : L"off (Start hidden in seamless)");
         LogInfo("QGARESYNCDEFER %s", g_ResyncDragDefer ? L"on" : L"off");
     }
 
