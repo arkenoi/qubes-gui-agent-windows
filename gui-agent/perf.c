@@ -49,7 +49,8 @@ DWORD    g_InputDragServoGainPct = 60; // beta*100; 70 is already unstable under
 DWORD    g_InputDragServoTauMs = 25;   // assumed announce transit+apply time
 DWORD    g_InputDragServoDeadband = 3; // px per axis
 BOOL     g_DdaMoveInvalidate = TRUE;
-BOOL     g_InputDragSlice = TRUE; // default ON: cannot freeze content (per-frame diff vs live screen)
+BOOL     g_InputDragSlice = TRUE;
+BOOL     g_InputDragFreezeContent = TRUE; // default ON (user request): no content updates while dragging
 BOOL     g_MonInfoCache = FALSE;
 BOOL     g_ResyncDragDefer = FALSE;
 LONGLONG g_PerfFreq = 0;
@@ -253,6 +254,8 @@ void PerfInit(void)
                 g_DdaMoveInvalidate = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SLICE_VALUE, &v, NULL))
                 g_InputDragSlice = (v != 0);
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_FREEZE_CONTENT_VALUE, &v, NULL))
+                g_InputDragFreezeContent = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_MON_INFO_CACHE_VALUE, &v, NULL))
                 g_MonInfoCache = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_RESYNC_DRAG_DEFER_VALUE, &v, NULL))
@@ -264,6 +267,7 @@ void PerfInit(void)
             g_InputDragServoTauMs, g_InputDragServoDeadband);
         LogInfo("QGADDAMOVEINV %s", g_DdaMoveInvalidate ? L"on" : L"off");
         LogInfo("QGADRAGSLICE %s", g_InputDragSlice ? L"on" : L"off");
+        LogInfo("QGADRAGFREEZECONTENT %s", g_InputDragFreezeContent ? L"on" : L"off");
         LogInfo("QGAMONCACHE %s", g_MonInfoCache ? L"on" : L"off");
         LogInfo("QGARESYNCDEFER %s", g_ResyncDragDefer ? L"on" : L"off");
     }

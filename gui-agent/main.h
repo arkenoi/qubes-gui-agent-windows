@@ -274,6 +274,10 @@ typedef struct _WINDOW_DATA
     // surface overlapped the window). Reported in the settle line so a hold is visible at
     // the shipped LogLevel=3 - an invisible content hold is the defect that shipped today.
     UINT PwDragHoldFrames;
+    // Content was frozen for this window during a drag (InputDragFreezeContent): the
+    // settle recapture is then mandatory and must repaint the WHOLE window, because
+    // dom0 has been showing a pre-drag bitmap the whole time.
+    BOOL PwDragFrozen;
 
     // Hash of the SCREEN pixels over this window's rect at the last recapture trigger.
     // Windows 11 presents ~1.9x more frames than Windows 10 for identical input (measured

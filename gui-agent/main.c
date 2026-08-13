@@ -4696,7 +4696,36 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 if (entry->PwSettleDue &&
                     pwNow - entry->PwLastMoveTick < PW_MOVE_SETTLE_MS)
                 {
-                    if (dragSliceReady)
+                    if (g_InputDragFreezeContent && entry->Handle == g_InputDragWindow)
+                    {
+                        // FREEZE CONTENT WHILE THE USER DRAGS (user request 2026-08-13).
+                        // Neither capture path is acceptable during a drag: PrintWindow is
+                        // a synchronous cross-process render that blocks the dragged app's
+                        // own message loop (measured 193/211 ms before the window even
+                        // starts moving), and copying from the desktop framebuffer bakes a
+                        // one-motion-step-stale edge strip into the window every frame
+                        // (the moving artifacts). Sending NOTHING has neither cost: dom0
+                        // keeps showing the last good bitmap - which is exactly what a
+                        // remote desktop does while a window is dragged - and the settle
+                        // branch below repaints once, authoritatively, when motion stops.
+                        //
+                        // This is only safe because the POSITION path is now clean: the
+                        // same suppression shipped earlier today while the announce loop
+                        // was still oscillating, and a frozen bitmap flung around by that
+                        // oscillation is what the user saw as 'wobble with rendering
+                        // artifacts'. The servo fixed the position side first.
+                        if (entry->PwDragSlice)
+                        {
+                            // Was slice-feeding (knob flipped mid-drag): hand the buffer
+                            // back so the settle recapture takes the normal path.
+                            entry->PwDragSlice = FALSE;
+                            WcSetDdaOwned(entry->Handle, FALSE);
+                        }
+                        entry->PwDragFrozen = TRUE;
+                        LogDebug("QGADRAGFREEZE,ev=hold,hwnd=0x%x",
+                            (uint32_t)(ULONG_PTR)entry->Handle);
+                    }
+                    else if (dragSliceReady)
                     {
                         // DRAG-SLICE (see the eligibility comment above). Engages on
                         // the PRESS frame itself - the g_InputDragWindow latch forces
@@ -4788,6 +4817,18 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // Quiet for PW_MOVE_SETTLE_MS: motion is over. Recapture once,
                     // regardless of where this frame's damage landed.
                     entry->PwSettleDue = FALSE;
+                    if (entry->PwDragFrozen)
+                    {
+                        // The drag froze this window's content: dom0 has been showing
+                        // the pre-drag bitmap. This settle is therefore not an
+                        // optimisation, it is the ONLY thing that makes the window
+                        // correct again - it must fire, and it must send the whole
+                        // window rather than a diff against a buffer that never moved.
+                        entry->PwDragFrozen = FALSE;
+                        entry->PwSliceNeedsFull = TRUE;
+                        LogInfo("QGADRAGFREEZE,ev=settle,hwnd=0x%x",
+                            (uint32_t)(ULONG_PTR)entry->Handle);
+                    }
                     if (entry->PwDragSlice)
                     {
                         // Release the drag-slice BEFORE the settle mark, or the

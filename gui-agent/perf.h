@@ -113,6 +113,7 @@
 // held state is while a TOPMOST guest surface overlaps the dragged window (bounded, and
 // repaired by the unconditional settle recapture) - which is why default ON is allowed.
 // 0 restores the throttled-PrintWindow drag path.
+#define REG_CONFIG_INPUT_DRAG_FREEZE_CONTENT_VALUE L"InputDragFreezeContent" // DWORD 0/1, default 1
 #define REG_CONFIG_INPUT_DRAG_SLICE_VALUE L"InputDragSlice" // DWORD 0/1, default 1
 // upd-spike reduction R1 (DWORD 0/1, default 0 = off): cache MONITORINFOEX+DEVMODE
 // per HMONITOR inside GetRealWindowRect, invalidated by WM_DISPLAYCHANGE + a 2 s TTL.
@@ -221,6 +222,12 @@ extern BOOL     g_DdaMoveInvalidate;
 // Slice-feed the input-dragged window from the composited desktop instead of
 // PrintWindow (drag-start latency fix; see the knob block above). Default ON.
 extern BOOL     g_InputDragSlice;
+// Send NO content updates for a window while the user drags it: dom0 keeps showing the
+// last good bitmap and one authoritative repaint follows on release. Avoids both capture
+// costs during a drag - PrintWindow blocking the app's own message loop (measured 193/211
+// ms of dead time before the window even starts moving) and the framebuffer copy's
+// one-step-stale edge strip (moving artifacts). Default ON (user request 2026-08-13).
+extern BOOL     g_InputDragFreezeContent;
 
 // upd-spike experiments, default OFF (old behaviour) until measured: R1 monitor-info
 // cache in GetRealWindowRect, R2 drag-time deferral of the resync backstop.
