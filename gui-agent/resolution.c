@@ -223,9 +223,11 @@ ULONG EnsureQubesIddSolo(void)
                                       L"SoloFaultInject", RRF_RT_REG_DWORD, &typeFault,
                                       &fault, &cbFault))
         fault = 0;
+    // %s in these log macros takes a WIDE string - a narrow literal here printed the format
+    // string itself and a run of garbage (seen live 2026-08-14).
     if (fault)
         LogWarning("IDD solo: SoloFaultInject=%lu - the apply will be made to FAIL on purpose%s",
-            fault, (fault == 2) ? " and the rollback is SUPPRESSED" : "");
+            fault, (fault == 2) ? L" and the rollback is SUPPRESSED" : L"");
 
     DISPLAY_DEVICEW dev;
     WCHAR iddName[CCHDEVICENAME] = { 0 };
