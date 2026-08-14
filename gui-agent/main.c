@@ -5587,6 +5587,24 @@ static ULONG WINAPI WatchForEvents(void)
     exitLoop = FALSE;
 
     LogInfo("Awaiting for a vchan client, write buffer size: %d", VchanGetWriteBufferSize(g_Vchan));
+
+    // FIRST-BOOT SELF-HEAL. On the FIRST boot of a freshly created AppVM this agent sits
+    // here forever: the log's last line is "Awaiting for a vchan client" and no gui-daemon
+    // ever attaches, so the qube runs with qrexec working and NOTHING on screen. Measured
+    // 3/3 on a Windows 10 AppVM built from a Windows 10 template (2026-08-14); the second
+    // and later boots of the same qube are fine, which is why it reads as "the qube starts
+    // and then does nothing" rather than as a crash (forum 42717 post 56).
+    //
+    // The daemon is not the problem: restarting ONLY this agent, with the qube untouched,
+    // makes the windows appear immediately. So the vchan server created on that first boot
+    // is the thing that is dead - plausibly because the Xen devices are re-enumerated under
+    // us while Windows specialises itself into a new qube identity, after we opened it.
+    //
+    // Exit and let the watchdog service restart us: that is exactly the recovery the
+    // experiment performed, rather than a narrower guess at re-initialising the vchan alone.
+    // Bounded by a persisted counter so a guest that legitimately has no daemon (gui off)
+    // cannot be restarted forever; after the budget we stay up and say so.
+    ULONGLONG vchanNoClientDeadline = GetTickCount64() + VCHAN_FIRST_CLIENT_WAIT_MS;
     watchedEvents[0] = g_ShutdownEvent;
     watchedEvents[1] = newFrameEvent;
     watchedEvents[2] = fullScreenOnEvent;
@@ -5661,6 +5679,28 @@ static ULONG WINAPI WatchForEvents(void)
             // Then the position announce for whatever that input just moved.
             if (WaitForSingleObject(g_WindowEventSignal, 0) == WAIT_OBJECT_0)
                 ProcessWindowEvents();
+        }
+
+        // No daemon has EVER attached and the grace period is over: restart (see the
+        // FIRST-BOOT SELF-HEAL note above). Checked before the wait so a quiet agent that
+        // nothing wakes still gets here - waitTimeout is bounded.
+        if (!g_VchanClientConnected && vchanNoClientDeadline != 0 &&
+            GetTickCount64() > vchanNoClientDeadline)
+        {
+            DWORD restarts = 0;
+            (void)CfgReadDword(NULL, REG_CONFIG_VCHAN_RESTARTS_VALUE, &restarts, NULL);
+            if (restarts < VCHAN_FIRST_CLIENT_MAX_RESTARTS)
+            {
+                (void)CfgWriteDword(NULL, REG_CONFIG_VCHAN_RESTARTS_VALUE, restarts + 1, NULL);
+                LogError("no gui-daemon client in %lu ms and none ever connected - exiting so the watchdog respawns the agent (attempt %lu of %lu). This is the first-boot AppVM case: the qube has qrexec but no windows.",
+                    VCHAN_FIRST_CLIENT_WAIT_MS, restarts + 1, (DWORD)VCHAN_FIRST_CLIENT_MAX_RESTARTS);
+                status = ERROR_TIMEOUT;
+                exitLoop = TRUE;
+                break;
+            }
+            LogError("no gui-daemon client in %lu ms after %lu restarts - staying up without one. If this qube is meant to have a GUI, check that its gui feature is set and that a gui-daemon runs for it in dom0.",
+                VCHAN_FIRST_CLIENT_WAIT_MS, restarts);
+            vchanNoClientDeadline = 0; // said once; do not spin
         }
 
         // Wait for events.
@@ -5935,6 +5975,11 @@ static ULONG WINAPI WatchForEvents(void)
                 // needs to be set before enumerating windows so maps get sent
                 // (and before sending anything really)
                 g_VchanClientConnected = TRUE;
+                // A daemon attached, so the first-boot restart budget has done its job (or
+                // was never needed): clear it, or a later genuine first-boot failure on this
+                // guest would start with the budget already spent.
+                vchanNoClientDeadline = 0;
+                (void)CfgWriteDword(NULL, REG_CONFIG_VCHAN_RESTARTS_VALUE, 0, NULL);
 
                 // This daemon knows about no windows yet; forget what the previous one
                 // was told before any per-window message can be gated against it.

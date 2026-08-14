@@ -39,6 +39,14 @@
 // is granted to dom0 once per agent lifetime and frames are copied into it; 0 restores
 // the legacy direct-map per-geometry grant (A/B switch, see gui-agent/capture.c)
 #define REG_CONFIG_STAGING_VALUE            L"StagingGrant"
+// How long the agent waits for its FIRST gui-daemon client before deciding the vchan
+// server it opened is dead and exiting for the watchdog to respawn it, and how many times
+// it may do that before giving up and staying quiet. See the FIRST-BOOT SELF-HEAL note in
+// gui-agent/main.c: on the first boot of a freshly created AppVM the daemon never attaches,
+// and restarting the agent alone fixes it (measured 3/3, 2026-08-14).
+#define VCHAN_FIRST_CLIENT_WAIT_MS      90000
+#define VCHAN_FIRST_CLIENT_MAX_RESTARTS 3
+#define REG_CONFIG_VCHAN_RESTARTS_VALUE     L"VchanFirstClientRestarts"
 
 // path to the gui agent, launched by the watchdog service
 #define REG_CONFIG_AGENT_PATH_VALUE  L"GuiAgentPath"
