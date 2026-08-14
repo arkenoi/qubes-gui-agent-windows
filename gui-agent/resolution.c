@@ -207,6 +207,26 @@ ULONG EnsureQubesIddSolo(void)
         return ERROR_SUCCESS;
     }
 
+    // FAULT INJECTION, same reasoning as the kill switch above: the never-headless guards
+    // are only evidence once they have been SEEN TO FAIL on a build carrying the defect
+    // (CLAUDE.md). The failure they exist for - the apply failing AFTER the detach - cannot
+    // be summoned on demand otherwise, because it depends on losing a boot race.
+    //   HKLM\SOFTWARE\QubesIDD!SoloFaultInject = 1  aim the set-primary at a device that
+    //       cannot exist, so the apply fails exactly as a modeless IDD makes it fail.
+    //       The rollback should then restore the previous display.
+    //                                        = 2  the same, with the rollback SUPPRESSED:
+    //       this is the pre-fix behaviour and it must leave the guest with no display at
+    //       all. It is what proves the check can fail.
+    // Absent (the shipped state) this is dead code.
+    DWORD fault = 0, cbFault = sizeof(fault), typeFault = 0;
+    if (ERROR_SUCCESS != RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\QubesIDD",
+                                      L"SoloFaultInject", RRF_RT_REG_DWORD, &typeFault,
+                                      &fault, &cbFault))
+        fault = 0;
+    if (fault)
+        LogWarning("IDD solo: SoloFaultInject=%lu - the apply will be made to FAIL on purpose%s",
+            fault, (fault == 2) ? " and the rollback is SUPPRESSED" : "");
+
     DISPLAY_DEVICEW dev;
     WCHAR iddName[CCHDEVICENAME] = { 0 };
     WCHAR attached[16][CCHDEVICENAME];
@@ -311,10 +331,11 @@ ULONG EnsureQubesIddSolo(void)
     ZeroMemory(&pm, sizeof(pm));
     pm.dmSize = sizeof(pm);
     pm.dmFields = DM_POSITION;
-    LONG prc = ChangeDisplaySettingsExW(iddName, &pm, NULL,
+    const WCHAR *primaryTarget = fault ? L"\\\\.\\DISPLAY_QUBES_FAULT_INJECT" : iddName;
+    LONG prc = ChangeDisplaySettingsExW(primaryTarget, &pm, NULL,
                                         CDS_SET_PRIMARY | CDS_UPDATEREGISTRY | CDS_NORESET, NULL);
     LONG crc = ChangeDisplaySettingsExW(NULL, NULL, NULL, 0, NULL);
-    LogInfo("IDD solo: set-primary '%s' -> %ld, commit -> %ld", iddName, prc, crc);
+    LogInfo("IDD solo: set-primary '%s' -> %ld, commit -> %ld", primaryTarget, prc, crc);
 
     // READBACK. "The call returned success" is not the criterion - re-enumerate and require
     // the IDD attached+primary with ZERO other attached displays. Without this the function
@@ -357,7 +378,11 @@ ULONG EnsureQubesIddSolo(void)
     // did not attach AND nothing else is attached either, i.e. the desktop now has no output
     // at all and CDS_UPDATEREGISTRY has already persisted that for the next boot. A partial
     // failure that still leaves a visible display is left alone deliberately.
-    if (!iddAttached && othersStillAttached == 0)
+    if (!iddAttached && othersStillAttached == 0 && fault == 2)
+    {
+        LogError("IDD solo: NO display is attached and SoloFaultInject=2 SUPPRESSES the rollback - this is the pre-fix behaviour, the guest now has no display. Recover with deactivate-idd.ps1 over qrexec.");
+    }
+    else if (!iddAttached && othersStillAttached == 0)
     {
         LogError("IDD solo: NO display is attached - restoring the %lu display(s) that were detached", attachedCount);
         DWORD restored = 0;
