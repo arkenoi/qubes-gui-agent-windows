@@ -132,7 +132,62 @@ void InitVideoModes()
 //
 // Returns ERROR_SUCCESS only when READBACK confirms the end state. It is a no-op (and NOT
 // an error) on a guest with no IDD - the Basic Display Adapter configuration is supported.
+//
+// NEVER LEAVE THE DESKTOP HEADLESS (added 2026-08-14, field report forum 42717 post 54:
+// "after the reboot, Windows 10 shows only a black inactive window"). The original sequence
+// detached every other display FIRST and only then tried to make the IDD primary. When that
+// second step failed - and on Win10 it can, because an IddCx adapter enumerates before its
+// monitor arrives and has no mode list until it does - the guest was left with ZERO attached
+// displays, persisted to the registry by CDS_UPDATEREGISTRY. That state survives reboots, so
+// the qube stays black forever: exactly what was reported, and unreachable on Win11 because
+// there the OS attaches the IDD itself and the idempotence check above returns early.
+// Two guards, both required:
+//   1. REFUSE to detach anything until the IDD publishes at least one mode (ERROR_NOT_READY,
+//      which the caller retries - the common case is simply "too early in boot");
+//   2. ROLL BACK if the readback finds nothing attached: re-attach exactly what we detached,
+//      with its previous mode and primary flag, and commit.
+// A degraded topology (IDD plus a leftover display) is NOT rolled back: it is suboptimal but
+// visible, and tearing it down again would risk the state this code exists to avoid.
 #define QUBES_IDD_DEVICE_STRING L"IddSampleDriver Device"
+
+// Does this adapter offer any usable mode? An IddCx adapter with no monitor attached
+// enumerates as a display device but has an EMPTY mode list, and CDS_SET_PRIMARY on it fails.
+static BOOL AdapterHasModes(IN const WCHAR *deviceName, OUT DWORD *width, OUT DWORD *height)
+{
+    DEVMODEW dm;
+    for (DWORD i = 0; ; i++)
+    {
+        ZeroMemory(&dm, sizeof(dm));
+        dm.dmSize = sizeof(dm);
+        if (!EnumDisplaySettingsW(deviceName, i, &dm))
+            return FALSE;
+        if (dm.dmPelsWidth != 0 && dm.dmPelsHeight != 0)
+        {
+            if (width) *width = dm.dmPelsWidth;
+            if (height) *height = dm.dmPelsHeight;
+            return TRUE;
+        }
+    }
+}
+
+// How many non-mirroring displays are attached to the desktop right now.
+static DWORD CountAttachedDisplays(void)
+{
+    DISPLAY_DEVICEW dev;
+    DWORD n = 0;
+    for (DWORD i = 0; ; i++)
+    {
+        ZeroMemory(&dev, sizeof(dev));
+        dev.cb = sizeof(dev);
+        if (!EnumDisplayDevicesW(NULL, i, &dev, 0))
+            break;
+        if (dev.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER)
+            continue;
+        if (dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP)
+            n++;
+    }
+    return n;
+}
 
 ULONG EnsureQubesIddSolo(void)
 {
@@ -155,6 +210,10 @@ ULONG EnsureQubesIddSolo(void)
     DISPLAY_DEVICEW dev;
     WCHAR iddName[CCHDEVICENAME] = { 0 };
     WCHAR attached[16][CCHDEVICENAME];
+    // Everything needed to put a detached display back exactly as it was, captured BEFORE
+    // the detach. Without this a rollback would have to guess a mode and a position.
+    DEVMODEW attachedMode[16];
+    BOOL attachedWasPrimary[16];
     DWORD attachedCount = 0;
     BOOL iddIsPrimary = FALSE;
 
@@ -182,6 +241,19 @@ ULONG EnsureQubesIddSolo(void)
                  attachedCount < ARRAYSIZE(attached))
         {
             StringCchCopyW(attached[attachedCount], CCHDEVICENAME, dev.DeviceName);
+            attachedWasPrimary[attachedCount] =
+                (dev.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) ? TRUE : FALSE;
+            ZeroMemory(&attachedMode[attachedCount], sizeof(attachedMode[0]));
+            attachedMode[attachedCount].dmSize = sizeof(attachedMode[0]);
+            if (!EnumDisplaySettingsExW(dev.DeviceName, ENUM_CURRENT_SETTINGS,
+                                        &attachedMode[attachedCount], 0))
+            {
+                // No current settings to remember: mark it unrollbackable rather than
+                // restoring a zeroed DEVMODE, which would detach it a second time.
+                attachedMode[attachedCount].dmSize = 0;
+                LogWarning("IDD solo: cannot read current settings of '%s' - it could not be restored if the apply fails",
+                    dev.DeviceName);
+            }
             attachedCount++;
         }
     }
@@ -204,6 +276,20 @@ ULONG EnsureQubesIddSolo(void)
         LogInfo("IDD solo: '%s' is already the sole active display - nothing to do", iddName);
         return ERROR_SUCCESS;
     }
+
+    // READINESS GATE - the first of the two never-headless guards. An IddCx adapter exists
+    // as soon as its devnode starts, but stays MODELESS until the monitor arrives, and
+    // CDS_SET_PRIMARY on a modeless adapter fails. Detaching the working display first and
+    // discovering that afterwards is how a guest ends up black. On a cold boot this is a
+    // matter of seconds, so the caller retries rather than giving up.
+    DWORD iddW = 0, iddH = 0;
+    if (!AdapterHasModes(iddName, &iddW, &iddH))
+    {
+        LogWarning("IDD solo: '%s' has no display modes yet (monitor not arrived) - leaving the topology untouched, will retry",
+            iddName);
+        return ERROR_NOT_READY;
+    }
+    LogDebug("IDD solo: '%s' offers modes (first %lux%lu) - proceeding", iddName, iddW, iddH);
 
     // Detach every other attached display FIRST. NORESET batches the changes so the
     // desktop is never momentarily headless between the detach and the set-primary.
@@ -266,7 +352,73 @@ ULONG EnsureQubesIddSolo(void)
 
     LogError("IDD solo: FAILED - idd attached=%d primary=%d, others still attached=%lu",
         iddAttached, iddPrimary, othersStillAttached);
+
+    // ROLLBACK - the second never-headless guard. Only for the catastrophic outcome: the IDD
+    // did not attach AND nothing else is attached either, i.e. the desktop now has no output
+    // at all and CDS_UPDATEREGISTRY has already persisted that for the next boot. A partial
+    // failure that still leaves a visible display is left alone deliberately.
+    if (!iddAttached && othersStillAttached == 0)
+    {
+        LogError("IDD solo: NO display is attached - restoring the %lu display(s) that were detached", attachedCount);
+        DWORD restored = 0;
+        for (DWORD i = 0; i < attachedCount; i++)
+        {
+            if (attachedMode[i].dmSize == 0)
+                continue;
+            attachedMode[i].dmFields |= DM_POSITION | DM_PELSWIDTH | DM_PELSHEIGHT;
+            DWORD flags = CDS_UPDATEREGISTRY | CDS_NORESET;
+            if (attachedWasPrimary[i])
+                flags |= CDS_SET_PRIMARY;
+            LONG rrc = ChangeDisplaySettingsExW(attached[i], &attachedMode[i], NULL, flags, NULL);
+            LogInfo("IDD solo: restore '%s' (%lux%lu, primary=%d) -> %ld",
+                attached[i], attachedMode[i].dmPelsWidth, attachedMode[i].dmPelsHeight,
+                attachedWasPrimary[i], rrc);
+            if (rrc == DISP_CHANGE_SUCCESSFUL)
+                restored++;
+        }
+        LONG rcommit = ChangeDisplaySettingsExW(NULL, NULL, NULL, 0, NULL);
+        DWORD nowAttached = CountAttachedDisplays();
+        if (nowAttached > 0)
+        {
+            LogWarning("IDD solo: rolled back - %lu display(s) attached again (restored=%lu, commit=%ld). The guest keeps its previous display; the IDD did not activate.",
+                nowAttached, restored, rcommit);
+        }
+        else
+        {
+            // Nothing left to try from here. Say exactly what a user has to do, because from
+            // dom0 this looks like a black unresponsive window with no other clue.
+            LogError("IDD solo: ROLLBACK FAILED - the desktop has NO attached display (restored=%lu, commit=%ld). Recover from dom0 with: qvm-run -u SYSTEM <vm> \"powershell -ExecutionPolicy Bypass -File C:\\qwt-improved-setup\\deactivate-idd.ps1\" then restart the qube.",
+                restored, rcommit);
+        }
+    }
+
     return ERROR_INVALID_STATE;
+}
+
+// Startup wrapper: EnsureQubesIddSolo returns ERROR_NOT_READY while the IddCx monitor is
+// still arriving, which on a cold boot is normal for a few seconds. Retry only that case -
+// a guest with no IDD at all returns ERROR_SUCCESS immediately and must not be delayed, and
+// a real failure (ERROR_INVALID_STATE, already rolled back) is not made better by repeating.
+ULONG EnsureQubesIddSoloWaiting(IN DWORD timeoutMs)
+{
+    const DWORD stepMs = 1000;
+    DWORD waited = 0;
+    ULONG status;
+
+    while (TRUE)
+    {
+        status = EnsureQubesIddSolo();
+        if (status != ERROR_NOT_READY)
+            return status;
+        if (waited >= timeoutMs)
+        {
+            LogWarning("IDD solo: the IDD never published a mode within %lu ms - staying on the current display topology",
+                timeoutMs);
+            return status;
+        }
+        Sleep(stepMs);
+        waited += stepMs;
+    }
 }
 
 static ULONG SetVideoModeInternal(IN ULONG width, IN ULONG height)

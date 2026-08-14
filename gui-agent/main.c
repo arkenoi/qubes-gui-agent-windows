@@ -6408,7 +6408,11 @@ static ULONG Init(void)
     // A failure here is deliberately NOT fatal - a guest whose IDD did not come up must
     // still get a working agent on the Basic Display Adapter rather than no GUI at all.
     // The failure is loud in the log and the health gate asserts the end state separately.
-    if (ERROR_SUCCESS != EnsureQubesIddSolo())
+    // WAITING variant: the agent is started very early by the watchdog service, routinely
+    // before the IddCx monitor has arrived, and the old one-shot call treated that race as
+    // a permanent failure. 20 s is generous against a measured arrival of a few seconds and
+    // costs nothing on a guest with no IDD, which returns immediately.
+    if (ERROR_SUCCESS != EnsureQubesIddSoloWaiting(20000))
         LogWarning("IDD solo failed - continuing on the current display topology");
 
     InitVideoModes();

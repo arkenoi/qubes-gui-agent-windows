@@ -38,6 +38,8 @@
 // No-op returning ERROR_SUCCESS when no IDD is present (Basic Display Adapter guests).
 // Returns ERROR_INVALID_STATE if readback shows the IDD is not solo-primary.
 ULONG EnsureQubesIddSolo(void);
+// Same, retrying while the IddCx monitor is still arriving (ERROR_NOT_READY). Use at startup.
+ULONG EnsureQubesIddSoloWaiting(IN DWORD timeoutMs);
 
 DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* source);
 ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source);
