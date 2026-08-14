@@ -23,6 +23,7 @@
 
 #include <log.h>
 #include <config.h>
+#include <qubesdb-client.h>   // dom0-set feature: /qubes-service/enableWinKey
 
 BOOL     g_PerfEnabled = FALSE;
 BOOL     g_ProtoTrace  = FALSE;
@@ -210,14 +211,50 @@ void PerfInit(void)
     }
 
     // Menu-key block (seamless only; see perf.h).
+    //
+    // SCOPE, deliberately: the block is applied as `g_BlockMenuKey && g_SeamlessMode`, so this
+    // flag NEVER affects fullscreen mode. There the guest owns the whole screen and its own
+    // desktop conventions, so the Super/Windows key always reaches Windows regardless of what is
+    // configured here. Everything below is about SEAMLESS mode only, where dom0 owns the key.
     {
         DWORD bv = 1;
         BOOL blk = TRUE;
         if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_BLOCK_MENU_KEY_VALUE, &bv, NULL))
             blk = (bv != 0);
+
+        // dom0-side knob, and it WINS over the guest registry value: the admin decides what a
+        // qube may take from the window manager, not the guest. Set from dom0 with
+        //
+        //     qvm-features <vm> service.enableWinKey 1
+        //
+        // `service.`-prefixed features are the ones Qubes exports into the guest's qubesdb (as
+        // /qubes-service/<name>); a plain feature stays dom0-side and the guest could never see
+        // it, which is why the name carries that prefix.
+        //
+        // DEFAULT OFF: absent feature means the key stays blocked in seamless mode, which is the
+        // behaviour every existing qube already has. It exists for guests running a third-party
+        // shell - OpenShell and friends - where the Super key is how the user opens their menu and
+        // swallowing it makes the shell unusable.
+        {
+            qdb_handle_t qdb = qdb_open(NULL);
+            if (qdb)
+            {
+                char *v = qdb_read(qdb, "/qubes-service/enableWinKey", NULL);
+                if (v)
+                {
+                    // Any value but "0" enables the key; Qubes writes "1" for a set service.
+                    blk = (v[0] == '0');
+                    LogInfo("QGABLOCKWIN qubesdb enableWinKey=%S -> block %s", v, blk ? L"on" : L"off");
+                    free(v);
+                }
+                qdb_close(qdb);
+            }
+        }
+
         g_BlockMenuKey = blk;
-        LogInfo("QGABLOCKWIN %s", g_BlockMenuKey ? L"on" : L"off");
+        LogInfo("QGABLOCKWIN %s (seamless only; fullscreen always passes the key)",
+                g_BlockMenuKey ? L"on" : L"off");
     }
 
     // Attribution switches - registry default, marker file overrides at runtime.
