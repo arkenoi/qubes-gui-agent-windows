@@ -390,6 +390,10 @@ static LRESULT CALLBACK WaWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         // WaCompute clamps against a stale screen and SPI_SETWORKAREA rejects the rect.
         ResolutionAdoptCurrent();
         WorkAreaReassert();
+        // A display may have been ATTACHED, not just resized - the IddCx monitor arriving
+        // during install is the routine case. Two attached displays grow the desktop past
+        // what dom0 sees, so re-assert solo (debounced, on its own thread).
+        ResolutionRequestIddSoloReassert();
         return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);

@@ -40,6 +40,10 @@
 ULONG EnsureQubesIddSolo(void);
 // Same, retrying while the IddCx monitor is still arriving (ERROR_NOT_READY). Use at startup.
 ULONG EnsureQubesIddSoloWaiting(IN DWORD timeoutMs);
+// Ask for a debounced solo re-assert, off the caller's thread. Call on WM_DISPLAYCHANGE: a
+// display attached after the agent started (the IddCx monitor during install) otherwise stays
+// attached until the next reboot, and Windows places windows where dom0 cannot see them.
+void ResolutionRequestIddSoloReassert(void);
 
 DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* source);
 ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source);

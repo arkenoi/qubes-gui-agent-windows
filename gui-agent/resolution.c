@@ -422,6 +422,75 @@ ULONG EnsureQubesIddSolo(void)
     return ERROR_INVALID_STATE;
 }
 
+// Re-assert IDD-solo when the display topology changes UNDER us.
+//
+// WHY (measured 2026-08-14 on a live install, dom0 window list):
+//     0x7600188 0    0   1024 768 override=0 mapped=0   <- the screen the agent mapped
+//     0x760018e 1920 728 1024 40  override=1 mapped=1   <- the guest's taskbar
+// The guest had TWO attached displays: the IddCx monitor arrives and Windows attaches it as
+// a SECOND display, which grows the desktop bounding box, and Windows then places windows -
+// here the taskbar - in a region dom0 never sees. In dom0 that shows up as a stray strip
+// floating over the desktop with nothing behind it. This is exactly the breakage CLAUDE.md
+// Phase 1B warns about, and it lasts until the next reboot because the solo apply ran ONCE
+// at agent startup, before the IDD existed. Every install goes through this window, which is
+// also when a user is looking at installer dialogs, and it fits the field report of the
+// pointer being off BEFORE the activation reboot (forum 42717 post 54).
+//
+// On its own thread, not on the broadcast listener's: EnsureQubesIddSolo attaches to the
+// input desktop, and SetThreadDesktop fails for a thread that owns a window - which the
+// listener does.
+static HANDLE g_IddSoloReassertEvent = NULL;
+
+static DWORD WINAPI IddSoloReassertThread(void *param)
+{
+    UNREFERENCED_PARAMETER(param);
+    ULONGLONG lastFailMs = 0;
+
+    while (TRUE)
+    {
+        WaitForSingleObject(g_IddSoloReassertEvent, INFINITE);
+        // Coalesce the burst. A topology change arrives as several WM_DISPLAYCHANGEs, and
+        // our own apply generates more - without this the two would chase each other.
+        while (WaitForSingleObject(g_IddSoloReassertEvent, 1500) == WAIT_OBJECT_0)
+            ;
+
+        ULONGLONG now = GetTickCount64();
+        if (lastFailMs != 0 && (now - lastFailMs) < 30000)
+        {
+            LogDebug("IDD solo: re-assert suppressed (previous attempt failed %llu ms ago)",
+                now - lastFailMs);
+            continue;
+        }
+        // Idempotent: returns immediately when the IDD is already the sole display, so the
+        // common case costs one enumeration and changes nothing.
+        if (ERROR_SUCCESS != EnsureQubesIddSolo())
+            lastFailMs = GetTickCount64();
+    }
+    return ERROR_SUCCESS;
+}
+
+// Called from the WM_DISPLAYCHANGE listener (single thread; the lazy init is not guarded).
+void ResolutionRequestIddSoloReassert(void)
+{
+    static HANDLE thread = NULL;
+
+    if (!g_IddSoloReassertEvent)
+        g_IddSoloReassertEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (!g_IddSoloReassertEvent)
+    {
+        win_perror("creating the IDD solo re-assert event");
+        return;
+    }
+    if (!thread)
+        thread = CreateThread(NULL, 0, IddSoloReassertThread, NULL, 0, 0);
+    if (!thread)
+    {
+        win_perror("creating the IDD solo re-assert thread");
+        return;
+    }
+    SetEvent(g_IddSoloReassertEvent);
+}
+
 // Startup wrapper: EnsureQubesIddSolo returns ERROR_NOT_READY while the IddCx monitor is
 // still arriving, which on a cold boot is normal for a few seconds. Retry only that case -
 // a guest with no IDD at all returns ERROR_SUCCESS immediately and must not be delayed, and
