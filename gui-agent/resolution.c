@@ -1437,20 +1437,6 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
     }
 
     BOOL replugged = FALSE;
-
-    // QUIESCE CAPTURE ACROSS THE WHOLE DISPLAY-STATE CHANGE. Two separate things below destroy a
-    // desktop duplication: the monitor replug that publishes a new mode (IddCxMonitorDeparture is
-    // a hot unplug) AND the mode apply itself. Measured 2026-08-16: a run with replug=0 still
-    // produced AcquireNextFrame 0x887a0026, because ChangeDisplaySettings alone is enough - so
-    // bracketing only the replug would have left the common case exactly as it was.
-    //
-    // The agent used to meet both as asynchronous faults from inside AcquireNextFrame, and that
-    // path's bad tail destroys the screen window and rebuilds the session. Nothing forces it: we
-    // initiate the change, so capture stops first and the duplication is rebuilt once at the end,
-    // at a point we choose. No protocol traffic on either side - the screen window stays
-    // announced, the grants stay valid, dom0 is told nothing.
-    CaptureReplugBegin(L"a mode change");
-
     ULONGLONG m0Start = 0; // M0BLINK obtain-start stamp; 0 = no obtain needed
     g_ExactTargetW = width;
     g_ExactTargetH = height;
@@ -1469,7 +1455,6 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
         LogInfo("M0BLINK obtain-start %lux%lu t=%I64u", width, height, m0Start);
         if (WriteIddModeSet(width, height) != ERROR_SUCCESS)
         {
-            (void)CaptureReplugEnd();   // nothing was changed; capture must not stay quiesced
             LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=modes-key-write-failed",
                 width, height, g_ScreenWidth, g_ScreenHeight);
             InterlockedExchange64(&g_M0BlinkObtainStart, 0); // obtain aborted, no repaint expected
@@ -1478,6 +1463,12 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
             return ERROR_SUCCESS;
         }
 
+        // Quiesce capture BEFORE the replug. The reload makes the driver depart and re-arrive the
+        // monitor, which destroys the desktop duplication; doing that while the capture thread is
+        // inside AcquireNextFrame is how the agent used to discover its own action as an
+        // asynchronous DXGI_ERROR_ACCESS_LOST. Paired with CaptureReplugEnd once the mode is
+        // settled, so there is exactly one rebuild, at a point we choose.
+        CaptureReplugBegin(L"an IDD mode reload");
 
         if (QiddReloadModes())
         {
@@ -1488,7 +1479,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
             LogWarning("QIDD ioctl-reload unavailable, falling back to device restart (PnP)");
             if (!RestartQubesIddDevice())
             {
-                (void)CaptureReplugEnd();
+                (void)CaptureReplugEnd();   // nothing was replugged after all; resume capture
                 LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=idd-not-present",
                     width, height, g_ScreenWidth, g_ScreenHeight);
                 InterlockedExchange64(&g_M0BlinkObtainStart, 0); // obtain aborted, no repaint expected
@@ -1535,7 +1526,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
 
         if (!offered)
         {
-            (void)CaptureReplugEnd();
+            (void)CaptureReplugEnd();   // the monitor did replug; rebuild before giving up
             LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=mode-never-appeared",
                 width, height, g_ScreenWidth, g_ScreenHeight);
             InterlockedExchange64(&g_M0BlinkObtainStart, 0); // obtain aborted, no repaint expected
@@ -1556,7 +1547,8 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
     ULONG status = SetVideoModeInternal(width, height);
     if (status != ERROR_SUCCESS)
     {
-        (void)CaptureReplugEnd();
+        if (replugged)
+            (void)CaptureReplugEnd();
         LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=apply-failed-0x%lx",
             width, height, g_ScreenWidth, g_ScreenHeight, status);
         InterlockedExchange64(&g_M0BlinkObtainStart, 0); // no repaint expected for this obtain
@@ -1605,8 +1597,9 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
     }
 
     // The display state is settled: the mode is applied and read back. Rebuild the duplication
-    // now, once, instead of letting the capture thread trip over a change we caused.
-    (void)CaptureReplugEnd();
+    // now, once, instead of letting the capture thread trip over the replug we caused.
+    if (replugged)
+        (void)CaptureReplugEnd();
 
     LogInfo("RESEXACT %lux%lu replug=%d", width, height, replugged ? 1 : 0);
 
