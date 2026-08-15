@@ -5637,8 +5637,20 @@ static ULONG WINAPI WatchForEvents(void)
     // Exit and let the watchdog service restart us: that is exactly the recovery the
     // experiment performed, rather than a narrower guess at re-initialising the vchan alone.
     // Bounded by a persisted counter so a guest that legitimately has no daemon (gui off)
+// How long the agent waits for the gui daemon to confirm MSG_DESTROY of the screen window before
+// deciding the confirm is not coming, and how many times it re-sends the destroy first. While that
+// confirm is outstanding NO window event is processed and no tracking pass runs, so this deadline
+// is the difference between a hiccup and a qube that is up, answers qrexec, and can never show a
+// window again.
+#define CAPTURE_GATE_WAIT_MS 15000
+#define CAPTURE_GATE_MAX_REASSERTS 2
+
     // cannot be restarted forever; after the budget we stay up and say so.
     ULONGLONG vchanNoClientDeadline = GetTickCount64() + VCHAN_FIRST_CLIENT_WAIT_MS;
+    // Deadline for the gui-daemon to confirm the screen window's destruction, and how many times
+    // the destroy has been re-sent while waiting. 0 = not waiting.
+    ULONGLONG captureGateDeadline = 0;
+    DWORD captureGateReasserts = 0;
     watchedEvents[0] = g_ShutdownEvent;
     watchedEvents[1] = newFrameEvent;
     watchedEvents[2] = fullScreenOnEvent;
@@ -5671,6 +5683,19 @@ static ULONG WINAPI WatchForEvents(void)
         }
 
         vchanIoInProgress = TRUE;
+
+        // CAPTURE GATE DEADLINE. While g_LocalScreenDestroyed is set the agent discards every
+        // window event and runs no tracking pass, so if the daemon's MSG_DESTROY(0) confirm never
+        // arrives the qube keeps whatever dom0 already had and NO NEW WINDOW CAN EVER APPEAR -
+        // apps start and are never announced, which is exactly the "qube is up, qrexec fine,
+        // nothing usable on screen" report. Wake up in time to notice.
+        if (g_LocalScreenDestroyed && captureGateDeadline != 0)
+        {
+            ULONGLONG now64 = GetTickCount64();
+            DWORD toGate = (captureGateDeadline > now64) ? (DWORD)(captureGateDeadline - now64) : 0;
+            if (waitTimeout == INFINITE || toGate < waitTimeout)
+                waitTimeout = toGate;
+        }
 
         // A7: while degraded, wake in time for the next capture-init retry; the
         // vchan/input events below are still serviced normally in between.
@@ -5713,6 +5738,45 @@ static ULONG WINAPI WatchForEvents(void)
             // Then the position announce for whatever that input just moved.
             if (WaitForSingleObject(g_WindowEventSignal, 0) == WAIT_OBJECT_0)
                 ProcessWindowEvents();
+        }
+
+        // THE GATE NEVER OPENED. Two escalations, in order, because the cheap one is also the
+        // likely one: the destroy may simply have been lost (a ring that was full when it was
+        // sent, a daemon that restarted mid-exchange), so re-send it before concluding anything.
+        // Deliberately NOT tearing capture down here: dom0 may still have the framebuffer mapped
+        // and revoking it early is the one thing this gate exists to prevent.
+        if (g_LocalScreenDestroyed && captureGateDeadline != 0 &&
+            GetTickCount64() > captureGateDeadline && g_VchanClientConnected)
+        {
+            if (captureGateReasserts < CAPTURE_GATE_MAX_REASSERTS)
+            {
+                captureGateReasserts++;
+                LogWarning("CAPTUREGATE no confirm from the gui daemon in %lu ms - re-sending the "
+                    L"screen destroy (attempt %lu of %lu). Until this clears, no window can be "
+                    L"announced to dom0.", CAPTURE_GATE_WAIT_MS, captureGateReasserts,
+                    (DWORD)CAPTURE_GATE_MAX_REASSERTS);
+                EnterCriticalSection(&g_VchanCriticalSection);
+                (void)SendWindowUnmap(NULL);
+                (void)SendWindowDestroy(NULL);
+                LeaveCriticalSection(&g_VchanCriticalSection);
+                captureGateDeadline = GetTickCount64() + CAPTURE_GATE_WAIT_MS;
+            }
+            else
+            {
+                // Out of cheap options. A fresh agent re-runs the handshake, re-creates window 0
+                // and re-announces every window it can see, which is the only remaining way to
+                // get the qube its GUI back - and it is exactly what a user does by hand when
+                // they restart a qube that "shows nothing". The watchdog backs off if this
+                // repeats, so a permanently wedged daemon cannot turn into a restart storm.
+                LogError("CAPTUREGATE the gui daemon never confirmed the screen destroy after %lu "
+                    L"re-sends - window tracking has been frozen for %lu ms and nothing can reach "
+                    L"dom0. Exiting so the watchdog respawns the agent and the session is rebuilt.",
+                    (DWORD)CAPTURE_GATE_MAX_REASSERTS,
+                    (DWORD)(CAPTURE_GATE_WAIT_MS * (CAPTURE_GATE_MAX_REASSERTS + 1)));
+                status = ERROR_TIMEOUT;
+                exitLoop = TRUE;
+                break;
+            }
         }
 
         // No daemon has EVER attached and the grace period is over: restart (see the
@@ -6126,6 +6190,8 @@ static ULONG WINAPI WatchForEvents(void)
                 // guest recorded NOTHING when capture stopped or restarted - the one
                 // question a "my qube is frozen" report needs answered.
                 LogInfo("CAPTUREGATE gui daemon confirms screen destruction - restarting capture");
+                captureGateDeadline = 0;
+                captureGateReasserts = 0;
                 // NEVEREXIT: capture is NULL if this confirm arrives while already in
                 // the A7 degraded state (CaptureTeardown would crash on NULL).
                 if (capture)
@@ -6161,6 +6227,8 @@ static ULONG WINAPI WatchForEvents(void)
                 StopFrameProcessing(&capture);
             // CaptureTeardown() is delayed until we receive confirming MSG_DESTROY for 0x0 from gui daemon
             // revoking framebuffer access before that is unsafe
+            captureGateDeadline = GetTickCount64() + CAPTURE_GATE_WAIT_MS;
+            captureGateReasserts = 0;
             break;
 
         case 6: // window events collected by the hook thread
