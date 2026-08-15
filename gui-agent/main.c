@@ -1233,7 +1233,9 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         // It was logged at ERROR and dominated the log - dozens of lines a minute on an idle
         // guest, which is how a real failure gets missed. Only this one status is demoted;
         // anything else still shouts.
-        if (status == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE))
+        // status is ULONG here while HRESULT_FROM_WIN32 yields a signed HRESULT, so compare as
+        // ULONG - /W4 with warnings-as-errors rejects the mixed-sign compare.
+        if (status == (ULONG)HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE))
         {
             LogDebug("0x%x: window gone before it could be measured", window);
             return (ULONG)status;
