@@ -5651,6 +5651,23 @@ static ULONG WINAPI WatchForEvents(void)
     // the destroy has been re-sent while waiting. 0 = not waiting.
     ULONGLONG captureGateDeadline = 0;
     DWORD captureGateReasserts = 0;
+
+    // FAULT INJECTION for the gate above (HKLM\SOFTWARE\QubesIDD!CaptureGateFaultInject, read
+    // once here, dead code when unset - same convention as SoloFaultInject/ModeSnapFaultInject):
+    //   1 = ignore the daemon's confirm, keep the deadline  -> the fix must recover the session
+    //   2 = ignore the confirm AND disable the deadline     -> the PRE-FIX behaviour: window
+    //       tracking stays frozen for ever, so no new window can ever reach dom0
+    // The capture error that opens the gate needs no injector: a resolution change produces it
+    // naturally (the AcquireNextFrame 0x887a0026 recorded in CLAUDE.md).
+    DWORD captureGateFault = 0, cbCgf = sizeof(captureGateFault), typeCgf = 0;
+    if (ERROR_SUCCESS != RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\QubesIDD",
+                                      L"CaptureGateFaultInject", RRF_RT_REG_DWORD, &typeCgf,
+                                      &captureGateFault, &cbCgf))
+        captureGateFault = 0;
+    if (captureGateFault)
+        LogWarning("CAPTUREGATE CaptureGateFaultInject=%lu - the gui daemon's screen-destroy "
+            L"confirm will be IGNORED on purpose%s", captureGateFault,
+            (captureGateFault == 2) ? L" and the deadline is DISABLED (pre-fix behaviour)" : L"");
     watchedEvents[0] = g_ShutdownEvent;
     watchedEvents[1] = newFrameEvent;
     watchedEvents[2] = fullScreenOnEvent;
@@ -5745,7 +5762,7 @@ static ULONG WINAPI WatchForEvents(void)
         // sent, a daemon that restarted mid-exchange), so re-send it before concluding anything.
         // Deliberately NOT tearing capture down here: dom0 may still have the framebuffer mapped
         // and revoking it early is the one thing this gate exists to prevent.
-        if (g_LocalScreenDestroyed && captureGateDeadline != 0 &&
+        if (g_LocalScreenDestroyed && captureGateDeadline != 0 && captureGateFault != 2 &&
             GetTickCount64() > captureGateDeadline && g_VchanClientConnected)
         {
             if (captureGateReasserts < CAPTURE_GATE_MAX_REASSERTS)
@@ -6183,6 +6200,13 @@ static ULONG WINAPI WatchForEvents(void)
             if (ERROR_SUCCESS == status)
                 ApplyAllPendingDaemonMoves();
             LeaveCriticalSection(&g_VchanCriticalSection);
+
+            if (screenDestroyed && captureGateFault)
+            {
+                LogWarning("CAPTUREGATE confirm received and DISCARDED (CaptureGateFaultInject=%lu)",
+                    captureGateFault);
+                screenDestroyed = FALSE;
+            }
 
             if (screenDestroyed)
             {
