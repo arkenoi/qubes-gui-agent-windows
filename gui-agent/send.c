@@ -510,7 +510,17 @@ static ULONG SendWindowCreateInternal(IN const WINDOW_DATA *windowData, IN BOOL 
     // FALSE so that the created-window gate quarantines every dependent message for this
     // hwnd. Failure then degrades to "the window is invisible until a later pass re-creates
     // it with a sane rect", never to agent and daemon disagreeing about what exists.
-    if (!SanitizeWireGeometry(window, L"MSG_CREATE", &createMsg.x, &createMsg.y,
+    // FI_RAW_CREATE (test builds only) takes the sanitizer out of the path, which is the
+    // only way to observe what it prevents: while it works, dom0 never sees the bad rect
+    // and its dialog cannot be seen to fire. Logged at WARNING because a run with this on
+    // is deliberately shipping a protocol violation to the daemon.
+    if (FiRawCreate())
+    {
+        LogWarning("QGAFAULT FI_RAW_CREATE: sending CREATE for hwnd 0x%x UNSANITIZED "
+            L"(%d,%d) %ux%u - dom0 is expected to reject this", window,
+            createMsg.x, createMsg.y, createMsg.width, createMsg.height);
+    }
+    else if (!SanitizeWireGeometry(window, L"MSG_CREATE", &createMsg.x, &createMsg.y,
         &createMsg.width, &createMsg.height))
     {
         return ERROR_INVALID_DATA;

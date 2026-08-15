@@ -41,6 +41,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define REG_CONFIG_FAULT_DELAY_VALUE        L"FaultArmDelaySec"
 #define REG_CONFIG_FAULT_NEG_CREATE_VALUE   L"FaultNegCreate"
 #define REG_CONFIG_FAULT_NEG_HWND_VALUE     L"FaultNegCreateHwnd"
+#define REG_CONFIG_FAULT_RAW_CREATE_VALUE   L"FaultRawCreate"
 #define REG_CONFIG_FAULT_RING_STALL_VALUE   L"FaultRingStallSec"
 #define REG_CONFIG_FAULT_PUMP_STALL_VALUE   L"FaultPumpStallSec"
 #define REG_CONFIG_FAULT_CAPTURE_EXIT_VALUE L"FaultCaptureExit"
@@ -50,6 +51,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define FAULT_DELAY_ENV_VALUE        L"QUBES_GUI_FAULT_DELAY"
 #define FAULT_NEG_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_NEG_CREATE"
 #define FAULT_NEG_HWND_ENV_VALUE     L"QUBES_GUI_FAULT_NEG_CREATE_HWND"
+#define FAULT_RAW_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_RAW_CREATE"
 #define FAULT_RING_STALL_ENV_VALUE   L"QUBES_GUI_FAULT_RING_STALL"
 #define FAULT_PUMP_STALL_ENV_VALUE   L"QUBES_GUI_FAULT_PUMP_STALL"
 #define FAULT_CAPTURE_EXIT_ENV_VALUE L"QUBES_GUI_FAULT_CAPTURE_EXIT"
@@ -78,6 +80,7 @@ static volatile LONG g_FiPumpStall   = 0;
 // Compared as ULONG_PTR against the low half of the HWND, the same 32-bit id the
 // protocol carries. Written once by FiInit.
 static DWORD g_FiNegCreateHwnd = 0;
+static DWORD g_FiRawCreate     = 0;
 
 // One-shot payload: how long the single stalled pump iteration sleeps. Written once.
 static DWORD g_FiPumpStallMs = 0;
@@ -155,6 +158,7 @@ void FiInit(void)
     ringStallSec   = FiReadDword(moduleName, REG_CONFIG_FAULT_RING_STALL_VALUE,   FAULT_RING_STALL_ENV_VALUE,   0);
     pumpStallSec   = FiReadDword(moduleName, REG_CONFIG_FAULT_PUMP_STALL_VALUE,   FAULT_PUMP_STALL_ENV_VALUE,   0);
     g_FiNegCreateHwnd = FiReadDword(moduleName, REG_CONFIG_FAULT_NEG_HWND_VALUE,  FAULT_NEG_HWND_ENV_VALUE,     0);
+    g_FiRawCreate     = FiReadDword(moduleName, REG_CONFIG_FAULT_RAW_CREATE_VALUE, FAULT_RAW_CREATE_ENV_VALUE,  0);
 
     g_FiNegCreate   = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_NEG_CREATE_VALUE,   FAULT_NEG_CREATE_ENV_VALUE,   0);
     g_FiDupCreate   = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_DUP_CREATE_VALUE,   FAULT_DUP_CREATE_ENV_VALUE,   0);
@@ -179,16 +183,16 @@ void FiInit(void)
     // cause is a measurement run attributed to the wrong build, so every log file from a
     // fault-capable binary has to say so on its first page whether or not anything is armed.
     LogWarning("QGAFAULT-INIT build=%S armdelay=%us negcreate=%d(hwnd=0x%x) ringstall=%us "
-        L"pumpstall=%us captureexit=%d dupcreate=%d legacysend=%d",
+        L"pumpstall=%us captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u",
         g_FaultInjectionMarker,
         delaySec,
         g_FiNegCreate, g_FiNegCreateHwnd,
         ringStallSec,
         pumpStallSec,
-        g_FiCaptureExit, g_FiDupCreate, g_FiLegacySend);
+        g_FiCaptureExit, g_FiDupCreate, g_FiLegacySend, g_FiRawCreate);
 
     if (g_FiNegCreate > 0 || g_FiDupCreate > 0 || g_FiLegacySend > 0 ||
-        g_FiCaptureExit > 0 || g_FiPumpStall > 0 || g_FiRingStallArmed)
+        g_FiCaptureExit > 0 || g_FiPumpStall > 0 || g_FiRingStallArmed || g_FiRawCreate)
     {
         LogWarning("QGAFAULT-INIT FAULTS ARE ARMED - this agent will break itself on purpose "
             L"in %u s; results from this run describe the INJECTED defect, not the build", delaySec);
@@ -213,6 +217,21 @@ BOOL FiShouldNegCreate(IN HWND window)
         L"carries an INVERTED rect (dom0 xside.c:2937 must reject it; the agent-side "
         L"sanitizer must stop it first). %d shots left", window, g_FiNegCreate);
     return TRUE;
+}
+
+// [FI_RAW_CREATE] The one injection that does NOT corrupt agent state: it removes the
+// agent-side sanitizer from the path so an injected bad rect actually reaches dom0. That is
+// the only way to validate the instrument - CLAUDE.md requires a check to be SEEN TO FAIL,
+// and the sanitizer's failure mode is "dom0 raises its invalid-GUI-request dialog", which
+// cannot be observed while the sanitizer is doing its job. Not a one-shot: it is a mode.
+// It stands alone deliberately - arming it WITHOUT FI_NEG_CREATE changes nothing, since a
+// correct rect passes the sanitizer unaltered.
+BOOL FiRawCreate(void)
+{
+    // Same arming delay every other fault honours (FiTakeShot line 128): a bypass that was
+    // live during the daemon handshake would reproduce "the agent never came up", not the
+    // defect under study.
+    return g_FiRawCreate != 0 && GetTickCount64() >= g_FiArmAt;
 }
 
 BOOL FiRingStallActive(void)

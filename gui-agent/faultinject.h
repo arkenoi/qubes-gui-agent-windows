@@ -65,6 +65,11 @@
  *   FaultNegCreateHwnd QUBES_GUI_FAULT_NEG_CREATE_HWND if non-zero, only the CREATE for
  *                                                     this hwnd (as the protocol carries
  *                                                     it: low 32 bits) is inverted
+ *   FaultRawCreate     QUBES_GUI_FAULT_RAW_CREATE     mode (not a shot): skip the agent-side
+ *                                                     geometry sanitizer for MSG_CREATE, so an
+ *                                                     injected bad rect really reaches dom0
+ *                                                     and the daemon's dialog can be seen to
+ *                                                     fire                  [FI_RAW_CREATE]
  *   FaultRingStallSec  QUBES_GUI_FAULT_RING_STALL     seconds: the send wrapper sees the
  *                                                     ring as permanently full [FI_RING_STALL]
  *   FaultPumpStallSec  QUBES_GUI_FAULT_PUMP_STALL     seconds, ONE-SHOT: one WatchForEvents
@@ -111,6 +116,11 @@ void FiInit(void);
 // per MSG_CREATE. Rank 3's sanitizer is the code this is aimed at.
 BOOL FiShouldNegCreate(IN HWND window);
 
+// [FI_RAW_CREATE] TRUE while the raw-create mode is on: the caller must send MSG_CREATE
+// WITHOUT running it through the geometry sanitizer. Pair with FI_NEG_CREATE to reproduce
+// the pre-fix behaviour end to end, i.e. to make dom0's own check fire.
+BOOL FiRawCreate(void);
+
 // [FI_RING_STALL] TRUE while the stall window is open: the agent's vchan wrapper must
 // behave as if the ring had no room, without consulting the real ring. Rank 2's deadline
 // is the code this is aimed at.
@@ -138,6 +148,7 @@ BOOL FiShouldLegacySend(void);
 // No-op stubs so the call sites need no #ifdef. UNREFERENCED_PARAMETER keeps /W4 quiet.
 static __forceinline void  FiInit(void) { }
 static __forceinline BOOL  FiShouldNegCreate(IN HWND window) { UNREFERENCED_PARAMETER(window); return FALSE; }
+static __forceinline BOOL  FiRawCreate(void) { return FALSE; }
 static __forceinline BOOL  FiRingStallActive(void) { return FALSE; }
 static __forceinline DWORD FiPumpStallMs(void) { return 0; }
 static __forceinline BOOL  FiShouldCaptureExit(void) { return FALSE; }
