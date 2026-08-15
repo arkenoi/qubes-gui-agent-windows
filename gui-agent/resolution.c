@@ -552,6 +552,37 @@ DWORD SelectSupportedMode(IN DWORD width, IN DWORD height)
 {
     DWORD mode = 0;
     float sim = 0;
+    BOOL found = FALSE;
+
+    // A ceiling we do not HAVE is not a ceiling of zero. g_HostScreenWidth/Height stay 0 until
+    // HandleXconf assigns them, and stay 0 if the daemon's msg_xconf carried zero - nothing
+    // validates it. At 0 the test below rejects EVERY mode, the loop body never runs, and the
+    // tail used to return index 0: an arbitrary adapter mode, unrelated to the request and not
+    // even inside the ceiling just enforced - which SetVideoMode then PERSISTS as
+    // FullscreenWidth/Height, so the next boot asks for it again. Unset bounds now mean "no
+    // ceiling", and "nothing passed the filter" returns a sentinel instead of a silent index 0.
+    //   HKLM\SOFTWARE\QubesIDD!ModeCeilingFaultInject = 1 forces the bounds back to 0x0, i.e.
+    //   re-introduces the defect on the SAME binary so this can be seen to fail. Note it only
+    //   bites where the snapper still runs: on an IDD guest pair it with ModeSnapFaultInject=1,
+    //   or the exact-follow path bypasses this function entirely and the run proves nothing.
+    DWORD ceilW = g_HostScreenWidth, ceilH = g_HostScreenHeight;
+    DWORD ceilFault = 0, cbCeil = sizeof(ceilFault), typeCeil = 0;
+    if (ERROR_SUCCESS != RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\QubesIDD",
+                                      L"ModeCeilingFaultInject", RRF_RT_REG_DWORD, &typeCeil,
+                                      &ceilFault, &cbCeil))
+        ceilFault = 0;
+    if (ceilFault)
+    {
+        LogWarning("ModeCeilingFaultInject=%lu - host bounds forced to 0x0 on purpose; every mode "
+            L"will be rejected (pre-fix behaviour)", ceilFault);
+        ceilW = 0;
+        ceilH = 0;
+    }
+    else
+    {
+        if (ceilW == 0) ceilW = MAXDWORD;
+        if (ceilH == 0) ceilH = MAXDWORD;
+    }
 
     LogVerbose("Host screen dimensions: %ux%u", g_HostScreenWidth, g_HostScreenHeight);
     for (DWORD i = 0; i < g_SupportedModes.Count; i++)
@@ -560,7 +591,7 @@ DWORD SelectSupportedMode(IN DWORD width, IN DWORD height)
         DWORD h = g_SupportedModes.Dimensions[i].y;
 
         // TODO: filter these when constructing supported mode list
-        if (w > g_HostScreenWidth || h > g_HostScreenHeight || w == 0 || h == 0)
+        if (w > ceilW || h > ceilH || w == 0 || h == 0)
             continue;
 
         if (w == width && h == height)
@@ -574,11 +605,23 @@ DWORD SelectSupportedMode(IN DWORD width, IN DWORD height)
         float inter = min(w, width) * (float)min(h, height);
         float similarity = inter / (float)(area_cur + area_req - inter);
 
-        if (similarity > sim)
+        if (similarity > sim || !found)
         {
             sim = similarity;
             mode = i;
+            found = TRUE;
         }
+    }
+
+    // NOTHING passed the ceiling. Returning index 0 here was a guess dressed up as an answer -
+    // and worse than none, because the caller applies it and persists it. MAXDWORD says "no
+    // opinion"; the caller keeps the resolution the guest already has.
+    if (!found)
+    {
+        LogWarning("no supported mode fits %ux%u within the %lux%lu host ceiling (%lu modes "
+            L"known) - keeping the current resolution", width, height,
+            g_HostScreenWidth, g_HostScreenHeight, g_SupportedModes.Count);
+        return MAXDWORD;
     }
 
     LogDebug("Returning mode %u (%ux%u) for %ux%u", mode,
@@ -1616,6 +1659,13 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
             L"driver does not offer yet will be downgraded and the downgrade published", snapFault);
 
     DWORD mode = SelectSupportedMode(width, height);
+
+    // "no opinion" - see SelectSupportedMode. ERROR_SUCCESS deliberately, not a failure code:
+    // the failure branch below clears g_SeamlessMode as a side effect, and the caller already
+    // treats a failure as "continue at the current resolution" anyway. Same observable outcome,
+    // strictly less state change.
+    if (mode == MAXDWORD)
+        return ERROR_SUCCESS;
 
     // instrumentation (log-only): what SelectSupportedMode chose,
     // marked SNAPPED when it differs from the request
