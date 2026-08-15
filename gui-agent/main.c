@@ -5824,12 +5824,16 @@ static ULONG WINAPI WatchForEvents(void)
             if (restarts < VCHAN_FIRST_CLIENT_MAX_RESTARTS)
             {
                 (void)CfgWriteDword(NULL, REG_CONFIG_VCHAN_RESTARTS_VALUE, restarts + 1, NULL);
+                // Two calls, not a ternary: the log macros paste an L onto the format literal,
+                // so a conditional expression there does not compile.
                 DWORD hadClientEarly = 0;
                 (void)CfgReadDword(NULL, REG_CONFIG_HAD_CLIENT_VALUE, &hadClientEarly, NULL);
-                LogError(hadClientEarly
-                    ? "no gui-daemon client in %lu ms - exiting so the watchdog respawns the agent (attempt %lu of %lu). This guest HAS had a daemon before, so this is a LOST session, not a first boot: dom0's gui-daemon for this qube most likely exited."
-                    : "no gui-daemon client in %lu ms and none ever connected - exiting so the watchdog respawns the agent (attempt %lu of %lu). This is the first-boot AppVM case: the qube has qrexec but no windows.",
-                    VCHAN_FIRST_CLIENT_WAIT_MS, restarts + 1, (DWORD)VCHAN_FIRST_CLIENT_MAX_RESTARTS);
+                if (hadClientEarly)
+                    LogError("no gui-daemon client in %lu ms - exiting so the watchdog respawns the agent (attempt %lu of %lu). This guest HAS had a daemon before, so this is a LOST session, not a first boot: dom0's gui-daemon for this qube most likely exited.",
+                        VCHAN_FIRST_CLIENT_WAIT_MS, restarts + 1, (DWORD)VCHAN_FIRST_CLIENT_MAX_RESTARTS);
+                else
+                    LogError("no gui-daemon client in %lu ms and none ever connected - exiting so the watchdog respawns the agent (attempt %lu of %lu). This is the first-boot AppVM case: the qube has qrexec but no windows.",
+                        VCHAN_FIRST_CLIENT_WAIT_MS, restarts + 1, (DWORD)VCHAN_FIRST_CLIENT_MAX_RESTARTS);
                 status = ERROR_TIMEOUT;
                 exitLoop = TRUE;
                 break;
