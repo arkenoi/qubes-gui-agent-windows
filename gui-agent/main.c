@@ -5701,6 +5701,15 @@ static ULONG WINAPI WatchForEvents(void)
 
         vchanIoInProgress = TRUE;
 
+        // A7: while degraded, wake in time for the next capture-init retry; the
+        // vchan/input events below are still serviced normally in between.
+        DWORD waitTimeout = INFINITE;
+        if (captureDegraded)
+        {
+            ULONGLONG now64 = GetTickCount64();
+            waitTimeout = (captureRetryDue > now64) ? (DWORD)(captureRetryDue - now64) : 0;
+        }
+
         // CAPTURE GATE DEADLINE. While g_LocalScreenDestroyed is set the agent discards every
         // window event and runs no tracking pass, so if the daemon's MSG_DESTROY(0) confirm never
         // arrives the qube keeps whatever dom0 already had and NO NEW WINDOW CAN EVER APPEAR -
@@ -5710,17 +5719,9 @@ static ULONG WINAPI WatchForEvents(void)
         {
             ULONGLONG now64 = GetTickCount64();
             DWORD toGate = (captureGateDeadline > now64) ? (DWORD)(captureGateDeadline - now64) : 0;
-            if (waitTimeout == INFINITE || toGate < waitTimeout)
+            // Compare as DWORD: /W4 with warnings-as-errors rejects the mixed-sign compare.
+            if (waitTimeout == INFINITE || toGate < (DWORD)waitTimeout)
                 waitTimeout = toGate;
-        }
-
-        // A7: while degraded, wake in time for the next capture-init retry; the
-        // vchan/input events below are still serviced normally in between.
-        DWORD waitTimeout = INFINITE;
-        if (captureDegraded)
-        {
-            ULONGLONG now64 = GetTickCount64();
-            waitTimeout = (captureRetryDue > now64) ? (DWORD)(captureRetryDue - now64) : 0;
         }
 
         // Daemon-settle work must not depend on another frame or vchan message ever
