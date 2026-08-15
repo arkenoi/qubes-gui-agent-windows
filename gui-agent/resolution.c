@@ -1149,14 +1149,24 @@ void ResolutionPublishBootModeSet(void)
         return;
     }
 
-    // No throttle wait here (main loop thread must not sleep), but the boot
-    // reload still counts as a topology change: stamp it so an obtain arriving
-    // right after connect is spaced away from it by the limiter.
-    NoteIddReload();
-    if (QiddReloadModes())
-        LogInfo("M6BOOT target=%lux%lu reloaded", g_ScreenWidth, g_ScreenHeight);
-    else
-        LogWarning("M6BOOT reload failed - set published, live on next obtain");
+    // NO RELOAD AT BOOT. Publishing the set is free; making it live is not - the driver answers a
+    // reload by departing and re-arriving the monitor, unconditionally and without comparing the
+    // sets (driver/IddSampleDriver/Driver.cpp: IddCxMonitorDeparture then FinishInit), which is a
+    // hot unplug of the display. This function runs two statements before StartFrameProcessing
+    // creates the desktop duplication, so the duplication was being built into a topology still
+    // settling from a replug we had just issued - and that boot window is where the recorded
+    // ACCESS_LOST events actually cluster (17 of 24 natural occurrences; FINDINGS 4113 counts 8
+    // transient 0x887a0026 in a single cold boot, one of them failing CaptureInitialize outright).
+    // The A7 retry loop in StartFrameProcessingWithRetry exists to survive precisely this.
+    //
+    // Nothing needs the reload here. The desktop is already running at g_ScreenWidth x
+    // g_ScreenHeight, so the mode in use is offered by definition; the reload only pre-arms LATER
+    // switches, and the first such switch performs its own obtain anyway. This is the discipline
+    // the sibling function below already states: registry rewrite only, "the next natural obtain
+    // makes the new set live" - a dom0 panel move must not blink the screen, and neither must a
+    // boot.
+    LogInfo("M6BOOT target=%lux%lu published, no reload (live on the next obtain)",
+        g_ScreenWidth, g_ScreenHeight);
 }
 
 // Recompute the published set when the dom0 work-area feed changes (called from
