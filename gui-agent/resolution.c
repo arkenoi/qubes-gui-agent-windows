@@ -618,6 +618,19 @@ DWORD SelectSupportedMode(IN DWORD width, IN DWORD height)
     // opinion"; the caller keeps the resolution the guest already has.
     if (!found)
     {
+        // The injector has to reproduce the WHOLE pre-fix behaviour, not just its first half:
+        // forcing the ceiling to zero while still returning the sentinel would leave the guest
+        // correctly at its current resolution, and the "defect-present" run would pass. That is
+        // precisely the kind of check that cannot fail, so the knob also restores the old return.
+        if (ceilFault)
+        {
+            LogWarning("ModeCeilingFaultInject: returning index 0 (%ux%u) as the pre-fix code did "
+                L"- an arbitrary mode unrelated to the requested %ux%u",
+                g_SupportedModes.Count ? g_SupportedModes.Dimensions[0].x : 0,
+                g_SupportedModes.Count ? g_SupportedModes.Dimensions[0].y : 0, width, height);
+            return 0;
+        }
+
         LogWarning("no supported mode fits %ux%u within the %lux%lu host ceiling (%lu modes "
             L"known) - keeping the current resolution", width, height,
             g_HostScreenWidth, g_HostScreenHeight, g_SupportedModes.Count);
