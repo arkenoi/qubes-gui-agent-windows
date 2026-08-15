@@ -46,12 +46,6 @@
 
 volatile LONG g_CaptureThreadEnable = 0;
 
-// The one live capture context, so code that has no CAPTURE_CONTEXT of its own (resolution.c,
-// which owns the IDD replug) can quiesce capture across an operation it KNOWS destroys the
-// duplication. Written by CaptureInitialize and cleared by CaptureTeardown, both of which run on
-// the main loop thread, so no lock is needed for the pointer itself.
-static CAPTURE_CONTEXT* g_LiveCapture = NULL;
-
 // M0BLINK phase marker for the applied->repaint tail. The 470 ms between the mode
 // APPLY and the repaint is spent entirely on this thread plus one vchan round trip,
 // and until now nothing inside it was timestamped. Silent unless a novel-size obtain
@@ -782,7 +776,6 @@ CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event)
 
     ctx->frame_event = frame_event;
     ctx->ready_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-    g_LiveCapture = ctx;
     ctx->error_event = error_event;
 
     LogVerbose("end");
@@ -807,8 +800,6 @@ void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx)
         return;
 
     DWORD status = GetLastError(); // preserve
-    if (g_LiveCapture == ctx)
-        g_LiveCapture = NULL;
     CaptureStop(ctx);
 
     // Same hazard as in RecreateDuplication: the mapped desktop surface is about to be
@@ -867,42 +858,6 @@ void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx)
     free(ctx);
     LogVerbose("end");
     SetLastError(status);
-}
-
-// REPLUG BRACKET. Publishing a new mode to the Qubes IDD makes the driver call
-// IddCxMonitorDeparture and re-arrive the monitor - a hot unplug, which destroys every desktop
-// duplication on that output. Until now that happened behind capture's back: the capture thread
-// was mid-AcquireNextFrame, got DXGI_ERROR_ACCESS_LOST, and the agent discovered its own action as
-// an asynchronous fault. In its bad tail that fault escalates to a session teardown.
-//
-// Nothing about that is inevitable - we own both sides. Quiesce capture first, replug, then rebuild
-// the duplication at a known point. No protocol traffic is involved: the screen window stays
-// announced, the grants stay valid, dom0 is told nothing, and no error path is entered at all.
-void CaptureReplugBegin(IN const WCHAR* why)
-{
-    if (!g_LiveCapture)
-        return;
-    LogInfo("CAPTUREPLUG quiescing capture across %s - the monitor is about to be replugged", why);
-    CaptureStop(g_LiveCapture);
-}
-
-BOOL CaptureReplugEnd(void)
-{
-    if (!g_LiveCapture)
-        return TRUE;    // nothing was running; nothing to restore
-
-    if (!RecreateDuplication(g_LiveCapture))
-    {
-        LogWarning("CAPTUREPLUG duplication could not be rebuilt after the replug");
-        return FALSE;
-    }
-    if (ERROR_SUCCESS != CaptureStart(g_LiveCapture))
-    {
-        LogWarning("CAPTUREPLUG duplication rebuilt but the capture thread would not start");
-        return FALSE;
-    }
-    LogInfo("CAPTUREPLUG capture resumed after the replug - no access-lost, no teardown");
-    return TRUE;
 }
 
 HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx)

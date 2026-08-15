@@ -110,11 +110,6 @@ HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx);
 // stop the capture thread
 void CaptureStop(IN OUT CAPTURE_CONTEXT* ctx);
 
-// Quiesce capture across an IDD monitor replug that WE issue, and restore it afterwards. Prevents
-// the duplication from being destroyed while it is being used, rather than recovering from it.
-void CaptureReplugBegin(IN const WCHAR* why);
-BOOL CaptureReplugEnd(void);
-
 void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx);
 
 // A6: try to revoke every parked (superseded) screen grant now, regardless of the ack
