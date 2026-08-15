@@ -1575,6 +1575,46 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
     if (source && 0 == wcscmp(source, L"seamless-force") && QiddInterfacePresent())
         return SetVideoModeExact(width, height, FALSE); // never snapped
 
+    // EVERY OTHER SOURCE TOO, whenever the Qubes IDD is the display: its mode list is ours to
+    // extend, so "the driver does not offer this size" is not a reason to downgrade the desktop,
+    // it is a reason to publish the size. Without this the legacy fall-through below is a TRAP,
+    // not merely a downgrade - measured 2026-08-15 on a guest whose IDD had just been created by
+    // the 4.3.1 installer, restoring a 1920x1200 desktop (src=lastapplied):
+    //
+    //     RESREQ 1920x1200 src=lastapplied
+    //     RESSNAP 1920x1080 SNAPPED          <- matched against the list as it is TODAY
+    //     RESAPPLIED 1920x1080
+    //     WriteIddModeSetRaw: M6SET n=2 target=1920x1080   <- publishes the SNAPPED size
+    //
+    // The publish happens AFTER the snap and carries the snapped target, so the wanted mode never
+    // becomes available and every later attempt snaps again - a 1920x1200 monitor is pinned to
+    // 1920x1080 for the life of the guest. dom0 keeps a 1920x1200 window over a 1920x1080 desktop,
+    // which is the reported "pointer about 1 cm below where Windows thinks it is" plus a dead band
+    // (forum 42717 post 54). SetVideoModeExact instead publishes the REQUEST, reloads the driver
+    // and waits for the mode, all under the same replug rate limiter.
+    //
+    // allowSnap stays TRUE here, matching the dom0 path: the habitual +-15 px snap to a work-area
+    // size is wanted, it is only the "nearest mode from a stale list" downgrade that is not.
+    // A guest with no Qubes IDD still takes the legacy path below - a fixed-mode adapter cannot be
+    // taught new modes, and stock behaviour there must not change.
+    //   HKLM\SOFTWARE\QubesIDD!ModeSnapFaultInject = 1 forces the legacy fall-through even with
+    //   the IDD present, i.e. re-introduces the trap on the SAME binary so the fix can be seen to
+    //   fail: with it set the log must show RESSNAP ... SNAPPED and M6SET carrying the snapped
+    //   size, without it RESAPPLIED must carry the REQUESTED size. Absent (the shipped state)
+    //   this is one registry read and dead code.
+    DWORD snapFault = 0, cbSnapFault = sizeof(snapFault), typeSnapFault = 0;
+    if (ERROR_SUCCESS != RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\QubesIDD",
+                                      L"ModeSnapFaultInject", RRF_RT_REG_DWORD, &typeSnapFault,
+                                      &snapFault, &cbSnapFault))
+        snapFault = 0;
+
+    if (QiddInterfacePresent() && !snapFault)
+        return SetVideoModeExact(width, height, TRUE);
+
+    if (snapFault)
+        LogWarning("ModeSnapFaultInject=%lu - taking the LEGACY snap path on purpose; a size the "
+            L"driver does not offer yet will be downgraded and the downgrade published", snapFault);
+
     DWORD mode = SelectSupportedMode(width, height);
 
     // instrumentation (log-only): what SelectSupportedMode chose,
