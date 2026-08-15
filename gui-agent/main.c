@@ -5654,11 +5654,17 @@ static ULONG WINAPI WatchForEvents(void)
 
     // FAULT INJECTION for the gate above (HKLM\SOFTWARE\QubesIDD!CaptureGateFaultInject, read
     // once here, dead code when unset - same convention as SoloFaultInject/ModeSnapFaultInject):
-    //   1 = ignore the daemon's confirm, keep the deadline  -> the fix must recover the session
-    //   2 = ignore the confirm AND disable the deadline     -> the PRE-FIX behaviour: window
-    //       tracking stays frozen for ever, so no new window can ever reach dom0
-    // The capture error that opens the gate needs no injector: a resolution change produces it
-    // naturally (the AcquireNextFrame 0x887a0026 recorded in CLAUDE.md).
+    // Bit flags, combined:
+    //   1 = ignore the daemon's confirm            (the gate then never opens on its own)
+    //   2 = also disable the deadline              (the PRE-FIX behaviour: frozen for ever)
+    //   4 = raise ONE capture error 20 s after start, which is what opens the gate
+    // So 5 = fix under test, 7 = defect re-introduced, on the same binary.
+    // Bit 4 exists because the natural producer is not reliable: a resolution change does raise
+    // AcquireNextFrame 0x887a0026, but on this build it was absorbed by the A7 degraded-retry path
+    // (StartFrameProcessingWithRetry) and never reached the gate at all - measured 2026-08-15.
+    // A test that cannot enter the state it is testing proves nothing.
+    BOOL captureGateFaultFired = FALSE;
+    ULONGLONG captureGateFaultDue = GetTickCount64() + 20000;
     DWORD captureGateFault = 0, cbCgf = sizeof(captureGateFault), typeCgf = 0;
     if (ERROR_SUCCESS != RegGetValueW(HKEY_LOCAL_MACHINE, L"SOFTWARE\\QubesIDD",
                                       L"CaptureGateFaultInject", RRF_RT_REG_DWORD, &typeCgf,
@@ -5708,6 +5714,16 @@ static ULONG WINAPI WatchForEvents(void)
         {
             ULONGLONG now64 = GetTickCount64();
             waitTimeout = (captureRetryDue > now64) ? (DWORD)(captureRetryDue - now64) : 0;
+        }
+
+        // [CaptureGateFaultInject bit 4] Raise one capture error, once, to open the gate.
+        if ((captureGateFault & 4) && !captureGateFaultFired &&
+            GetTickCount64() > captureGateFaultDue && g_VchanClientConnected)
+        {
+            captureGateFaultFired = TRUE;
+            LogWarning("CAPTUREGATE CaptureGateFaultInject: raising a capture error on purpose to "
+                L"open the gate");
+            SetEvent(captureErrorEvent);
         }
 
         // CAPTURE GATE DEADLINE. While g_LocalScreenDestroyed is set the agent discards every
