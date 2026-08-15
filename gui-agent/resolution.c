@@ -585,6 +585,16 @@ DWORD SelectSupportedMode(IN DWORD width, IN DWORD height)
     }
 
     LogVerbose("Host screen dimensions: %ux%u", g_HostScreenWidth, g_HostScreenHeight);
+
+    // A request with a zero dimension is not answerable; do not let the similarity arithmetic
+    // decide it by accident. It is reachable: nothing validates xconf, and with no saved size
+    // HandleXconf calls SetVideoMode(0,0,"xconf").
+    if (width == 0 || height == 0)
+    {
+        LogWarning("no resolution requested (%lux%lu) - keeping the current mode", width, height);
+        return MAXDWORD;
+    }
+
     for (DWORD i = 0; i < g_SupportedModes.Count; i++)
     {
         DWORD w = g_SupportedModes.Dimensions[i].x;
@@ -605,7 +615,13 @@ DWORD SelectSupportedMode(IN DWORD width, IN DWORD height)
         float inter = min(w, width) * (float)min(h, height);
         float similarity = inter / (float)(area_cur + area_req - inter);
 
-        if (similarity > sim || !found)
+        // NOT `|| !found`: similarity is 0 for every candidate exactly when the REQUEST has a
+        // zero dimension (the filter above already dropped zero-sized modes, so `inter` can only
+        // be 0 when width or height is). `|| !found` would then pin index 0 on the first
+        // iteration - reinstating the arbitrary pick this function was changed to stop making,
+        // for the one input that actually produces it. For any nonzero request similarity > 0 and
+        // the first candidate assigns anyway, so the clause bought nothing.
+        if (similarity > sim)
         {
             sim = similarity;
             mode = i;

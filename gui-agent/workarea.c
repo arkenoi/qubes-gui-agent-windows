@@ -39,6 +39,7 @@ static int g_WaInferX = -1;
 static int g_WaInferY = -1;
 
 static RECT g_WaLastApplied;   // zero until first successful apply
+static RECT g_WaLastRefused;   // last rect Windows refused, so it is logged once, not every pass
 
 // Broadcast-listener window. Created, destroyed and used ONLY on the window-event
 // thread (window handles are thread-affine for DestroyWindow), so no lock.
@@ -232,9 +233,21 @@ void WorkAreaApply(void)
     {
         // Say WHAT was refused: "SPI_SETWORKAREA failed with error 0x57" on its own sent us
         // looking for a broken API instead of a bad rectangle.
-        LogWarning("SPI_SETWORKAREA refused (%d,%d)-(%d,%d) on a %dx%d desktop, error 0x%x",
-            target.left, target.top, target.right, target.bottom,
-            screen.right, screen.bottom, GetLastError());
+        // Latched: `changed` is computed against g_WaLastApplied, which a refusal leaves alone,
+        // so every later pass re-attempts the same rect and would re-log it forever. Say it once
+        // per distinct rectangle, and say what actually happens next - NOT "giving up", because
+        // the retry does continue.
+        DWORD err = GetLastError();
+        BOOL sayIt;
+        EnterCriticalSection(&g_WaLock);
+        sayIt = !EqualRect(&target, &g_WaLastRefused);
+        g_WaLastRefused = target;
+        LeaveCriticalSection(&g_WaLock);
+        if (sayIt)
+            LogWarning("SPI_SETWORKAREA refused (%d,%d)-(%d,%d) on a %dx%d desktop, error 0x%x - "
+                L"the guest keeps the work area Windows already had; this rect will be retried",
+                target.left, target.top, target.right, target.bottom,
+                screen.right, screen.bottom, err);
         return;
     }
 
@@ -244,6 +257,7 @@ void WorkAreaApply(void)
     // never accepted, with nothing retrying it.
     EnterCriticalSection(&g_WaLock);
     g_WaLastApplied = target;
+    SetRectEmpty(&g_WaLastRefused);   // a rect that just succeeded is no longer a refused one
     LeaveCriticalSection(&g_WaLock);
 
     LogInfo("guest work area set to (%d,%d)-(%d,%d)",

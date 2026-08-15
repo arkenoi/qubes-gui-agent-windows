@@ -221,7 +221,16 @@ end:
     {
         LogError("NEVEREXIT SetVideoMode(%ux%u) failed (0x%x) - continuing at current resolution",
             fullscreenWidth, fullscreenHeight, status);
+    }
 
+    // OUTSIDE the failure branch deliberately. SetVideoMode can now return ERROR_SUCCESS WITHOUT
+    // applying a mode - that is what "no supported mode fits, keep the current one" means - and
+    // g_ScreenWidth/Height are written only on a successful set. Leaving this rescue inside the
+    // failure branch would let a SUCCESSFUL return walk past it with the sizes still 0, and the
+    // input handlers divide by them: HandleMotion's `x * 65535 / g_ScreenWidth` is a division by
+    // zero on the first pointer event. The condition below is the real guard; the branch it used
+    // to sit in never was.
+    {
         // g_ScreenWidth/Height are only ever written on a SUCCESSFUL mode set
         // (resolution.c); at first connect they are still 0 here, and the input
         // handlers (HandleMotion/HandleButton) divide by them. Adopt the mode

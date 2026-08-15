@@ -1226,7 +1226,13 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 
     RECT rect;
     status = GetRealWindowRect(window, &rect);
-    if (!SUCCEEDED(status))
+    // GetRealWindowRect returns a WIN32 code, not an HRESULT, and two of its failure returns are
+    // POSITIVE - ERROR_INVALID_DATA and win_perror's return - for which SUCCEEDED() is TRUE. The
+    // old !SUCCEEDED test therefore SKIPPED this block for them, fell through with `rect` still
+    // UNINITIALIZED, and returned ERROR_SUCCESS: stack garbage announced to dom0 as window
+    // geometry. That is a protocol violation the daemon is entitled to kill the qube over - it is
+    // the "invalid or suspicious GUI request" dialog, whose source was never identified.
+    if (status != ERROR_SUCCESS)
     {
         // A window that died between being enumerated and being measured is the normal case,
         // not a fault: DwmGetWindowAttribute answers E_HANDLE for a handle that is already gone.
@@ -3078,7 +3084,17 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     status = GetWindowData(windowData->Handle, &ptr);
     if (status != ERROR_SUCCESS)
     {
-        win_perror2(status, "GetWindowData");
+        // The IsWindow() check above does NOT close the race - DWM can drop the window between
+        // it and the measurement - so demoting inside GetWindowData only moved this ERROR line
+        // one frame up, at the same rate, under a different name. ERROR_INVALID_DATA belongs
+        // here too: GetRealWindowRect already logged that case WITH the offending rectangle, and
+        // before the fix above it never reached this line at all; it must not arrive as a flood
+        // now that it does.
+        if (status == (ULONG)HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE) ||
+            status == ERROR_INVALID_DATA)
+            LogDebug("0x%x: not measurable this pass (0x%x)", windowData->Handle, status);
+        else
+            win_perror2(status, "GetWindowData");
         goto end;
     }
 
@@ -6100,7 +6116,10 @@ static ULONG WINAPI WatchForEvents(void)
 
             if (screenDestroyed)
             {
-                LogDebug("gui daemon confirms screen destruction");
+                // Both edges of this state were below the default log level, so a shipped
+                // guest recorded NOTHING when capture stopped or restarted - the one
+                // question a "my qube is frozen" report needs answered.
+                LogInfo("CAPTUREGATE gui daemon confirms screen destruction - restarting capture");
                 // NEVEREXIT: capture is NULL if this confirm arrives while already in
                 // the A7 degraded state (CaptureTeardown would crash on NULL).
                 if (capture)
@@ -6126,7 +6145,8 @@ static ULONG WINAPI WatchForEvents(void)
             break;
 
         case 5: // capture error, can be due to a desktop switch or resolution change
-            LogDebug("capture error");
+            LogWarning("CAPTUREGATE capture error - screen window destroyed, waiting for the "
+                L"gui-daemon confirm before capture can restart");
 
             // NEVEREXIT: a stale error event from a torn-down capture generation can
             // fire while degraded (capture == NULL); StopFrameProcessing dereferences
