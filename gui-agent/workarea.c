@@ -197,12 +197,27 @@ void WorkAreaApply(void)
     EnterCriticalSection(&g_WaLock);
     BOOL have = WaCompute(&target);
     BOOL changed = have && !EqualRect(&target, &g_WaLastApplied);
-    if (changed)
-        g_WaLastApplied = target;
     LeaveCriticalSection(&g_WaLock);
 
     if (!have || !changed)
         return;
+
+    // CLAMP TO THE DESKTOP WE ACTUALLY HAVE. The dom0 feed describes dom0's window, and the guest
+    // desktop can legitimately be smaller - during a mode change it briefly IS smaller. Windows
+    // rejects a work area that leaves the screen with ERROR_INVALID_PARAMETER, which was observed
+    // repeating every 30 s forever on a guest whose feed still described the previous, larger
+    // desktop. A clamped work area is right; an out-of-bounds one is simply refused.
+    RECT screen = { 0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN) };
+    RECT clamped;
+    if (IntersectRect(&clamped, &target, &screen) && !IsRectEmpty(&clamped))
+    {
+        if (!EqualRect(&clamped, &target))
+            LogInfo("work area (%d,%d)-(%d,%d) clipped to the %dx%d desktop -> (%d,%d)-(%d,%d)",
+                target.left, target.top, target.right, target.bottom,
+                screen.right, screen.bottom,
+                clamped.left, clamped.top, clamped.right, clamped.bottom);
+        target = clamped;
+    }
 
     RECT current;
     if (SystemParametersInfoW(SPI_GETWORKAREA, 0, &current, 0) &&
@@ -215,9 +230,22 @@ void WorkAreaApply(void)
     // re-fitted explicitly below instead of relying on the WM_SETTINGCHANGE fanout.
     if (!SystemParametersInfoW(SPI_SETWORKAREA, 0, &target, 0))
     {
-        win_perror("SPI_SETWORKAREA");
+        // Say WHAT was refused: "SPI_SETWORKAREA failed with error 0x57" on its own sent us
+        // looking for a broken API instead of a bad rectangle.
+        LogWarning("SPI_SETWORKAREA refused (%d,%d)-(%d,%d) on a %dx%d desktop, error 0x%x",
+            target.left, target.top, target.right, target.bottom,
+            screen.right, screen.bottom, GetLastError());
         return;
     }
+
+    // Record the applied rect ONLY once Windows accepted it. It used to be stored before the
+    // attempt, so a REFUSED apply was remembered as applied: the next pass computed the same
+    // target, saw "unchanged" and returned early, and the guest kept a work area Windows had
+    // never accepted, with nothing retrying it.
+    EnterCriticalSection(&g_WaLock);
+    g_WaLastApplied = target;
+    LeaveCriticalSection(&g_WaLock);
+
     LogInfo("guest work area set to (%d,%d)-(%d,%d)",
         target.left, target.top, target.right, target.bottom);
     EnumWindows(WaRefitProc, 0);

@@ -1228,6 +1228,16 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     status = GetRealWindowRect(window, &rect);
     if (!SUCCEEDED(status))
     {
+        // A window that died between being enumerated and being measured is the normal case,
+        // not a fault: DwmGetWindowAttribute answers E_HANDLE for a handle that is already gone.
+        // It was logged at ERROR and dominated the log - dozens of lines a minute on an idle
+        // guest, which is how a real failure gets missed. Only this one status is demoted;
+        // anything else still shouts.
+        if (status == HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE))
+        {
+            LogDebug("0x%x: window gone before it could be measured", window);
+            return (ULONG)status;
+        }
         return win_perror2(status, "GetRealWindowRect");
     }
 
