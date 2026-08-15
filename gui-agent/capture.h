@@ -110,11 +110,6 @@ HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx);
 // stop the capture thread
 void CaptureStop(IN OUT CAPTURE_CONTEXT* ctx);
 
-// Rebuild the duplication and restart the capture thread WITHOUT touching the protocol: the screen
-// window stays announced and the grants stay valid. Returns FALSE if the fault is not recoverable
-// this way, in which case the caller must fall back to the session-level restart.
-BOOL CaptureRecoverInPlace(IN OUT CAPTURE_CONTEXT* ctx);
-
 void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx);
 
 // A6: try to revoke every parked (superseded) screen grant now, regardless of the ack

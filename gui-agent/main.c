@@ -6282,18 +6282,6 @@ static ULONG WINAPI WatchForEvents(void)
             LogWarning("CAPTUREGATE capture error - screen window destroyed, waiting for the "
                 L"gui-daemon confirm before capture can restart");
 
-            // IN-PLACE FIRST. Tearing the session down is the expensive answer to this fault and
-            // the one that can cost the qube its GUI outright: it destroys the screen window and
-            // then depends on a confirm from a daemon that, by design, exits rather than
-            // accumulate errors. Rebuild the duplication instead - grants and window list intact,
-            // nothing sent to dom0 - and only fall back if that genuinely cannot be done.
-            if (capture && CaptureRecoverInPlace(capture))
-            {
-                captureGateDeadline = 0;
-                captureGateReasserts = 0;
-                break;
-            }
-
             // NEVEREXIT: a stale error event from a torn-down capture generation can
             // fire while degraded (capture == NULL); StopFrameProcessing dereferences
             // *capture. Nothing to stop in that case.
