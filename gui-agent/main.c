@@ -1241,9 +1241,15 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         // anything else still shouts.
         // status is ULONG here while HRESULT_FROM_WIN32 yields a signed HRESULT, so compare as
         // ULONG - /W4 with warnings-as-errors rejects the mixed-sign compare.
-        if (status == (ULONG)HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE))
+        // Neither of these is a fault, and both are already explained one frame down:
+        // E_HANDLE is a window that died between enumeration and measurement, and
+        // ERROR_INVALID_DATA was just logged BY GetRealWindowRect with the offending rectangle.
+        // Measured: fixing the swallow above turned 64 silent garbage announcements into 65 ERROR
+        // lines per 40 s, which would simply move the noise rather than remove it.
+        if (status == (ULONG)HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE) ||
+            status == ERROR_INVALID_DATA)
         {
-            LogDebug("0x%x: window gone before it could be measured", window);
+            LogDebug("0x%x: not measurable this pass (0x%x)", window, status);
             return (ULONG)status;
         }
         return win_perror2(status, "GetRealWindowRect");
