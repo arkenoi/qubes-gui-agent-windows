@@ -860,6 +860,43 @@ void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx)
     SetLastError(status);
 }
 
+// IN-PLACE RECOVERY. The capture thread already retries RecreateDuplication itself and only
+// signals error_event when that fails, but "failed just then" is not "cannot work": the failure is
+// usually a display topology still settling, and the main loop's answer to it used to be a
+// SESSION-level teardown - destroy the screen window, wait for dom0 to confirm, re-create
+// everything. That is enormously more disruptive than the fault, and if the confirm does not come
+// the qube loses its GUI until it is restarted, because dom0's daemon exits by design rather than
+// accumulate errors.
+//
+// So try the cheap thing once more from here, on the main thread, with the whole recovery window
+// available again: rebuild the duplication (the staging grant deliberately survives it) and restart
+// the capture thread. On success NOTHING is sent to dom0 - window 0 stays announced, the grants are
+// unchanged, the window list is untouched, and the user sees at most a dropped frame.
+BOOL CaptureRecoverInPlace(IN OUT CAPTURE_CONTEXT* ctx)
+{
+    if (!ctx)
+        return FALSE;
+
+    // The thread has already left its loop; make its exit definite before touching the duplication,
+    // and leave ctx->thread NULL so CaptureStart can create a fresh one.
+    CaptureStop(ctx);
+
+    if (!RecreateDuplication(ctx))
+    {
+        LogWarning("CAPTUREGATE in-place recovery: duplication could not be rebuilt");
+        return FALSE;
+    }
+
+    if (ERROR_SUCCESS != CaptureStart(ctx))
+    {
+        LogWarning("CAPTUREGATE in-place recovery: duplication rebuilt but the capture thread would not start");
+        return FALSE;
+    }
+
+    LogInfo("CAPTUREGATE recovered IN PLACE - screen window kept, grants kept, dom0 told nothing");
+    return TRUE;
+}
+
 HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx)
 {
     LogVerbose("start");
