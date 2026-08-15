@@ -5779,7 +5779,7 @@ static ULONG WINAPI WatchForEvents(void)
         // sent, a daemon that restarted mid-exchange), so re-send it before concluding anything.
         // Deliberately NOT tearing capture down here: dom0 may still have the framebuffer mapped
         // and revoking it early is the one thing this gate exists to prevent.
-        if (g_LocalScreenDestroyed && captureGateDeadline != 0 && captureGateFault != 2 &&
+        if (g_LocalScreenDestroyed && captureGateDeadline != 0 && !(captureGateFault & 2) &&
             GetTickCount64() > captureGateDeadline && g_VchanClientConnected)
         {
             if (captureGateReasserts < CAPTURE_GATE_MAX_REASSERTS)
@@ -5824,14 +5824,24 @@ static ULONG WINAPI WatchForEvents(void)
             if (restarts < VCHAN_FIRST_CLIENT_MAX_RESTARTS)
             {
                 (void)CfgWriteDword(NULL, REG_CONFIG_VCHAN_RESTARTS_VALUE, restarts + 1, NULL);
-                LogError("no gui-daemon client in %lu ms and none ever connected - exiting so the watchdog respawns the agent (attempt %lu of %lu). This is the first-boot AppVM case: the qube has qrexec but no windows.",
+                DWORD hadClientEarly = 0;
+                (void)CfgReadDword(NULL, REG_CONFIG_HAD_CLIENT_VALUE, &hadClientEarly, NULL);
+                LogError(hadClientEarly
+                    ? "no gui-daemon client in %lu ms - exiting so the watchdog respawns the agent (attempt %lu of %lu). This guest HAS had a daemon before, so this is a LOST session, not a first boot: dom0's gui-daemon for this qube most likely exited."
+                    : "no gui-daemon client in %lu ms and none ever connected - exiting so the watchdog respawns the agent (attempt %lu of %lu). This is the first-boot AppVM case: the qube has qrexec but no windows.",
                     VCHAN_FIRST_CLIENT_WAIT_MS, restarts + 1, (DWORD)VCHAN_FIRST_CLIENT_MAX_RESTARTS);
                 status = ERROR_TIMEOUT;
                 exitLoop = TRUE;
                 break;
             }
-            LogError("no gui-daemon client in %lu ms after %lu restarts - staying up without one. If this qube is meant to have a GUI, check that its gui feature is set and that a gui-daemon runs for it in dom0.",
-                VCHAN_FIRST_CLIENT_WAIT_MS, restarts);
+            DWORD hadClient = 0;
+            (void)CfgReadDword(NULL, REG_CONFIG_HAD_CLIENT_VALUE, &hadClient, NULL);
+            if (hadClient)
+                LogError("no gui-daemon client in %lu ms after %lu restarts, but this guest HAS had one before - dom0's gui-daemon for this qube is gone and is not coming back on its own. The qube keeps running (qrexec works) and will show no windows until it is restarted.",
+                    VCHAN_FIRST_CLIENT_WAIT_MS, restarts);
+            else
+                LogError("no gui-daemon client in %lu ms after %lu restarts and none ever connected - staying up without one. If this qube is meant to have a GUI, check that its gui feature is set and that a gui-daemon runs for it in dom0.",
+                    VCHAN_FIRST_CLIENT_WAIT_MS, restarts);
             vchanNoClientDeadline = 0; // said once; do not spin
         }
 
@@ -6112,6 +6122,13 @@ static ULONG WINAPI WatchForEvents(void)
                 // guest would start with the budget already spent.
                 vchanNoClientDeadline = 0;
                 (void)CfgWriteDword(NULL, REG_CONFIG_VCHAN_RESTARTS_VALUE, 0, NULL);
+
+                // Remember that this guest HAS had a daemon. A respawned agent cannot otherwise
+                // tell "this qube never had a GUI" from "its GUI died a minute ago", and it
+                // currently reports the first in both cases - which sends the reader looking for a
+                // missing gui feature when the real answer is that dom0's gui-daemon for this qube
+                // exited and did not restart.
+                (void)CfgWriteDword(NULL, REG_CONFIG_HAD_CLIENT_VALUE, 1, NULL);
 
                 // This daemon knows about no windows yet; forget what the previous one
                 // was told before any per-window message can be gated against it.

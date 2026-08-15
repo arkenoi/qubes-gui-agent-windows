@@ -47,6 +47,9 @@
 #define VCHAN_FIRST_CLIENT_WAIT_MS      90000
 #define VCHAN_FIRST_CLIENT_MAX_RESTARTS 3
 #define REG_CONFIG_VCHAN_RESTARTS_VALUE     L"VchanFirstClientRestarts"
+// Set once a gui-daemon has ever connected, so a RESPAWNED agent can distinguish "this qube
+// never had a GUI" from "its GUI died and dom0's daemon is not coming back".
+#define REG_CONFIG_HAD_CLIENT_VALUE         L"VchanHadClient"
 
 // path to the gui agent, launched by the watchdog service
 #define REG_CONFIG_AGENT_PATH_VALUE  L"GuiAgentPath"
