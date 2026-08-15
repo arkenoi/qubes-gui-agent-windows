@@ -3101,6 +3101,30 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             LogDebug("0x%x: not measurable this pass (0x%x)", windowData->Handle, status);
         else
             win_perror2(status, "GetWindowData");
+
+        // A window we cannot MEASURE can still be asked whether it belongs here at all, and
+        // those two calls do not depend on the rect. Without this refresh the end: block below
+        // re-evaluates ShouldAcceptWindow against the STALE copy - still IsVisible=TRUE, still
+        // the old rect - so the window is never marked for removal and never unmapped.
+        // Measured on a 4.3.2 guest: a UWP ApplicationFrameWindow that the shell CLOAKED after
+        // we had mapped it stayed mapped, and dom0 painted an untitled full-screen rectangle
+        // over the whole qube while every app kept working behind it - indistinguishable, to a
+        // user, from "the qube is up but the screen is dead". A cloaked frame is exactly the
+        // window whose measurement fails, so the two faults arrive together.
+        BOOL stillVisible = IsWindowVisible(windowData->Handle);
+        if (stillVisible)
+        {
+            DWORD cloaked = 0;
+            if (SUCCEEDED(DwmGetWindowAttribute(windowData->Handle, DWMWA_CLOAKED,
+                                                &cloaked, sizeof(cloaked))) && cloaked != 0)
+                stillVisible = FALSE;
+        }
+        if (windowData->IsVisible != stillVisible)
+        {
+            LogInfo("0x%x: unmeasurable and now %s - re-evaluating whether it belongs in dom0",
+                windowData->Handle, stillVisible ? L"visible" : L"invisible");
+            windowData->IsVisible = stillVisible;
+        }
         goto end;
     }
 
