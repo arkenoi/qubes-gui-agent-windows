@@ -150,15 +150,61 @@ DWORD WINAPI WatchdogThread(void *param)
 
     LogDebug("cmdline: '%s', exe: '%s'", cmdline, exeName);
 
+    // BACK OFF WHEN THE AGENT DIES IMMEDIATELY. The loop used to respawn once per second for
+    // ever, which is right for a crash but wrong for a failure the agent cannot recover from by
+    // being run again - measured 2026-08-15: with the Xen grant table exhausted the agent exits
+    // during vchan init (0x5aa) and the watchdog respawned it every second indefinitely, each
+    // attempt writing a fresh 0-byte log and asking for grants that are not there. A guest in
+    // that state answers qrexec and has no GUI at all, and hammering it only makes the table
+    // situation worse. Healthy restarts are unaffected: the delay only grows for an agent that
+    // dies again within QUICK_DEATH_MS of being started, and resets the moment one survives.
+    #define QUICK_DEATH_MS 10000
+    #define BACKOFF_MAX_MS 60000
+    DWORD backoffMs = 1000;
+    DWORD quickDeaths = 0;
+    ULONGLONG startedAt = 0;
+
     while (TRUE)
     {
-        Sleep(1000);
+        Sleep(backoffMs);
 
         // Check if the gui agent is running.
         if (!IsProcessRunning(exeName, NULL, NULL))
         {
-            LogWarning("Process '%s' not running, restarting it", exeName);
+            if (startedAt != 0 && GetTickCount64() - startedAt < QUICK_DEATH_MS)
+            {
+                quickDeaths++;
+                if (backoffMs < BACKOFF_MAX_MS)
+                {
+                    backoffMs *= 2;
+                    if (backoffMs > BACKOFF_MAX_MS)
+                        backoffMs = BACKOFF_MAX_MS;
+                }
+                LogWarning("Process '%s' died within %u ms of starting, %u time(s) in a row - "
+                    L"backing off to %u ms. The guest has NO GUI while this lasts; the agent log "
+                    L"names the failure (grant-table exhaustion, 0x5aa, needs a reboot).",
+                    exeName, QUICK_DEATH_MS, quickDeaths, backoffMs);
+            }
+            else
+            {
+                if (quickDeaths != 0)
+                    LogInfo("Process '%s' had been failing fast; it last ran long enough to count "
+                        L"as healthy, restart delay reset to 1000 ms", exeName);
+                quickDeaths = 0;
+                backoffMs = 1000;
+                LogWarning("Process '%s' not running, restarting it", exeName);
+            }
+
             StartTargetProcess(cmdline);
+            startedAt = GetTickCount64();
+        }
+        else if (quickDeaths != 0 && startedAt != 0 &&
+                 GetTickCount64() - startedAt >= QUICK_DEATH_MS)
+        {
+            // Survived the window - stop punishing it.
+            LogInfo("Process '%s' has been up for %u ms, restart delay reset", exeName, QUICK_DEATH_MS);
+            quickDeaths = 0;
+            backoffMs = 1000;
         }
     }
 
