@@ -99,9 +99,26 @@ BOOL     g_InputDragQuantise = TRUE;   // DEFAULT: measured better than stock by
 // is what distinguishes it from damping/servo: a damper would smooth the step by withholding motion
 // and hand back the latency the 70->25 ladder just bought.
 // Hide the guest's own title bar on windows whose caption is drawn by WINDOWS, so dom0's
-// decoration is the only header instead of two stacked ones. Default ON; dom0 turns it off per
-// qube with `qvm-features <vm> service.guestTitleBar 1` ("show the guest title bar").
-BOOL     g_HideGuestTitleBar = TRUE;
+// decoration is the only header instead of two stacked ones.
+//
+// DEFAULT OFF, and not because the idea is wrong: THE MECHANISM CANNOT WORK FROM THIS PROCESS.
+// Measured 2026-08-16 - SetWindowLongPtr(GWL_STYLE) on a user-owned window returns 0 with
+// GetLastError()==5 (ERROR_ACCESS_DENIED), style unchanged 0x14cf0000 -> 0x14cf0000, on every
+// window tried. The agent runs as NT AUTHORITY\SYSTEM in the console session (watchdog.c
+// duplicates its own SYSTEM token and retargets TokenSessionId so the agent can attach to the
+// input desktop), while app windows belong to the interactive user - and the same call from a
+// process running AS THAT USER succeeds, which is the control that identifies the cause.
+//
+// So restyling other processes' windows is not available to us. The workable route is to stop
+// touching the app at all and CROP the caption out of what we announce: the agent already owns
+// the buffer and the announced geometry, and toastcrop.c is precedent for cropping a window's
+// visible rect. That is a real change (announced rect, capture offset, and input coordinate
+// translation) and is not attempted here.
+//
+// The knob stays wired (`qvm-features <vm> service.guestTitleBar 0` opts in) so the code path
+// can be exercised on a build where the agent has a different identity, but shipping it ON would
+// only produce one ACCESS_DENIED warning per window and change nothing on screen.
+BOOL     g_HideGuestTitleBar = FALSE;
 BOOL     g_InputDragOriginInterp = TRUE;   // ON: user-approved baseline 2026-08-16
 DWORD    g_InputDragLagMs = 10;            // dom0 apply lag; measured L < 18 ms, median 0, p75 17
 DWORD    g_InputDragAdoptMs = 25;
@@ -318,6 +335,8 @@ void PerfInit(void)
                 char *tb = qdb_read(qdb, "/qubes-service/guestTitleBar", NULL);
                 if (tb)
                 {
+                    // '0' asks us to hide the guest caption (the feature is named for what the
+                    // guest SHOWS). Absent -> default above, which is currently OFF.
                     g_HideGuestTitleBar = (tb[0] == '0');
                     LogInfo("QGAHIDETITLE qubesdb guestTitleBar=%S -> hide %s",
                         tb, g_HideGuestTitleBar ? L"on" : L"off");
