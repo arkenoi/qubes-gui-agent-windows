@@ -674,6 +674,15 @@ static DWORD HandleMotion(IN HWND window)
         // Translate against the newest announce dom0 has certainly applied, so the addend is exact
         // rather than leading (live) or predicted (servo). The event's own announce cannot move the
         // origin the event used, which is precisely what breaks the gain-1 loop.
+        // INTERPOLATED ORIGIN: evaluate dom0's origin at (now - measured lag) by ramping between the
+        // bracketing announces, rather than holding one announce and switching all at once. Removes
+        // the step discontinuity the quantised law leaves behind, without adding lag. Falls through
+        // to the quantised branch when off or when the ring cannot answer.
+        else if (g_InputDragOriginInterp && window == g_InputDragWindow && g_InputDragOriginValid &&
+                 DragAnnounceOriginAt(GetTickCount() - g_InputDragLagMs, &trackedX, &trackedY))
+        {
+            haveTracked = TRUE;
+        }
         else if (g_InputDragQuantise && window == g_InputDragWindow && g_InputDragOriginValid &&
                  DragAnnounceAppliedOrigin(g_InputDragAdoptMs, &trackedX, &trackedY))
         {

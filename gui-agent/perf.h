@@ -180,6 +180,8 @@ extern BOOL     g_SeamlessStart;
 // ("BlockMenuKey", default on): dom0 owns that key, a stray forward pops the guest Start
 // over the seamless desktop (GWeck #44), and the sanctioned way to open Start is the
 // dom0 appmenu shortcut, which injects guest-side and never crosses this filter.
+extern BOOL     g_InputDragOriginInterp;  // InputDragOriginInterp: ramp the origin instead of stepping it
+extern DWORD    g_InputDragLagMs;         // InputDragLagMs: dom0's measured apply lag
 extern BOOL     g_BlockMenuKey;
 
 // Raise on MSG_FOCUS, making guest z-order agree with dom0 for the focused window.

@@ -87,6 +87,19 @@ BOOL     g_InputDragQuantise = TRUE;   // DEFAULT: measured better than stock by
 // felt it as "jumps back a bit". And pacing below 50 buys nothing: 13.4/s vs 13.7/s, because the
 // announce rate is already saturated by the window's own movement and CFG_POS_MIN_INTERVAL_MS,
 // not by this knob. So 25/50 is a measured floor in both directions, not a preference.
+// INTERPOLATED ORIGIN. dom0's origin really does move STEPWISE - it applies each configure at one
+// discrete instant - so the exactly-correct law is "newest announce older than L", i.e. the
+// quantised law with adopt == L. That is only optimal if L is CONSTANT, and it is not: measured
+// median 0, p75 17, with a tail (82, 398). Set adopt below the actual L of a given announce and the
+// adopted origin has not been applied yet, the error takes the wrong sign, and the loop reopens -
+// which is exactly what 20/40 measured (excess reversals 118 -> 180).
+// So do not guess each step EDGE. Ramp between the two bracketing announces instead: the worst-case
+// error halves and, more importantly, the step discontinuity - the "jumps back a bit" the user felt
+// and the p99=180 px spurious per-event jump we measured - stops existing. This adds no lag, which
+// is what distinguishes it from damping/servo: a damper would smooth the step by withholding motion
+// and hand back the latency the 70->25 ladder just bought.
+BOOL     g_InputDragOriginInterp = FALSE;  // OFF by default until measured against 25/50
+DWORD    g_InputDragLagMs = 10;            // dom0 apply lag; measured L < 18 ms, median 0, p75 17
 DWORD    g_InputDragAdoptMs = 25;
 DWORD    g_InputDragAnnounceMs = 50;   // 0 = natural rate, which DESTROYS the quantised origin
 DWORD    g_InputDragServoGainPct = 85;  // user-accepted on the guest 2026-08-13 (was 60):
@@ -175,8 +188,16 @@ void PerfInit(void)
             DWORD nv = 0;
             if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragAnnounceMs", &nv, NULL))
                 g_InputDragAnnounceMs = nv;
+            DWORD iv = 0;
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragOriginInterp", &iv, NULL))
+                g_InputDragOriginInterp = (iv != 0);
+            DWORD lv = 0;
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragLagMs", &lv, NULL))
+                g_InputDragLagMs = lv;
             LogInfo("QGADRAGQUANT %s (adopt=%lu ms, announce pacing=%lu ms)",
                 g_InputDragQuantise ? L"on" : L"off", g_InputDragAdoptMs, g_InputDragAnnounceMs);
+            LogInfo("QGADRAGINTERP %s (lag=%lu ms)",
+                g_InputDragOriginInterp ? L"on" : L"off", g_InputDragLagMs);
         }
 
         if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PERF_VALUE, &value, NULL))
