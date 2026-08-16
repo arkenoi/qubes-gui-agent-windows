@@ -1785,9 +1785,6 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
         return;
     }
 
-    const LONG_PTR style = GetWindowLongPtr(entry->Handle, GWL_STYLE);
-    const LONG_PTR ex = GetWindowLongPtr(entry->Handle, GWL_EXSTYLE);
-
     // Run the actual restyle as the WINDOW'S OWNER, in a one-shot copy of this binary. Doing it
     // in-process fails: as SYSTEM, SetWindowLongPtr on a user-owned window returns
     // ERROR_ACCESS_DENIED, and impersonating the owner's token does NOT help - measured, because
