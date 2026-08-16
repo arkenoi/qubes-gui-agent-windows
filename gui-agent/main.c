@@ -423,6 +423,10 @@ HANDLE g_ShutdownEvent = NULL;
 // Frame shadow strips Office draws around its own windows, see ShouldAcceptWindow().
 #define MSO_BORDER_EFFECT_CLASS L"MSO_BORDEREFFECT_WINDOW_CLASS"
 
+// Drop shadow NetUI draws behind its popups - the framework behind BOTH Office's chrome and
+// Explorer's Win10 ribbon, so this fires without Office installed. See ShouldAcceptWindow().
+#define SCENIC_DROPSHADOW_CLASS L"SCENIC_DROPSHADOW_WINDOW_CLASS"
+
 // Written by the hook thread, drained by the main loop.
 static CRITICAL_SECTION g_csWindowEvents;
 static HWND g_PendingWindows[PENDING_WINDOWS_MAX];
@@ -3115,6 +3119,36 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         // LogVerbose for rule 2's reason: the strips move with the window they decorate,
         // so during a drag this is re-evaluated at input rate.
         LogVerbose("0x%x: rejecting Office frame shadow strip (owner 0x%x, %ux%u)",
+            data->Handle, data->Owner, data->Width, data->Height);
+        return FALSE;
+    }
+
+    // Rule 4: NetUI drop shadows. Measured 2026-08-16 with tools/winwatch.cs over a 627 s
+    // Explorer-ribbon session: 41 of these announced, each MAPPED FOR ~317 ms, and dom0 draws
+    // its 1 px qube border around every window it maps - which is the red frames the user
+    // reported flashing around ribbon dropdowns. Each also costs CREATE + MAP + ~15
+    // full-window DAMAGE. They are pure UpdateLayeredWindow decoration (per-pixel alpha, which
+    // dom0 has no channel for), so there is nothing to show even when they render.
+    //
+    // Rule 2 above cannot catch them, and NOT only because of its Owner clause: measured
+    // ex=0x08180028 has no WS_EX_TOOLWINDOW either, so rule 2 misses on TWO clauses. Ownership
+    // is unusable here regardless - 16 of 25 are born ownerless and 9 more are orphaned within
+    // 112-165 ms, so any owner-gated test is a race against when we happen to sample.
+    //
+    // Deliberately an EXACT CLASS match rather than the style shape
+    // (LAYERED|TRANSPARENT|NOACTIVATE|WS_DISABLED), which fits all 59 measured samples equally
+    // well: the style form buys no measured coverage over this and carries the whole
+    // false-positive risk, because a click-through non-activating per-pixel-alpha window that
+    // EXISTS TO BE SEEN - a drag image, splash screen or HUD overlay - is byte-identical in
+    // style to a shadow. Here a false positive means real UI silently vanishes from dom0, which
+    // this file already calls "much worse than a spurious border". Ship the style form only if
+    // a second shadow class is ever observed that this misses, and only after measuring
+    // Open-Shell, an OLE drag image, a CJK IME candidate window and a splash screen.
+    if (0 == wcscmp(data->Class, SCENIC_DROPSHADOW_CLASS))
+    {
+        // LogVerbose for rule 2's reason: shadows move with the popup they back, and the
+        // reject cache keys on the rect, so a move re-runs this at input rate.
+        LogVerbose("0x%x: rejecting NetUI drop shadow (owner 0x%x, %ux%u)",
             data->Handle, data->Owner, data->Width, data->Height);
         return FALSE;
     }
