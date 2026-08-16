@@ -1787,11 +1787,29 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
 
     const LONG_PTR style = GetWindowLongPtr(entry->Handle, GWL_STYLE);
     const LONG_PTR ex = GetWindowLongPtr(entry->Handle, GWL_EXSTYLE);
+
+    // ORDER MATTERS, and getting it wrong strands the window OUTSIDE dom0's control.
+    // IsPopup() calls a window an override-redirect popup unless it has WS_CAPTION *or*
+    // WS_SYSMENU+WS_EX_APPWINDOW. These are two separate calls that can fail independently, so
+    // removing the caption first and failing to add WS_EX_APPWINDOW leaves the window matching
+    // NEITHER arm: dom0 stops managing it, draws no decoration, and there is nothing left to
+    // move or close it by. That exact state was produced accidentally during testing today
+    // (Notepad: cap=0 sys=1 app=0), so this is an observed failure, not a theoretical one.
+    // Therefore: ADD the keep-managed pair FIRST and verify it, and only then take the caption.
+    SetLastError(0);
+    SetWindowLongPtr(entry->Handle, GWL_EXSTYLE, ex | WS_EX_APPWINDOW);
+    const LONG_PTR exAfter = GetWindowLongPtr(entry->Handle, GWL_EXSTYLE);
+    if (!HasFlags((DWORD)exAfter, WS_EX_APPWINDOW))
+    {
+        LogWarning("0x%x: cannot add WS_EX_APPWINDOW (ex 0x%x, err %lu) - NOT removing the "
+            "caption, because doing so would take the window out of dom0's managed set",
+            entry->Handle, (DWORD)exAfter, GetLastError());
+        return;
+    }
     SetLastError(0);
     const LONG_PTR prev = SetWindowLongPtr(entry->Handle, GWL_STYLE,
         (style & ~(LONG_PTR)WS_CAPTION) | WS_SYSMENU);
     const DWORD setErr = GetLastError();
-    SetWindowLongPtr(entry->Handle, GWL_EXSTYLE, ex | WS_EX_APPWINDOW);
     // SWP_NOMOVE|SWP_NOSIZE keeps the OUTER rect, so the geometry this entry was sampled with -
     // and is about to be announced with - stays correct; only the client area grows.
     SetWindowPos(entry->Handle, NULL, 0, 0, 0, 0,
