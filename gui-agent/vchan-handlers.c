@@ -670,6 +670,15 @@ static DWORD HandleMotion(IN HWND window)
             trackedX = g_InputDragOriginX;
             trackedY = g_InputDragOriginY;
         }
+        // QUANTISED ORIGIN: dom0's origin is not unknown - it is the position we last announced.
+        // Translate against the newest announce dom0 has certainly applied, so the addend is exact
+        // rather than leading (live) or predicted (servo). The event's own announce cannot move the
+        // origin the event used, which is precisely what breaks the gain-1 loop.
+        else if (g_InputDragQuantise && window == g_InputDragWindow && g_InputDragOriginValid &&
+                 DragAnnounceAppliedOrigin(g_InputDragAdoptMs, &trackedX, &trackedY))
+        {
+            haveTracked = TRUE;
+        }
         else
         {
             EnterCriticalSection(&g_csWatchedWindows);

@@ -56,6 +56,16 @@ BOOL     g_InputDragFreeze = FALSE; // fallback tier only; the servo below is th
 // called "works well", and its real fix is structural (see docs/PLAN-drag-quality.md).
 // Set InputDragServo=1 to re-enable for further experiments.
 BOOL     g_InputDragServo = FALSE;
+
+// QUANTISED-ORIGIN DRAG (InputDragQuantise=1). Reconstruct the dom0 cursor against the last
+// announce dom0 has CERTAINLY applied, instead of the live window position (which leads dom0 and
+// closes the oscillating loop) or a predicted origin (the servo, whose estimate was the weak part).
+// InputDragAdoptMs is how long an announce is assumed to take to land - below it the previous
+// origin is kept. InputDragAnnounceMs paces announces during the drag: larger means dom0's window
+// steps rather than glides, but the origin is settled a larger fraction of the time.
+BOOL     g_InputDragQuantise = FALSE;
+DWORD    g_InputDragAdoptMs = 120;
+DWORD    g_InputDragAnnounceMs = 0;   // 0 = announce at the natural rate
 DWORD    g_InputDragServoGainPct = 85;  // user-accepted on the guest 2026-08-13 (was 60):
                                        // damped enough to absorb predictor error, snappy
                                        // enough that slow drags track cleanly
@@ -132,6 +142,20 @@ void PerfInit(void)
 
     if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)))
     {
+        {
+            DWORD qv = 0;
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragQuantise", &qv, NULL))
+                g_InputDragQuantise = (qv != 0);
+            DWORD av = 0;
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragAdoptMs", &av, NULL) && av > 0)
+                g_InputDragAdoptMs = av;
+            DWORD nv = 0;
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragAnnounceMs", &nv, NULL))
+                g_InputDragAnnounceMs = nv;
+            LogInfo("QGADRAGQUANT %s (adopt=%lu ms, announce pacing=%lu ms)",
+                g_InputDragQuantise ? L"on" : L"off", g_InputDragAdoptMs, g_InputDragAnnounceMs);
+        }
+
         if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PERF_VALUE, &value, NULL))
             enabled = (value != 0);
 

@@ -65,6 +65,9 @@ void DragAnnounceReset(IN int x, IN int y);
 void DragAnnounceClear(void);
 void DragAnnounceRecord(IN int x, IN int y);
 BOOL DragAnnounceMoved(void);
+// Newest announce dom0 has certainly applied (see main.c): the exact-origin drag mode.
+BOOL DragAnnounceAppliedOrigin(IN DWORD adoptMs, OUT int* x, OUT int* y);
+
 BOOL DragAnnounceOriginAt(IN DWORD atTick, OUT int* x, OUT int* y);
 extern char g_DomainName[256];
 extern USHORT g_GuiDomainId;

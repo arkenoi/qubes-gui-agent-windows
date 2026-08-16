@@ -220,6 +220,9 @@ extern BOOL     g_InputDragFreeze;
 
 // Live-feedback drag servo (see the knob block above and g_DragAnnounces in main.c).
 extern BOOL     g_InputDragServo;
+extern BOOL     g_InputDragQuantise;
+extern DWORD    g_InputDragAdoptMs;
+extern DWORD    g_InputDragAnnounceMs;
 extern DWORD    g_InputDragServoGainPct;
 extern DWORD    g_InputDragServoTauMs;
 extern DWORD    g_InputDragServoDeadband;

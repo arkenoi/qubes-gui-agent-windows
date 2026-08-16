@@ -274,6 +274,46 @@ BOOL DragAnnounceMoved(void)
     return g_DragAnnounceCount > 1;
 }
 
+// QUANTISED ORIGIN (drag wobble, exact variant). The servo below interpolates because it is
+// GUESSING when each announce landed. That guess is the servo's weak point - and it is avoidable,
+// because dom0's origin is not an unknown quantity at all: it is a value WE chose and sent. The only
+// unknown is WHEN it took effect.
+//
+// So do not estimate the value; wait out the timing. Return the newest announce that is older than
+// adoptMs, i.e. one dom0 has certainly applied by now. Between announces the origin is then exactly
+// right rather than approximately right, the reconstruction r + origin is exact, and the gain-1
+// feedback loop that produces the 40-163 px oscillation never closes: the origin this event uses
+// cannot be moved by the announce this event causes.
+//
+// The cost is deliberate and bounded: while an announce is still within adoptMs we keep using the
+// PREVIOUS one, so a fast hand runs ahead of dom0 by up to one announce interval - a constant
+// offset, not an oscillation. Pair it with InputDragAnnounceMs to make that interval a choice.
+BOOL DragAnnounceAppliedOrigin(IN DWORD adoptMs, OUT int* x, OUT int* y)
+{
+    if (g_DragAnnounceCount == 0)
+        return FALSE;
+
+    const DWORD now = GetTickCount();
+    const UINT oldest = (g_DragAnnounceHead + DRAG_ANNOUNCE_RING - g_DragAnnounceCount) % DRAG_ANNOUNCE_RING;
+
+    // Walk newest -> oldest for the first entry old enough to be applied. The press seed is the
+    // floor: dom0's origin cannot differ from it before the first mid-drag announce.
+    for (UINT i = 0; i < g_DragAnnounceCount; i++)
+    {
+        UINT idx = (g_DragAnnounceHead + DRAG_ANNOUNCE_RING - 1 - i) % DRAG_ANNOUNCE_RING;
+        if ((DWORD)(now - g_DragAnnounces[idx].Tick) >= adoptMs)
+        {
+            *x = g_DragAnnounces[idx].X;
+            *y = g_DragAnnounces[idx].Y;
+            return TRUE;
+        }
+    }
+
+    *x = g_DragAnnounces[oldest].X;
+    *y = g_DragAnnounces[oldest].Y;
+    return TRUE;
+}
+
 // dom0's origin at absolute tick atTick, linearly interpolated between the two
 // bracketing announces. D really moves stepwise at unobservable apply times;
 // interpolation smooths the announce quantization instead of guessing each step edge,
@@ -1896,8 +1936,27 @@ static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
     }
 }
 
+// Pace announces for the dragged window when InputDragAnnounceMs is set. A larger interval means
+// dom0's window steps instead of gliding, but the origin the quantised reconstruction uses is
+// settled for a larger fraction of the drag - the whole dial between "dom0 follows smoothly" and
+// "input maps exactly". Zero keeps the natural rate.
+static BOOL DragAnnouncePaced(IN const WINDOW_DATA* entry)
+{
+    static DWORD lastTick = 0;
+    if (!g_InputDragAnnounceMs || entry->Handle != g_InputDragWindow || !g_InputDragOriginValid)
+        return TRUE;
+    const DWORD now = GetTickCount();
+    if (lastTick != 0 && (DWORD)(now - lastTick) < g_InputDragAnnounceMs)
+        return FALSE;
+    lastTick = now;
+    return TRUE;
+}
+
 static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
 {
+    if (!DragAnnouncePaced(entry))
+        return ERROR_SUCCESS;
+
     if (entry->Synthesized)
         return ERROR_SUCCESS; // never announced; see main.h
     if (entry->CfgSentValid &&
