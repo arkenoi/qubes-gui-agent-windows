@@ -63,9 +63,9 @@ BOOL     g_InputDragServo = FALSE;
 // InputDragAdoptMs is how long an announce is assumed to take to land - below it the previous
 // origin is kept. InputDragAnnounceMs paces announces during the drag: larger means dom0's window
 // steps rather than glides, but the origin is settled a larger fraction of the time.
-BOOL     g_InputDragQuantise = FALSE;
-DWORD    g_InputDragAdoptMs = 120;
-DWORD    g_InputDragAnnounceMs = 0;   // 0 = announce at the natural rate
+BOOL     g_InputDragQuantise = TRUE;   // DEFAULT: measured better than stock by hand (see below)
+DWORD    g_InputDragAdoptMs = 70;      // adopt < pacing by a margin; see the ladder in PLAN-drag-quality
+DWORD    g_InputDragAnnounceMs = 140;  // 0 = natural rate, which DESTROYS the quantised origin
 DWORD    g_InputDragServoGainPct = 85;  // user-accepted on the guest 2026-08-13 (was 60):
                                        // damped enough to absorb predictor error, snappy
                                        // enough that slow drags track cleanly
