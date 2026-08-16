@@ -69,8 +69,26 @@ BOOL     g_InputDragServo = FALSE;
 // origin is kept. InputDragAnnounceMs paces announces during the drag: larger means dom0's window
 // steps rather than glides, but the origin is settled a larger fraction of the time.
 BOOL     g_InputDragQuantise = TRUE;   // DEFAULT: measured better than stock by hand (see below)
-DWORD    g_InputDragAdoptMs = 70;      // adopt < pacing by a margin; see the ladder in PLAN-drag-quality
-DWORD    g_InputDragAnnounceMs = 140;  // 0 = natural rate, which DESTROYS the quantised origin
+// MEASURED 2026-08-16, not guessed. 70/140 was chosen conservatively against a dom0 apply lag
+// nobody had measured; the QGAPROTO MOTION trace then measured it at L < 18 ms (median 0, p75 17,
+// against a 9 ms sampling interval), so the old adopt waited 4-8x longer than dom0 needs and the
+// pacing was bounded below by that wait. Ladder, scored on a path-independent metric (reversals in
+// the injected path MINUS reversals the hand actually made, so the score does not depend on how the
+// tester moved):
+//
+//     rung     announce rate   excess reversals   deviation p90/max
+//     70/140   ~7.4/s          (baseline)         -
+//     35/70    6.4/s           208 (+38%)         82 / 800 px
+//     25/50    13.7/s          118 (+23%)         67 / 261 px   <- minimum
+//     20/40    13.4/s          180 (+36%)         45 / 215 px
+//
+// 20/40 is WORSE: adopt=20 drops below dom0's real apply lag on some events, so the origin adopted
+// has not been applied yet, the error takes the wrong sign and the gain-1 loop reopens - the user
+// felt it as "jumps back a bit". And pacing below 50 buys nothing: 13.4/s vs 13.7/s, because the
+// announce rate is already saturated by the window's own movement and CFG_POS_MIN_INTERVAL_MS,
+// not by this knob. So 25/50 is a measured floor in both directions, not a preference.
+DWORD    g_InputDragAdoptMs = 25;
+DWORD    g_InputDragAnnounceMs = 50;   // 0 = natural rate, which DESTROYS the quantised origin
 DWORD    g_InputDragServoGainPct = 85;  // user-accepted on the guest 2026-08-13 (was 60):
                                        // damped enough to absorb predictor error, snappy
                                        // enough that slow drags track cleanly
