@@ -1788,84 +1788,67 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
     const LONG_PTR style = GetWindowLongPtr(entry->Handle, GWL_STYLE);
     const LONG_PTR ex = GetWindowLongPtr(entry->Handle, GWL_EXSTYLE);
 
-    // IMPERSONATE THE WINDOW'S OWNER. As SYSTEM every SetWindowLongPtr on a user-owned window is
-    // refused with ERROR_ACCESS_DENIED (measured: style 0x14cf0000 unchanged, err 5, every
-    // window), while the identical call from a process running as that user succeeds - an
-    // Explorer window restyled by hand that way has been sitting correct and dom0-managed for
-    // hours. So borrow the target's own token for the duration: open the window's process, take
-    // an impersonation token, and act as it. If USER32 validates this per-thread we are done; if
-    // it validates per-process the verification read below reports it and we change nothing.
-    HANDLE impersonated = NULL;
+    // Run the actual restyle as the WINDOW'S OWNER, in a one-shot copy of this binary. Doing it
+    // in-process fails: as SYSTEM, SetWindowLongPtr on a user-owned window returns
+    // ERROR_ACCESS_DENIED, and impersonating the owner's token does NOT help - measured, because
+    // USER32 validates window access per-PROCESS, not per-thread. The same call from a process
+    // genuinely running as that user succeeds, which an Explorer window restyled by hand proved
+    // by staying correct and dom0-managed for hours.
+    //
+    // Fire and forget: the caption change does not move the window (SWP_NOMOVE|SWP_NOSIZE keeps
+    // the outer rect), so the geometry being announced below stays correct whether the helper
+    // lands before or after it. Blocking the frame loop on a process spawn would be far worse
+    // than a repaint.
+    DWORD ownerPid = 0;
+    GetWindowThreadProcessId(entry->Handle, &ownerPid);
+    HANDLE proc = ownerPid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ownerPid) : NULL;
+    if (!proc)
     {
-        DWORD ownerPid = 0;
-        GetWindowThreadProcessId(entry->Handle, &ownerPid);
-        HANDLE proc = ownerPid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ownerPid) : NULL;
-        if (proc)
+        LogWarning("0x%x: cannot open the owning process (pid %lu) to borrow its token",
+            entry->Handle, ownerPid);
+        return;
+    }
+
+    HANDLE tok = NULL, primary = NULL;
+    BOOL spawned = FALSE;
+    if (OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY, &tok) &&
+        DuplicateTokenEx(tok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &primary))
+    {
+        WCHAR self[MAX_PATH] = { 0 };
+        if (GetModuleFileName(NULL, self, RTL_NUMBER_OF(self)))
         {
-            HANDLE tok = NULL;
-            if (OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY, &tok))
+            WCHAR cmd[MAX_PATH + 64];
+            StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\" --restyle-caption %llx",
+                self, (unsigned long long)(ULONG_PTR)entry->Handle);
+
+            STARTUPINFO si = { 0 };
+            PROCESS_INFORMATION pi = { 0 };
+            si.cb = sizeof(si);
+            si.lpDesktop = L"winsta0\\default";   // the interactive desktop, or it sees no windows
+            if (CreateProcessAsUser(primary, NULL, cmd, NULL, NULL, FALSE,
+                    CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
             {
-                HANDLE dup = NULL;
-                if (DuplicateTokenEx(tok, TOKEN_IMPERSONATE | TOKEN_QUERY, NULL,
-                        SecurityImpersonation, TokenImpersonation, &dup))
-                {
-                    if (ImpersonateLoggedOnUser(dup))
-                        impersonated = dup;
-                    else
-                        CloseHandle(dup);
-                }
-                CloseHandle(tok);
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                spawned = TRUE;
             }
-            CloseHandle(proc);
+            else
+            {
+                win_perror("CreateProcessAsUser(--restyle-caption)");
+            }
         }
-        if (!impersonated)
-            LogDebug("0x%x: could not impersonate the window's owner, trying as ourselves",
-                entry->Handle);
     }
+    if (primary) CloseHandle(primary);
+    if (tok) CloseHandle(tok);
+    CloseHandle(proc);
 
-    // ORDER MATTERS, and getting it wrong strands the window OUTSIDE dom0's control.
-    // IsPopup() calls a window an override-redirect popup unless it has WS_CAPTION *or*
-    // WS_SYSMENU+WS_EX_APPWINDOW. These are two separate calls that can fail independently, so
-    // removing the caption first and failing to add WS_EX_APPWINDOW leaves the window matching
-    // NEITHER arm: dom0 stops managing it, draws no decoration, and there is nothing left to
-    // move or close it by. That exact state was produced accidentally during testing today
-    // (Notepad: cap=0 sys=1 app=0), so this is an observed failure, not a theoretical one.
-    // Therefore: ADD the keep-managed pair FIRST and verify it, and only then take the caption.
-    SetLastError(0);
-    SetWindowLongPtr(entry->Handle, GWL_EXSTYLE, ex | WS_EX_APPWINDOW);
-    const LONG_PTR exAfter = GetWindowLongPtr(entry->Handle, GWL_EXSTYLE);
-    if (!HasFlags((DWORD)exAfter, WS_EX_APPWINDOW))
+    if (!spawned)
     {
-        LogWarning("0x%x: cannot add WS_EX_APPWINDOW (ex 0x%x, err %lu) - NOT removing the "
-            "caption, because doing so would take the window out of dom0's managed set",
-            entry->Handle, (DWORD)exAfter, GetLastError());
-        if (impersonated) { RevertToSelf(); CloseHandle(impersonated); }
+        LogWarning("0x%x: could not launch the restyle helper as the window's owner", entry->Handle);
         return;
     }
-    SetLastError(0);
-    const LONG_PTR prev = SetWindowLongPtr(entry->Handle, GWL_STYLE,
-        (style & ~(LONG_PTR)WS_CAPTION) | WS_SYSMENU);
-    const DWORD setErr = GetLastError();
-    // SWP_NOMOVE|SWP_NOSIZE keeps the OUTER rect, so the geometry this entry was sampled with -
-    // and is about to be announced with - stays correct; only the client area grows.
-    SetWindowPos(entry->Handle, NULL, 0, 0, 0, 0,
-        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-    entry->CaptionHidden = TRUE;
-
-    // VERIFY, do not assume: a cross-process style change can be silently refused (integrity
-    // level, session, or the app re-applying its own styles), and the first field build claimed
-    // success in the log while the window kept its caption. Read it back.
-    const LONG_PTR after = GetWindowLongPtr(entry->Handle, GWL_STYLE);
-    if (impersonated) { RevertToSelf(); CloseHandle(impersonated); }
-    if (HasFlags((DWORD)after, WS_CAPTION))
-    {
-        LogWarning("0x%x: caption strip DID NOT STICK (style 0x%x -> 0x%x, prev %d, err %lu, "
-            "impersonated %d) - leaving the window as it is", entry->Handle, (DWORD)style,
-            (DWORD)after, prev != 0, setErr, impersonated != NULL);
-        return;
-    }
-    LogInfo("0x%x: guest caption hidden (was inset %d, style 0x%x -> 0x%x)",
-        entry->Handle, topInset, (DWORD)style, (DWORD)after);
+    LogInfo("0x%x: restyle helper launched as the window's owner (inset %d)",
+        entry->Handle, topInset);
 }
 
 ULONG AddWindow(IN WINDOW_DATA* entry)
@@ -6889,12 +6872,42 @@ static ULONG Init(void)
     return ERROR_SUCCESS;
 }
 
+// One-shot helper mode. The agent runs as SYSTEM and USER32 refuses its style changes on
+// user-owned windows (ERROR_ACCESS_DENIED, per-PROCESS check - impersonating the owner's token
+// was measured NOT to help). So for this one job the agent re-launches ITSELF under the window
+// owner's token and the copy, now running as that user, does the call. Same signed binary, no
+// new component; it touches nothing else and exits immediately.
+static int RestyleCaptionMain(LPSTR cmdLine)
+{
+    unsigned long long raw = 0;
+    if (sscanf_s(cmdLine, "--restyle-caption %llx", &raw) != 1 || raw == 0)
+        return ERROR_INVALID_PARAMETER;
+
+    const HWND hwnd = (HWND)(ULONG_PTR)raw;
+    if (!IsWindow(hwnd))
+        return ERROR_INVALID_WINDOW_HANDLE;
+
+    const LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+    SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex | WS_EX_APPWINDOW);
+    if (!(GetWindowLongPtr(hwnd, GWL_EXSTYLE) & WS_EX_APPWINDOW))
+        return ERROR_ACCESS_DENIED;   // never strip the caption without the keep-managed pair
+
+    const LONG_PTR style = GetWindowLongPtr(hwnd, GWL_STYLE);
+    SetWindowLongPtr(hwnd, GWL_STYLE, (style & ~(LONG_PTR)WS_CAPTION) | WS_SYSMENU);
+    SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+
+    return (GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CAPTION) ? ERROR_ACCESS_DENIED : ERROR_SUCCESS;
+}
+
 int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow)
 {
     UNREFERENCED_PARAMETER(hInstance);
     UNREFERENCED_PARAMETER(hPrevInstance);
-    UNREFERENCED_PARAMETER(lpCmdLine);
     UNREFERENCED_PARAMETER(nCmdShow);
+
+    if (lpCmdLine && 0 == strncmp(lpCmdLine, "--restyle-caption", 17))
+        return RestyleCaptionMain(lpCmdLine);
 
     if (ERROR_SUCCESS != Init())
         return win_perror("Init");
