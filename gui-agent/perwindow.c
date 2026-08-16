@@ -513,6 +513,25 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     return ERROR_SUCCESS;
 }
 
+// Recompute the WGC crop from the CURRENT geometry and push it if it moved. Attach computes this
+// once; a plain move never re-attaches, so without this the channel keeps whatever offset was true
+// when the window was first seen.
+void PwRefreshCrop(IN const WINDOW_DATA* entry)
+{
+    if (!entry || !entry->PwDumpSent || entry->PwSliceFed)
+        return;
+
+    RECT wr;
+    if (!GetWindowRect(entry->Handle, &wr))
+        return;
+
+    int cropX = entry->X - wr.left;
+    int cropY = entry->Y - wr.top;
+    if (cropX < 0) cropX = 0;
+    if (cropY < 0) cropY = 0;
+    WcSetCrop(entry->Handle, cropX, cropY);
+}
+
 void PwDetachWindow(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->PwDumpSent)

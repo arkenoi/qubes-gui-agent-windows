@@ -68,6 +68,9 @@ void WcSetDdaOwned(HWND hwnd, BOOL owned);
 // Set the buffer-relative regions this window's capture must not write, because a
 // synthesized child owns those pixels. Replaces any previous mask; count 0 clears.
 // The rects may be given in any order and may overlap: the capture sorts its own copy.
+// Refresh the visible-rect offset after the window's frame relationship changes (see .cpp).
+void WcSetCrop(HWND hwnd, int cropX, int cropY);
+
 void WcSetMask(HWND hwnd, const RECT* rects, int count);
 
 // Synchronously render the window's current content into the buffer via

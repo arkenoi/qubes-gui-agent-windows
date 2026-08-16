@@ -379,6 +379,33 @@ void WcRemoveWindow(HWND hwnd)
     ReleaseSRWLockExclusive(&g_eng->lock);
 }
 
+// Update the visible-rect offset inside the OS window rect. It is computed at WcAddWindow from
+// (announce rect - GetWindowRect), i.e. the DWM invisible border, and was then FROZEN for the
+// channel's whole life - but that relationship is not constant: it changes when a window's frame
+// state changes, and nothing re-attaches on a plain move. A stale crop of 0 makes the buffer hold
+// the window INCLUDING its invisible border, which dom0 then draws at the visible-rect position -
+// the 7 px black band down the left edge measured after a drag on 2026-08-16.
+void WcSetCrop(HWND hwnd, int cropX, int cropY)
+{
+    if (!g_eng)
+        return;
+    if (cropX < 0) cropX = 0;
+    if (cropY < 0) cropY = 0;
+    AcquireSRWLockExclusive(&g_eng->lock);
+    for (auto& ch : g_eng->channels)
+        if (ch->hwnd == hwnd)
+        {
+            if (ch->cropX != cropX || ch->cropY != cropY)
+            {
+                ch->cropX = cropX;
+                ch->cropY = cropY;
+                ch->dirty.store(true); // the whole buffer is now wrong; re-capture it
+            }
+            break;
+        }
+    ReleaseSRWLockExclusive(&g_eng->lock);
+}
+
 void WcSetMask(HWND hwnd, const RECT* rects, int count)
 {
     if (!g_eng)

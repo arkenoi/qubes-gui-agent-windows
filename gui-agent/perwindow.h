@@ -44,6 +44,9 @@ BOOL PwIsAttached(IN const WINDOW_DATA* entry);
 // call for non-attached windows. Call before the entry is freed.
 void PwDetachWindow(IN OUT WINDOW_DATA* entry);
 
+// Push a fresh visible-rect offset to the capture engine after a geometry change.
+void PwRefreshCrop(IN const WINDOW_DATA* entry);
+
 // FALSE if PrintWindow cannot produce correct pixels for this window (ULW-style or
 // colorkeyed layered windows) - such windows must stay on the legacy screen-slice path.
 BOOL PwWindowEligible(IN const WINDOW_DATA* entry);

@@ -3340,6 +3340,14 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // buffer still holds the old region's pixels. Schedule a full re-copy.
         if (windowData->PwSliceFed)
             windowData->PwSliceNeedsFull = TRUE;
+        else
+            // A WGC-fed window keeps the visible-rect offset it was attached with, and that
+            // offset is (announce rect - OS window rect) - a relationship a move can change.
+            // Left stale it puts the window's invisible border INSIDE the buffer, which dom0
+            // draws at the visible-rect position: the 7 px black band down the left edge
+            // measured after a drag on 2026-08-16. Recompute it from the geometry we just
+            // adopted; WcSetCrop is a no-op when nothing moved.
+            PwRefreshCrop(windowData);
     }
 
     BOOL oldPopupState = windowData->IsOverrideRedirect;
