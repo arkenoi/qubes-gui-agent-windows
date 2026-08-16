@@ -1740,6 +1740,64 @@ static void SynthDeactivate(IN OUT WINDOW_DATA* entry)
     }
 }
 
+// --- guest title-bar hiding (service.guestTitleBar) ---------------------------
+// A Windows guest draws its OWN caption inside the window bitmap, and dom0's window manager
+// decorates the same window again: two stacked title bars, which is not how a Linux qube looks.
+// Strip the guest's when Windows is the one drawing it, so dom0's decoration is the only header.
+//
+// THE DISCRIMINATOR IS THE CLIENT-RECT INSET, NOT WS_CAPTION. Measured 2026-08-16: Edge,
+// Explorer, the Store frame and UWP CoreWindows ALL carry WS_CAPTION, yet paint their own header
+// into the CLIENT area (they eat the non-client area via WM_NCCALCSIZE), so their client rect
+// reaches the top of the window - top inset 0. Notepad, whose caption Windows really draws,
+// measures 51. Touching a zero-inset window would strip a frame that is not there and leave the
+// app's own buttons in place, and one unreproduced observation had Edge exit outright when its
+// styles were changed from outside. So: act only where the OS demonstrably owns the caption.
+//
+// WS_SYSMENU|WS_EX_APPWINDOW is ADDED as the caption is removed, because IsPopup() treats a
+// window as an override-redirect popup unless it has WS_CAPTION *or* that pair - without it the
+// window would leave dom0's managed set entirely (measured: it vanishes from _NET_CLIENT_LIST,
+// so dom0 draws no decoration either and there is nothing left to drag or close by).
+// With the pair, dom0 keeps managing it and its titlebar X still works: HandleClose posts
+// WM_SYSCOMMAND/SC_CLOSE, verified against a control on a stripped window.
+#define TITLEBAR_MIN_INSET 20   // px of OS-drawn non-client area above the client rect
+
+static void HideGuestCaption(IN WINDOW_DATA* entry)
+{
+    if (!g_HideGuestTitleBar || entry->CaptionHidden)
+        return;
+    // Popups have no caption to remove, and stripping one would flip IsPopup's verdict.
+    if (entry->IsOverrideRedirect || entry->Synthesized)
+        return;
+    if (!HasFlags(entry->Style, WS_CAPTION))
+        return;
+
+    RECT wr;
+    POINT cl = { 0, 0 };
+    if (!GetWindowRect(entry->Handle, &wr) || !ClientToScreen(entry->Handle, &cl))
+        return;
+    const int topInset = cl.y - wr.top;
+    if (topInset < TITLEBAR_MIN_INSET)
+    {
+        // The app draws its own header (Chromium, Explorer's ribbon, UWP frames). Leave it.
+        LogVerbose("0x%x: own-frame app (top inset %d), keeping its caption",
+            entry->Handle, topInset);
+        entry->CaptionHidden = TRUE;   // decided; do not re-measure every pass
+        return;
+    }
+
+    const LONG_PTR style = GetWindowLongPtr(entry->Handle, GWL_STYLE);
+    const LONG_PTR ex = GetWindowLongPtr(entry->Handle, GWL_EXSTYLE);
+    SetWindowLongPtr(entry->Handle, GWL_STYLE, (style & ~(LONG_PTR)WS_CAPTION) | WS_SYSMENU);
+    SetWindowLongPtr(entry->Handle, GWL_EXSTYLE, ex | WS_EX_APPWINDOW);
+    // SWP_NOMOVE|SWP_NOSIZE keeps the OUTER rect, so the geometry this entry was sampled with -
+    // and is about to be announced with - stays correct; only the client area grows.
+    SetWindowPos(entry->Handle, NULL, 0, 0, 0, 0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    entry->CaptionHidden = TRUE;
+    LogDebug("0x%x: guest caption hidden (was inset %d), dom0's decoration is now the only header",
+        entry->Handle, topInset);
+}
+
 ULONG AddWindow(IN WINDOW_DATA* entry)
 {
     ULONG status = ERROR_SUCCESS;
@@ -1771,6 +1829,10 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
         entry->DeletePending = TRUE;
         return ERROR_SUCCESS;
     }
+
+    // Strip the guest caption BEFORE the announce, so dom0 never sees the two-titlebar
+    // version even briefly. The outer rect is unchanged, so entry's geometry stays valid.
+    HideGuestCaption(entry);
 
     // send window creation info to gui daemon
     if (g_VchanClientConnected)

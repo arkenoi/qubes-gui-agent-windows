@@ -98,6 +98,10 @@ BOOL     g_InputDragQuantise = TRUE;   // DEFAULT: measured better than stock by
 // and the p99=180 px spurious per-event jump we measured - stops existing. This adds no lag, which
 // is what distinguishes it from damping/servo: a damper would smooth the step by withholding motion
 // and hand back the latency the 70->25 ladder just bought.
+// Hide the guest's own title bar on windows whose caption is drawn by WINDOWS, so dom0's
+// decoration is the only header instead of two stacked ones. Default ON; dom0 turns it off per
+// qube with `qvm-features <vm> service.guestTitleBar 1` ("show the guest title bar").
+BOOL     g_HideGuestTitleBar = TRUE;
 BOOL     g_InputDragOriginInterp = TRUE;   // ON: user-approved baseline 2026-08-16
 DWORD    g_InputDragLagMs = 10;            // dom0 apply lag; measured L < 18 ms, median 0, p75 17
 DWORD    g_InputDragAdoptMs = 25;
@@ -196,6 +200,7 @@ void PerfInit(void)
                 g_InputDragLagMs = lv;
             LogInfo("QGADRAGQUANT %s (adopt=%lu ms, announce pacing=%lu ms)",
                 g_InputDragQuantise ? L"on" : L"off", g_InputDragAdoptMs, g_InputDragAnnounceMs);
+            LogInfo("QGAHIDETITLE %s", g_HideGuestTitleBar ? L"on" : L"off");
             LogInfo("QGADRAGINTERP %s (lag=%lu ms)",
                 g_InputDragOriginInterp ? L"on" : L"off", g_InputDragLagMs);
         }
@@ -308,6 +313,16 @@ void PerfInit(void)
             qdb_handle_t qdb = qdb_open(NULL);
             if (qdb)
             {
+                // Same dom0-owned pattern as enableWinKey: `service.`-prefixed features are the
+                // ones Qubes exports into the guest's qubesdb. Absent -> default (hide).
+                char *tb = qdb_read(qdb, "/qubes-service/guestTitleBar", NULL);
+                if (tb)
+                {
+                    g_HideGuestTitleBar = (tb[0] == '0');
+                    LogInfo("QGAHIDETITLE qubesdb guestTitleBar=%S -> hide %s",
+                        tb, g_HideGuestTitleBar ? L"on" : L"off");
+                    free(tb);
+                }
                 char *v = qdb_read(qdb, "/qubes-service/enableWinKey", NULL);
                 if (v)
                 {
