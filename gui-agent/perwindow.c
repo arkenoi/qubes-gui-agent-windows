@@ -225,7 +225,16 @@ static PW_SLAB* PwSlabAcquire(IN ULONG pageCount)
         best->InUse = TRUE;
         g_PwSlabsReused++;
         LeaveCriticalSection(&g_PwSlabLock);
-        LogDebug("PWSLAB reused %lu-page slab for %lu pages (created=%lu reused=%lu)",
+
+        // ZERO IT. A window's buffer is filled by damage, so any region the first frames do not
+        // cover keeps whatever the pages already held. Freshly VirtualAlloc'd pages are zero, so
+        // before pooling that showed as BLACK until the window painted - observed live on a drag,
+        // where a moved window came back with its right-hand side black. A REUSED slab would show
+        // the PREVIOUS WINDOW'S PIXELS there instead, which is a far worse failure: the user sees
+        // one application's content inside another's frame. Same guest, so no isolation boundary
+        // is crossed, but it must not happen. Zeroing restores exactly the pre-pool behaviour.
+        memset(best->Buffer, 0, (size_t)best->Pages * PAGE_SIZE);
+        LogDebug("PWSLAB reused %lu-page slab for %lu pages, zeroed (created=%lu reused=%lu)",
                  best->Pages, pageCount, g_PwSlabsCreated, g_PwSlabsReused);
         return best;
     }
