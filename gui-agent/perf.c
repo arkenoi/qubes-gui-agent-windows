@@ -55,6 +55,7 @@ BOOL     g_InputDragFreeze = FALSE; // fallback tier only; the servo below is th
 // modes; the residual ~16% announce wobble is the SAME one present in the build the user
 // called "works well", and its real fix is structural (see docs/PLAN-drag-quality.md).
 // Set InputDragServo=1 to re-enable for further experiments.
+BOOL     g_InputDragServo = FALSE;
 
 // QUANTISED-ORIGIN DRAG (InputDragQuantise=1). Reconstruct the dom0 cursor against the last
 // announce dom0 has CERTAINLY applied, instead of the live window position (which leads dom0 and
@@ -62,15 +63,21 @@ BOOL     g_InputDragFreeze = FALSE; // fallback tier only; the servo below is th
 // InputDragAdoptMs is how long an announce is assumed to take to land - below it the previous
 // origin is kept. InputDragAnnounceMs paces announces during the drag: larger means dom0's window
 // steps rather than glides, but the origin is settled a larger fraction of the time.
-BOOL     g_InputDragQuantise = TRUE;   // default ON: what it replaces is the oscillator itself
+BOOL     g_InputDragQuantise = FALSE;
 DWORD    g_InputDragAdoptMs = 120;
 DWORD    g_InputDragAnnounceMs = 0;   // 0 = announce at the natural rate
+DWORD    g_InputDragServoGainPct = 85;  // user-accepted on the guest 2026-08-13 (was 60):
                                        // damped enough to absorb predictor error, snappy
                                        // enough that slow drags track cleanly
+DWORD    g_InputDragServoTauMs = 25;   // assumed announce transit+apply time
+DWORD    g_InputDragServoDeadband = 3;
+DWORD    g_InputDragServoFastPx = 24;
+BOOL     g_InputDragServoClamp = TRUE;
 // Gain scheduling is NEUTRAL by default (fast gain == base gain). At 100% a mis-reconstructed
 // dom0 origin was applied in full and produced 'crazy extrapolated jumps' on fast drags
 // (user, 2026-08-13); the damping had been absorbing those prediction errors. Re-enable per
 // guest via InputDragServoFastGainPct once the clamp below is proven in the field.
+DWORD    g_InputDragServoFastGainPct = 85;
 BOOL     g_DdaMoveInvalidate = TRUE;
 BOOL     g_InputDragSlice = TRUE;
 BOOL     g_InputDragFreezeContent = TRUE;
@@ -300,6 +307,8 @@ void PerfInit(void)
         {
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_FREEZE_VALUE, &v, NULL))
                 g_InputDragFreeze = (v != 0);
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_VALUE, &v, NULL))
+                g_InputDragServo = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_GAIN_VALUE, &v, NULL))
             {
                 // 0 would inject a constant (a freeze that still announces - nonsense);
@@ -309,16 +318,25 @@ void PerfInit(void)
                     v = 1;
                 if (v > 100)
                     v = 100;
+                g_InputDragServoGainPct = v;
             }
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_TAU_VALUE, &v, NULL))
             {
                 if (v > 250) // beyond the max measured apply lag: a misconfiguration
                     v = 250;
+                g_InputDragServoTauMs = v;
             }
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_FASTPX_VALUE, &v, NULL))
+                g_InputDragServoFastPx = v;
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_FASTGAIN_VALUE, &v, NULL) && v <= 100)
+                g_InputDragServoFastGainPct = v;
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_CLAMP_VALUE, &v, NULL))
+                g_InputDragServoClamp = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_DEADBAND_VALUE, &v, NULL))
             {
                 if (v > 50) // larger than the smallest measured oscillation (40 px):
                     v = 50; // past that the dead zone is itself a visible defect
+                g_InputDragServoDeadband = v;
             }
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_DDA_MOVE_INVALIDATE_VALUE, &v, NULL))
                 g_DdaMoveInvalidate = (v != 0);
@@ -337,6 +355,10 @@ void PerfInit(void)
         }
         LogInfo("QGADRAGFREEZE %s", g_InputDragFreeze ? L"on" : L"off");
         LogInfo("QGADRAGSERVO %s gain=%u%% tau=%ums deadband=%upx fast>=%upx@%u%% clamp=%s",
+            g_InputDragServo ? L"on" : L"off", g_InputDragServoGainPct,
+            g_InputDragServoTauMs, g_InputDragServoDeadband,
+            g_InputDragServoFastPx, g_InputDragServoFastGainPct,
+            g_InputDragServoClamp ? L"on" : L"off");
         LogInfo("QGADDAMOVEINV %s", g_DdaMoveInvalidate ? L"on" : L"off");
         LogInfo("QGADRAGSLICE %s", g_InputDragSlice ? L"on" : L"off");
         LogInfo("QGADRAGFREEZECONTENT %s", g_InputDragFreezeContent ? L"on" : L"off");

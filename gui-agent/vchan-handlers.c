@@ -484,9 +484,9 @@ static DWORD HandleButton(IN HWND window)
         // converge through. A Button1 PRESS never takes this path (it anchors a NEW
         // drag; stale state from a lost release must not leak in), and a failed
         // reconstruction falls through to the historic live lookup.
-        else if (g_InputDragQuantise && window == g_InputDragWindow && g_InputDragOriginValid &&
+        else if (g_InputDragServo && window == g_InputDragWindow && g_InputDragOriginValid &&
                  !(buttonMsg.button == Button1 && buttonMsg.type == ButtonPress) &&
-                 DragAnnounceAppliedOrigin(g_InputDragAdoptMs, &trackedX, &trackedY))
+                 DragAnnounceOriginAt(GetTickCount() - g_InputDragServoTauMs, &trackedX, &trackedY))
         {
             haveTracked = TRUE;
         }
@@ -693,9 +693,120 @@ static DWORD HandleMotion(IN HWND window)
             }
             LeaveCriticalSection(&g_csWatchedWindows);
 
-            // The historic live-origin translation. With InputDragQuantise the exact origin was
-            // already chosen above; the servo that used to damp this path has been removed - it
-            // repaired a reconstruction that no longer needs repairing.
+            // LIVE SERVO (D1 drag wobble, live-feedback fix; mechanism comment at
+            // g_DragAnnounces in main.c). The plain live translation below this branch
+            // is A = r + W_live; the app's modal move loop applies W' = A - g, closing
+            // a gain-1 servo through the 66-250 ms announce-apply transport lag -
+            // structurally oscillatory over the whole measured lag range (roots
+            // |z| = 1.00-1.19), the observed 40-163 px forth-and-back. Restructure the
+            // law instead of freezing the window: reconstruct the dom0 cursor
+            // C_hat = r + D_hat from our own announce history (which removes the lag
+            // from the loop equation - single real pole at 1-beta, stable for ANY
+            // transport lag), then move the window a FRACTION beta of the remaining
+            // deviation per event. The 3 px default deadband absorbs announce
+            // quantization so a stationary hand yields a stationary window. Cost of
+            // the detune: ~33 px of extra cursor trail at the measured p50 hand speed,
+            // on top of the ~83 px irreducible pipeline lag even a perfect estimator
+            // shows. A failed reconstruction (no seeded ring) leaves the historic
+            // live-origin translation untouched.
+            if (haveTracked && g_InputDragServo &&
+                window == g_InputDragWindow && g_InputDragOriginValid)
+            {
+                int dhatX, dhatY;
+                if (DragAnnounceOriginAt(GetTickCount() - g_InputDragServoTauMs, &dhatX, &dhatY))
+                {
+                    if (!DragAnnounceMoved())
+                    {
+                        // No position announce since the press: dom0's applied origin
+                        // IS the press origin, the reconstruction is exact and no
+                        // feedback loop exists to damp. This is every client-area drag
+                        // (selection, scrollbars - the window never moves, so this
+                        // branch carries the whole gesture) and the first ~66 ms of a
+                        // title-bar drag. Damping here would be pure harm: a selection
+                        // cursor would undershoot by (1-beta) of its pull.
+                        trackedX = dhatX;
+                        trackedY = dhatY;
+                    }
+                    else
+                    {
+                        // SERVO THE CURSOR, NOT THE WINDOW. Deviation between the
+                        // reconstructed dom0 cursor and the cursor we last injected;
+                        // the injected cursor then walks toward the real one by beta.
+                        //
+                        // Deliberately NOT expressed against the grab offset: Windows
+                        // RE-ANCHORS the modal loop's grab mid-drag (dragging a
+                        // maximized or snapped window to restore it re-anchors it
+                        // proportionally under the cursor), and a law written against a
+                        // grab captured at the press then has a fixed point offset by
+                        // (grab - grab_new)*(1/beta - 1) - a constant several-hundred-px
+                        // tracking error for a restore gesture (review finding, with an
+                        // analytic fixed point and a simulation agreeing at ~390px).
+                        // Servoing the cursor removes the grab from the loop entirely,
+                        // so whatever grab the modal loop currently holds is applied by
+                        // Windows itself and cancels. It also fixes left/top
+                        // resize-border drags, which re-anchor the same way.
+                        int cHatX = x + dhatX;
+                        int cHatY = y + dhatY;
+                        int devX = cHatX - g_DragLastInjectedX;
+                        int devY = cHatY - g_DragLastInjectedY;
+                        int db = (int)g_InputDragServoDeadband;
+                        if (devX <= db && devX >= -db)
+                            devX = 0;
+                        if (devY <= db && devY >= -db)
+                            devY = 0;
+                        // GAIN SCHEDULING (user request 2026-08-13: "first jump
+                        // immediately and then adapt to the speed"). The damping exists
+                        // only to absorb prediction error near the settling point, where
+                        // an over-correction would ring. A LARGE deviation is not a
+                        // prediction error - it is the hand genuinely moving fast, and
+                        // damping it just makes the window trail ("slow moves fine, fast
+                        // ones look off"). So: apply a large deviation in FULL and reserve
+                        // the damped gain for the small ones. Per axis, because a drag is
+                        // usually fast on one axis and settling on the other.
+                        int gainX = (devX >= (int)g_InputDragServoFastPx ||
+                                     devX <= -(int)g_InputDragServoFastPx)
+                                    ? (int)g_InputDragServoFastGainPct
+                                    : (int)g_InputDragServoGainPct;
+                        int gainY = (devY >= (int)g_InputDragServoFastPx ||
+                                     devY <= -(int)g_InputDragServoFastPx)
+                                    ? (int)g_InputDragServoFastGainPct
+                                    : (int)g_InputDragServoGainPct;
+                        int stepX = devX * gainX / 100;
+                        int stepY = devY * gainY / 100;
+                        if (g_InputDragServoClamp)
+                        {
+                            // NEVER MOVE FURTHER THAN THE HAND DID. dom0's relative
+                            // coordinate moved by (x,y) minus the previous relative
+                            // position, and no legitimate cursor motion can exceed that
+                            // plus the window's own travel since the last event. A wrong
+                            // origin reconstruction can therefore make the injected
+                            // cursor LAG, but never overshoot - which is what produced
+                            // the 'crazy extrapolated jumps' when a bad estimate was
+                            // applied at full gain (user, 2026-08-13). The bound is
+                            // deliberately generous (2x + 32px) so it never throttles a
+                            // genuinely fast hand; it exists to cap nonsense, not to
+                            // shape normal motion.
+                            int dRelX = x - g_DragLastRelX;
+                            int dRelY = y - g_DragLastRelY;
+                            if (dRelX < 0) dRelX = -dRelX;
+                            if (dRelY < 0) dRelY = -dRelY;
+                            int limX = 2 * dRelX + 32;
+                            int limY = 2 * dRelY + 32;
+                            if (stepX >  limX) stepX =  limX;
+                            if (stepX < -limX) stepX = -limX;
+                            if (stepY >  limY) stepY =  limY;
+                            if (stepY < -limY) stepY = -limY;
+                        }
+                        g_DragLastInjectedX += stepX;
+                        g_DragLastInjectedY += stepY;
+                        // Express the target as the addend the shared translation below
+                        // applies to the window-relative (x,y).
+                        trackedX = g_DragLastInjectedX - x;
+                        trackedY = g_DragLastInjectedY - y;
+                    }
+                }
+            }
+        }
 
         if (haveTracked)
         {
