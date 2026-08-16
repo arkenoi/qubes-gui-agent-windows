@@ -1563,6 +1563,8 @@ static BOOL SynthOwnerQualifies(IN const WINDOW_DATA* owner, IN const WINDOW_DAT
 //      leaves the containment materializes via the normal re-check.
 // A window that is ALREADY synthesized re-qualifies only against its recorded owner:
 // hopping owners mid-life would desync the mask/child accounting.
+static void SynthDeactivate(IN OUT WINDOW_DATA* entry);   // defined below
+
 // Hand every synthesized child of this owner back to dom0 as its own window.
 //
 // WHY AT DRAG START. Synthesis paints a contained popup into its owner's buffer, and that is only
