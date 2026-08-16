@@ -1787,15 +1787,30 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
 
     const LONG_PTR style = GetWindowLongPtr(entry->Handle, GWL_STYLE);
     const LONG_PTR ex = GetWindowLongPtr(entry->Handle, GWL_EXSTYLE);
-    SetWindowLongPtr(entry->Handle, GWL_STYLE, (style & ~(LONG_PTR)WS_CAPTION) | WS_SYSMENU);
+    SetLastError(0);
+    const LONG_PTR prev = SetWindowLongPtr(entry->Handle, GWL_STYLE,
+        (style & ~(LONG_PTR)WS_CAPTION) | WS_SYSMENU);
+    const DWORD setErr = GetLastError();
     SetWindowLongPtr(entry->Handle, GWL_EXSTYLE, ex | WS_EX_APPWINDOW);
     // SWP_NOMOVE|SWP_NOSIZE keeps the OUTER rect, so the geometry this entry was sampled with -
     // and is about to be announced with - stays correct; only the client area grows.
     SetWindowPos(entry->Handle, NULL, 0, 0, 0, 0,
         SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
     entry->CaptionHidden = TRUE;
-    LogDebug("0x%x: guest caption hidden (was inset %d), dom0's decoration is now the only header",
-        entry->Handle, topInset);
+
+    // VERIFY, do not assume: a cross-process style change can be silently refused (integrity
+    // level, session, or the app re-applying its own styles), and the first field build claimed
+    // success in the log while the window kept its caption. Read it back.
+    const LONG_PTR after = GetWindowLongPtr(entry->Handle, GWL_STYLE);
+    if (HasFlags((DWORD)after, WS_CAPTION))
+    {
+        LogWarning("0x%x: caption strip DID NOT STICK (style 0x%x -> 0x%x, prev %d, err %lu) - "
+            "leaving the window as it is", entry->Handle, (DWORD)style, (DWORD)after,
+            prev != 0, setErr);
+        return;
+    }
+    LogInfo("0x%x: guest caption hidden (was inset %d, style 0x%x -> 0x%x)",
+        entry->Handle, topInset, (DWORD)style, (DWORD)after);
 }
 
 ULONG AddWindow(IN WINDOW_DATA* entry)
