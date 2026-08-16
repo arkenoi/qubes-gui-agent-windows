@@ -829,6 +829,20 @@ static DWORD HandleMotion(IN HWND window)
         }
 
         LogVerbose("0x%x: (%d,%d)", window, x, y);
+
+        // The other half of the drag record. Announces alone say where we PUT the window;
+        // this says what dom0 told us and which origin we reconstructed against, which is
+        // what makes dom0's true apply lag recoverable offline: replay these events against
+        // the announce history at a candidate lag L and the L that minimises the injected
+        // path's reversals is dom0's real lag. InputDragAdoptMs (70 ms) was never measured
+        // against it - it was chosen conservatively - and the announce pacing is bounded
+        // below by that choice, so this is the measurement that could tighten both.
+        if (g_ProtoTrace)
+        {
+            LogInfo("QGAPROTO,msg=MOTION,hwnd=0x%x,rx=%d,ry=%d,ox=%d,oy=%d,ax=%d,ay=%d,trk=%d",
+                (uint32_t)(ULONG_PTR)window, motionMsg.x, motionMsg.y,
+                haveTracked ? trackedX : 0, haveTracked ? trackedY : 0, x, y, haveTracked ? 1 : 0);
+        }
     }
 
     // Relative coordinates of THIS motion, for the next event's clamp bound.
