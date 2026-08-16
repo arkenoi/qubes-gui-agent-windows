@@ -118,7 +118,7 @@ BOOL     g_InputDragQuantise = TRUE;   // DEFAULT: measured better than stock by
 // The knob stays wired (`qvm-features <vm> service.guestTitleBar 0` opts in) so the code path
 // can be exercised on a build where the agent has a different identity, but shipping it ON would
 // only produce one ACCESS_DENIED warning per window and change nothing on screen.
-BOOL     g_HideGuestTitleBar = FALSE;
+BOOL     g_HideGuestTitleBar = TRUE;
 BOOL     g_InputDragOriginInterp = TRUE;   // ON: user-approved baseline 2026-08-16
 DWORD    g_InputDragLagMs = 10;            // dom0 apply lag; measured L < 18 ms, median 0, p75 17
 DWORD    g_InputDragAdoptMs = 25;

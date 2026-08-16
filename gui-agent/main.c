@@ -1788,6 +1788,41 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
     const LONG_PTR style = GetWindowLongPtr(entry->Handle, GWL_STYLE);
     const LONG_PTR ex = GetWindowLongPtr(entry->Handle, GWL_EXSTYLE);
 
+    // IMPERSONATE THE WINDOW'S OWNER. As SYSTEM every SetWindowLongPtr on a user-owned window is
+    // refused with ERROR_ACCESS_DENIED (measured: style 0x14cf0000 unchanged, err 5, every
+    // window), while the identical call from a process running as that user succeeds - an
+    // Explorer window restyled by hand that way has been sitting correct and dom0-managed for
+    // hours. So borrow the target's own token for the duration: open the window's process, take
+    // an impersonation token, and act as it. If USER32 validates this per-thread we are done; if
+    // it validates per-process the verification read below reports it and we change nothing.
+    HANDLE impersonated = NULL;
+    {
+        DWORD ownerPid = 0;
+        GetWindowThreadProcessId(entry->Handle, &ownerPid);
+        HANDLE proc = ownerPid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ownerPid) : NULL;
+        if (proc)
+        {
+            HANDLE tok = NULL;
+            if (OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY, &tok))
+            {
+                HANDLE dup = NULL;
+                if (DuplicateTokenEx(tok, TOKEN_IMPERSONATE | TOKEN_QUERY, NULL,
+                        SecurityImpersonation, TokenImpersonation, &dup))
+                {
+                    if (ImpersonateLoggedOnUser(dup))
+                        impersonated = dup;
+                    else
+                        CloseHandle(dup);
+                }
+                CloseHandle(tok);
+            }
+            CloseHandle(proc);
+        }
+        if (!impersonated)
+            LogDebug("0x%x: could not impersonate the window's owner, trying as ourselves",
+                entry->Handle);
+    }
+
     // ORDER MATTERS, and getting it wrong strands the window OUTSIDE dom0's control.
     // IsPopup() calls a window an override-redirect popup unless it has WS_CAPTION *or*
     // WS_SYSMENU+WS_EX_APPWINDOW. These are two separate calls that can fail independently, so
@@ -1804,6 +1839,7 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
         LogWarning("0x%x: cannot add WS_EX_APPWINDOW (ex 0x%x, err %lu) - NOT removing the "
             "caption, because doing so would take the window out of dom0's managed set",
             entry->Handle, (DWORD)exAfter, GetLastError());
+        if (impersonated) { RevertToSelf(); CloseHandle(impersonated); }
         return;
     }
     SetLastError(0);
@@ -1820,11 +1856,12 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
     // level, session, or the app re-applying its own styles), and the first field build claimed
     // success in the log while the window kept its caption. Read it back.
     const LONG_PTR after = GetWindowLongPtr(entry->Handle, GWL_STYLE);
+    if (impersonated) { RevertToSelf(); CloseHandle(impersonated); }
     if (HasFlags((DWORD)after, WS_CAPTION))
     {
-        LogWarning("0x%x: caption strip DID NOT STICK (style 0x%x -> 0x%x, prev %d, err %lu) - "
-            "leaving the window as it is", entry->Handle, (DWORD)style, (DWORD)after,
-            prev != 0, setErr);
+        LogWarning("0x%x: caption strip DID NOT STICK (style 0x%x -> 0x%x, prev %d, err %lu, "
+            "impersonated %d) - leaving the window as it is", entry->Handle, (DWORD)style,
+            (DWORD)after, prev != 0, setErr, impersonated != NULL);
         return;
     }
     LogInfo("0x%x: guest caption hidden (was inset %d, style 0x%x -> 0x%x)",
