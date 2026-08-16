@@ -3341,13 +3341,11 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         if (windowData->PwSliceFed)
             windowData->PwSliceNeedsFull = TRUE;
         else
-            // A WGC-fed window keeps the visible-rect offset it was attached with, and that
-            // offset is (announce rect - OS window rect) - a relationship a move can change.
-            // Left stale it puts the window's invisible border INSIDE the buffer, which dom0
-            // draws at the visible-rect position: the 7 px black band down the left edge
-            // measured after a drag on 2026-08-16. Recompute it from the geometry we just
-            // adopted; WcSetCrop is a no-op when nothing moved.
-            PwRefreshCrop(windowData);
+            // The WGC crop is now stale (see the settle handler). Deliberately NOT refreshed
+            // here: WcSetCrop marks the channel dirty, so doing it per move event would force a
+            // full-window recapture at input rate - the exact cost the drag path exists to
+            // avoid. Flag it and fix it when motion stops.
+            windowData->PwCropStale = TRUE;
     }
 
     BOOL oldPopupState = windowData->IsOverrideRedirect;
@@ -4949,6 +4947,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // Quiet for PW_MOVE_SETTLE_MS: motion is over. Recapture once,
                     // regardless of where this frame's damage landed.
                     entry->PwSettleDue = FALSE;
+
+                    // Motion is over, and a full recapture is about to happen anyway: this is
+                    // the moment to fix the visible-rect offset, which a move can invalidate
+                    // (stale crop = the window's invisible border inside the buffer, drawn by
+                    // dom0 at the visible-rect position - the 7 px black band on one edge).
+                    // Doing it here rather than per move keeps the correction free.
+                    if (entry->PwCropStale)
+                    {
+                        entry->PwCropStale = FALSE;
+                        PwRefreshCrop(entry);
+                    }
                     if (entry->PwDragFrozen)
                     {
                         // The drag froze this window's content: dom0 has been showing

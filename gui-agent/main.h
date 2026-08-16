@@ -257,6 +257,7 @@ typedef struct _WINDOW_DATA
     int PwFrameX;
     int PwFrameY;
     BOOL PwSettleDue;
+    BOOL PwCropStale;      // a move invalidated the WGC visible-rect offset; fixed at settle
     DWORD PwLastMoveTick;
     DWORD PwLastMoveCapTick;
 
