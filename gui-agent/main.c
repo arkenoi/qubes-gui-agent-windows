@@ -1582,10 +1582,11 @@ static void SynthDeactivate(IN OUT WINDOW_DATA* entry);   // defined below
 // containment path at the geometry check already does.
 //
 // Caller must hold the watched-windows CS (every call site is inside the frame loop's walk).
-static void SynthMaterializeChildren(IN const WINDOW_DATA* owner, IN const WCHAR* why)
+static UINT SynthMaterializeChildren(IN const WINDOW_DATA* owner, IN const WCHAR* why)
 {
+    UINT freed = 0;
     if (!owner || owner->SynthChildCount == 0)
-        return;
+        return 0;
 
     for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; )
     {
@@ -1597,7 +1598,9 @@ static void SynthMaterializeChildren(IN const WINDOW_DATA* owner, IN const WCHAR
             c->Handle, why, owner->Handle);
         SynthDeactivate(c);
         c->DeletePending = TRUE;
+        freed++;
     }
+    return freed;
 }
 
 static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerOut)
@@ -5022,24 +5025,48 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             // just stop refreshing - the settle below hands it back.
                             entry->PwDragSlice = FALSE;
                         }
+                        BOOL deferFreeze = FALSE;
                         if (!entry->PwDragFrozen)
                         {
-                            // CLAIM THE CHANNEL. Suppressing our own recapture is not
-                            // enough: the capture engine sweeps live channels on its own
-                            // timer and services pending dirty marks, and each of those is
-                            // a PrintWindow into the DRAGGED APP'S thread - the very stall
-                            // this freeze exists to remove (measured 156-259 ms on a cold
-                            // first drag, 0 ms once warm). Owning the channel for the
-                            // duration is what makes the freeze actually quiet.
-                            WcSetDdaOwned(entry->Handle, TRUE);
-                            entry->PwDdaActive = FALSE;
-                            // Freeze is engaging: any popup composited into this buffer would now
-                            // travel with the window. Hand them back before that can happen.
-                            SynthMaterializeChildren(entry, L"drag freeze");
+                            // DETACH COMPOSITED POPUPS BEFORE FREEZING, AND LET ONE CLEAN
+                            // CAPTURE HAPPEN FIRST. Materializing alone is not enough and the
+                            // first attempt at this failed for exactly that reason: the child's
+                            // pixels are ALREADY PAINTED into the owner's buffer, so detaching
+                            // it changes nothing about the bitmap - the menu still travelled with
+                            // the window ("still drags out"). SynthDeactivate marks the owner
+                            // dirty precisely to repaint that region with the owner's own
+                            // content, but a claimed channel and a frozen buffer both suppress
+                            // that repaint.
+                            // So when we actually free a child, skip engaging the freeze for THIS
+                            // frame: the normal path recaptures the owner without the child, and
+                            // the freeze takes hold on the next frame over a clean bitmap. The
+                            // cost is one extra PrintWindow at drag start, once, only when a
+                            // popup was open.
+                            if (SynthMaterializeChildren(entry, L"drag freeze") > 0)
+                            {
+                                LogDebug("QGADRAGFREEZE,ev=defer,hwnd=0x%x (clean recapture first)",
+                                    (uint32_t)(ULONG_PTR)entry->Handle);
+                                deferFreeze = TRUE;
+                            }
+                            else
+                            {
+                                // CLAIM THE CHANNEL. Suppressing our own recapture is not
+                                // enough: the capture engine sweeps live channels on its own
+                                // timer and services pending dirty marks, and each of those is
+                                // a PrintWindow into the DRAGGED APP'S thread - the very stall
+                                // this freeze exists to remove (measured 156-259 ms on a cold
+                                // first drag, 0 ms once warm). Owning the channel for the
+                                // duration is what makes the freeze actually quiet.
+                                WcSetDdaOwned(entry->Handle, TRUE);
+                                entry->PwDdaActive = FALSE;
+                            }
                         }
-                        entry->PwDragFrozen = TRUE;
-                        LogDebug("QGADRAGFREEZE,ev=hold,hwnd=0x%x",
-                            (uint32_t)(ULONG_PTR)entry->Handle);
+                        if (!deferFreeze)
+                        {
+                            entry->PwDragFrozen = TRUE;
+                            LogDebug("QGADRAGFREEZE,ev=hold,hwnd=0x%x",
+                                (uint32_t)(ULONG_PTR)entry->Handle);
+                        }
                     }
                     else if (dragSliceReady)
                     {
@@ -5460,13 +5487,22 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         if (entry->DaemonStreamTick != 0 &&
             (GetTickCount() - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS)
         {
-            // Same reason as the guest-native latch: the hold freezes this window's dom0
-            // content, so a composited popup would travel with it. Fire once, on the
-            // transition into the hold, not every frame of the drive.
-            if (!entry->DaemonDamageHeld)
-                SynthMaterializeChildren(entry, L"dom0 drive hold");
-            daemonHoldDamage = TRUE;
-            entry->DaemonDamageHeld = TRUE;
+            // Same reason as the guest-native latch, and the same one-cycle deferral: holding
+            // damage freezes dom0's copy of this window, and dom0's copy still contains the
+            // child's painted pixels. Detaching the child does not repaint them - the damage
+            // that would is exactly what the hold suppresses. So on the transition, materialize
+            // and let THIS cycle's damage through; the hold engages on the next one, over a
+            // window dom0 has already seen without the popup.
+            if (!entry->DaemonDamageHeld && SynthMaterializeChildren(entry, L"dom0 drive hold") > 0)
+            {
+                LogDebug("0x%x: dom0 drive hold deferred one cycle (clean repaint first)",
+                    (uint32_t)(ULONG_PTR)entry->Handle);
+            }
+            else
+            {
+                daemonHoldDamage = TRUE;
+                entry->DaemonDamageHeld = TRUE;
+            }
         }
         else if (g_InputDragFreeze && g_InputDragOriginValid && entry->Handle == g_InputDragWindow &&
                  entry->CfgPendingPos)
