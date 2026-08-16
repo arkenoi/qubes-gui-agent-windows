@@ -40,17 +40,12 @@ BOOL     g_ButtonAbsolute = TRUE;
 // the natural anchor, let dom0 move only the frame) - a separate future experiment.
 DWORD    g_ShellManaged = SHELL_MANAGED_NONE;
 BOOL     g_SeamlessStart = FALSE;
-// DEFAULT OFF since 2026-08-16. It shipped ON in 4.3.2 and cost the reporter every menu he had:
-// the block drops Super presses and Mod4 chords for the whole seamless session, and in seamless the
-// taskbar HWND is never mapped, so the Windows key is the ONLY entry point to a Start menu - stock
-// or Open-Shell alike. We had already dropped the stock Start menu as unsupported and told him
-// Open-Shell was the answer (forum 42717 #6/#7, he confirmed it working in post 55), so this flag
-// suppressed a menu we do not support by killing the one we recommend. Forum 42717 post 64:
-// "Neither the Windows nor the Open-Shell menu can be used at all."
-// Suppressing the stock Start's garbled rendering is cosmetic; removing the user's only menu is
-// functional. Keep the mechanism - it is correct for anyone who wants stock Start suppressed - but
-// it is opt-in now, per the blast-radius gate in docs/RELEASE-TESTING-PROTOCOL.md.
-BOOL     g_BlockMenuKey = FALSE;
+// Blocked by default; dom0 re-enables per qube with `qvm-features <vm> service.enableWinKey 1`
+// (see the qubesdb read in PerfInit). That is the designed remedy and it is deliberate: the admin
+// decides what a qube may take from the window manager. Forum 42717 post 64 was NOT this default
+// being wrong - it was the remedy being undiscoverable, so the reporter had no way to know it
+// existed. The fix for that is documentation and telling him the command, not flipping the default.
+BOOL     g_BlockMenuKey = TRUE;
 BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
 BOOL     g_FrameDrop   = FALSE;
@@ -251,8 +246,8 @@ void PerfInit(void)
     // desktop conventions, so the Super/Windows key always reaches Windows regardless of what is
     // configured here. Everything below is about SEAMLESS mode only, where dom0 owns the key.
     {
-        DWORD bv = 0;
-        BOOL blk = FALSE;
+        DWORD bv = 1;
+        BOOL blk = TRUE;
         if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_BLOCK_MENU_KEY_VALUE, &bv, NULL))
             blk = (bv != 0);
