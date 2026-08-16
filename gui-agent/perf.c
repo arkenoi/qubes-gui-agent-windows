@@ -98,7 +98,7 @@ BOOL     g_InputDragQuantise = TRUE;   // DEFAULT: measured better than stock by
 // and the p99=180 px spurious per-event jump we measured - stops existing. This adds no lag, which
 // is what distinguishes it from damping/servo: a damper would smooth the step by withholding motion
 // and hand back the latency the 70->25 ladder just bought.
-BOOL     g_InputDragOriginInterp = FALSE;  // OFF by default until measured against 25/50
+BOOL     g_InputDragOriginInterp = TRUE;   // ON: user-approved baseline 2026-08-16
 DWORD    g_InputDragLagMs = 10;            // dom0 apply lag; measured L < 18 ms, median 0, p75 17
 DWORD    g_InputDragAdoptMs = 25;
 DWORD    g_InputDragAnnounceMs = 50;   // 0 = natural rate, which DESTROYS the quantised origin
