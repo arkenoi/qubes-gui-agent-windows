@@ -152,6 +152,156 @@ BOOL PwIsAttached(IN const WINDOW_DATA* entry)
     return entry->PwDumpSent;
 }
 
+// GRANT SLAB POOL. The Windows grant driver as shipped never returns a reference: xeniface's only
+// RevokeForeignAccess call sits inside an ASSERT, which a release build compiles out (verified by
+// disassembling the shipped xeniface.sys). So every grant this agent creates is permanent for the
+// life of the domain, and a per-window buffer granted per window APPEARANCE burns ~2025 refs at
+// 1080p and never gets them back. Measured on 2026-08-16: the guest's pool is ~1,048,576 refs and
+// dies at 144 agent restarts (7200 pages each); at ~2025 per window it dies after ~517 windows -
+// an afternoon of opening and closing applications. The end state is a qube that runs, answers
+// qrexec, and can never show a window again until it is restarted.
+//
+// We cannot fix the driver (it is XenProject's, and we stage it bit-identical from a signed MSI),
+// so the agent must stop making grants a function of ACTIVITY. Slabs are granted once, kept for
+// ever, and reused: references then scale with PEAK CONCURRENT WINDOWS instead of with window
+// history, which is a constant a guest cannot walk off the end of.
+//
+// Sizing: capacity is rounded up to PW_SLAB_GRANULARITY pages so that similar windows share a
+// class and a resize inside the class needs no new grant at all. Handing the daemon a LARGER ref
+// count than the geometry needs is explicitly safe - the screen path already relies on it ("the
+// daemon accepts a larger-than-needed count; only a too-small one is exit(1)").
+//
+// Quarantine: dom0 may still map a buffer for a moment after detach (that is why the revoke path
+// was deferred in the first place). A slab therefore becomes reusable only after
+// PW_SLAB_QUARANTINE_MS, so a fresh window cannot be handed pages the daemon is still compositing
+// the previous one from. Same-guest only - no isolation boundary is involved - but it would be a
+// visible flash of the wrong window.
+#define PW_SLAB_GRANULARITY   256      // pages (1 MB) - bounds waste per window
+#define PW_SLAB_QUARANTINE_MS 2000
+
+typedef struct _PW_SLAB
+{
+    PVOID  Buffer;
+    ULONG* Refs;
+    PVOID  Shared;      // grant handle
+    ULONG  Pages;       // granted capacity, >= any window that uses it
+    BOOL   InUse;
+    ULONGLONG FreeAt;   // tick after which a released slab may be reused
+    struct _PW_SLAB* Next;
+} PW_SLAB;
+
+static PW_SLAB* g_PwSlabs = NULL;
+static CRITICAL_SECTION g_PwSlabLock;
+static BOOL g_PwSlabLockInit = FALSE;
+static ULONG g_PwSlabsCreated = 0;   // grants we had to make (the number that must stay bounded)
+static ULONG g_PwSlabsReused = 0;    // attaches served without a new grant
+
+static void PwSlabLockInit(void)
+{
+    if (!g_PwSlabLockInit)
+    {
+        InitializeCriticalSection(&g_PwSlabLock);
+        g_PwSlabLockInit = TRUE;
+    }
+}
+
+// Take a slab that can hold pageCount pages, granting a new one only if nothing fits.
+static PW_SLAB* PwSlabAcquire(IN ULONG pageCount)
+{
+    PwSlabLockInit();
+    const ULONGLONG now = GetTickCount64();
+    PW_SLAB* best = NULL;
+
+    EnterCriticalSection(&g_PwSlabLock);
+    for (PW_SLAB* s = g_PwSlabs; s; s = s->Next)
+    {
+        if (s->InUse || s->Pages < pageCount || now < s->FreeAt)
+            continue;
+        if (!best || s->Pages < best->Pages)   // smallest that fits: keep big slabs for big windows
+            best = s;
+    }
+    if (best)
+    {
+        best->InUse = TRUE;
+        g_PwSlabsReused++;
+        LeaveCriticalSection(&g_PwSlabLock);
+        LogDebug("PWSLAB reused %lu-page slab for %lu pages (created=%lu reused=%lu)",
+                 best->Pages, pageCount, g_PwSlabsCreated, g_PwSlabsReused);
+        return best;
+    }
+    LeaveCriticalSection(&g_PwSlabLock);
+
+    // Nothing fits: this is the only path that consumes grant references, and every one it
+    // consumes is permanent. Round up so the slab can serve a whole size class later.
+    ULONG capacity = ((pageCount + PW_SLAB_GRANULARITY - 1) / PW_SLAB_GRANULARITY) * PW_SLAB_GRANULARITY;
+    if (capacity < pageCount)
+        capacity = pageCount;   // overflow guard
+
+    PW_SLAB* slab = (PW_SLAB*)calloc(1, sizeof(*slab));
+    if (!slab)
+        return NULL;
+
+    slab->Buffer = VirtualAlloc(NULL, (size_t)capacity * PAGE_SIZE,
+                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+    if (!slab->Buffer)
+    {
+        free(slab);
+        return NULL;
+    }
+    slab->Refs = (ULONG*)malloc(capacity * sizeof(ULONG));
+    if (!slab->Refs)
+    {
+        VirtualFree(slab->Buffer, 0, MEM_RELEASE);
+        free(slab);
+        return NULL;
+    }
+
+    ULONG status = XcGnttabPermitForeignAccess2(g_PwXc, g_GuiDomainId, slab->Buffer, capacity,
+                                                0, 0, XENIFACE_GNTTAB_READONLY,
+                                                &slab->Shared, slab->Refs);
+    if (status != ERROR_SUCCESS)
+    {
+        win_perror2(status, "XcGnttabPermitForeignAccess2(slab)");
+        free(slab->Refs);
+        VirtualFree(slab->Buffer, 0, MEM_RELEASE);
+        free(slab);
+        return NULL;
+    }
+
+    slab->Pages = capacity;
+    slab->InUse = TRUE;
+    EnterCriticalSection(&g_PwSlabLock);
+    slab->Next = g_PwSlabs;
+    g_PwSlabs = slab;
+    g_PwSlabsCreated++;
+    LeaveCriticalSection(&g_PwSlabLock);
+
+    LogInfo("PWSLAB granted a new %lu-page slab for %lu pages (created=%lu reused=%lu) - this is "
+            L"the only path that spends grant references, and they are never returned",
+            capacity, pageCount, g_PwSlabsCreated, g_PwSlabsReused);
+    return slab;
+}
+
+// Return a slab to the pool. Deliberately does NOT revoke: the revoke is a no-op in the shipped
+// driver, and keeping the grant is the entire point - the pages are ours to hand out again.
+static void PwSlabRelease(IN PVOID buffer)
+{
+    if (!buffer)
+        return;
+    PwSlabLockInit();
+    EnterCriticalSection(&g_PwSlabLock);
+    for (PW_SLAB* s = g_PwSlabs; s; s = s->Next)
+    {
+        if (s->Buffer == buffer)
+        {
+            s->InUse = FALSE;
+            s->FreeAt = GetTickCount64() + PW_SLAB_QUARANTINE_MS;
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_PwSlabLock);
+}
+
 static void PwQueueRevoke(PVOID shared, ULONG* refs, PVOID buffer)
 {
     PW_PENDING_REVOKE* p = (PW_PENDING_REVOKE*)malloc(sizeof(*p));
@@ -270,29 +420,18 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     const size_t imageBytes = (size_t)entry->Width * entry->Height * 4;
     const ULONG pageCount = (ULONG)((imageBytes + PAGE_SIZE - 1) / PAGE_SIZE);
 
-    PVOID buffer = VirtualAlloc(NULL, (size_t)pageCount * PAGE_SIZE,
-                                MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-    if (!buffer)
+    // Take a pooled slab. Only a pool MISS spends grant references, and on this driver they are
+    // spent for ever - see the PW_SLAB comment. The slab may be larger than this window needs;
+    // that is deliberate and safe, and it is what lets the next window (or the next size within
+    // the class) attach without granting anything at all.
+    PW_SLAB* slab = PwSlabAcquire(pageCount);
+    if (!slab)
         return ERROR_NOT_ENOUGH_MEMORY;
 
-    ULONG* refs = (ULONG*)malloc(pageCount * sizeof(ULONG));
-    if (!refs)
-    {
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return ERROR_NOT_ENOUGH_MEMORY;
-    }
-
-    PVOID shared = NULL;
-    status = XcGnttabPermitForeignAccess2(g_PwXc, g_GuiDomainId, buffer, pageCount,
-                                          0, 0, XENIFACE_GNTTAB_READONLY,
-                                          &shared, refs);
-    if (status != ERROR_SUCCESS)
-    {
-        win_perror2(status, "XcGnttabPermitForeignAccess2(window)");
-        free(refs);
-        VirtualFree(buffer, 0, MEM_RELEASE);
-        return status;
-    }
+    PVOID buffer = slab->Buffer;
+    ULONG* refs = slab->Refs;
+    PVOID shared = slab->Shared;
+    const ULONG grantedPages = slab->Pages;   // what the daemon is told about
 
     if (!sliceFed)
     {
@@ -314,8 +453,7 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
         {
             LogInfo("WcAddWindow(0x%x) failed 0x%x - staying on legacy path",
                      entry->Handle, status);
-            PwQueueRevoke(shared, refs, buffer);
-            PwRevokeTick(); // nothing maps it yet; usually succeeds immediately
+            PwSlabRelease(buffer);   // back to the pool; never revoked, never freed
             return status;
         }
 
@@ -360,8 +498,8 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     // Fresh channel starts un-owned in the engine, so the drag-slice must re-engage
     // (re-claim ownership) before its next copy - a mid-drag resize lands here.
     entry->PwDragSlice = FALSE;
-    LogInfo("0x%x: per-window buffer %ux%u (%lu pages) attached%s",
-             entry->Handle, entry->Width, entry->Height, pageCount,
+    LogInfo("0x%x: per-window buffer %ux%u (%lu pages of a %lu-page slab) attached%s",
+             entry->Handle, entry->Width, entry->Height, pageCount, grantedPages,
              sliceFed ? L" (slice-fed)" : L"");
     return ERROR_SUCCESS;
 }
@@ -374,7 +512,9 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
             entry->PwWidth, entry->PwHeight, entry->PwSliceFed ? L" (slice-fed)" : L"");
     if (!entry->PwSliceFed)
         WcRemoveWindow(entry->Handle);
-    PwQueueRevoke(entry->PwGrantHandle, entry->PwGrantRefs, entry->PwBuffer);
+    // The slab goes back to the pool, still granted. Revoking would achieve nothing on the shipped
+    // driver and freeing the pages would strand the references for ever.
+    PwSlabRelease(entry->PwBuffer);
     entry->PwBuffer = NULL;
     entry->PwPageCount = 0;
     entry->PwGrantRefs = NULL;
