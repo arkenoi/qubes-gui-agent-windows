@@ -1563,6 +1563,41 @@ static BOOL SynthOwnerQualifies(IN const WINDOW_DATA* owner, IN const WINDOW_DAT
 //      leaves the containment materializes via the normal re-check.
 // A window that is ALREADY synthesized re-qualifies only against its recorded owner:
 // hopping owners mid-life would desync the mask/child accounting.
+// Hand every synthesized child of this owner back to dom0 as its own window.
+//
+// WHY AT DRAG START. Synthesis paints a contained popup into its owner's buffer, and that is only
+// correct while the buffer is FRESH: a menu is a separate top-level window that does NOT move when
+// its owner is dragged, so the composite is right only as long as it is recaptured. A drag freezes
+// the owner's content (PwDragFrozen / DaemonDamageHeld - no recapture until settle), so from the
+// first frozen frame the painted menu TRAVELS WITH THE WINDOW while the real one stays put, and
+// when the owner finally moves far enough the containment test materializes the child at the
+// position the owner has already left. Captured 2026-08-16: Explorer's Home ribbon panel rendered
+// as its own red-bordered dom0 window on top of an unrelated terminal.
+//
+// So materialize at the moment the freeze engages, not after containment breaks. The child is then
+// announced at its true screen position and never rides inside a stale bitmap. Materialization
+// funnels through the normal add path (DeletePending -> re-examined -> announced), exactly as the
+// containment path at the geometry check already does.
+//
+// Caller must hold the watched-windows CS (every call site is inside the frame loop's walk).
+static void SynthMaterializeChildren(IN const WINDOW_DATA* owner, IN const WCHAR* why)
+{
+    if (!owner || owner->SynthChildCount == 0)
+        return;
+
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; )
+    {
+        WINDOW_DATA* c = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        e = e->Flink;
+        if (!c->Synthesized || c->SynthOwner != owner->Handle)
+            continue;
+        LogInfo("0x%x: %s - materializing synthesized child of 0x%x before its buffer freezes",
+            c->Handle, why, owner->Handle);
+        SynthDeactivate(c);
+        c->DeletePending = TRUE;
+    }
+}
+
 static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerOut)
 {
     if (!entry->IsOverrideRedirect || entry->IsIconic || !entry->IsVisible)
@@ -4996,6 +5031,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             // duration is what makes the freeze actually quiet.
                             WcSetDdaOwned(entry->Handle, TRUE);
                             entry->PwDdaActive = FALSE;
+                            // Freeze is engaging: any popup composited into this buffer would now
+                            // travel with the window. Hand them back before that can happen.
+                            SynthMaterializeChildren(entry, L"drag freeze");
                         }
                         entry->PwDragFrozen = TRUE;
                         LogDebug("QGADRAGFREEZE,ev=hold,hwnd=0x%x",
@@ -5420,6 +5458,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         if (entry->DaemonStreamTick != 0 &&
             (GetTickCount() - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS)
         {
+            // Same reason as the guest-native latch: the hold freezes this window's dom0
+            // content, so a composited popup would travel with it. Fire once, on the
+            // transition into the hold, not every frame of the drive.
+            if (!entry->DaemonDamageHeld)
+                SynthMaterializeChildren(entry, L"dom0 drive hold");
             daemonHoldDamage = TRUE;
             entry->DaemonDamageHeld = TRUE;
         }
