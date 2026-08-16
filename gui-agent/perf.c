@@ -53,9 +53,6 @@ BOOL     g_InputDragFreeze = FALSE; // fallback tier only; the servo below is th
 // reconstruction ran ahead so the deviation collapsed to zero. Shipping the historic
 // translation keeps the drag path predictable and free of a mechanism that can fail in two
 // modes; the residual ~16% announce wobble is the SAME one present in the build the user
-// called "works well", and its real fix is structural (see docs/PLAN-drag-quality.md).
-// Set InputDragServo=1 to re-enable for further experiments.
-BOOL     g_InputDragServo = FALSE;
 
 // QUANTISED-ORIGIN DRAG (InputDragQuantise=1). Reconstruct the dom0 cursor against the last
 // announce dom0 has CERTAINLY applied, instead of the live window position (which leads dom0 and
@@ -63,21 +60,9 @@ BOOL     g_InputDragServo = FALSE;
 // InputDragAdoptMs is how long an announce is assumed to take to land - below it the previous
 // origin is kept. InputDragAnnounceMs paces announces during the drag: larger means dom0's window
 // steps rather than glides, but the origin is settled a larger fraction of the time.
-BOOL     g_InputDragQuantise = FALSE;
+BOOL     g_InputDragQuantise = TRUE;   // default ON: what it replaces is the oscillator itself
 DWORD    g_InputDragAdoptMs = 120;
 DWORD    g_InputDragAnnounceMs = 0;   // 0 = announce at the natural rate
-DWORD    g_InputDragServoGainPct = 85;  // user-accepted on the guest 2026-08-13 (was 60):
-                                       // damped enough to absorb predictor error, snappy
-                                       // enough that slow drags track cleanly
-DWORD    g_InputDragServoTauMs = 25;   // assumed announce transit+apply time
-DWORD    g_InputDragServoDeadband = 3;
-DWORD    g_InputDragServoFastPx = 24;
-BOOL     g_InputDragServoClamp = TRUE;
-// Gain scheduling is NEUTRAL by default (fast gain == base gain). At 100% a mis-reconstructed
-// dom0 origin was applied in full and produced 'crazy extrapolated jumps' on fast drags
-// (user, 2026-08-13); the damping had been absorbing those prediction errors. Re-enable per
-// guest via InputDragServoFastGainPct once the clamp below is proven in the field.
-DWORD    g_InputDragServoFastGainPct = 85;
 BOOL     g_DdaMoveInvalidate = TRUE;
 BOOL     g_InputDragSlice = TRUE;
 BOOL     g_InputDragFreezeContent = TRUE;
@@ -93,251 +78,11 @@ __declspec(thread) LONG     g_PerfSendCount = 0;
 
 // Accumulated over g_PerfEveryN frames. Touched only by the main loop.
 typedef struct _PERF_ACC
-{
-    UINT     frames;
-    LONGLONG dt;        // wall time covered by those frames
-    LONGLONG acquire;
-    LONGLONG wakeup;
-    LONGLONG moverect;
-    LONGLONG dirtyrect;
-    LONGLONG update;
-    LONGLONG enumerate;
-    LONGLONG remove;
-    LONGLONG damage;
-    LONGLONG send;
-    LONGLONG total;
-    LONG     sends;
-    UINT     dirty_rects;
-    UINT     move_rects;
-    UINT64   dirty_area;
-    UINT     interrogated;  // windows actually queried
-    UINT     events;        // window events applied
-    UINT     windows;   // last value, not a sum
-    BOOL     seamless;  // last value
-} PERF_ACC;
-
-static PERF_ACC g_Acc;
-static UINT64   g_Seq = 0;              // processed frames since agent start
-static UINT     g_MoveRectsMax = 0;     // high water mark, survives into every record
-static BOOL     g_MoveRectsReported = FALSE;
-static LONGLONG g_PrevFrameQpc = 0;
-static LONGLONG g_EmitTicks = 0;        // cost of the *previous* emit, reported as "log"
-static volatile LONG g_SkippedFrames = 0;   // capture thread -> main loop
-static volatile LONG g_PwSkipped = 0;       // per-window recaptures avoided (screen bytes unchanged)
-static volatile LONG g_PwCaptured = 0;      // per-window recaptures actually issued
-static volatile LONG g_PwRefuse[PW_REFUSE_MAX];  // why the fast path declined, by cause
-static volatile LONG g_RedundantFrames = 0;      // frames dropped: damage reported, pixels identical
-static volatile LONG g_DdaCaptures = 0;          // windows served from the composited desktop
-
-void PerfInit(void)
-{
-    LARGE_INTEGER freq;
-    WCHAR moduleName[CFG_MODULE_MAX];
-    WCHAR env[8];
-    DWORD value;
-    BOOL enabled = (QGA_PERF_DEFAULT != 0);
-
-    QueryPerformanceFrequency(&freq);
-    g_PerfFreq = freq.QuadPart;
-
-    if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)))
-    {
-        {
-            DWORD qv = 0;
-            if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragQuantise", &qv, NULL))
-                g_InputDragQuantise = (qv != 0);
-            DWORD av = 0;
-            if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragAdoptMs", &av, NULL) && av > 0)
-                g_InputDragAdoptMs = av;
-            DWORD nv = 0;
-            if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragAnnounceMs", &nv, NULL))
-                g_InputDragAnnounceMs = nv;
-            LogInfo("QGADRAGQUANT %s (adopt=%lu ms, announce pacing=%lu ms)",
-                g_InputDragQuantise ? L"on" : L"off", g_InputDragAdoptMs, g_InputDragAnnounceMs);
-        }
-
-        if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PERF_VALUE, &value, NULL))
-            enabled = (value != 0);
-
-        if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PERF_EVERY_VALUE, &value, NULL) && value > 0)
-            g_PerfEveryN = value;
-    }
-
-    if (GetEnvironmentVariable(PERF_ENV_VALUE, env, RTL_NUMBER_OF(env)) > 0)
-        enabled = (env[0] != L'0');
-
-    g_PerfEnabled = enabled;
-
-    // Protocol trace is independent of the perf switch: it is about correctness, not cost.
-    {
-        BOOL proto = FALSE;
-        DWORD pv = 0;
-        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
-            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PROTO_VALUE, &pv, NULL))
-            proto = (pv != 0);
-        if (GetEnvironmentVariable(PROTO_ENV_VALUE, env, RTL_NUMBER_OF(env)) > 0)
-            proto = (env[0] != L'0');
-        g_ProtoTrace = proto;
-
-        // The per-rect live-rect (wobble) probe is opt-in on top of ProtoTrace: it costs a
-        // DWM query + lock per damage rect, which under a drag is a measured tail hazard.
-        BOOL wobble = FALSE;
-        DWORD wv = 0;
-        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
-            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PROTO_WOBBLE_VALUE, &wv, NULL))
-            wobble = (wv != 0);
-        g_ProtoTraceWobble = wobble;
-        LogInfo("QGAPROTO %s (wobble probe %s)", g_ProtoTrace ? L"on" : L"off",
-            g_ProtoTraceWobble ? L"on" : L"off");
-    }
-
-    // Z-order sync switch. Read here for the same reason as ProtoTrace: it is behaviour, not
-    // measurement, so it must apply whether or not the perf log is on. Logged unconditionally
-    // so any captured log states which condition produced it - a hit rate is meaningless
-    // without knowing whether the raise was active.
-    {
-        BOOL raise = FALSE;
-        DWORD rv = 0;
-        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
-            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_FOCUS_RAISE_VALUE, &rv, NULL))
-            raise = (rv != 0);
-        g_FocusRaise = raise;
-        LogInfo("QGAFOCUSRAISE %s", g_FocusRaise ? L"on" : L"off");
-    }
-
-    // Button events carry their own absolute position (fixes clicks landing wherever the
-    // last motion happened to be - the unclickable-toast defect). Default ON; the registry
-    // switch exists as the escape hatch for the interleaved regression run.
-    {
-        BOOL btnAbs = TRUE;
-        DWORD bv = 1;
-        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
-            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_BUTTON_ABS_VALUE, &bv, NULL))
-            btnAbs = (bv != 0);
-        g_ButtonAbsolute = btnAbs;
-        LogInfo("QGABUTTONABS %s", g_ButtonAbsolute ? L"on" : L"off");
-    }
-
-    // Shell-surface policy: 0 = none (all or=1), 1 = all managed, 2 = Start-only managed
-    // (default - the GWeck goal state: movable+size-locked Start, corner-popup toasts).
-    {
-        DWORD mv = SHELL_MANAGED_NONE;
-        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
-            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SHELL_MANAGED_VALUE, &mv, NULL))
-        {
-            if (mv > SHELL_MANAGED_START)
-                mv = SHELL_MANAGED_START;
-        }
-        else
-            mv = SHELL_MANAGED_NONE;
-        g_ShellManaged = mv;
-        LogInfo("QGASHELLMANAGED policy=%u (0=none 1=all 2=start-only)", g_ShellManaged);
-    }
-
-    // Menu-key block (seamless only; see perf.h).
-    //
-    // SCOPE, deliberately: the block is applied as `g_BlockMenuKey && g_SeamlessMode`, so this
-    // flag NEVER affects fullscreen mode. There the guest owns the whole screen and its own
-    // desktop conventions, so the Super/Windows key always reaches Windows regardless of what is
-    // configured here. Everything below is about SEAMLESS mode only, where dom0 owns the key.
-    {
-        DWORD bv = 1;
-        BOOL blk = TRUE;
-        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
-            ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_BLOCK_MENU_KEY_VALUE, &bv, NULL))
-            blk = (bv != 0);
-
-        // dom0-side knob, and it WINS over the guest registry value: the admin decides what a
-        // qube may take from the window manager, not the guest. Set from dom0 with
-        //
-        //     qvm-features <vm> service.enableWinKey 1
-        //
-        // `service.`-prefixed features are the ones Qubes exports into the guest's qubesdb (as
-        // /qubes-service/<name>); a plain feature stays dom0-side and the guest could never see
-        // it, which is why the name carries that prefix.
-        //
-        // DEFAULT OFF: absent feature means the key stays blocked in seamless mode, which is the
-        // behaviour every existing qube already has. It exists for guests running a third-party
-        // shell - OpenShell and friends - where the Super key is how the user opens their menu and
-        // swallowing it makes the shell unusable.
-        {
-            qdb_handle_t qdb = qdb_open(NULL);
-            if (qdb)
-            {
-                char *v = qdb_read(qdb, "/qubes-service/enableWinKey", NULL);
-                if (v)
-                {
-                    // Any value but "0" enables the key; Qubes writes "1" for a set service.
-                    blk = (v[0] == '0');
-                    LogInfo("QGABLOCKWIN qubesdb enableWinKey=%S -> block %s", v, blk ? L"on" : L"off");
-                    free(v);
-                }
-                qdb_close(qdb);
-            }
-        }
-
-        g_BlockMenuKey = blk;
-        LogInfo("QGABLOCKWIN %s (seamless only; fullscreen always passes the key)",
-                g_BlockMenuKey ? L"on" : L"off");
-    }
-
-    // Attribution switches - registry default, marker file overrides at runtime.
-    {
-        DWORD v = 0;
-        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)))
-        {
-            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_DDA_CAPTURE_VALUE, &v, NULL))
-                g_DdaCapture = (v != 0);
-            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_FRAME_DROP_VALUE, &v, NULL))
-                g_FrameDrop = (v != 0);
-            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SWEEP_EXEMPT_VALUE, &v, NULL))
-                g_SweepDdaExempt = (v != 0);
-        }
-        LogInfo("QGADDACAPTURE %s", g_DdaCapture ? L"on" : L"off");
-        LogInfo("QGAFRAMEDROP %s", g_FrameDrop ? L"on" : L"off");
-        LogInfo("QGASWEEPEXEMPT %s", g_SweepDdaExempt ? L"on" : L"off");
-    }
-
-    // Drag-wobble / mis-render fixes and upd-spike experiments. Logged unconditionally,
-    // like the switches above: an acceptance run is meaningless without knowing which
-    // condition the deployed binary ran under.
-    {
-        DWORD v = 0;
-        if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)))
-        {
-            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_FREEZE_VALUE, &v, NULL))
-                g_InputDragFreeze = (v != 0);
-            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_VALUE, &v, NULL))
-                g_InputDragServo = (v != 0);
-            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_GAIN_VALUE, &v, NULL))
-            {
-                // 0 would inject a constant (a freeze that still announces - nonsense);
-                // >100 would overshoot every event. The unstable 66..100 range stays
-                // reachable ON PURPOSE: gain=100 is the defect-reintroduction falsifier.
-                if (v < 1)
-                    v = 1;
-                if (v > 100)
-                    v = 100;
-                g_InputDragServoGainPct = v;
-            }
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_TAU_VALUE, &v, NULL))
-            {
-                if (v > 250) // beyond the max measured apply lag: a misconfiguration
-                    v = 250;
-                g_InputDragServoTauMs = v;
-            }
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_FASTPX_VALUE, &v, NULL))
-                g_InputDragServoFastPx = v;
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_FASTGAIN_VALUE, &v, NULL) && v <= 100)
-                g_InputDragServoFastGainPct = v;
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_CLAMP_VALUE, &v, NULL))
-                g_InputDragServoClamp = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SERVO_DEADBAND_VALUE, &v, NULL))
-            {
-                if (v > 50) // larger than the smallest measured oscillation (40 px):
-                    v = 50; // past that the dead zone is itself a visible defect
-                g_InputDragServoDeadband = v;
-            }
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_DDA_MOVE_INVALIDATE_VALUE, &v, NULL))
                 g_DdaMoveInvalidate = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_SLICE_VALUE, &v, NULL))
@@ -355,10 +100,6 @@ void PerfInit(void)
         }
         LogInfo("QGADRAGFREEZE %s", g_InputDragFreeze ? L"on" : L"off");
         LogInfo("QGADRAGSERVO %s gain=%u%% tau=%ums deadband=%upx fast>=%upx@%u%% clamp=%s",
-            g_InputDragServo ? L"on" : L"off", g_InputDragServoGainPct,
-            g_InputDragServoTauMs, g_InputDragServoDeadband,
-            g_InputDragServoFastPx, g_InputDragServoFastGainPct,
-            g_InputDragServoClamp ? L"on" : L"off");
         LogInfo("QGADDAMOVEINV %s", g_DdaMoveInvalidate ? L"on" : L"off");
         LogInfo("QGADRAGSLICE %s", g_InputDragSlice ? L"on" : L"off");
         LogInfo("QGADRAGFREEZECONTENT %s", g_InputDragFreezeContent ? L"on" : L"off");

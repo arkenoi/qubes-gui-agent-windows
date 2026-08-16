@@ -219,23 +219,15 @@ extern BOOL     g_SweepDdaExempt;
 extern BOOL     g_InputDragFreeze;
 
 // Live-feedback drag servo (see the knob block above and g_DragAnnounces in main.c).
-extern BOOL     g_InputDragServo;
 extern BOOL     g_InputDragQuantise;
 extern DWORD    g_InputDragAdoptMs;
 extern DWORD    g_InputDragAnnounceMs;
-extern DWORD    g_InputDragServoGainPct;
-extern DWORD    g_InputDragServoTauMs;
-extern DWORD    g_InputDragServoDeadband;
-// Above this per-axis deviation the servo applies g_InputDragServoFastGainPct (default
 // 100%) instead of the damped gain: a big deviation means the hand is moving fast, not
 // that the predictor is wrong, and damping it only makes the window trail.
 // Never let the injected cursor move FURTHER in one event than the hand actually moved
 // (dom0's own relative delta bounds legitimate motion). A wrong origin reconstruction can
 // then only make the window lag, never extrapolate - the failure the user saw as 'crazy
 // extrapolated jumps' when the full gain applied a bad estimate.
-extern BOOL     g_InputDragServoClamp;
-extern DWORD    g_InputDragServoFastPx;
-extern DWORD    g_InputDragServoFastGainPct;
 
 // Drop DDA ownership when the frame loop sees a window move (D2 mis-render). Default
 // ON: without it the move-settle recapture is a no-op for a DDA-active window and the

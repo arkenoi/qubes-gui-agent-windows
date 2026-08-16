@@ -314,63 +314,6 @@ BOOL DragAnnounceAppliedOrigin(IN DWORD adoptMs, OUT int* x, OUT int* y)
     return TRUE;
 }
 
-// dom0's origin at absolute tick atTick, linearly interpolated between the two
-// bracketing announces. D really moves stepwise at unobservable apply times;
-// interpolation smooths the announce quantization instead of guessing each step edge,
-// and the servo's stability margin (worst root 0.881 under a +/-46 ms mismatch, a full
-// announce interval) covers the difference. Clamped to the oldest entry before the
-// recorded range (the exact press origin) and to the newest after it.
-BOOL DragAnnounceOriginAt(IN DWORD atTick, OUT int* x, OUT int* y)
-{
-    if (g_DragAnnounceCount == 0)
-        return FALSE;
-
-    UINT oldest = (g_DragAnnounceHead + DRAG_ANNOUNCE_RING - g_DragAnnounceCount) % DRAG_ANNOUNCE_RING;
-    BOOL haveBelow = FALSE;
-    UINT below = 0; // logical index (0..count-1) of the newest entry with Tick <= atTick
-    for (UINT i = 0; i < g_DragAnnounceCount; i++)
-    {
-        UINT idx = (oldest + i) % DRAG_ANNOUNCE_RING;
-        // Signed wraparound-safe compare: entry tick <= atTick?
-        if ((LONG)(g_DragAnnounces[idx].Tick - atTick) <= 0)
-        {
-            haveBelow = TRUE;
-            below = i;
-        }
-        else
-            break; // ticks are monotone; the first future entry ends the scan
-    }
-
-    if (!haveBelow) // atTick predates the whole ring: the seed (press origin) is exact
-    {
-        *x = g_DragAnnounces[oldest].X;
-        *y = g_DragAnnounces[oldest].Y;
-        return TRUE;
-    }
-
-    UINT prevIdx = (oldest + below) % DRAG_ANNOUNCE_RING;
-    if (below + 1 >= g_DragAnnounceCount) // nothing newer recorded: clamp to the last announce
-    {
-        *x = g_DragAnnounces[prevIdx].X;
-        *y = g_DragAnnounces[prevIdx].Y;
-        return TRUE;
-    }
-
-    UINT nextIdx = (oldest + below + 1) % DRAG_ANNOUNCE_RING;
-    DWORD span = g_DragAnnounces[nextIdx].Tick - g_DragAnnounces[prevIdx].Tick;
-    DWORD frac = atTick - g_DragAnnounces[prevIdx].Tick;
-    if (span == 0)
-    {
-        *x = g_DragAnnounces[nextIdx].X;
-        *y = g_DragAnnounces[nextIdx].Y;
-        return TRUE;
-    }
-    *x = g_DragAnnounces[prevIdx].X + (int)(((LONGLONG)(g_DragAnnounces[nextIdx].X -
-        g_DragAnnounces[prevIdx].X) * (LONGLONG)frac) / (LONGLONG)span);
-    *y = g_DragAnnounces[prevIdx].Y + (int)(((LONGLONG)(g_DragAnnounces[nextIdx].Y -
-        g_DragAnnounces[prevIdx].Y) * (LONGLONG)frac) / (LONGLONG)span);
-    return TRUE;
-}
 
 HWND g_TaskbarWindow = NULL;
 BOOL g_ShowTaskbar = FALSE;
