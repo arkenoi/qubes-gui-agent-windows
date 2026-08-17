@@ -3721,24 +3721,33 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // So restore what would have happened natively and close it. WM_CANCELMODE ends
                 // the owner's menu mode; the child then disappears through the normal destroy
                 // path, with no stranded window and no stale paint.
-                // TAKE FOCUS AWAY - the owner's observation, and the only mechanism observed to
-                // actually work: "when focus moves elsewhere, it vanishes". Windows closes a menu
-                // when activation leaves it, so activating the window being dragged dismisses it,
-                // which is also exactly what a native title-bar drag does.
+                // ESC through the input queue. Menus consume keyboard input while they hold
+                // capture, and SendInput is a path this agent legitimately owns - it is how dom0's
+                // keyboard reaches the guest at all.
                 //
-                // The two mechanisms tried before did nothing. PostMessage(WM_CANCELMODE) from
-                // SYSTEM to another user's window is ignored (measured: fired 9 times during one
-                // drag, menu unmoved). Injecting ESC would work only if the key reached the menu.
-                // SetForegroundWindow is already the agent's own focus path
-                // (vchan-handlers.c:1207, MSG_FOCUS), so it is known to work from this process.
+                // TWO MECHANISMS MEASURED AND REJECTED before this one:
+                //  - PostMessage(WM_CANCELMODE) cross-process from SYSTEM: ignored. Fired 9 times
+                //    during one drag with the menu unmoved, then re-synthesized next pass.
+                //  - SetForegroundWindow(owner): SUCCEEDS (fg=1) and changes nothing, because the
+                //    menu's OWNER IS THAT WINDOW. Activating it never takes activation away from
+                //    the menu. The owner's observation was that focus moving ELSEWHERE dismisses
+                //    it - a different window - and focusing the owner is not that.
+                // Stealing focus to some unrelated window would dismiss it but is far too
+                // disruptive mid-drag, so the input queue is what is left.
                 //
                 // Once per popup: a menu that survives this is not worth hammering every pass.
                 if (!c->DismissSent)
                 {
-                    const BOOL fg = SetForegroundWindow(windowData->Handle);
+                    INPUT esc[2] = { 0 };
+                    esc[0].type = INPUT_KEYBOARD;
+                    esc[0].ki.wVk = VK_ESCAPE;
+                    esc[1].type = INPUT_KEYBOARD;
+                    esc[1].ki.wVk = VK_ESCAPE;
+                    esc[1].ki.dwFlags = KEYEVENTF_KEYUP;
+                    const UINT sent = SendInput(2, esc, sizeof(INPUT));
                     c->DismissSent = TRUE;
-                    LogInfo("0x%x: owner moved without it - taking focus to 0x%x to dismiss (fg=%d)",
-                        c->Handle, windowData->Handle, fg);
+                    LogInfo("0x%x: owner moved without it - ESC to dismiss (sent %u)",
+                        c->Handle, sent);
                 }
             }
             else if (!SynthQualifies(c, &stillOwner))
