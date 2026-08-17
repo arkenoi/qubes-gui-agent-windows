@@ -3721,27 +3721,24 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // So restore what would have happened natively and close it. WM_CANCELMODE ends
                 // the owner's menu mode; the child then disappears through the normal destroy
                 // path, with no stranded window and no stale paint.
-                // ESCAPE, not WM_CANCELMODE. Measured: the WM_CANCELMODE version fired 9 times
-                // during one drag and the menu did not budge - posting it cross-process from
-                // SYSTEM is ignored, the same wall the caption restyle hit. A menu closes on
-                // Escape, and SendInput is a path this agent legitimately owns (it is how dom0's
-                // keyboard reaches the guest). While a menu is up it holds capture, so the key
-                // goes to the menu and not to the application behind it.
+                // TAKE FOCUS AWAY - the owner's observation, and the only mechanism observed to
+                // actually work: "when focus moves elsewhere, it vanishes". Windows closes a menu
+                // when activation leaves it, so activating the window being dragged dismisses it,
+                // which is also exactly what a native title-bar drag does.
                 //
-                // Sent ONCE per menu: the flag is cleared only when this child goes away, so a
-                // menu that ignores Escape is not hammered every pass.
+                // The two mechanisms tried before did nothing. PostMessage(WM_CANCELMODE) from
+                // SYSTEM to another user's window is ignored (measured: fired 9 times during one
+                // drag, menu unmoved). Injecting ESC would work only if the key reached the menu.
+                // SetForegroundWindow is already the agent's own focus path
+                // (vchan-handlers.c:1207, MSG_FOCUS), so it is known to work from this process.
+                //
+                // Once per popup: a menu that survives this is not worth hammering every pass.
                 if (!c->DismissSent)
                 {
-                    INPUT esc[2] = { 0 };
-                    esc[0].type = INPUT_KEYBOARD;
-                    esc[0].ki.wVk = VK_ESCAPE;
-                    esc[1].type = INPUT_KEYBOARD;
-                    esc[1].ki.wVk = VK_ESCAPE;
-                    esc[1].ki.dwFlags = KEYEVENTF_KEYUP;
-                    const UINT sent = SendInput(2, esc, sizeof(INPUT));
+                    const BOOL fg = SetForegroundWindow(windowData->Handle);
                     c->DismissSent = TRUE;
-                    LogInfo("0x%x: owner moved without it - dismissing the menu with ESC (sent %u)",
-                        c->Handle, sent);
+                    LogInfo("0x%x: owner moved without it - taking focus to 0x%x to dismiss (fg=%d)",
+                        c->Handle, windowData->Handle, fg);
                 }
             }
             else if (!SynthQualifies(c, &stillOwner))
