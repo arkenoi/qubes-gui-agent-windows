@@ -3643,35 +3643,6 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             e = e->Flink;
             if (!c->Synthesized || c->SynthOwner != windowData->Handle)
                 continue;
-            // E1b (docs/RESEARCH-menu-dismiss.md): post ESC into the OWNER'S QUEUE.
-            //
-            // A menu holds mouse capture but NOT keyboard focus - it runs a modal message loop on
-            // the owner's thread. That is why the earlier SendInput(ESC) did nothing: SendInput
-            // goes to whatever has focus, which during a dom0-driven drag need not be this window,
-            // so the key never reached the loop that would act on it. Posting puts it directly in
-            // the queue that loop is already pumping. This is also NOT the WM_CANCELMODE post that
-            // was ignored - that asked a window to cancel a mode; this is ordinary key input.
-            //
-            // Fires only when the owner ACTUALLY moved (coordsChanged) and the child did not move
-            // with it, i.e. it is a menu rather than part of a compound window. Ungated, "the child
-            // did not move" is true on every quiet pass and dismisses menus the instant they open
-            // (measured: 18 spurious dismissals).
-            RECT cr;
-            BOOL childMoved = TRUE;
-            if (GetWindowRect(c->Handle, &cr))
-                childMoved = (cr.left != c->X || cr.top != c->Y);
-
-            if (coordsChanged && !childMoved && !c->DismissSent)
-            {
-                const LPARAM down = 0x00010001;   // scan 0x01 (ESC), repeat 1
-                const LPARAM up   = 0xC0010001;   // same, with transition/previous-state bits
-                PostMessage(windowData->Handle, WM_KEYDOWN, VK_ESCAPE, down);
-                PostMessage(windowData->Handle, WM_KEYUP, VK_ESCAPE, up);
-                c->DismissSent = TRUE;
-                LogInfo("0x%x: owner moved without it - posted ESC to owner 0x%x",
-                    c->Handle, windowData->Handle);
-            }
-
             WINDOW_DATA* stillOwner = NULL;
             if (!SynthQualifies(c, &stillOwner))
             {
