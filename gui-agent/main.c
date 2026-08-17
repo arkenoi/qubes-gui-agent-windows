@@ -1801,6 +1801,64 @@ static void SynthDeactivate(IN OUT WINDOW_DATA* entry)
 // WM_SYSCOMMAND/SC_CLOSE, verified against a control on a stripped window.
 #define TITLEBAR_MIN_INSET 20   // px of OS-drawn non-client area above the client rect
 
+// Launch a one-shot copy of ourselves under the token of `tokenSource`'s process. The agent runs as
+// SYSTEM (watchdog.c retargets its own token's session), and both helper jobs - restyling a window,
+// writing an HKCU preference - are refused in that identity. Borrowing a user process's token is
+// what makes them possible; measured, impersonation alone is not enough because USER32 and the
+// per-user hive are process-scoped.
+static BOOL SpawnHelperAsUser(IN HWND tokenSource, IN const WCHAR* args)
+{
+    DWORD pid = 0;
+    GetWindowThreadProcessId(tokenSource, &pid);
+    HANDLE proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+    if (!proc)
+        return FALSE;
+
+    HANDLE tok = NULL, primary = NULL;
+    BOOL ok = FALSE;
+    if (OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY, &tok) &&
+        DuplicateTokenEx(tok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &primary))
+    {
+        WCHAR self[MAX_PATH] = { 0 };
+        if (GetModuleFileName(NULL, self, RTL_NUMBER_OF(self)))
+        {
+            WCHAR cmd[MAX_PATH + 64];
+            StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\" %s", self, args);
+            STARTUPINFO si = { 0 };
+            PROCESS_INFORMATION pi = { 0 };
+            si.cb = sizeof(si);
+            si.lpDesktop = L"winsta0\\default";
+            if (CreateProcessAsUser(primary, NULL, cmd, NULL, NULL, FALSE,
+                    CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+            {
+                CloseHandle(pi.hThread);
+                CloseHandle(pi.hProcess);
+                ok = TRUE;
+            }
+        }
+    }
+    if (primary) CloseHandle(primary);
+    if (tok) CloseHandle(tok);
+    CloseHandle(proc);
+    return ok;
+}
+
+// Guest-native window shadows off in seamless, restored in fullscreen. The shell window gives us a
+// process that belongs to the interactive user, which is all the helper needs.
+static void ApplyGuestShadows(IN BOOL enable)
+{
+    HWND shell = GetShellWindow();
+    if (!shell)
+    {
+        LogWarning("no shell window; cannot %s guest shadows", enable ? L"restore" : L"disable");
+        return;
+    }
+    if (SpawnHelperAsUser(shell, enable ? L"--set-shadows 1" : L"--set-shadows 0"))
+        LogInfo("guest window shadows %s", enable ? L"restored (fullscreen)" : L"disabled (seamless)");
+    else
+        LogWarning("could not launch the shadow helper as the interactive user");
+}
+
 static void HideGuestCaption(IN WINDOW_DATA* entry)
 {
     if (!g_HideGuestTitleBar || entry->CaptionHidden)
@@ -3035,6 +3093,9 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     }
 
     g_SeamlessMode = seamlessMode;
+
+    // Shadows are dom0's job in seamless and the guest's own in fullscreen.
+    ApplyGuestShadows(!seamlessMode);
 
     // The published IDD mode set is seamless-dependent (the host size is only in
     // it while seamless is active - resolution.c BuildIddModeSet a1), so a
@@ -6955,6 +7016,61 @@ static ULONG Init(void)
 // was measured NOT to help). So for this one job the agent re-launches ITSELF under the window
 // owner's token and the copy, now running as that user, does the call. Same signed binary, no
 // new component; it touches nothing else and exits immediately.
+// Guest-native window shadows are pure waste in seamless mode: dom0 draws its own decoration, and
+// every shadow pixel is capture area and damage traffic for something the user is not meant to see.
+// They also inflate DWM's EXTENDED FRAME BOUNDS beyond the window rect, which is the source of the
+// invisible-border crop math - the 7 px black band measured 2026-08-16.
+//
+// This is a per-USER preference (HKCU), so the agent cannot write it as SYSTEM; it runs in the same
+// owner-context helper as the caption restyle. The previous UserPreferencesMask is saved so the
+// fullscreen direction restores what the user actually had, rather than assuming a default.
+static int SetShadowsMain(LPSTR cmdLine)
+{
+    int enable = 1;
+    if (sscanf_s(cmdLine, "--set-shadows %d", &enable) != 1)
+        return ERROR_INVALID_PARAMETER;
+
+    HKEY key = NULL;
+    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Control Panel\\Desktop", 0, KEY_READ | KEY_WRITE, &key))
+        return ERROR_ACCESS_DENIED;
+
+    BYTE mask[8] = { 0 };
+    DWORD cb = sizeof(mask), type = 0;
+    if (RegQueryValueEx(key, L"UserPreferencesMask", NULL, &type, mask, &cb) || cb < 1)
+    {
+        RegCloseKey(key);
+        return ERROR_FILE_NOT_FOUND;
+    }
+
+    // Byte 1, bit 0x04 is the drop-shadow preference.
+    const BYTE saved = mask[1];
+    if (enable)
+        mask[1] |= 0x04;
+    else
+        mask[1] &= (BYTE)~0x04;
+
+    if (saved != mask[1])
+        RegSetValueEx(key, L"UserPreferencesMask", 0, REG_BINARY, mask, cb);
+    RegCloseKey(key);
+
+    // The VisualEffects mirror is what the Performance Options UI reads back.
+    HKEY ve = NULL;
+    if (!RegCreateKeyEx(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects\\DropShadow",
+            0, NULL, 0, KEY_WRITE, NULL, &ve, NULL))
+    {
+        DWORD v = enable ? 1 : 0;
+        RegSetValueEx(ve, L"DefaultValue", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+        RegCloseKey(ve);
+    }
+
+    // Make it live without a logoff.
+    DWORD_PTR res = 0;
+    SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETUSERPREFERENCESMASK,
+        (LPARAM)L"WindowMetrics", SMTO_ABORTIFHUNG, 1000, &res);
+    return ERROR_SUCCESS;
+}
+
 static int RestyleCaptionMain(LPSTR cmdLine)
 {
     unsigned long long raw = 0;
@@ -6986,6 +7102,8 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
 
     if (lpCmdLine && 0 == strncmp(lpCmdLine, "--restyle-caption", 17))
         return RestyleCaptionMain(lpCmdLine);
+    if (lpCmdLine && 0 == strncmp(lpCmdLine, "--set-shadows", 13))
+        return SetShadowsMain(lpCmdLine);
 
     if (ERROR_SUCCESS != Init())
         return win_perror("Init");
