@@ -7065,8 +7065,10 @@ static int SetShadowsMain(LPSTR cmdLine)
     }
 
     // Make it live without a logoff.
+    // SPI_SETUSERPREFERENCESMASK (0x1045) is not in this SDK's headers; the broadcast only needs
+    // the numeric wParam, and "WindowMetrics" is the section name listeners match on.
     DWORD_PTR res = 0;
-    SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, SPI_SETUSERPREFERENCESMASK,
+    SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0x1045,
         (LPARAM)L"WindowMetrics", SMTO_ABORTIFHUNG, 1000, &res);
     return ERROR_SUCCESS;
 }
