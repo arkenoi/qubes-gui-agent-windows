@@ -3702,10 +3702,22 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             WINDOW_DATA* stillOwner = NULL;
             if (!childMoved)
             {
-                LogInfo("0x%x: owner moved and this child did not - materializing (not part of "
-                    "the compound window)", c->Handle);
-                SynthDeactivate(c);
-                c->DeletePending = TRUE;
+                // DISMISS IT, do not detach it. A child that did not travel with the moving owner
+                // is a menu, not part of the compound window - and on native Windows this state
+                // cannot arise at all: the click that grabs the title bar dismisses the menu
+                // before the drag starts. A dom0-driven move never delivers that click to the
+                // guest, so the menu is left open in a configuration Windows itself would never
+                // produce, and every way of PRESENTING it is wrong (composited: it rides inside
+                // the owner's bitmap; detached: it strands as its own bordered window at a
+                // position the owner has left). Detaching sooner only performs the artefact
+                // sooner - measured by the owner as "drops out even more aggressively".
+                // So restore what would have happened natively and close it. WM_CANCELMODE ends
+                // the owner's menu mode; the child then disappears through the normal destroy
+                // path, with no stranded window and no stale paint.
+                LogInfo("0x%x: owner moved without it - dismissing the menu (WM_CANCELMODE to 0x%x)",
+                    c->Handle, windowData->Handle);
+                PostMessage(windowData->Handle, WM_CANCELMODE, 0, 0);
+                PostMessage(c->Handle, WM_CANCELMODE, 0, 0);
             }
             else if (!SynthQualifies(c, &stillOwner))
             {
