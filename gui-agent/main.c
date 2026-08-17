@@ -3683,8 +3683,31 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             e = e->Flink;
             if (!c->Synthesized || c->SynthOwner != windowData->Handle)
                 continue;
+            // MEMBERSHIP, not containment. A compound window's chrome (Office/Explorer NetUI
+            // strips, task panes) MOVES WITH the frame, because it is part of the same window as
+            // far as the user is concerned. A menu does not: it is a separate top-level window
+            // that stays where it was opened. Since we only get here because the OWNER moved,
+            // a child whose absolute position is unchanged demonstrably did not travel with it,
+            // and therefore was never part of the compound window - composite it any longer and
+            // it rides along inside the owner's bitmap until containment finally breaks, which
+            // is the orphaned Explorer ribbon panel captured 2026-08-17.
+            //
+            // Checked BEFORE containment: while the child is still geometrically inside the
+            // moved owner, SynthQualifies is happy and the old test says nothing.
+            RECT cr;
+            BOOL childMoved = TRUE;
+            if (GetWindowRect(c->Handle, &cr))
+                childMoved = (cr.left != c->X || cr.top != c->Y);
+
             WINDOW_DATA* stillOwner = NULL;
-            if (!SynthQualifies(c, &stillOwner))
+            if (!childMoved)
+            {
+                LogInfo("0x%x: owner moved and this child did not - materializing (not part of "
+                    "the compound window)", c->Handle);
+                SynthDeactivate(c);
+                c->DeletePending = TRUE;
+            }
+            else if (!SynthQualifies(c, &stillOwner))
             {
                 LogInfo("0x%x: owner geometry changed, materializing child", c->Handle);
                 SynthDeactivate(c);
