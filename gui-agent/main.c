@@ -3721,10 +3721,28 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // So restore what would have happened natively and close it. WM_CANCELMODE ends
                 // the owner's menu mode; the child then disappears through the normal destroy
                 // path, with no stranded window and no stale paint.
-                LogInfo("0x%x: owner moved without it - dismissing the menu (WM_CANCELMODE to 0x%x)",
-                    c->Handle, windowData->Handle);
-                PostMessage(windowData->Handle, WM_CANCELMODE, 0, 0);
-                PostMessage(c->Handle, WM_CANCELMODE, 0, 0);
+                // ESCAPE, not WM_CANCELMODE. Measured: the WM_CANCELMODE version fired 9 times
+                // during one drag and the menu did not budge - posting it cross-process from
+                // SYSTEM is ignored, the same wall the caption restyle hit. A menu closes on
+                // Escape, and SendInput is a path this agent legitimately owns (it is how dom0's
+                // keyboard reaches the guest). While a menu is up it holds capture, so the key
+                // goes to the menu and not to the application behind it.
+                //
+                // Sent ONCE per menu: the flag is cleared only when this child goes away, so a
+                // menu that ignores Escape is not hammered every pass.
+                if (!c->DismissSent)
+                {
+                    INPUT esc[2] = { 0 };
+                    esc[0].type = INPUT_KEYBOARD;
+                    esc[0].ki.wVk = VK_ESCAPE;
+                    esc[1].type = INPUT_KEYBOARD;
+                    esc[1].ki.wVk = VK_ESCAPE;
+                    esc[1].ki.dwFlags = KEYEVENTF_KEYUP;
+                    const UINT sent = SendInput(2, esc, sizeof(INPUT));
+                    c->DismissSent = TRUE;
+                    LogInfo("0x%x: owner moved without it - dismissing the menu with ESC (sent %u)",
+                        c->Handle, sent);
+                }
             }
             else if (!SynthQualifies(c, &stillOwner))
             {
