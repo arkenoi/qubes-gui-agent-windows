@@ -88,3 +88,36 @@ trigger earlier, from "containment broke" to "the owner is about to move".
 NOT ATTEMPTED because it cannot be honestly tested from here: it needs a real dom0-driven drag with
 a menu held open, and dom0 pointer injection is not available to this repo (a guest-side SendInput
 drag bypasses the dom0 motion path entirely). Needs a hand test on the rig.
+
+## 2026-08-17 — REGRESSION: the caption strip makes dom0 minimize the window. Default OFF.
+
+Owner: "some movement of explorer window made notepad window switch to minimized."
+
+**dom0 initiated it, not the guest.** From the protocol trace:
+
+    HandleWindowFlags: 0x1a0284: set 0x4, unset 0x0     <- dom0 -> guest, WINDOW_FLAG_MINIMIZE
+    HandleWindowFlags: 0x102ca: set 0x4, unset 0x0
+    HandleWindowFlags: 0x1a0284: set 0x0, unset 0x4     <- later restored
+    HandleWindowFlags: 0x102ca: set 0x0, unset 0x4
+
+The agent obeyed (`ShowWindowAsync(SW_MINIMIZE)`), which is why it then logged
+`UpdateWindowData: 0x1a0284 became minimized` and reported the state back. The guest never minimized
+anything on its own - by the time it was inspected, `IsIconic=False` on every window.
+
+**It hit exactly the restyled windows.** `0x1a0284` (Notepad) and `0x102ca` (Explorer "addins") both
+carry `style=0x140f0000 ex=0x00040110`, i.e. caption removed + `WS_EX_APPWINDOW` added by the
+title-bar feature. `0x20244` ("ANSWER (D:)", inset 0, own-frame app, never touched) was NOT
+minimized.
+
+**Mechanism**: the restyle changes the window's style, the agent re-maps it (`SendWindowMap` seen
+repeatedly for the same hwnd with the style changing mid-stream, `0x14cf0000` -> `0x140f0000`), and
+dom0's window manager answers that unmap/map cycle with a minimize.
+
+**Action: `g_HideGuestTitleBar` defaulted OFF.** Windows spontaneously minimizing is worse than the
+duplicate title bar the feature removes. What is proven and kept: the inset discriminator (own-frame
+apps correctly untouched), the owner-context helper that makes the restyle possible at all, and the
+keep-managed invariant. What is unsolved: doing it WITHOUT provoking a re-map.
+
+That is also an argument for the crop route in `docs/PLAN-composition-layer.md` stage 3 - announced
+geometry independent of the OS window rect changes no window styles at all, so there is no re-map to
+provoke.

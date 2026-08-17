@@ -118,7 +118,14 @@ BOOL     g_InputDragQuantise = TRUE;   // DEFAULT: measured better than stock by
 // The knob stays wired (`qvm-features <vm> service.guestTitleBar 0` opts in) so the code path
 // can be exercised on a build where the agent has a different identity, but shipping it ON would
 // only produce one ACCESS_DENIED warning per window and change nothing on screen.
-BOOL     g_HideGuestTitleBar = TRUE;
+// DEFAULT OFF since 2026-08-17: the restyle changes the window's style, which makes the agent
+// RE-MAP it, and dom0's WM answers an unmap/map cycle with MSG_WINDOW_FLAGS set=MINIMIZE. Measured:
+// both restyled windows (0x1a0284 Notepad, 0x102ca Explorer, style 0x140f0000 ex 0x00040110) were
+// minimized by dom0 while the untouched 0x20244 was not, and the agent dutifully obeyed
+// (ShowWindowAsync -> "became minimized"). Windows spontaneously minimizing is far worse than the
+// duplicate title bar this removes. The mechanism (caption strip via an owner-context helper) works
+// and is verified; what is unsolved is doing it WITHOUT a re-map, so re-enable only after that.
+BOOL     g_HideGuestTitleBar = FALSE;
 BOOL     g_InputDragOriginInterp = TRUE;   // ON: user-approved baseline 2026-08-16
 DWORD    g_InputDragLagMs = 10;            // dom0 apply lag; measured L < 18 ms, median 0, p75 17
 DWORD    g_InputDragAdoptMs = 25;
