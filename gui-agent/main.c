@@ -1563,46 +1563,6 @@ static BOOL SynthOwnerQualifies(IN const WINDOW_DATA* owner, IN const WINDOW_DAT
 //      leaves the containment materializes via the normal re-check.
 // A window that is ALREADY synthesized re-qualifies only against its recorded owner:
 // hopping owners mid-life would desync the mask/child accounting.
-static void SynthDeactivate(IN OUT WINDOW_DATA* entry);   // defined below
-
-// Hand every synthesized child of this owner back to dom0 as its own window.
-//
-// WHY AT DRAG START. Synthesis paints a contained popup into its owner's buffer, and that is only
-// correct while the buffer is FRESH: a menu is a separate top-level window that does NOT move when
-// its owner is dragged, so the composite is right only as long as it is recaptured. A drag freezes
-// the owner's content (PwDragFrozen / DaemonDamageHeld - no recapture until settle), so from the
-// first frozen frame the painted menu TRAVELS WITH THE WINDOW while the real one stays put, and
-// when the owner finally moves far enough the containment test materializes the child at the
-// position the owner has already left. Captured 2026-08-16: Explorer's Home ribbon panel rendered
-// as its own red-bordered dom0 window on top of an unrelated terminal.
-//
-// So materialize at the moment the freeze engages, not after containment breaks. The child is then
-// announced at its true screen position and never rides inside a stale bitmap. Materialization
-// funnels through the normal add path (DeletePending -> re-examined -> announced), exactly as the
-// containment path at the geometry check already does.
-//
-// Caller must hold the watched-windows CS (every call site is inside the frame loop's walk).
-static UINT SynthMaterializeChildren(IN const WINDOW_DATA* owner, IN const WCHAR* why)
-{
-    UINT freed = 0;
-    if (!owner || owner->SynthChildCount == 0)
-        return 0;
-
-    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; )
-    {
-        WINDOW_DATA* c = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
-        e = e->Flink;
-        if (!c->Synthesized || c->SynthOwner != owner->Handle)
-            continue;
-        LogInfo("0x%x: %s - materializing synthesized child of 0x%x before its buffer freezes",
-            c->Handle, why, owner->Handle);
-        SynthDeactivate(c);
-        c->DeletePending = TRUE;
-        freed++;
-    }
-    return freed;
-}
-
 static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerOut)
 {
     if (!entry->IsOverrideRedirect || entry->IsIconic || !entry->IsVisible)
@@ -3683,74 +3643,8 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             e = e->Flink;
             if (!c->Synthesized || c->SynthOwner != windowData->Handle)
                 continue;
-            // MEMBERSHIP, not containment. A compound window's chrome (Office/Explorer NetUI
-            // strips, task panes) MOVES WITH the frame, because it is part of the same window as
-            // far as the user is concerned. A menu does not: it is a separate top-level window
-            // that stays where it was opened. Since we only get here because the OWNER moved,
-            // a child whose absolute position is unchanged demonstrably did not travel with it,
-            // and therefore was never part of the compound window - composite it any longer and
-            // it rides along inside the owner's bitmap until containment finally breaks, which
-            // is the orphaned Explorer ribbon panel captured 2026-08-17.
-            //
-            // Checked BEFORE containment: while the child is still geometrically inside the
-            // moved owner, SynthQualifies is happy and the old test says nothing.
-            //
-            // GATED ON coordsChanged, and getting this wrong is what made it unusable: this
-            // block is entered whenever the owner has synthesized children, NOT only when the
-            // owner moved - my first version's comment claimed otherwise and was simply wrong.
-            // Ungated, "the child did not move" is true on every quiet tracking pass, so the
-            // menu was dismissed the instant it opened (measured: 18 dismissals, owner reported
-            // it as "dismisses with the slightest mouse move, barely usable").
-            RECT cr;
-            BOOL childMoved = TRUE;
-            if (GetWindowRect(c->Handle, &cr))
-                childMoved = (cr.left != c->X || cr.top != c->Y);
-
             WINDOW_DATA* stillOwner = NULL;
-            if (coordsChanged && !childMoved)
-            {
-                // DISMISS IT, do not detach it. A child that did not travel with the moving owner
-                // is a menu, not part of the compound window - and on native Windows this state
-                // cannot arise at all: the click that grabs the title bar dismisses the menu
-                // before the drag starts. A dom0-driven move never delivers that click to the
-                // guest, so the menu is left open in a configuration Windows itself would never
-                // produce, and every way of PRESENTING it is wrong (composited: it rides inside
-                // the owner's bitmap; detached: it strands as its own bordered window at a
-                // position the owner has left). Detaching sooner only performs the artefact
-                // sooner - measured by the owner as "drops out even more aggressively".
-                // So restore what would have happened natively and close it. WM_CANCELMODE ends
-                // the owner's menu mode; the child then disappears through the normal destroy
-                // path, with no stranded window and no stale paint.
-                // ESC through the input queue. Menus consume keyboard input while they hold
-                // capture, and SendInput is a path this agent legitimately owns - it is how dom0's
-                // keyboard reaches the guest at all.
-                //
-                // TWO MECHANISMS MEASURED AND REJECTED before this one:
-                //  - PostMessage(WM_CANCELMODE) cross-process from SYSTEM: ignored. Fired 9 times
-                //    during one drag with the menu unmoved, then re-synthesized next pass.
-                //  - SetForegroundWindow(owner): SUCCEEDS (fg=1) and changes nothing, because the
-                //    menu's OWNER IS THAT WINDOW. Activating it never takes activation away from
-                //    the menu. The owner's observation was that focus moving ELSEWHERE dismisses
-                //    it - a different window - and focusing the owner is not that.
-                // Stealing focus to some unrelated window would dismiss it but is far too
-                // disruptive mid-drag, so the input queue is what is left.
-                //
-                // Once per popup: a menu that survives this is not worth hammering every pass.
-                if (!c->DismissSent)
-                {
-                    INPUT esc[2] = { 0 };
-                    esc[0].type = INPUT_KEYBOARD;
-                    esc[0].ki.wVk = VK_ESCAPE;
-                    esc[1].type = INPUT_KEYBOARD;
-                    esc[1].ki.wVk = VK_ESCAPE;
-                    esc[1].ki.dwFlags = KEYEVENTF_KEYUP;
-                    const UINT sent = SendInput(2, esc, sizeof(INPUT));
-                    c->DismissSent = TRUE;
-                    LogInfo("0x%x: owner moved without it - ESC to dismiss (sent %u)",
-                        c->Handle, sent);
-                }
-            }
-            else if (!SynthQualifies(c, &stillOwner))
+            if (!SynthQualifies(c, &stillOwner))
             {
                 LogInfo("0x%x: owner geometry changed, materializing child", c->Handle);
                 SynthDeactivate(c);
@@ -5152,48 +5046,21 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             // just stop refreshing - the settle below hands it back.
                             entry->PwDragSlice = FALSE;
                         }
-                        BOOL deferFreeze = FALSE;
                         if (!entry->PwDragFrozen)
                         {
-                            // DETACH COMPOSITED POPUPS BEFORE FREEZING, AND LET ONE CLEAN
-                            // CAPTURE HAPPEN FIRST. Materializing alone is not enough and the
-                            // first attempt at this failed for exactly that reason: the child's
-                            // pixels are ALREADY PAINTED into the owner's buffer, so detaching
-                            // it changes nothing about the bitmap - the menu still travelled with
-                            // the window ("still drags out"). SynthDeactivate marks the owner
-                            // dirty precisely to repaint that region with the owner's own
-                            // content, but a claimed channel and a frozen buffer both suppress
-                            // that repaint.
-                            // So when we actually free a child, skip engaging the freeze for THIS
-                            // frame: the normal path recaptures the owner without the child, and
-                            // the freeze takes hold on the next frame over a clean bitmap. The
-                            // cost is one extra PrintWindow at drag start, once, only when a
-                            // popup was open.
-                            if (SynthMaterializeChildren(entry, L"drag freeze") > 0)
-                            {
-                                LogDebug("QGADRAGFREEZE,ev=defer,hwnd=0x%x (clean recapture first)",
-                                    (uint32_t)(ULONG_PTR)entry->Handle);
-                                deferFreeze = TRUE;
-                            }
-                            else
-                            {
-                                // CLAIM THE CHANNEL. Suppressing our own recapture is not
-                                // enough: the capture engine sweeps live channels on its own
-                                // timer and services pending dirty marks, and each of those is
-                                // a PrintWindow into the DRAGGED APP'S thread - the very stall
-                                // this freeze exists to remove (measured 156-259 ms on a cold
-                                // first drag, 0 ms once warm). Owning the channel for the
-                                // duration is what makes the freeze actually quiet.
-                                WcSetDdaOwned(entry->Handle, TRUE);
-                                entry->PwDdaActive = FALSE;
-                            }
+                            // CLAIM THE CHANNEL. Suppressing our own recapture is not
+                            // enough: the capture engine sweeps live channels on its own
+                            // timer and services pending dirty marks, and each of those is
+                            // a PrintWindow into the DRAGGED APP'S thread - the very stall
+                            // this freeze exists to remove (measured 156-259 ms on a cold
+                            // first drag, 0 ms once warm). Owning the channel for the
+                            // duration is what makes the freeze actually quiet.
+                            WcSetDdaOwned(entry->Handle, TRUE);
+                            entry->PwDdaActive = FALSE;
                         }
-                        if (!deferFreeze)
-                        {
-                            entry->PwDragFrozen = TRUE;
-                            LogDebug("QGADRAGFREEZE,ev=hold,hwnd=0x%x",
-                                (uint32_t)(ULONG_PTR)entry->Handle);
-                        }
+                        entry->PwDragFrozen = TRUE;
+                        LogDebug("QGADRAGFREEZE,ev=hold,hwnd=0x%x",
+                            (uint32_t)(ULONG_PTR)entry->Handle);
                     }
                     else if (dragSliceReady)
                     {
@@ -5614,22 +5481,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         if (entry->DaemonStreamTick != 0 &&
             (GetTickCount() - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS)
         {
-            // Same reason as the guest-native latch, and the same one-cycle deferral: holding
-            // damage freezes dom0's copy of this window, and dom0's copy still contains the
-            // child's painted pixels. Detaching the child does not repaint them - the damage
-            // that would is exactly what the hold suppresses. So on the transition, materialize
-            // and let THIS cycle's damage through; the hold engages on the next one, over a
-            // window dom0 has already seen without the popup.
-            if (!entry->DaemonDamageHeld && SynthMaterializeChildren(entry, L"dom0 drive hold") > 0)
-            {
-                LogDebug("0x%x: dom0 drive hold deferred one cycle (clean repaint first)",
-                    (uint32_t)(ULONG_PTR)entry->Handle);
-            }
-            else
-            {
-                daemonHoldDamage = TRUE;
-                entry->DaemonDamageHeld = TRUE;
-            }
+            daemonHoldDamage = TRUE;
+            entry->DaemonDamageHeld = TRUE;
         }
         else if (g_InputDragFreeze && g_InputDragOriginValid && entry->Handle == g_InputDragWindow &&
                  entry->CfgPendingPos)

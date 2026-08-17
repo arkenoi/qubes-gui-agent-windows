@@ -309,7 +309,6 @@ typedef struct _WINDOW_DATA
     // message naming a window it has no CREATE for, so UNMAP/DESTROY at teardown must
     // be gated on this - a window that was synthesized (or whose announce failed) must
     // die silently.
-    BOOL DismissSent;      // ESC already sent to close this popup; do not repeat every pass
     BOOL CaptionHidden;    // we stripped this window's caption once; never re-apply
     BOOL CreateSent;
     BOOL Synthesized;      // this window is composited into SynthOwner, never announced
