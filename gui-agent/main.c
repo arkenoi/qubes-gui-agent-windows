@@ -3694,13 +3694,20 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             //
             // Checked BEFORE containment: while the child is still geometrically inside the
             // moved owner, SynthQualifies is happy and the old test says nothing.
+            //
+            // GATED ON coordsChanged, and getting this wrong is what made it unusable: this
+            // block is entered whenever the owner has synthesized children, NOT only when the
+            // owner moved - my first version's comment claimed otherwise and was simply wrong.
+            // Ungated, "the child did not move" is true on every quiet tracking pass, so the
+            // menu was dismissed the instant it opened (measured: 18 dismissals, owner reported
+            // it as "dismisses with the slightest mouse move, barely usable").
             RECT cr;
             BOOL childMoved = TRUE;
             if (GetWindowRect(c->Handle, &cr))
                 childMoved = (cr.left != c->X || cr.top != c->Y);
 
             WINDOW_DATA* stillOwner = NULL;
-            if (!childMoved)
+            if (coordsChanged && !childMoved)
             {
                 // DISMISS IT, do not detach it. A child that did not travel with the moving owner
                 // is a menu, not part of the compound window - and on native Windows this state
