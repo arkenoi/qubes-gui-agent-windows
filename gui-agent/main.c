@@ -3156,11 +3156,16 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
                 data->Handle, data->Class, data->Width, data->Height);
             return FALSE;
         }
-        // MODE 2 - a normal fullscreen-sized APP window: allowed only when opted in.
-        if (!g_ShowFullscreenScreen)
+        // A WINDOWED fullscreen (a maximized normal app - it has a title bar / WS_CAPTION) is
+        // ALWAYS allowed: it is just a large normal window (owner refinement 2026-08-19).
+        // Only a BORDERLESS true-fullscreen (no caption - a game/video/presentation that takes
+        // over the whole screen) is the feature-gated MODE 2. NOTE: many normal apps (Edge,
+        // Explorer, UWP) carry WS_CAPTION while painting their own header (main.c ~1757), which
+        // is exactly what we want - they count as windowed and are always allowed.
+        if (!(data->Style & WS_CAPTION) && !g_ShowFullscreenScreen)
         {
-            LogDebug("0x%x: fullscreen app window (class %s, %ux%u) hidden (set service.gui-fullscreen to allow)",
-                data->Handle, data->Class, data->Width, data->Height);
+            LogDebug("0x%x: borderless fullscreen (class %s, %ux%u, style 0x%08x) hidden (set service.gui-fullscreen to allow)",
+                data->Handle, data->Class, data->Width, data->Height, data->Style);
             return FALSE;
         }
     }
