@@ -67,15 +67,14 @@ DWORD g_ScreenWidth;
 
 BOOL g_VchanClientConnected = FALSE;
 BOOL g_SeamlessMode = TRUE;
-// Boot/shutdown full-desktop "flash" opt-in. Default FALSE = HIDE the desktop shell window
-// (Progman / WorkerW, the 5120x1440 wallpaper surface) so it is never mapped during the
-// seamless transition. Measured 2026-08-19 (ProtoTrace): the agent boots seamless and never
-// maps window 0 - the flash is the DESKTOP window slipping through ShouldAcceptWindow's
-// GetShellWindow() reject at boot/shutdown, when the shell is not yet/no longer registered
-// so GetShellWindow() returns a different handle. A class-based reject (below) is stable
-// across the transition. Set TRUE by the dom0 feature service.gui-fullscreen (or the guest
-// registry ShowFullscreenScreen DWORD) to restore the classic visible behavior. Read once
-// in Init. Does NOT touch runtime case-2 fullscreen (dom0 fullscreens the window).
+// Allow fullscreen-sized guest windows in seamless mode. Default FALSE = deny any window that
+// spans the whole guest screen (the boot/shutdown "flash" is such a window mapping transiently
+// during the seamless transition; identified by SIZE, not class - see ShouldAcceptWindow).
+// TRUE = allow non-override fullscreen windows (opt-in for anyone who wants a fullscreen app
+// in seamless). Override-redirect fullscreen is NEVER mapped regardless (owner design). Set by
+// the dom0 feature service.gui-fullscreen (or the guest registry ShowFullscreenScreen DWORD),
+// read once in Init. Does NOT touch true fullscreen MODE (dom0 fullscreens the window), which
+// maps window 0 directly and does not go through ShouldAcceptWindow.
 BOOL g_ShowFullscreenScreen = FALSE;
 LONG g_ScreenWinX = 0;
 LONG g_ScreenWinY = 0;
@@ -3119,22 +3118,34 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     if (data->Handle == GetShellWindow())
         return FALSE;
 
-    // DESKTOP SHELL WINDOW (the boot/shutdown full-desktop "flash"). The wallpaper surface -
-    // class "Progman" (Program Manager) and its worker "WorkerW" - is the whole 5120x1440
-    // desktop, never a real app window. The GetShellWindow() reject above catches it at
-    // STEADY STATE, but measured 2026-08-19 (ProtoTrace): during the boot/shutdown transition
-    // the shell is not yet/no longer registered, so GetShellWindow() returns a different
-    // handle and the desktop window slips through and is mapped fullscreen = the flash the
-    // owner reported. Rejecting by CLASS is stable across the transition (the class does not
-    // depend on shell-registration timing). Hidden by default; service.gui-fullscreen opts in
-    // to the classic visible behavior. A genuine maximized APP is a different class (its own
-    // window class, not Progman/WorkerW), so it is unaffected.
-    if (!g_ShowFullscreenScreen &&
-        (0 == wcscmp(data->Class, L"Progman") || 0 == wcscmp(data->Class, L"WorkerW")))
+    // FULLSCREEN-SIZED WINDOW GATE (owner design 2026-08-19). The boot/shutdown "flash" is a
+    // window covering the whole screen (the desktop, a logon/boot surface, or a splash) that
+    // maps transiently during the seamless transition - identified by SIZE, not class, so it
+    // catches whatever the transient window actually is (class-based filtering missed it).
+    // A guest window that spans the full guest screen is essentially never something seamless
+    // wants to present (dom0's WM owns placement; a real app does not need to BE the screen).
+    // Two rules, per the owner:
+    //   - override-redirect + fullscreen -> NEVER map (a splash/overlay; unconditional).
+    //   - other fullscreen -> map only when the fullscreen feature is on (normal operation);
+    //     default off hides the startup/shutdown flash.
+    // g_ScreenWidth/Height is the live guest resolution; treat >=99% as fullscreen so a window
+    // one pixel shy of the edge still counts. Zero screen size (pre-xconf) disables the gate.
+    if (g_SeamlessMode && g_ScreenWidth && g_ScreenHeight &&
+        data->Width  >= (g_ScreenWidth  - g_ScreenWidth  / 100) &&
+        data->Height >= (g_ScreenHeight - g_ScreenHeight / 100))
     {
-        LogDebug("0x%x: desktop shell window (class %s) not presented (hiding boot/shutdown flash; set service.gui-fullscreen to show)",
-            data->Handle, data->Class);
-        return FALSE;
+        if (data->IsOverrideRedirect)
+        {
+            LogDebug("0x%x: override-redirect fullscreen (%ux%u, class %s) - never presented",
+                data->Handle, data->Width, data->Height, data->Class);
+            return FALSE;
+        }
+        if (!g_ShowFullscreenScreen)
+        {
+            LogDebug("0x%x: fullscreen window (%ux%u, class %s) hidden (startup/shutdown flash; set service.gui-fullscreen to allow fullscreen)",
+                data->Handle, data->Width, data->Height, data->Class);
+            return FALSE;
+        }
     }
 
     // START IS DISABLED IN SEAMLESS MODE (user decision 2026-08-13, shipped state).
