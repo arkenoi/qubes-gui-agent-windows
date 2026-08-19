@@ -2997,19 +2997,18 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     LogVerbose("start");
     LogDebug("Seamless mode changing to %d", seamlessMode);
 
-    // ARCHITECTURE DECISION (owner, 2026-08-19): the guest is NEVER granted a fullscreen
-    // presentation unless explicitly opted in. Nothing the guest shows fullscreen - the
-    // desktop, the Windows logon/"secure" desktop, the shutdown screen, a boot splash, an
-    // override-redirect overlay - is trusted or needed by the seamless model, so deny it
-    // OUTRIGHT every time the guest tries it. A request to LEAVE seamless (go fullscreen) is
-    // refused when service.gui-fullscreen is off: we coerce back to seamless, which keeps
-    // per-window mapping alive (no black screen) and never maps the whole-screen window 0.
-    // This closes the shutdown/teardown fullscreen path that the per-window ShouldAcceptWindow
-    // size-filter cannot reach (window 0 is not a per-window). Opt in with
-    // service.gui-fullscreen=1 (guest registry ShowFullscreenScreen) to allow true fullscreen.
-    if (!seamlessMode && !g_ShowFullscreenScreen)
+    // ARCHITECTURE DECISION (owner, 2026-08-19) - MODE 1 of 2: the WHOLE-SCREEN fullscreen
+    // (window 0, the "boot/shutdown screen") is UNCONDITIONALLY off. This is the desktop /
+    // logon / shutdown / splash surface the guest tries to map as the entire screen during the
+    // seamless transition; it is never trusted or wanted, in ANY configuration - NOT gated by
+    // service.gui-fullscreen. So a switch OUT of seamless (which would map window 0 via
+    // SendWindowMap(NULL) below) is ALWAYS refused: coerce back to seamless, keeping per-window
+    // mapping alive (no black screen), window 0 never mapped. Mode 2 (a fullscreen-sized normal
+    // APP window) is the separate, feature-gated case handled in ShouldAcceptWindow - do NOT
+    // confuse the two: enabling fullscreen apps must NOT bring back the boot/shutdown screen.
+    if (!seamlessMode)
     {
-        LogInfo("QGAFSFLASH fullscreen switch refused (service.gui-fullscreen off) - staying seamless");
+        LogInfo("QGAFSFLASH whole-screen fullscreen mode refused (boot/shutdown screen is unconditionally off) - staying seamless");
         seamlessMode = TRUE;
     }
 
@@ -3134,18 +3133,16 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     if (data->Handle == GetShellWindow())
         return FALSE;
 
-    // FULLSCREEN-SIZED WINDOW GATE (owner design 2026-08-19). The boot/shutdown "flash" is a
-    // window covering the whole screen (the desktop, a logon/boot surface, or a splash) that
-    // maps transiently during the seamless transition - identified by SIZE, not class, so it
-    // catches whatever the transient window actually is (class-based filtering missed it).
-    // A guest window that spans the full guest screen is essentially never something seamless
-    // wants to present (dom0's WM owns placement; a real app does not need to BE the screen).
-    // Two rules, per the owner:
-    //   - override-redirect + fullscreen -> NEVER map (a splash/overlay; unconditional).
-    //   - other fullscreen -> map only when the fullscreen feature is on (normal operation);
-    //     default off hides the startup/shutdown flash.
-    // g_ScreenWidth/Height is the live guest resolution; treat >=99% as fullscreen so a window
-    // one pixel shy of the edge still counts. Zero screen size (pre-xconf) disables the gate.
+    // FULLSCREEN-SIZED PER-WINDOW GATE (owner design 2026-08-19) - MODE 2 of 2: a normal APP
+    // window that happens to span the whole guest screen. Conditionally allowed: mapped only
+    // when service.gui-fullscreen is on. Identified by SIZE (>=99% of the guest screen), not
+    // class. Two rules:
+    //   - override-redirect + fullscreen -> NEVER map (a splash/overlay; unconditional, even
+    //     with the feature on).
+    //   - other fullscreen -> map only when the feature is on; default off.
+    // NOTE: the whole-screen "boot/shutdown SCREEN" (window 0) is Mode 1, handled
+    // UNCONDITIONALLY in SetSeamlessMode above and NOT by this feature. Zero screen size
+    // (pre-xconf) disables the gate.
     if (g_SeamlessMode && g_ScreenWidth && g_ScreenHeight &&
         data->Width  >= (g_ScreenWidth  - g_ScreenWidth  / 100) &&
         data->Height >= (g_ScreenHeight - g_ScreenHeight / 100))
