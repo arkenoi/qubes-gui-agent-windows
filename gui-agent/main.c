@@ -2997,18 +2997,16 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     LogVerbose("start");
     LogDebug("Seamless mode changing to %d", seamlessMode);
 
-    // ARCHITECTURE DECISION (owner, 2026-08-19) - MODE 1 of 2: the WHOLE-SCREEN fullscreen
-    // (window 0, the "boot/shutdown screen") is UNCONDITIONALLY off. This is the desktop /
-    // logon / shutdown / splash surface the guest tries to map as the entire screen during the
-    // seamless transition; it is never trusted or wanted, in ANY configuration - NOT gated by
-    // service.gui-fullscreen. So a switch OUT of seamless (which would map window 0 via
-    // SendWindowMap(NULL) below) is ALWAYS refused: coerce back to seamless, keeping per-window
-    // mapping alive (no black screen), window 0 never mapped. Mode 2 (a fullscreen-sized normal
-    // APP window) is the separate, feature-gated case handled in ShouldAcceptWindow - do NOT
-    // confuse the two: enabling fullscreen apps must NOT bring back the boot/shutdown screen.
-    if (!seamlessMode)
+    // Whole-screen fullscreen MODE (window 0) is feature-gated: a switch OUT of seamless maps
+    // window 0 via SendWindowMap(NULL) below, so refuse it unless service.gui-fullscreen is on.
+    // NOTE: this is NOT the boot/shutdown screen path - that turned out to be per-window LogonUI
+    // (handled UNCONDITIONALLY in ShouldAcceptWindow, class "LogonUI"). This gate only governs
+    // the intentional whole-screen fullscreen mode (dom0 fullscreens the qube window), which is
+    // part of "fullscreen conditionally allowed". Coerce to seamless when off: per-window
+    // mapping stays alive (no black screen), window 0 never mapped.
+    if (!seamlessMode && !g_ShowFullscreenScreen)
     {
-        LogInfo("QGAFSFLASH whole-screen fullscreen mode refused (boot/shutdown screen is unconditionally off) - staying seamless");
+        LogInfo("QGAFSFLASH fullscreen mode refused (service.gui-fullscreen off) - staying seamless");
         seamlessMode = TRUE;
     }
 
@@ -3147,16 +3145,22 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         data->Width  >= (g_ScreenWidth  - g_ScreenWidth  / 100) &&
         data->Height >= (g_ScreenHeight - g_ScreenHeight / 100))
     {
-        if (data->IsOverrideRedirect)
+        // MODE 1 - the boot/shutdown/logon SCREEN: UNCONDITIONALLY denied, never an app, not
+        // gated by the feature. Windows renders login, lock, "shutting down" and the initial
+        // desktop through LogonUI (class "LogonUI Logon Window" - measured 2026-08-19 by this
+        // filter's own debug log). Match the class substring so any LogonUI variant is caught.
+        // Override-redirect fullscreen (a splash/overlay) is denied here too - never legitimate.
+        if (data->IsOverrideRedirect || wcsstr(data->Class, L"LogonUI"))
         {
-            LogDebug("0x%x: override-redirect fullscreen (%ux%u, class %s) - never presented",
-                data->Handle, data->Width, data->Height, data->Class);
+            LogDebug("0x%x: boot/shutdown/logon screen (class %s, %ux%u) - unconditionally denied",
+                data->Handle, data->Class, data->Width, data->Height);
             return FALSE;
         }
+        // MODE 2 - a normal fullscreen-sized APP window: allowed only when opted in.
         if (!g_ShowFullscreenScreen)
         {
-            LogDebug("0x%x: fullscreen window (%ux%u, class %s) hidden (startup/shutdown flash; set service.gui-fullscreen to allow fullscreen)",
-                data->Handle, data->Width, data->Height, data->Class);
+            LogDebug("0x%x: fullscreen app window (class %s, %ux%u) hidden (set service.gui-fullscreen to allow)",
+                data->Handle, data->Class, data->Width, data->Height);
             return FALSE;
         }
     }
