@@ -39,6 +39,13 @@
 // is granted to dom0 once per agent lifetime and frames are copied into it; 0 restores
 // the legacy direct-map per-geometry grant (A/B switch, see gui-agent/capture.c)
 #define REG_CONFIG_STAGING_VALUE            L"StagingGrant"
+// Boot/shutdown full-desktop "flash" visibility (DWORD, default 0=hidden). The flash is the
+// desktop shell window (class Progman/WorkerW) slipping through ShouldAcceptWindow's
+// GetShellWindow() reject during the seamless transition; a class-based reject hides it.
+// The dom0 opt-in feature service.gui-fullscreen (guest qubesdb /qubes-service/gui-fullscreen)
+// overrides this guest-local base, and dom0 wins. Only governs the desktop-window filter;
+// the runtime fullscreen path (dom0 fullscreens the window) is untouched.
+#define REG_CONFIG_SHOW_FS_VALUE            L"ShowFullscreenScreen"
 // How long the agent waits for its FIRST gui-daemon client before deciding the vchan
 // server it opened is dead and exiting for the watchdog to respawn it, and how many times
 // it may do that before giving up and staying quiet. See the FIRST-BOOT SELF-HEAL note in

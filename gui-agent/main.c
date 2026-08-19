@@ -67,6 +67,16 @@ DWORD g_ScreenWidth;
 
 BOOL g_VchanClientConnected = FALSE;
 BOOL g_SeamlessMode = TRUE;
+// Boot/shutdown full-desktop "flash" opt-in. Default FALSE = HIDE the desktop shell window
+// (Progman / WorkerW, the 5120x1440 wallpaper surface) so it is never mapped during the
+// seamless transition. Measured 2026-08-19 (ProtoTrace): the agent boots seamless and never
+// maps window 0 - the flash is the DESKTOP window slipping through ShouldAcceptWindow's
+// GetShellWindow() reject at boot/shutdown, when the shell is not yet/no longer registered
+// so GetShellWindow() returns a different handle. A class-based reject (below) is stable
+// across the transition. Set TRUE by the dom0 feature service.gui-fullscreen (or the guest
+// registry ShowFullscreenScreen DWORD) to restore the classic visible behavior. Read once
+// in Init. Does NOT touch runtime case-2 fullscreen (dom0 fullscreens the window).
+BOOL g_ShowFullscreenScreen = FALSE;
 LONG g_ScreenWinX = 0;
 LONG g_ScreenWinY = 0;
 
@@ -3108,6 +3118,24 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 
     if (data->Handle == GetShellWindow())
         return FALSE;
+
+    // DESKTOP SHELL WINDOW (the boot/shutdown full-desktop "flash"). The wallpaper surface -
+    // class "Progman" (Program Manager) and its worker "WorkerW" - is the whole 5120x1440
+    // desktop, never a real app window. The GetShellWindow() reject above catches it at
+    // STEADY STATE, but measured 2026-08-19 (ProtoTrace): during the boot/shutdown transition
+    // the shell is not yet/no longer registered, so GetShellWindow() returns a different
+    // handle and the desktop window slips through and is mapped fullscreen = the flash the
+    // owner reported. Rejecting by CLASS is stable across the transition (the class does not
+    // depend on shell-registration timing). Hidden by default; service.gui-fullscreen opts in
+    // to the classic visible behavior. A genuine maximized APP is a different class (its own
+    // window class, not Progman/WorkerW), so it is unaffected.
+    if (!g_ShowFullscreenScreen &&
+        (0 == wcscmp(data->Class, L"Progman") || 0 == wcscmp(data->Class, L"WorkerW")))
+    {
+        LogDebug("0x%x: desktop shell window (class %s) not presented (hiding boot/shutdown flash; set service.gui-fullscreen to show)",
+            data->Handle, data->Class);
+        return FALSE;
+    }
 
     // START IS DISABLED IN SEAMLESS MODE (user decision 2026-08-13, shipped state).
     // On 25H2 the Start surface has never rendered acceptably through the seamless path:
@@ -6841,6 +6869,32 @@ static ULONG Init(void)
     else
     {
         g_SeamlessMode = seamlessMode;
+    }
+
+    // Boot/shutdown full-desktop "flash" gate. See g_ShowFullscreenScreen above and the
+    // class-based reject in ShouldAcceptWindow(). Default hidden; opt-in via the dom0 feature
+    // service.gui-fullscreen (guest qubesdb /qubes-service/gui-fullscreen) or the guest-local
+    // ShowFullscreenScreen registry DWORD - same dom0-owned pattern as enableWinKey (perf.c),
+    // dom0 wins over the registry base. Read once here in Init.
+    {
+        DWORD showFs = 0;
+        (void)CfgReadDword(moduleName, REG_CONFIG_SHOW_FS_VALUE, &showFs, NULL); // absent -> 0 (hidden)
+        g_ShowFullscreenScreen = (showFs != 0);
+        qdb_handle_t qdb = qdb_open(NULL);
+        if (qdb)
+        {
+            // `service.`-prefixed features are exported into the guest qubesdb as
+            // /qubes-service/<name>; dom0 wins over the registry base. Absent -> keep base.
+            char *v = qdb_read(qdb, "/qubes-service/gui-fullscreen", NULL);
+            if (v)
+            {
+                g_ShowFullscreenScreen = (v[0] != '0'); // any non-'0' shows; "0" hides
+                free(v); // match perf.c's qubesdb-read convention (same binary, proven)
+            }
+            qdb_close(qdb);
+        }
+        LogInfo("QGAFSFLASH show full-desktop at boot/shutdown: %s",
+            g_ShowFullscreenScreen ? L"on (opt-in)" : L"off (default, hidden)");
     }
 
     DWORD stagingGrant;
