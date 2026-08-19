@@ -2997,6 +2997,22 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     LogVerbose("start");
     LogDebug("Seamless mode changing to %d", seamlessMode);
 
+    // ARCHITECTURE DECISION (owner, 2026-08-19): the guest is NEVER granted a fullscreen
+    // presentation unless explicitly opted in. Nothing the guest shows fullscreen - the
+    // desktop, the Windows logon/"secure" desktop, the shutdown screen, a boot splash, an
+    // override-redirect overlay - is trusted or needed by the seamless model, so deny it
+    // OUTRIGHT every time the guest tries it. A request to LEAVE seamless (go fullscreen) is
+    // refused when service.gui-fullscreen is off: we coerce back to seamless, which keeps
+    // per-window mapping alive (no black screen) and never maps the whole-screen window 0.
+    // This closes the shutdown/teardown fullscreen path that the per-window ShouldAcceptWindow
+    // size-filter cannot reach (window 0 is not a per-window). Opt in with
+    // service.gui-fullscreen=1 (guest registry ShowFullscreenScreen) to allow true fullscreen.
+    if (!seamlessMode && !g_ShowFullscreenScreen)
+    {
+        LogInfo("QGAFSFLASH fullscreen switch refused (service.gui-fullscreen off) - staying seamless");
+        seamlessMode = TRUE;
+    }
+
     if (g_SeamlessMode == seamlessMode && !forceUpdate)
         goto end; // nothing to do
 
