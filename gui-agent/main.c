@@ -3454,6 +3454,15 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
 
         if (!data.IsVisible || !ShouldAcceptWindow(windowData))
         {
+            // Already-announced window that just became INELIGIBLE (e.g. an app that
+            // animated INTO borderless fullscreen with the feature off): UNMAP it now
+            // instead of waiting for RemoveWindow later in the pass. That gap is a visible
+            // flash of the fullscreen surface (owner-observed 2026-08-19). Light touch:
+            // an immediate unmap hides the dom0 window this pass; RemoveWindow's DESTROY
+            // still follows. A window born fullscreen (LogonUI) is rejected before its first
+            // MAP and never reaches here, so this only affects the transition case.
+            if (windowData->CreateSent && !windowData->Synthesized)
+                (void)SendWindowUnmap(windowData->Handle);
             windowData->DeletePending = TRUE; // silent removal via RemoveWindow
             status = ERROR_SUCCESS;
             goto end;
