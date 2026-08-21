@@ -115,9 +115,15 @@ BOOL     g_InputDragQuantise = TRUE;   // DEFAULT: measured better than stock by
 // visible rect. That is a real change (announced rect, capture offset, and input coordinate
 // translation) and is not attempted here.
 //
-// The knob stays wired (`qvm-features <vm> service.guestTitleBar 0` opts in) so the code path
+// The knob stays wired (`qvm-features <vm> service.hideGuestTitleBar 1` opts in) so the code path
 // can be exercised on a build where the agent has a different identity, but shipping it ON would
 // only produce one ACCESS_DENIED warning per window and change nothing on screen.
+//
+// RENAMED 2026-08-21, from `service.guestTitleBar` whose opt-in was spelled `0`. Measured on a
+// live guest: dom0 exports a service feature as "1" whenever the stored value is non-empty, so
+// `qvm-features <vm> service.guestTitleBar 0` reached the guest as "1" and the documented opt-in
+// could not be expressed at all. Every other feature here follows the Qubes convention - any
+// non-empty value enables, an empty value disables - and this one now does too.
 // DEFAULT OFF since 2026-08-17: the restyle changes the window's style, which makes the agent
 // RE-MAP it, and dom0's WM answers an unmap/map cycle with MSG_WINDOW_FLAGS set=MINIMIZE. Measured:
 // both restyled windows (0x1a0284 Notepad, 0x102ca Explorer, style 0x140f0000 ex 0x00040110) were
@@ -338,14 +344,14 @@ void PerfInit(void)
             if (qdb)
             {
                 // Same dom0-owned pattern as enableWinKey: `service.`-prefixed features are the
-                // ones Qubes exports into the guest's qubesdb. Absent -> default (hide).
-                char *tb = qdb_read(qdb, "/qubes-service/guestTitleBar", NULL);
+                // ones Qubes exports into the guest's qubesdb. Absent -> default above (OFF).
+                char *tb = qdb_read(qdb, "/qubes-service/hideGuestTitleBar", NULL);
                 if (tb)
                 {
-                    // '0' asks us to hide the guest caption (the feature is named for what the
-                    // guest SHOWS). Absent -> default above, which is currently OFF.
-                    g_HideGuestTitleBar = (tb[0] == '0');
-                    LogInfo("QGAHIDETITLE qubesdb guestTitleBar=%S -> hide %s",
+                    // Qubes convention, and the only one dom0 can actually express: any non-empty
+                    // feature value arrives here as "1" and enables; an empty value arrives as "0".
+                    g_HideGuestTitleBar = (tb[0] != '0');
+                    LogInfo("QGAHIDETITLE qubesdb hideGuestTitleBar=%S -> hide %s",
                         tb, g_HideGuestTitleBar ? L"on" : L"off");
                     free(tb);
                 }

@@ -1749,7 +1749,7 @@ static void SynthDeactivate(IN OUT WINDOW_DATA* entry)
     }
 }
 
-// --- guest title-bar hiding (service.guestTitleBar) ---------------------------
+// --- guest title-bar hiding (service.hideGuestTitleBar) -----------------------
 // A Windows guest draws its OWN caption inside the window bitmap, and dom0's window manager
 // decorates the same window again: two stacked title bars, which is not how a Linux qube looks.
 // Strip the guest's when Windows is the one drawing it, so dom0's decoration is the only header.
