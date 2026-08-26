@@ -79,6 +79,17 @@ BOOL g_ShowFullscreenScreen = FALSE;
 LONG g_ScreenWinX = 0;
 LONG g_ScreenWinY = 0;
 
+// DIAGNOSTIC ONLY - registry DWORD DiagWindowFilterOff (default 0), read once in Init.
+// Bitmask disabling individual ShouldAcceptWindow rejects so a field condition can be
+// simulated and a fix proven against the re-introduced defect on ONE binary:
+//   bit 0 (1): skip the GetShellWindow() identity check - simulates a rig where the shell
+//              window is unregistered or mismatched (forum 42717 post 85: Progman mapped as
+//              a black fullscreen window; that rig runs OpenShell).
+//   bit 1 (2): skip the shell-furniture attribute reject below.
+// Never set in production; every bit WEAKENS filtering. Guest-local presentation only -
+// dom0 still borders and isolates everything regardless.
+DWORD g_DiagWindowFilterOff = 0;
+
 // after we send MSG_DESTROY in fullscreen mode we can get delayed MSG_CONFIGURE,
 // we shouldn't reply to that before sending MSG_CREATE
 BOOL g_LocalScreenDestroyed = FALSE;
@@ -3128,7 +3139,7 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     if (data->DeletePending)
         return FALSE;
 
-    if (data->Handle == GetShellWindow())
+    if (!(g_DiagWindowFilterOff & 1) && data->Handle == GetShellWindow())
         return FALSE;
 
     // FULLSCREEN-SIZED PER-WINDOW GATE (owner design 2026-08-19) - MODE 2 of 2: a normal APP
@@ -3244,6 +3255,29 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         (data->ExStyle & WS_EX_TOOLWINDOW))
     {
         LogDebug("0x%x: click-through uncapturable shell overlay (%s), rejecting",
+            data->Handle, data->Class);
+        return FALSE;
+    }
+
+    // SHELL FURNITURE that the GetShellWindow() identity check above cannot vouch for.
+    // Field case (forum 42717 post 85, identified from the attached winenum): Progman -
+    // the desktop window itself - mapped as a black fullscreen window, minimizable but not
+    // closable, on a rig where the identity check evidently did not match (OpenShell
+    // present; shell registration timing/identity differs). Progman is
+    // NOREDIRECTIONBITMAP|TOOLWINDOW: uncapturable by PrintWindow (hence black) and marked
+    // as a tool surface, but NOT topmost. That combination is shell furniture, never an
+    // app surface the user launched. ATTRIBUTE-based on purpose, so it holds regardless of
+    // shell-window registration timing or identity.
+    // Toasts must survive this filter (CLAUDE.md 2A-chrome 3c): a toast is CoreWindow
+    // TOPMOST|NOREDIRECTIONBITMAP (toastcrop.h), so the !TOPMOST arm makes them
+    // unmatchable here. Checked against all 12 visible windows in the field winenum: this
+    // matches Progman and the already-cloaked DWM stub windows, nothing else.
+    if (!(g_DiagWindowFilterOff & 2) &&
+        (data->ExStyle & WS_EX_NOREDIRECTIONBITMAP) &&
+        (data->ExStyle & WS_EX_TOOLWINDOW) &&
+        !(data->ExStyle & WS_EX_TOPMOST))
+    {
+        LogDebug("0x%x: uncapturable non-topmost toolwindow (%s) - shell furniture, rejecting",
             data->Handle, data->Class);
         return FALSE;
     }
@@ -6900,6 +6934,15 @@ static ULONG Init(void)
         LogWarning("Failed to read '%s' config value, using default (TRUE)", REG_CONFIG_CURSOR_VALUE);
         g_DisableCursor = TRUE;
     }
+
+    // Diagnostic-only window-filter override; absent (the normal case) means 0 = all
+    // filters active. See g_DiagWindowFilterOff.
+    status = CfgReadDword(moduleName, L"DiagWindowFilterOff", &g_DiagWindowFilterOff, NULL);
+    if (ERROR_SUCCESS != status)
+        g_DiagWindowFilterOff = 0;
+    if (g_DiagWindowFilterOff != 0)
+        LogWarning("DiagWindowFilterOff=0x%x - window filters DISABLED for diagnosis; never ship this state",
+            g_DiagWindowFilterOff);
 
     DWORD seamlessMode;
     status = CfgReadDword(moduleName, REG_CONFIG_SEAMLESS_VALUE, &seamlessMode, NULL);
