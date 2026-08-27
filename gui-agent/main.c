@@ -4868,21 +4868,16 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         EnsureOnInputDesktop();
 
         static BOOL s_WasSecure = FALSE;
-        // SEAMLESS ONLY, and the reason is TAKEOVER, not pixels (owner 2026-08-27).
+        // UNCONDITIONAL. The secure desktop is never granted to dom0 in ANY mode (owner rule
+        // 2026-08-19, re-affirmed 2026-08-27 after a demo of the non-seamless case put a
+        // screen-sized window on the owner's display).
         //
-        // In seamless mode each guest window becomes its own dom0 window, so a secure-desktop
-        // switch hands dom0 the consent dialog AND its screen-sized dimming backdrop as
-        // free-standing windows: the backdrop is a full-screen, unclosable, input-dead surface
-        // in the user's dom0 session - the field "black window". That is takeover, and it is
-        // what this freeze exists to stop.
-        //
-        // In NON-SEAMLESS mode the guest desktop is confined to ONE bounded dom0 window that
-        // keeps its decorations and controls. If the guest switches its own desktop inside
-        // that window, dom0 simply shows different pixels in a window it still fully owns -
-        // no full-screen grab, no dom0 controls taken, no override-redirect escape (that one
-        // stays rejected unconditionally in ShouldAcceptWindow). Nothing to defend against,
-        // so nothing is frozen: the user sees what is in their window.
-        if (g_OnSecureDesktop && g_SeamlessMode)
+        // The "it is only a bounded window" argument does not survive contact with reality:
+        // the guest desktop is sized to the HOST, so the non-seamless window is as large as
+        // the user's entire screen. A window that covers the whole display IS a takeover to
+        // the person in front of it, whatever the window manager calls it. There is no mode
+        // in which secure-desktop content may reach dom0.
+        if (g_OnSecureDesktop)
         {
             s_WasSecure = TRUE;
             return ERROR_SUCCESS;
