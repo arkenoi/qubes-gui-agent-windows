@@ -3073,6 +3073,31 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
         seamlessMode = TRUE;
     }
 
+    // HARD GEOMETRY GUARD (owner, 2026-08-27: "never fucking ever non-seamless mode goes
+    // fullscreen unless requested explicitly - maximized from dom0 is the only explicit way
+    // it could be, not by itself ever").
+    //
+    // Window 0 is mapped at the GUEST screen size, and the guest screen is normally sized to
+    // the host - so a switch out of seamless hands dom0 a window that covers the user's whole
+    // display. That is the guest promoting itself to fullscreen, and it must be impossible:
+    // the legitimate way for the qube to fill the screen is the USER maximizing its window in
+    // dom0, which is dom0's own action on an ordinary window and needs nothing from us.
+    //
+    // This guard is deliberately independent of service.gui-fullscreen: the switch is driven
+    // by a NAMED EVENT that any code in the guest can set (its supported caller is dom0's
+    // set-gui-mode qrexec service, but the event itself carries no provenance - proven by
+    // signalling it from an in-guest script), so the feature alone cannot be the only barrier.
+    if (!seamlessMode && g_HostScreenWidth > 0 && g_HostScreenHeight > 0 &&
+        g_ScreenWidth >= (g_HostScreenWidth * 99) / 100 &&
+        g_ScreenHeight >= (g_HostScreenHeight * 99) / 100)
+    {
+        LogWarning("QGAFSFLASH non-seamless REFUSED: window 0 would be %ux%u against a %ux%u host "
+            L"screen - a guest may never promote itself to a screen-covering window; maximize the "
+            L"qube's window from dom0 instead. Staying seamless.",
+            g_ScreenWidth, g_ScreenHeight, g_HostScreenWidth, g_HostScreenHeight);
+        seamlessMode = TRUE;
+    }
+
     // Re-assert the prompt policy on every mode call (see ApplyUacPromptPolicy): it is
     // unconditional, and this is simply a convenient point that runs at start and on change.
     ApplyUacPromptPolicy();
