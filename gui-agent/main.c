@@ -148,6 +148,10 @@ HWND g_DesktopWindow = NULL;
 // 2026-08-27 after the field "black window" proved the dimming backdrop was mapped).
 volatile BOOL g_OnSecureDesktop = FALSE;
 
+// A non-seamless switch was asked for while the desktop was still host-sized: the agent
+// requested a windowed resolution first and completes the switch once that lands.
+static volatile BOOL g_NonSeamlessPending = FALSE;
+
 // Last window the foreground re-raise in AddAllWindows acted on. Cleared by ResetWatch so
 // the corrective re-fires on the first pass after every mass re-announce.
 static HWND g_LastForeground = NULL;
@@ -3057,6 +3061,14 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
 {
     ULONG status = ERROR_SUCCESS;
 
+    // An explicit switch back to seamless cancels any deferred non-seamless entry: the user
+    // changed their mind while the shrink was in flight.
+    if (seamlessMode && g_NonSeamlessPending)
+    {
+        LogInfo("QGAFSFLASH deferred non-seamless switch cancelled - seamless requested again");
+        g_NonSeamlessPending = FALSE;
+    }
+
     LogVerbose("start");
     LogDebug("Seamless mode changing to %d", seamlessMode);
 
@@ -3087,15 +3099,39 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     // by a NAMED EVENT that any code in the guest can set (its supported caller is dom0's
     // set-gui-mode qrexec service, but the event itself carries no provenance - proven by
     // signalling it from an in-guest script), so the feature alone cannot be the only barrier.
-    if (!seamlessMode && g_HostScreenWidth > 0 && g_HostScreenHeight > 0 &&
+    // ...unless DOM0 asked for this size: the user sizing or maximizing the qube's window is
+    // the one explicit, legitimate way for a qube to fill the screen, and it must not be
+    // second-guessed. Only guest-originated host-sized geometry is refused/shrunk below.
+    if (!seamlessMode && !g_ResolutionFromDom0 &&
+        g_HostScreenWidth > 0 && g_HostScreenHeight > 0 &&
         g_ScreenWidth >= (g_HostScreenWidth * 99) / 100 &&
         g_ScreenHeight >= (g_HostScreenHeight * 99) / 100)
     {
-        LogWarning("QGAFSFLASH non-seamless REFUSED: window 0 would be %ux%u against a %ux%u host "
-            L"screen - a guest may never promote itself to a screen-covering window; maximize the "
-            L"qube's window from dom0 instead. Staying seamless.",
-            g_ScreenWidth, g_ScreenHeight, g_HostScreenWidth, g_HostScreenHeight);
-        seamlessMode = TRUE;
+        // The desktop is still host-sized (seamless forces that, see the seamless branch
+        // below), so mapping window 0 now would cover the user's whole display. Do NOT do
+        // that, and do NOT simply refuse either - that left non-seamless unreachable, since
+        // the size can only be reduced while... not seamless. Ask for the windowed size and
+        // let the mode switch complete on the next pass, once the smaller mode has landed
+        // (a resolution change restarts capture, which re-applies the mode - see
+        // StartFrameProcessing). g_NonSeamlessPending survives that round trip.
+        DWORD ww = 0, wh = 0;
+        if (ERROR_SUCCESS != CfgReadDword(NULL, REG_CONFIG_WINDOWED_WIDTH_VALUE, &ww, NULL) || ww == 0)
+            ww = WINDOWED_DEFAULT_WIDTH;
+        if (ERROR_SUCCESS != CfgReadDword(NULL, REG_CONFIG_WINDOWED_HEIGHT_VALUE, &wh, NULL) || wh == 0)
+            wh = WINDOWED_DEFAULT_HEIGHT;
+        // Never larger than the host, and never host-sized: this value decides whether the
+        // window covers the screen, so clamp it rather than trusting the stored number.
+        if (ww >= (g_HostScreenWidth * 99) / 100 || wh >= (g_HostScreenHeight * 99) / 100)
+        {
+            ww = WINDOWED_DEFAULT_WIDTH;
+            wh = WINDOWED_DEFAULT_HEIGHT;
+        }
+        LogInfo("QGAFSFLASH non-seamless requested while the desktop is host-sized (%ux%u): "
+            L"shrinking to %ux%u first so window 0 cannot cover the screen; the switch completes "
+            L"when the new mode lands", g_ScreenWidth, g_ScreenHeight, ww, wh);
+        g_NonSeamlessPending = TRUE;
+        (void)RequestResolutionChange((LONG)ww, (LONG)wh, L"non-seamless-entry");
+        seamlessMode = TRUE;   // stay seamless for THIS pass
     }
 
     // Re-assert the prompt policy on every mode call (see ApplyUacPromptPolicy): it is
@@ -3137,7 +3173,12 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     else // seamless mode
     {
         // change the resolution to match host, if different
-        if (g_ScreenWidth != g_HostScreenWidth || g_ScreenHeight != g_HostScreenHeight)
+        // NOT while a non-seamless switch is pending: that path deliberately shrank the
+        // desktop so window 0 cannot cover the screen, and forcing it back to host size here
+        // would undo the shrink on every pass - the two would fight forever and the switch
+        // would never complete.
+        if (!g_NonSeamlessPending &&
+            (g_ScreenWidth != g_HostScreenWidth || g_ScreenHeight != g_HostScreenHeight))
         {
             LogDebug("Changing resolution to match host's");
             status = RequestResolutionChange(g_HostScreenWidth, g_HostScreenHeight, L"seamless-force");
@@ -5940,6 +5981,28 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
         return win_perror2(status, "SendScreenGrants");
 
     // this (re)initializes watched windows list
+    // Complete a non-seamless switch that was deferred until the desktop shrank (see the
+    // entry path in SetSeamlessMode): capture has just restarted at the new resolution, so
+    // window 0 can now be mapped at a size that does not cover the host screen.
+    if (g_NonSeamlessPending)
+    {
+        if (g_HostScreenWidth > 0 &&
+            g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
+            g_ScreenHeight < (g_HostScreenHeight * 99) / 100)
+        {
+            g_NonSeamlessPending = FALSE;
+            LogInfo("QGAFSFLASH desktop is now %ux%u (host %ux%u) - completing the deferred "
+                L"non-seamless switch", g_ScreenWidth, g_ScreenHeight,
+                g_HostScreenWidth, g_HostScreenHeight);
+            status = SetSeamlessMode(FALSE, TRUE);
+            if (status != ERROR_SUCCESS)
+                win_perror2(status, "SetSeamlessMode(FALSE) after shrink");
+            LogVerbose("end");
+            return status;
+        }
+        // still host-sized: the shrink has not landed yet, keep waiting (a later pass retries)
+    }
+
     status = SetSeamlessMode(g_SeamlessMode, TRUE);
     if (ERROR_SUCCESS != status)
         return win_perror2(status, "SetSeamlessMode");
@@ -7150,6 +7213,25 @@ static ULONG Init(void)
         const BOOL wantDisable = (uacOff && uacOff[0] == '1');
         DWORD wasOurs = 0;
         (void)CfgReadDword(moduleName, L"UacDisabledByFeature", &wasOurs, NULL);
+
+        // UAC on/off is decided at BOOT (EnableLUA splits the user's token at logon; there is
+        // no way to re-split a live session, so Windows requires a restart). On a guest with a
+        // VOLATILE root - an AppVM, whose C: is reset from its template at every boot - our
+        // write therefore lands AFTER the boot that would have honoured it and is discarded
+        // before the next one: the feature can never take effect. Measured 2026-08-28:
+        // EnableLUA read back 0 after a reboot while UAC still prompted. Say so instead of
+        // pretending it worked; the feature belongs on the TEMPLATE.
+        if (wantDisable)
+        {
+            qdb_handle_t q2 = qdb_open(NULL);
+            char *cls = q2 ? qdb_read(q2, "/type", NULL) : NULL;
+            if (cls && strcmp(cls, "TemplateVM") != 0 && strcmp(cls, "StandaloneVM") != 0)
+                LogWarning("QGAUAC service.uac-disable is set on a %S, whose C: is reset from its "
+                    L"template at every boot - EnableLUA is read at boot, so this can NEVER take "
+                    L"effect here. Set the feature on the TEMPLATE instead.", cls);
+            if (cls) free(cls);
+            if (q2) qdb_close(q2);
+        }
 
         if (wantDisable || wasOurs)
         {

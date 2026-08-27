@@ -45,6 +45,10 @@ ULONG EnsureQubesIddSoloWaiting(IN DWORD timeoutMs);
 // attached until the next reboot, and Windows places windows where dom0 cannot see them.
 void ResolutionRequestIddSoloReassert(void);
 
+// TRUE when the currently applied desktop size was requested by dom0 (the user sizing or
+// maximizing the qube's window) rather than by the guest itself. See the non-seamless guard.
+extern BOOL g_ResolutionFromDom0;
+
 DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* source);
 ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source);
 

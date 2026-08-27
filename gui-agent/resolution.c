@@ -1761,6 +1761,16 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
         // save last-set resolution to use on next startup
         CfgWriteDword(NULL, REG_CONFIG_FULLSCREEN_WIDTH_VALUE, g_ScreenWidth, NULL);
         CfgWriteDword(NULL, REG_CONFIG_FULLSCREEN_HEIGHT_VALUE, g_ScreenHeight, NULL);
+        // ...and remember it as the WINDOWED size too, but ONLY when it is not the host-sized
+        // seamless force. Those two were the same value before, so the seamless force wiped
+        // the only record of a windowed size and entering non-seamless had nothing smaller to
+        // return to (see the entry path in SetSeamlessMode).
+        if (!(g_HostScreenWidth > 0 && g_ScreenWidth >= (g_HostScreenWidth * 99) / 100 &&
+              g_ScreenHeight >= (g_HostScreenHeight * 99) / 100))
+        {
+            CfgWriteDword(NULL, REG_CONFIG_WINDOWED_WIDTH_VALUE, g_ScreenWidth, NULL);
+            CfgWriteDword(NULL, REG_CONFIG_WINDOWED_HEIGHT_VALUE, g_ScreenHeight, NULL);
+        }
         // resolution changed: recompute the guest work area against the new screen
         WorkAreaApply();
     }
@@ -1798,6 +1808,12 @@ static DWORD WINAPI ResolutionChangeThread(void *param)
     return ERROR_SUCCESS;
 }
 
+// TRUE when the size currently applied was requested by dom0 - i.e. the user sized or
+// maximized the qube's window. The non-seamless guard consults this: dom0 asking for a
+// host-sized desktop is the ONE explicit, legitimate way for a qube to fill the screen,
+// while the guest asking for it is the self-promotion that must never happen.
+BOOL g_ResolutionFromDom0 = FALSE;
+
 DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* source)
 {
     static RESOLUTION_THREAD_PARAMS threadArgs = { 0 };
@@ -1808,6 +1824,8 @@ DWORD RequestResolutionChange(IN LONG width, IN LONG height, IN const WCHAR* sou
     static HANDLE thread = NULL;
 
     LogVerbose("%dx%d", width, height);
+
+    g_ResolutionFromDom0 = (source && 0 == wcscmp(source, L"dom0"));
 
     if (!threadArgs.Event)
         threadArgs.Event = CreateEvent(NULL, FALSE, FALSE, NULL);

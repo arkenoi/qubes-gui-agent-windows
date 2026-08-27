@@ -33,6 +33,14 @@
 #define REG_CONFIG_SEAMLESS_VALUE   L"SeamlessMode"
 #define REG_CONFIG_FULLSCREEN_WIDTH_VALUE   L"FullscreenWidth"
 #define REG_CONFIG_FULLSCREEN_HEIGHT_VALUE  L"FullscreenHeight"
+// Desktop size to use in NON-SEAMLESS mode (the whole guest desktop inside ONE dom0 window).
+// Kept separate from FullscreenWidth/Height because those are overwritten by the seamless
+// force-to-host, which left no windowed size to return to - so entering non-seamless
+// inherited host geometry and produced a screen-covering window every time.
+#define REG_CONFIG_WINDOWED_WIDTH_VALUE     L"WindowedWidth"
+#define REG_CONFIG_WINDOWED_HEIGHT_VALUE    L"WindowedHeight"
+#define WINDOWED_DEFAULT_WIDTH   1280
+#define WINDOWED_DEFAULT_HEIGHT   800
 // guest work area override "x,y,w,h" (see gui-agent/workarea.h)
 #define REG_CONFIG_WORKAREA_VALUE           L"WorkArea"
 // persistent staging framebuffer grant (DWORD, default 1=ON): the screen framebuffer
