@@ -270,6 +270,32 @@ void PerfInit(void)
             g_ProtoTraceWobble ? L"on" : L"off");
     }
 
+    // ONE dom0 switch for full diagnostic logging (added 4.3.10, when the defaults went
+    // quiet): `qvm-features <vm> service.gui-agent-debug 1` turns on everything a field
+    // diagnosis needs - per-frame QGAPERF lines, protocol/paint traces, and Debug-level
+    // logging - with no guest-side registry surgery. Same dom0-owned pattern as
+    // enableWinKey/gui-fullscreen: dom0 wins over the registry base in BOTH directions
+    // ("0" forces the diagnostics off); absent keeps the base. Read once here at Init.
+    {
+        qdb_handle_t qdb = qdb_open(NULL);
+        if (qdb)
+        {
+            char *dv = qdb_read(qdb, "/qubes-service/gui-agent-debug", NULL);
+            if (dv)
+            {
+                const BOOL dbg = (dv[0] != '0');
+                g_PerfEnabled = dbg;
+                g_ProtoTrace = dbg;
+                if (dbg && LogGetLevel() < LOG_LEVEL_DEBUG)
+                    LogSetLevel(LOG_LEVEL_DEBUG);
+                LogInfo("QGADEBUG qubesdb gui-agent-debug=%S -> full diagnostic logging %s "
+                    "(perf frames + proto traces + debug level)", dv, dbg ? L"ON" : L"OFF");
+                free(dv);
+            }
+            qdb_close(qdb);
+        }
+    }
+
     // Z-order sync switch. Read here for the same reason as ProtoTrace: it is behaviour, not
     // measurement, so it must apply whether or not the perf log is on. Logged unconditionally
     // so any captured log states which condition produced it - a hit rate is meaningless
@@ -464,7 +490,7 @@ void PerfInit(void)
         // Off is the shipping default since 4.3.10 (per-frame lines were 91% of a
         // field log's bytes). One self-describing line so a field log still says how
         // to turn the instrument on.
-        LogInfo("QGAPERF off (registry DWORD PerfLog=1 under the gui-agent key to enable; PerfEveryN throttles)");
+        LogInfo("QGAPERF off (enable ALL diagnostics from dom0: qvm-features <vm> service.gui-agent-debug 1; or registry DWORD PerfLog=1, PerfEveryN throttles)");
         return;
     }
 
