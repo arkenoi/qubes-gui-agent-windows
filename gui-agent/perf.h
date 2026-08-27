@@ -42,9 +42,12 @@
 
 // Compile-time default for the master switch, used when neither the registry
 // value nor the environment variable is present.
-// 1 for the Qubes display-performance measurement builds, 0 for upstream.
+// 0 since 4.3.10: per-frame QGAPERF lines were 91% of a field log's bytes (2.1 of 2.3 MB
+// in a 15-minute session, GWeck 2026-08-27) - diagnostic-grade, not normal-user-grade.
+// Re-enable per install with the PerfLog registry DWORD (plus PerfEveryN to throttle),
+// or the QGA_PERF env var; measurement builds can still compile with it as 1.
 #ifndef QGA_PERF_DEFAULT
-#define QGA_PERF_DEFAULT 1
+#define QGA_PERF_DEFAULT 0
 #endif
 
 // Registry values, read from HKLM\Software\Invisible Things Lab\Qubes Tools\gui-agent

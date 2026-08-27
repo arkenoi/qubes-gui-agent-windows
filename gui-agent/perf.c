@@ -461,7 +461,10 @@ void PerfInit(void)
 
     if (!g_PerfEnabled)
     {
-        LogInfo("QGAPERF off");
+        // Off is the shipping default since 4.3.10 (per-frame lines were 91% of a
+        // field log's bytes). One self-describing line so a field log still says how
+        // to turn the instrument on.
+        LogInfo("QGAPERF off (registry DWORD PerfLog=1 under the gui-agent key to enable; PerfEveryN throttles)");
         return;
     }
 

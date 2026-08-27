@@ -4302,9 +4302,12 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
         return;
     }
 
-    LogInfo("QGAPROTO,msg=SYNTHPAINT,hwnd=0x%x,owner=0x%x,rx=%d,ry=%d,w=%d,h=%d",
-        (uint32_t)(ULONG_PTR)c->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
-        relX, relY, w, h);
+    // Per-patch trace: fires ~30x/s while an animated tooltip is up (1254 lines / 163 KB
+    // in one 15-minute field log) - gate on the protocol-trace switch its tag names.
+    if (g_ProtoTrace)
+        LogInfo("QGAPROTO,msg=SYNTHPAINT,hwnd=0x%x,owner=0x%x,rx=%d,ry=%d,w=%d,h=%d",
+            (uint32_t)(ULONG_PTR)c->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
+            relX, relY, w, h);
 
     const BYTE* src = g_FbBits + (size_t)r.top * g_FbPitch + (size_t)r.left * 4;
     BYTE* dst = (BYTE*)owner->PwBuffer +
