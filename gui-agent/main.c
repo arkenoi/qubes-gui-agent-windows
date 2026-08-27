@@ -4868,11 +4868,21 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         EnsureOnInputDesktop();
 
         static BOOL s_WasSecure = FALSE;
-        // UNCONDITIONAL: the secure desktop is never granted to dom0 in any mode (owner rule
-        // 2026-08-19). Prompts are drawn on the normal desktop by ApplyUacPromptPolicy, so a
-        // secure desktop here means a lock screen, Ctrl+Alt+Del or a site policy - none of
-        // which dom0 may see.
-        if (g_OnSecureDesktop)
+        // SEAMLESS ONLY, and the reason is TAKEOVER, not pixels (owner 2026-08-27).
+        //
+        // In seamless mode each guest window becomes its own dom0 window, so a secure-desktop
+        // switch hands dom0 the consent dialog AND its screen-sized dimming backdrop as
+        // free-standing windows: the backdrop is a full-screen, unclosable, input-dead surface
+        // in the user's dom0 session - the field "black window". That is takeover, and it is
+        // what this freeze exists to stop.
+        //
+        // In NON-SEAMLESS mode the guest desktop is confined to ONE bounded dom0 window that
+        // keeps its decorations and controls. If the guest switches its own desktop inside
+        // that window, dom0 simply shows different pixels in a window it still fully owns -
+        // no full-screen grab, no dom0 controls taken, no override-redirect escape (that one
+        // stays rejected unconditionally in ShouldAcceptWindow). Nothing to defend against,
+        // so nothing is frozen: the user sees what is in their window.
+        if (g_OnSecureDesktop && g_SeamlessMode)
         {
             s_WasSecure = TRUE;
             return ERROR_SUCCESS;
