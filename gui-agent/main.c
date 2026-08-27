@@ -7089,50 +7089,72 @@ static ULONG Init(void)
 
     // UAC FROM DOM0 (owner design 2026-08-27), deliberately ONE knob:
     //
-    //   service.uac   absent -> leave the guest's EnableLUA alone (never silently re-enable
-    //                 UAC on a guest configured without it - this project's own testbeds
-    //                 included); "1" -> EnableLUA=1; "0" -> EnableLUA=0. Off means off.
-    //                 Changing it needs a guest REBOOT, and turning UAC off removes the
-    //                 admin/kernel barrier that faces the hypervisor (hypercalls, grant
-    //                 tables, PV drivers), so it is warned about loudly.
+    //   service.uac-disable   "1" -> UAC OFF (EnableLUA=0). Anything else - absent, cleared,
+    //                         "0" - means we do not disable it, and we UNDO a disable we
+    //                         previously applied. Needs a guest REBOOT to take effect.
+    //
+    // WHY the dangerous direction needs an explicit "1": a Qubes feature CLEARED the ordinary
+    // way (`qvm-features <vm> <feat> ''`) reads back as "0", indistinguishable from a
+    // deliberate false. With a plain service.uac knob that made "clear the feature" silently
+    // DISABLE UAC - measured on this testbed 2026-08-27, and unacceptable for a setting that
+    // governs the admin/kernel barrier (hypercalls, grant tables and the PV drivers all sit
+    // behind ring 0, so UAC here is real guest->host attack-surface reduction, whatever it is
+    // worth inside Windows). Now only an explicit "1" acts; everything else is safe.
+    //
+    // Reversibility without touching guests we never modified: when we disable UAC we record
+    // it under our own config key, and we restore EnableLUA=1 only if that marker says the
+    // disable was ours. A guest that had UAC off before QWT keeps it off.
     //
     // WHERE the prompt is drawn is NOT a feature: it follows the display mode, because the
-    // right answer is different in each and both are already known to the agent -
-    // seamless -> normal desktop (the prompt arrives in dom0 as its own window, visible and
-    // clickable); fullscreen -> secure desktop (dom0 shows the whole screen anyway, so the
-    // prompt appears exactly as on a physical machine, with Windows' own spoofing
-    // protection intact). ApplyUacPromptPolicy() below is called from SetSeamlessMode, so
-    // it tracks live mode switches, not just this Init.
+    // right answer differs and the agent already knows the mode - seamless -> normal desktop
+    // (the prompt arrives in dom0 as its own window, visible and clickable); fullscreen ->
+    // secure desktop (dom0 shows the whole screen anyway, so it appears exactly as on
+    // physical hardware). See ApplyUacPromptPolicy, called from SetSeamlessMode.
     {
         qdb_handle_t qdb = qdb_open(NULL);
-        char *uac = qdb ? qdb_read(qdb, "/qubes-service/uac", NULL) : NULL;
-        if (uac)
+        char *uacOff = qdb ? qdb_read(qdb, "/qubes-service/uac-disable", NULL) : NULL;
+        const BOOL wantDisable = (uacOff && uacOff[0] == '1');
+        DWORD wasOurs = 0;
+        (void)CfgReadDword(moduleName, L"UacDisabledByFeature", &wasOurs, NULL);
+
+        if (wantDisable || wasOurs)
         {
             HKEY polKey = NULL;
             LONG rc = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
                 L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
                 0, KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY, &polKey);
-            if (rc == ERROR_SUCCESS)
-            {
-                DWORD want = (uac[0] != '0') ? 1 : 0;
-                DWORD cur = 1, sz = sizeof(cur), type = 0;
-                (void)RegQueryValueEx(polKey, L"EnableLUA", NULL, &type, (BYTE*)&cur, &sz);
-                rc = RegSetValueEx(polKey, L"EnableLUA", 0, REG_DWORD, (const BYTE*)&want, sizeof(want));
-                LogInfo("QGAUAC service.uac=%S -> EnableLUA=%lu (was %lu)%s", uac, want, cur,
-                    (cur != want) ? L" - REBOOT REQUIRED" : L"");
-                if (rc != ERROR_SUCCESS)
-                    LogWarning("QGAUAC writing EnableLUA failed 0x%x", rc);
-                if (want == 0)
-                    LogWarning("QGAUAC UAC DISABLED by dom0 policy: any code in this qube can "
-                        L"reach admin/kernel, which is guest->host attack surface");
-                RegCloseKey(polKey);
-            }
-            else
+            if (rc != ERROR_SUCCESS)
             {
                 LogWarning("QGAUAC cannot open the UAC policy key (0x%x)", rc);
             }
-            free(uac);
+            else
+            {
+                DWORD want = wantDisable ? 0 : 1;
+                DWORD cur = 1, sz = sizeof(cur), type = 0;
+                (void)RegQueryValueEx(polKey, L"EnableLUA", NULL, &type, (BYTE*)&cur, &sz);
+                if (cur != want)
+                {
+                    rc = RegSetValueEx(polKey, L"EnableLUA", 0, REG_DWORD,
+                                       (const BYTE*)&want, sizeof(want));
+                    if (rc != ERROR_SUCCESS)
+                        LogWarning("QGAUAC writing EnableLUA failed 0x%x", rc);
+                    else
+                        LogInfo("QGAUAC service.uac-disable=%S -> EnableLUA %lu -> %lu - REBOOT REQUIRED",
+                            uacOff ? uacOff : "absent", cur, want);
+                }
+                else
+                {
+                    LogInfo("QGAUAC service.uac-disable=%S -> EnableLUA already %lu",
+                        uacOff ? uacOff : "absent", cur);
+                }
+                if (wantDisable)
+                    LogWarning("QGAUAC UAC DISABLED by dom0 policy: any code in this qube can "
+                        L"reach admin/kernel, which is guest->host attack surface");
+                RegCloseKey(polKey);
+                (void)CfgWriteDword(moduleName, L"UacDisabledByFeature", wantDisable ? 1 : 0, NULL);
+            }
         }
+        if (uacOff) free(uacOff);
         if (qdb) qdb_close(qdb);
     }
 
