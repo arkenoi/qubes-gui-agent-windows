@@ -2836,6 +2836,16 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
 
     EnsureOnInputDesktop();
 
+    // SECURE-DESKTOP FREEZE, enumeration leg (v3): a respawned agent initializing while a
+    // UAC prompt is up (ResetWatch -> here; the exact field respawn-during-consent case)
+    // would enumerate the WINLOGON desktop and map its surfaces. Enumerate nothing; the
+    // resume path's resync re-enumerates the Default desktop when the prompt is gone.
+    if (g_OnSecureDesktop)
+    {
+        LogInfo("AddAllWindows suppressed: secure desktop is active");
+        return ERROR_SUCCESS;
+    }
+
     g_TaskbarWindow = FindWindow(L"Shell_TrayWnd", 0);
     g_ShowTaskbar = FALSE;
 
@@ -3956,6 +3966,14 @@ static ULONG TrackWindows(OUT TRACK_STATS* stats)
 // window moves reach the gui daemon at input rate instead of at capture rate.
 static void ProcessWindowEvents(void)
 {
+    // SECURE-DESKTOP FREEZE, event leg (v3; the v2 frame-loop gate alone left THIS path
+    // live, which mapped the UAC consent dialog as a damage-starved black box - measured
+    // shot14/win-4). While the secure desktop is up, no tracking mutation may run from
+    // events either; QueueWindowEvent keeps queueing, and the resume path requests a full
+    // resync so nothing that changed while frozen is missed.
+    if (g_OnSecureDesktop)
+        return;
+
     PwRevokeTick();
 
     // Reap dead capture channels: a WGC session that threw (window gone mid-poll,
@@ -4808,8 +4826,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         if (s_WasSecure)
         {
             s_WasSecure = FALSE;
-            LogInfo("secure desktop left - resuming frame flow with the frame signature invalidated");
+            LogInfo("secure desktop left - resuming with a full resync and the frame signature invalidated");
             PwInvalidateFramebuffer(); // FrameSigInvalidate + g_FbBits reset; republished just below
+            QueueWindowEvent(NULL, 0, TRUE); // full re-enumeration: catch up on everything frozen out
         }
     }
 
