@@ -3019,15 +3019,17 @@ static ULONG ResetWatch(BOOL seamlessMode)
 // set fullscreen/seamless mode
 // Force Windows to draw UAC consent on the NORMAL desktop (PromptOnSecureDesktop=0), always.
 //
-// The secure desktop is NEVER granted to dom0, under any condition (owner rule 2026-08-19).
-// A prompt drawn there is therefore a prompt nobody can see or answer - the qube simply
-// stops responding until it times out, and in the field its dimming backdrop leaked into
-// dom0 as the notorious unclosable black window. Moving consent to the normal desktop is
-// exactly the "convert the elevation prompt to a normal in-desktop dialog" outcome that rule
-// called for as future work: the prompt becomes an ordinary mapped window the user reads and
-// clicks (verified end to end by the owner). This is NOT mode-dependent - there is no
-// configuration in which showing the secure desktop is acceptable. consent.exe reads the
-// value per prompt, so no reboot is needed.
+// Then the prompt is just a window, and dom0 renders it the way it renders every other guest
+// window: in SEAMLESS mode it arrives as its own standalone dom0 window; in NON-SEAMLESS mode
+// it appears inside the desktop window. Nothing here selects between those - that difference
+// is simply how the two display modes work, and neither needs a special case.
+//
+// The alternative, Windows' secure desktop, is never an option: it is NEVER granted to dom0
+// under any condition (owner rule 2026-08-19), so a prompt drawn there is one nobody can see
+// or answer, and in the field its dimming backdrop leaked into dom0 as the notorious
+// unclosable black window. Moving consent to the normal desktop is exactly the "convert the
+// elevation prompt to a normal in-desktop dialog" outcome that rule called for.
+// consent.exe reads the value per prompt, so no reboot is needed.
 static void ApplyUacPromptPolicy(void)
 {
     HKEY polKey = NULL;
@@ -3046,8 +3048,9 @@ static void ApplyUacPromptPolicy(void)
     if (rc != ERROR_SUCCESS)
         LogWarning("QGAUAC writing PromptOnSecureDesktop failed 0x%x", rc);
     else
-        LogInfo("QGAUAC PromptOnSecureDesktop=0: elevation prompts are drawn on the normal "
-            L"desktop and mapped to dom0 as ordinary windows (the secure desktop is never shown)");
+        LogInfo("QGAUAC PromptOnSecureDesktop=0: elevation prompts are ordinary windows on the "
+            L"normal desktop (standalone in dom0 when seamless, inside the desktop window when "
+            L"not); the secure desktop is never shown");
 }
 
 ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
@@ -7107,8 +7110,9 @@ static ULONG Init(void)
     // it under our own config key, and we restore EnableLUA=1 only if that marker says the
     // disable was ours. A guest that had UAC off before QWT keeps it off.
     //
-    // WHERE the prompt is drawn is not configurable and not mode-dependent: ALWAYS the
-    // normal desktop (see ApplyUacPromptPolicy). The secure desktop is never granted to
+    // WHERE the prompt is drawn is not configurable: ALWAYS the normal desktop (see
+    // ApplyUacPromptPolicy), which makes it an ordinary window - standalone in dom0 when
+    // seamless, inside the desktop window when not. The secure desktop is never granted to
     // dom0, so a prompt drawn there could never be seen or answered.
     {
         qdb_handle_t qdb = qdb_open(NULL);
