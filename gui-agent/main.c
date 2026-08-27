@@ -4909,6 +4909,23 @@ static BOOL FrameRedundant(IN const CAPTURE_FRAME* frame, IN const BYTE* fb, IN 
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
     IN UINT fbWidth, IN UINT fbHeight)
 {
+    // Complete a deferred non-seamless switch as soon as frames flow again at the smaller
+    // size. This lives on the FRAME path deliberately: a resolution change can take the
+    // capture down with 0x887a0026 (keyed mutex abandoned) and recover via
+    // RecreateDuplication, which does NOT go through StartFrameProcessing - so a completion
+    // hook there is never reached (measured 2026-08-28: the shrink landed, the switch did
+    // not). Frames resuming is the one signal that always arrives.
+    if (g_NonSeamlessPending && g_HostScreenWidth > 0 &&
+        g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
+        g_ScreenHeight < (g_HostScreenHeight * 99) / 100)
+    {
+        g_NonSeamlessPending = FALSE;
+        LogInfo("QGAFSFLASH desktop is now %ux%u (host %ux%u) - completing the deferred "
+            L"non-seamless switch", g_ScreenWidth, g_ScreenHeight,
+            g_HostScreenWidth, g_HostScreenHeight);
+        (void)SetSeamlessMode(FALSE, TRUE);
+    }
+
     // SECURE-DESKTOP FREEZE (owner rule: the secure desktop is NEVER granted; field root
     // cause 2026-08-27 - the mapped UAC dimming backdrop WAS GWeck's black window). While
     // the input desktop is not "Default", NOTHING may flow: the framebuffer now holds
