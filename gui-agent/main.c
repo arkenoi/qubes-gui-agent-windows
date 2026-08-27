@@ -7048,6 +7048,78 @@ static ULONG Init(void)
             g_ShowFullscreenScreen ? L"on (opt-in)" : L"off (default, hidden)");
     }
 
+    // UAC POLICY FROM DOM0 (owner request 2026-08-27). Two dom0 features, applied here at
+    // every agent start because the agent runs as SYSTEM and is the component that owns the
+    // secure-desktop interaction:
+    //
+    //   service.uac-secure-desktop  absent/0 -> PromptOnSecureDesktop=0 (DEFAULT, shipped):
+    //                               the consent prompt renders on the NORMAL desktop, so it
+    //                               arrives in dom0 as an ordinary window the user can see
+    //                               and click. 1 -> classic secure-desktop prompt, which the
+    //                               agent must (and does) freeze out of dom0 entirely - i.e.
+    //                               the prompt becomes INVISIBLE and the qube appears to hang
+    //                               until it times out. Opt in only if in-guest prompt
+    //                               spoofing matters more than being able to answer it.
+    //   service.uac-disable         absent -> leave EnableLUA untouched (whatever the guest
+    //                               has). 1 -> EnableLUA=0, 0 -> EnableLUA=1. Turning UAC off
+    //                               removes the admin/kernel elevation barrier, which is real
+    //                               guest->host attack surface (hypercalls, grant tables and
+    //                               the PV drivers all live behind ring 0); it is NOT
+    //                               recommended and needs a REBOOT to take effect.
+    //
+    // Absent-means-enforce-the-default is deliberate for the first feature (the installer
+    // seeds the same value, so this only repairs drift); absent-means-do-not-touch is
+    // deliberate for the second (never silently re-enable UAC on a guest configured without
+    // it - including this project's own testbeds).
+    {
+        HKEY polKey = NULL;
+        LONG rc = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+            0, KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY, &polKey);
+        if (rc != ERROR_SUCCESS)
+        {
+            LogWarning("QGAUAC cannot open the UAC policy key (0x%x) - UAC features not applied", rc);
+        }
+        else
+        {
+            qdb_handle_t qdb = qdb_open(NULL);
+            char *sd = qdb ? qdb_read(qdb, "/qubes-service/uac-secure-desktop", NULL) : NULL;
+            char *off = qdb ? qdb_read(qdb, "/qubes-service/uac-disable", NULL) : NULL;
+
+            DWORD wantSd = (sd && sd[0] != '0') ? 1 : 0;   // absent -> 0, the shipped default
+            rc = RegSetValueEx(polKey, L"PromptOnSecureDesktop", 0, REG_DWORD,
+                               (const BYTE*)&wantSd, sizeof(wantSd));
+            LogInfo("QGAUAC PromptOnSecureDesktop=%lu (feature %S) - prompts are %s",
+                wantSd, sd ? sd : "absent",
+                wantSd ? L"on the secure desktop: INVISIBLE in dom0 while the agent freezes it"
+                       : L"on the normal desktop: visible and clickable in dom0");
+            if (rc != ERROR_SUCCESS)
+                LogWarning("QGAUAC writing PromptOnSecureDesktop failed 0x%x", rc);
+
+            if (off)
+            {
+                DWORD wantLua = (off[0] != '0') ? 0 : 1;   // uac-disable=1 -> EnableLUA=0
+                DWORD cur = 1, sz = sizeof(cur), type = 0;
+                (void)RegQueryValueEx(polKey, L"EnableLUA", NULL, &type, (BYTE*)&cur, &sz);
+                rc = RegSetValueEx(polKey, L"EnableLUA", 0, REG_DWORD,
+                                   (const BYTE*)&wantLua, sizeof(wantLua));
+                LogInfo("QGAUAC EnableLUA=%lu (feature uac-disable=%S, was %lu)%s",
+                    wantLua, off, cur,
+                    (cur != wantLua) ? L" - REBOOT REQUIRED for this to take effect" : L"");
+                if (rc != ERROR_SUCCESS)
+                    LogWarning("QGAUAC writing EnableLUA failed 0x%x", rc);
+                if (wantLua == 0)
+                    LogWarning("QGAUAC UAC is being DISABLED by dom0 policy: any code in this "
+                        L"qube can reach admin/kernel, which is guest->host attack surface");
+            }
+
+            if (sd) free(sd);
+            if (off) free(off);
+            if (qdb) qdb_close(qdb);
+            RegCloseKey(polKey);
+        }
+    }
+
     DWORD stagingGrant;
     status = CfgReadDword(moduleName, REG_CONFIG_STAGING_VALUE, &stagingGrant, NULL);
     if (ERROR_SUCCESS != status)
