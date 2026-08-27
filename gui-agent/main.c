@@ -3017,6 +3017,37 @@ static ULONG ResetWatch(BOOL seamlessMode)
 }
 
 // set fullscreen/seamless mode
+// Where Windows draws the UAC consent prompt, decided by the display mode (see the QGAUAC
+// block in Init). Seamless: PromptOnSecureDesktop=0, so consent renders on the normal
+// desktop and reaches dom0 as an ordinary window the user can read and click - the secure
+// desktop would instead be frozen out of dom0 and the prompt would be invisible.
+// Fullscreen: PromptOnSecureDesktop=1, because dom0 is showing the whole guest screen, so
+// the secure desktop displays exactly as it would on physical hardware, keeping Windows'
+// own anti-spoofing behaviour. consent.exe reads this per prompt, so no reboot is needed.
+static void ApplyUacPromptPolicy(IN BOOL seamlessMode)
+{
+    HKEY polKey = NULL;
+    LONG rc = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+        0, KEY_SET_VALUE | KEY_WOW64_64KEY, &polKey);
+    if (rc != ERROR_SUCCESS)
+    {
+        LogWarning("QGAUAC cannot open the UAC policy key (0x%x) - prompt policy unchanged", rc);
+        return;
+    }
+    DWORD want = seamlessMode ? 0 : 1;
+    rc = RegSetValueEx(polKey, L"PromptOnSecureDesktop", 0, REG_DWORD,
+                       (const BYTE*)&want, sizeof(want));
+    RegCloseKey(polKey);
+    if (rc != ERROR_SUCCESS)
+        LogWarning("QGAUAC writing PromptOnSecureDesktop failed 0x%x", rc);
+    else
+        LogInfo("QGAUAC PromptOnSecureDesktop=%lu (%s mode): elevation prompts are %s",
+            want, seamlessMode ? L"seamless" : L"fullscreen",
+            want ? L"on the secure desktop, shown as part of the full screen"
+                 : L"on the normal desktop, mapped to dom0 as their own window");
+}
+
 ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
 {
     ULONG status = ERROR_SUCCESS;
@@ -3036,6 +3067,10 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
         LogInfo("QGAFSFLASH fullscreen mode refused (service.gui-fullscreen off) - staying seamless");
         seamlessMode = TRUE;
     }
+
+    // UAC prompts follow the mode (see ApplyUacPromptPolicy): re-asserted on every call,
+    // including forceUpdate, so a mode that was coerced above still lands on the right one.
+    ApplyUacPromptPolicy(seamlessMode);
 
     if (g_SeamlessMode == seamlessMode && !forceUpdate)
         goto end; // nothing to do
@@ -4828,7 +4863,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         EnsureOnInputDesktop();
 
         static BOOL s_WasSecure = FALSE;
-        if (g_OnSecureDesktop)
+        // Freeze only in SEAMLESS mode. In fullscreen dom0 renders the whole guest screen,
+        // and the secure desktop is then the screen the user is meant to see (that is where
+        // the prompt is drawn, by the policy above) - freezing would show them a stale
+        // desktop and hide the very prompt they must answer.
+        if (g_OnSecureDesktop && g_SeamlessMode)
         {
             s_WasSecure = TRUE;
             return ERROR_SUCCESS;
@@ -7048,76 +7087,53 @@ static ULONG Init(void)
             g_ShowFullscreenScreen ? L"on (opt-in)" : L"off (default, hidden)");
     }
 
-    // UAC POLICY FROM DOM0 (owner request 2026-08-27). Two dom0 features, applied here at
-    // every agent start because the agent runs as SYSTEM and is the component that owns the
-    // secure-desktop interaction:
+    // UAC FROM DOM0 (owner design 2026-08-27), deliberately ONE knob:
     //
-    //   service.uac-secure-desktop  absent/0 -> PromptOnSecureDesktop=0 (DEFAULT, shipped):
-    //                               the consent prompt renders on the NORMAL desktop, so it
-    //                               arrives in dom0 as an ordinary window the user can see
-    //                               and click. 1 -> classic secure-desktop prompt, which the
-    //                               agent must (and does) freeze out of dom0 entirely - i.e.
-    //                               the prompt becomes INVISIBLE and the qube appears to hang
-    //                               until it times out. Opt in only if in-guest prompt
-    //                               spoofing matters more than being able to answer it.
-    //   service.uac-disable         absent -> leave EnableLUA untouched (whatever the guest
-    //                               has). 1 -> EnableLUA=0, 0 -> EnableLUA=1. Turning UAC off
-    //                               removes the admin/kernel elevation barrier, which is real
-    //                               guest->host attack surface (hypercalls, grant tables and
-    //                               the PV drivers all live behind ring 0); it is NOT
-    //                               recommended and needs a REBOOT to take effect.
+    //   service.uac   absent -> leave the guest's EnableLUA alone (never silently re-enable
+    //                 UAC on a guest configured without it - this project's own testbeds
+    //                 included); "1" -> EnableLUA=1; "0" -> EnableLUA=0. Off means off.
+    //                 Changing it needs a guest REBOOT, and turning UAC off removes the
+    //                 admin/kernel barrier that faces the hypervisor (hypercalls, grant
+    //                 tables, PV drivers), so it is warned about loudly.
     //
-    // Absent-means-enforce-the-default is deliberate for the first feature (the installer
-    // seeds the same value, so this only repairs drift); absent-means-do-not-touch is
-    // deliberate for the second (never silently re-enable UAC on a guest configured without
-    // it - including this project's own testbeds).
+    // WHERE the prompt is drawn is NOT a feature: it follows the display mode, because the
+    // right answer is different in each and both are already known to the agent -
+    // seamless -> normal desktop (the prompt arrives in dom0 as its own window, visible and
+    // clickable); fullscreen -> secure desktop (dom0 shows the whole screen anyway, so the
+    // prompt appears exactly as on a physical machine, with Windows' own spoofing
+    // protection intact). ApplyUacPromptPolicy() below is called from SetSeamlessMode, so
+    // it tracks live mode switches, not just this Init.
     {
-        HKEY polKey = NULL;
-        LONG rc = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
-            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-            0, KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY, &polKey);
-        if (rc != ERROR_SUCCESS)
+        qdb_handle_t qdb = qdb_open(NULL);
+        char *uac = qdb ? qdb_read(qdb, "/qubes-service/uac", NULL) : NULL;
+        if (uac)
         {
-            LogWarning("QGAUAC cannot open the UAC policy key (0x%x) - UAC features not applied", rc);
-        }
-        else
-        {
-            qdb_handle_t qdb = qdb_open(NULL);
-            char *sd = qdb ? qdb_read(qdb, "/qubes-service/uac-secure-desktop", NULL) : NULL;
-            char *off = qdb ? qdb_read(qdb, "/qubes-service/uac-disable", NULL) : NULL;
-
-            DWORD wantSd = (sd && sd[0] != '0') ? 1 : 0;   // absent -> 0, the shipped default
-            rc = RegSetValueEx(polKey, L"PromptOnSecureDesktop", 0, REG_DWORD,
-                               (const BYTE*)&wantSd, sizeof(wantSd));
-            LogInfo("QGAUAC PromptOnSecureDesktop=%lu (feature %S) - prompts are %s",
-                wantSd, sd ? sd : "absent",
-                wantSd ? L"on the secure desktop: INVISIBLE in dom0 while the agent freezes it"
-                       : L"on the normal desktop: visible and clickable in dom0");
-            if (rc != ERROR_SUCCESS)
-                LogWarning("QGAUAC writing PromptOnSecureDesktop failed 0x%x", rc);
-
-            if (off)
+            HKEY polKey = NULL;
+            LONG rc = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+                L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                0, KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY, &polKey);
+            if (rc == ERROR_SUCCESS)
             {
-                DWORD wantLua = (off[0] != '0') ? 0 : 1;   // uac-disable=1 -> EnableLUA=0
+                DWORD want = (uac[0] != '0') ? 1 : 0;
                 DWORD cur = 1, sz = sizeof(cur), type = 0;
                 (void)RegQueryValueEx(polKey, L"EnableLUA", NULL, &type, (BYTE*)&cur, &sz);
-                rc = RegSetValueEx(polKey, L"EnableLUA", 0, REG_DWORD,
-                                   (const BYTE*)&wantLua, sizeof(wantLua));
-                LogInfo("QGAUAC EnableLUA=%lu (feature uac-disable=%S, was %lu)%s",
-                    wantLua, off, cur,
-                    (cur != wantLua) ? L" - REBOOT REQUIRED for this to take effect" : L"");
+                rc = RegSetValueEx(polKey, L"EnableLUA", 0, REG_DWORD, (const BYTE*)&want, sizeof(want));
+                LogInfo("QGAUAC service.uac=%S -> EnableLUA=%lu (was %lu)%s", uac, want, cur,
+                    (cur != want) ? L" - REBOOT REQUIRED" : L"");
                 if (rc != ERROR_SUCCESS)
                     LogWarning("QGAUAC writing EnableLUA failed 0x%x", rc);
-                if (wantLua == 0)
-                    LogWarning("QGAUAC UAC is being DISABLED by dom0 policy: any code in this "
-                        L"qube can reach admin/kernel, which is guest->host attack surface");
+                if (want == 0)
+                    LogWarning("QGAUAC UAC DISABLED by dom0 policy: any code in this qube can "
+                        L"reach admin/kernel, which is guest->host attack surface");
+                RegCloseKey(polKey);
             }
-
-            if (sd) free(sd);
-            if (off) free(off);
-            if (qdb) qdb_close(qdb);
-            RegCloseKey(polKey);
+            else
+            {
+                LogWarning("QGAUAC cannot open the UAC policy key (0x%x)", rc);
+            }
+            free(uac);
         }
+        if (qdb) qdb_close(qdb);
     }
 
     DWORD stagingGrant;
