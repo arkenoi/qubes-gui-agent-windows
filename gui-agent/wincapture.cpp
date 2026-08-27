@@ -232,31 +232,34 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
         }
 
         // Black-capture telemetry (field diagnosis 2026-08-27): a PrintWindow that
-        // SUCCEEDS but renders all-black (DirectComposition content it cannot reach)
-        // produced logs identical to a healthy capture - dom0 showed a black window
-        // with nothing to go on. Sample the cropped region (1/64 of pixels, RGB only -
-        // PrintWindow leaves alpha 0); latch one warning per channel after 3
-        // consecutive all-black captures, one info line if content returns.
-        bool allBlack = true;
-        for (int y = 0; y < c.height && allBlack; y += 8)
+        // SUCCEEDS but renders (essentially) black - DirectComposition content it
+        // cannot reach - produced logs identical to a healthy capture; dom0 showed a
+        // black window with nothing to go on. Sample the cropped region (1/64 of
+        // pixels, RGB only - PrintWindow leaves alpha 0); a capture counts as black
+        // when >= 99% of samples are near-black (< 0x0C per channel: a partial render
+        // can still paint the 1px frame, and real windows measure <= 4% near-black -
+        // 25x separation). Latch one warning per channel after 3 consecutive black
+        // captures, one info line if content returns.
+        int samples = 0, nearBlack = 0;
+        for (int y = 0; y < c.height; y += 8)
         {
             const DWORD* srow = (const DWORD*)((const BYTE*)bits +
                 (size_t)(y + c.cropY) * capW * 4 + (size_t)c.cropX * 4);
             for (int x = 0; x < c.width; x += 8)
             {
-                if (srow[x] & 0x00FFFFFF)
-                {
-                    allBlack = false;
-                    break;
-                }
+                samples++;
+                const DWORD px = srow[x];
+                if ((px & 0xFF) < 0x0C && ((px >> 8) & 0xFF) < 0x0C && ((px >> 16) & 0xFF) < 0x0C)
+                    nearBlack++;
             }
         }
+        const bool allBlack = samples > 0 && nearBlack * 100 >= samples * 99;
         if (allBlack)
         {
             if (++c.blackRun == 3 && !c.blackLogged)
             {
                 c.blackLogged = true;
-                LogWarning("WCBLACK 0x%x: PrintWindow succeeds but returns all-black %dx%d "
+                LogWarning("WCBLACK 0x%x: PrintWindow succeeds but returns >=99%% near-black %dx%d "
                     "content (3 consecutive) - dom0 is showing this window black",
                     c.hwnd, c.width, c.height);
             }
