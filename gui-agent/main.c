@@ -3017,15 +3017,18 @@ static ULONG ResetWatch(BOOL seamlessMode)
 }
 
 // set fullscreen/seamless mode
-// Where Windows draws the UAC consent prompt, decided by the display mode (see the QGAUAC
-// block in Init). SEAMLESS: PromptOnSecureDesktop=0, so consent renders on the normal
-// desktop and reaches dom0 as an ordinary window the user can read and click - the secure
-// desktop would instead be frozen out of dom0 and the prompt would be invisible.
-// NON-SEAMLESS (the whole guest desktop inside one dom0 window - nothing is "fullscreened"):
-// PromptOnSecureDesktop=1, because that window already shows the guest's whole desktop, so
-// the secure desktop displays exactly as it would on physical hardware, keeping Windows'
-// own anti-spoofing behaviour. consent.exe reads this per prompt, so no reboot is needed.
-static void ApplyUacPromptPolicy(IN BOOL seamlessMode)
+// Force Windows to draw UAC consent on the NORMAL desktop (PromptOnSecureDesktop=0), always.
+//
+// The secure desktop is NEVER granted to dom0, under any condition (owner rule 2026-08-19).
+// A prompt drawn there is therefore a prompt nobody can see or answer - the qube simply
+// stops responding until it times out, and in the field its dimming backdrop leaked into
+// dom0 as the notorious unclosable black window. Moving consent to the normal desktop is
+// exactly the "convert the elevation prompt to a normal in-desktop dialog" outcome that rule
+// called for as future work: the prompt becomes an ordinary mapped window the user reads and
+// clicks (verified end to end by the owner). This is NOT mode-dependent - there is no
+// configuration in which showing the secure desktop is acceptable. consent.exe reads the
+// value per prompt, so no reboot is needed.
+static void ApplyUacPromptPolicy(void)
 {
     HKEY polKey = NULL;
     LONG rc = RegOpenKeyEx(HKEY_LOCAL_MACHINE,
@@ -3036,17 +3039,15 @@ static void ApplyUacPromptPolicy(IN BOOL seamlessMode)
         LogWarning("QGAUAC cannot open the UAC policy key (0x%x) - prompt policy unchanged", rc);
         return;
     }
-    DWORD want = seamlessMode ? 0 : 1;
+    DWORD zero = 0;
     rc = RegSetValueEx(polKey, L"PromptOnSecureDesktop", 0, REG_DWORD,
-                       (const BYTE*)&want, sizeof(want));
+                       (const BYTE*)&zero, sizeof(zero));
     RegCloseKey(polKey);
     if (rc != ERROR_SUCCESS)
         LogWarning("QGAUAC writing PromptOnSecureDesktop failed 0x%x", rc);
     else
-        LogInfo("QGAUAC PromptOnSecureDesktop=%lu (%s mode): elevation prompts are %s",
-            want, seamlessMode ? L"seamless" : L"non-seamless",
-            want ? L"on the secure desktop, shown inside the whole-desktop window"
-                 : L"on the normal desktop, mapped to dom0 as their own window");
+        LogInfo("QGAUAC PromptOnSecureDesktop=0: elevation prompts are drawn on the normal "
+            L"desktop and mapped to dom0 as ordinary windows (the secure desktop is never shown)");
 }
 
 ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
@@ -3069,9 +3070,9 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
         seamlessMode = TRUE;
     }
 
-    // UAC prompts follow the mode (see ApplyUacPromptPolicy): re-asserted on every call,
-    // including forceUpdate, so a mode that was coerced above still lands on the right one.
-    ApplyUacPromptPolicy(seamlessMode);
+    // Re-assert the prompt policy on every mode call (see ApplyUacPromptPolicy): it is
+    // unconditional, and this is simply a convenient point that runs at start and on change.
+    ApplyUacPromptPolicy();
 
     if (g_SeamlessMode == seamlessMode && !forceUpdate)
         goto end; // nothing to do
@@ -4864,11 +4865,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         EnsureOnInputDesktop();
 
         static BOOL s_WasSecure = FALSE;
-        // Freeze only in SEAMLESS mode. In NON-SEAMLESS mode dom0 shows the whole guest
-        // desktop inside one ordinary window, and the secure desktop is then the desktop the
-        // user is meant to see (that is where the prompt is drawn, by the policy above) -
-        // freezing would show them a stale desktop and hide the prompt they must answer.
-        if (g_OnSecureDesktop && g_SeamlessMode)
+        // UNCONDITIONAL: the secure desktop is never granted to dom0 in any mode (owner rule
+        // 2026-08-19). Prompts are drawn on the normal desktop by ApplyUacPromptPolicy, so a
+        // secure desktop here means a lock screen, Ctrl+Alt+Del or a site policy - none of
+        // which dom0 may see.
+        if (g_OnSecureDesktop)
         {
             s_WasSecure = TRUE;
             return ERROR_SUCCESS;
@@ -7106,12 +7107,9 @@ static ULONG Init(void)
     // it under our own config key, and we restore EnableLUA=1 only if that marker says the
     // disable was ours. A guest that had UAC off before QWT keeps it off.
     //
-    // WHERE the prompt is drawn is NOT a feature: it follows the display mode, because the
-    // right answer differs and the agent already knows the mode - seamless -> normal desktop
-    // (the prompt arrives in dom0 as its own window, visible and clickable); non-seamless ->
-    // secure desktop (dom0 is already showing the whole guest desktop in one window, so the
-    // prompt appears there exactly as on physical hardware). See ApplyUacPromptPolicy,
-    // called from SetSeamlessMode.
+    // WHERE the prompt is drawn is not configurable and not mode-dependent: ALWAYS the
+    // normal desktop (see ApplyUacPromptPolicy). The secure desktop is never granted to
+    // dom0, so a prompt drawn there could never be seen or answered.
     {
         qdb_handle_t qdb = qdb_open(NULL);
         char *uacOff = qdb ? qdb_read(qdb, "/qubes-service/uac-disable", NULL) : NULL;
