@@ -3139,13 +3139,6 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     if (!data->IsVisible)
         return FALSE;
 
-    // SECURE DESKTOP: never granted, as a class (owner rule; see g_OnSecureDesktop).
-    // While the input desktop is Winlogon, everything enumerable here is a secure-desktop
-    // surface - the UAC consent dialog and its fullscreen dimming backdrop included. The
-    // backdrop mapped through this filter IS the field-reported unclosable black window.
-    if (g_OnSecureDesktop)
-        return FALSE;
-
     if (!g_ShowTaskbar && data->Handle == g_TaskbarWindow)
         return FALSE;
 
@@ -4792,6 +4785,34 @@ static BOOL FrameRedundant(IN const CAPTURE_FRAME* frame, IN const BYTE* fb, IN 
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
     IN UINT fbWidth, IN UINT fbHeight)
 {
+    // SECURE-DESKTOP FREEZE (owner rule: the secure desktop is NEVER granted; field root
+    // cause 2026-08-27 - the mapped UAC dimming backdrop WAS GWeck's black window). While
+    // the input desktop is not "Default", NOTHING may flow: the framebuffer now holds
+    // secure-desktop pixels (consent dialog included), and the enumerable windows ARE the
+    // secure surfaces. Returning early here freezes everything at once - no publish of the
+    // secure framebuffer, no tracking pass (so no accept of consent/backdrop AND no removal
+    // of the Default desktop's still-mapped windows - a first attempt that denied in
+    // ShouldAcceptWindow instead unmapped every open window, measured shot13), no damage.
+    // NOTE the warning below about early returns from this function causing a black guest
+    // window: that argument is about skipping work the DEFAULT desktop needs. Here
+    // suppression is the specification - and the resume path invalidates the frame
+    // signature so the first Default-desktop frame after the prompt cannot be skipped as
+    // redundant and repaints promptly.
+    {
+        static BOOL s_WasSecure = FALSE;
+        if (g_OnSecureDesktop)
+        {
+            s_WasSecure = TRUE;
+            return ERROR_SUCCESS;
+        }
+        if (s_WasSecure)
+        {
+            s_WasSecure = FALSE;
+            LogInfo("secure desktop left - resuming frame flow with the frame signature invalidated");
+            PwInvalidateFramebuffer(); // FrameSigInvalidate + g_FbBits reset; republished just below
+        }
+    }
+
     // Publish the live desktop image for paths outside this loop (synthesis).
     if (framebuffer && frame->rect.Pitch > 0)
     {
