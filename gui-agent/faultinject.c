@@ -47,6 +47,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define REG_CONFIG_FAULT_CAPTURE_EXIT_VALUE L"FaultCaptureExit"
 #define REG_CONFIG_FAULT_DUP_CREATE_VALUE   L"FaultDupCreate"
 #define REG_CONFIG_FAULT_LEGACY_SEND_VALUE  L"FaultLegacySend"
+#define REG_CONFIG_FAULT_PW_FAIL_VALUE      L"FaultPrintWindowFail"
 
 #define FAULT_DELAY_ENV_VALUE        L"QUBES_GUI_FAULT_DELAY"
 #define FAULT_NEG_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_NEG_CREATE"
@@ -57,6 +58,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define FAULT_CAPTURE_EXIT_ENV_VALUE L"QUBES_GUI_FAULT_CAPTURE_EXIT"
 #define FAULT_DUP_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_DUP_CREATE"
 #define FAULT_LEGACY_SEND_ENV_VALUE  L"QUBES_GUI_FAULT_LEGACY_SEND"
+#define FAULT_PW_FAIL_ENV_VALUE      L"QUBES_GUI_FAULT_PRINTWINDOW_FAIL"
 
 // Seconds between FiInit() and the first fault that may fire. See faultinject.h: every
 // failure being reproduced is a failure of a CONNECTED agent, so a fault landing during
@@ -75,6 +77,7 @@ static volatile LONG g_FiDupCreate   = 0;
 static volatile LONG g_FiLegacySend  = 0;
 static volatile LONG g_FiCaptureExit = 0;
 static volatile LONG g_FiPumpStall   = 0;
+static volatile LONG g_FiPrintWindowFail = 0;
 
 // Only the CREATE for this window id is inverted; 0 means "whichever comes next".
 // Compared as ULONG_PTR against the low half of the HWND, the same 32-bit id the
@@ -164,6 +167,7 @@ void FiInit(void)
     g_FiDupCreate   = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_DUP_CREATE_VALUE,   FAULT_DUP_CREATE_ENV_VALUE,   0);
     g_FiLegacySend  = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_LEGACY_SEND_VALUE,  FAULT_LEGACY_SEND_ENV_VALUE,  0);
     g_FiCaptureExit = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_CAPTURE_EXIT_VALUE, FAULT_CAPTURE_EXIT_ENV_VALUE, 0);
+    g_FiPrintWindowFail = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_PW_FAIL_VALUE, FAULT_PW_FAIL_ENV_VALUE, 0);
 
     g_FiArmAt = GetTickCount64() + (ULONGLONG)delaySec * 1000ULL;
 
@@ -183,16 +187,17 @@ void FiInit(void)
     // cause is a measurement run attributed to the wrong build, so every log file from a
     // fault-capable binary has to say so on its first page whether or not anything is armed.
     LogWarning("QGAFAULT-INIT build=%S armdelay=%us negcreate=%d(hwnd=0x%x) ringstall=%us "
-        L"pumpstall=%us captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u",
+        L"pumpstall=%us captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d",
         g_FaultInjectionMarker,
         delaySec,
         g_FiNegCreate, g_FiNegCreateHwnd,
         ringStallSec,
         pumpStallSec,
-        g_FiCaptureExit, g_FiDupCreate, g_FiLegacySend, g_FiRawCreate);
+        g_FiCaptureExit, g_FiDupCreate, g_FiLegacySend, g_FiRawCreate, g_FiPrintWindowFail);
 
     if (g_FiNegCreate > 0 || g_FiDupCreate > 0 || g_FiLegacySend > 0 ||
-        g_FiCaptureExit > 0 || g_FiPumpStall > 0 || g_FiRingStallArmed || g_FiRawCreate)
+        g_FiCaptureExit > 0 || g_FiPumpStall > 0 || g_FiRingStallArmed || g_FiRawCreate ||
+        g_FiPrintWindowFail > 0)
     {
         LogWarning("QGAFAULT-INIT FAULTS ARE ARMED - this agent will break itself on purpose "
             L"in %u s; results from this run describe the INJECTED defect, not the build", delaySec);
@@ -232,6 +237,20 @@ BOOL FiRawCreate(void)
     // live during the daemon handshake would reproduce "the agent never came up", not the
     // defect under study.
     return g_FiRawCreate != 0 && GetTickCount64() >= g_FiArmAt;
+}
+
+BOOL FiPrintWindowFail(void)
+{
+    if (g_FiPrintWindowFail <= 0)
+        return FALSE;
+
+    if (!FiTakeShot(&g_FiPrintWindowFail))
+        return FALSE;
+
+    LogWarning("QGAFAULT FI_PRINTWINDOW_FAIL firing: this capture reports PrintWindow "
+        L"failure (%d shots left) - 5 consecutive on one channel must latch WCDEAD",
+        g_FiPrintWindowFail);
+    return TRUE;
 }
 
 BOOL FiRingStallActive(void)

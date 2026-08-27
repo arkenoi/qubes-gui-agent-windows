@@ -108,6 +108,10 @@ extern const char g_FaultInjectionMarker[];
 
 #if QGA_FAULT_INJECTION
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 // Read the switches, log the banner. Call once from Init(), next to PerfInit().
 void FiInit(void);
 
@@ -143,6 +147,19 @@ BOOL FiShouldDupCreate(IN HWND window);
 // the behaviour it replaces.
 BOOL FiShouldLegacySend(void);
 
+// [FI_PRINTWINDOW_FAIL] TRUE once per armed shot: the per-window capture engine must treat
+// this PrintWindow as FAILED. Window destruction cannot reach the WCDEAD latch (tracking
+// detaches the channel before the ~250 ms sweep retries 5 times - measured 2026-08-27), so
+// this is the only way to make a LIVE channel fail 5 consecutive captures and prove the
+// latch fires. Arm >= 6 shots: the failing channel re-marks itself dirty and retries on the
+// engine loop's 2 ms cadence, so one channel consumes 5 shots before the sweep offers the
+// fault to another.
+BOOL FiPrintWindowFail(void);
+
+#ifdef __cplusplus
+} // extern "C"
+#endif
+
 #else
 
 // No-op stubs so the call sites need no #ifdef. UNREFERENCED_PARAMETER keeps /W4 quiet.
@@ -154,5 +171,6 @@ static __forceinline DWORD FiPumpStallMs(void) { return 0; }
 static __forceinline BOOL  FiShouldCaptureExit(void) { return FALSE; }
 static __forceinline BOOL  FiShouldDupCreate(IN HWND window) { UNREFERENCED_PARAMETER(window); return FALSE; }
 static __forceinline BOOL  FiShouldLegacySend(void) { return FALSE; }
+static __forceinline BOOL  FiPrintWindowFail(void) { return FALSE; }
 
 #endif

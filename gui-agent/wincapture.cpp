@@ -28,6 +28,7 @@
 #include <cstring>
 
 #include "wincapture.h"
+#include "faultinject.h"
 
 #include <log.h>
 
@@ -148,6 +149,8 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
     }
     HGDIOBJ old = SelectObject(memdc, bmp);
     BOOL ok = PrintWindow(c.hwnd, memdc, PW_RENDERFULLCONTENT);
+    if (ok && FiPrintWindowFail())
+        ok = FALSE; // injected: exercise the failure path incl. the WCDEAD latch
     if (!ok)
         c.lastErr = GetLastError();
     GdiFlush();
