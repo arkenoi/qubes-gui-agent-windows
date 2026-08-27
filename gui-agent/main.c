@@ -142,6 +142,12 @@ CRITICAL_SECTION g_csWatchedWindows;
 
 HWND g_DesktopWindow = NULL;
 
+// TRUE while the input desktop is not "Default" (UAC consent, lock, logon screens).
+// Written by AttachToInputDesktop (any thread), read by ShouldAcceptWindow: the secure
+// desktop's surfaces are never mapped (owner rule 2026-08-19; enforced structurally
+// 2026-08-27 after the field "black window" proved the dimming backdrop was mapped).
+volatile BOOL g_OnSecureDesktop = FALSE;
+
 // Last window the foreground re-raise in AddAllWindows acted on. Cleared by ResetWatch so
 // the corrective re-fires on the first pass after every mass re-announce.
 static HWND g_LastForeground = NULL;
@@ -3131,6 +3137,13 @@ WINDOW_DATA *FindWindowByHandle(IN HWND window)
 BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 {
     if (!data->IsVisible)
+        return FALSE;
+
+    // SECURE DESKTOP: never granted, as a class (owner rule; see g_OnSecureDesktop).
+    // While the input desktop is Winlogon, everything enumerable here is a secure-desktop
+    // surface - the UAC consent dialog and its fullscreen dimming backdrop included. The
+    // backdrop mapped through this filter IS the field-reported unclosable black window.
+    if (g_OnSecureDesktop)
         return FALSE;
 
     if (!g_ShowTaskbar && data->Handle == g_TaskbarWindow)

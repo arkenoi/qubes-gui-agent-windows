@@ -313,6 +313,24 @@ ULONG AttachToInputDesktop(void)
         GetUserObjectInformation(desktop, UOI_NAME, after, sizeof(after), &needed);
         LogInfo("QGADESK,tid=%lu,from=%s,to=%s,oldh=0x%p,newh=0x%p",
             GetCurrentThreadId(), before, after, oldDesktop, desktop);
+
+        // SECURE-DESKTOP STATE (field diagnosis 2026-08-27, GWeck's "black window"): while
+        // the input desktop is anything but "Default" - Winlogon during UAC consent, lock,
+        // logon - the windows this thread now enumerates ARE the secure desktop's surfaces
+        // (consent.exe's dialog and the fullscreen dimming backdrop). Mapping them violates
+        // the owner rule that the secure desktop is NEVER granted, and the mapped dimming
+        // backdrop is exactly the unclosable black window reported from the field (agent
+        // crash timing decides whether the dialog beside it ever shows). ShouldAcceptWindow
+        // consults this flag to suppress ALL mapping until the Default desktop returns.
+        {
+            BOOL secure = (_wcsicmp(after, L"Default") != 0);
+            if (secure != g_OnSecureDesktop)
+                LogInfo("QGADESK secure-desktop %s (input desktop '%s') - window mapping %s",
+                    secure ? L"ENTERED" : L"LEFT", after,
+                    secure ? L"suppressed (owner rule: the secure desktop is never granted)"
+                           : L"resumes");
+            g_OnSecureDesktop = secure;
+        }
     }
 
     if (!SetThreadDesktop(desktop))
