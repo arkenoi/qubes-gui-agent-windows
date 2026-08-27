@@ -4817,6 +4817,16 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
     // signature so the first Default-desktop frame after the prompt cannot be skipped as
     // redundant and repaints promptly.
     {
+        // Re-observe the input desktop FIRST, every frame, BEFORE the freeze decision.
+        // g_OnSecureDesktop is only written by AttachToInputDesktop; EnsureOnInputDesktop
+        // is the one path that calls it on a change. If the freeze gate came first, that
+        // path would be gated by the very flag it must clear - a deadlock (measured v3:
+        // agent stuck on Winlogon forever, zero windows, after the prompt cleared).
+        // EnsureOnInputDesktop early-returns cheaply while the desktop is unchanged, and
+        // on the Default->... and ...->Default transitions re-attaches + rearms the hooks,
+        // updating g_OnSecureDesktop as a side effect.
+        EnsureOnInputDesktop();
+
         static BOOL s_WasSecure = FALSE;
         if (g_OnSecureDesktop)
         {
