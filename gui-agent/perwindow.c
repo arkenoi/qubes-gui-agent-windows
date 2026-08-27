@@ -466,10 +466,12 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
             return status;
         }
 
-        // Real pixels before the first WGC frame; failure just means a black window until
-        // the first frame, so it is logged and ignored.
+        // Real pixels before the first engine frame; failure means a black window until
+        // the first capture lands - worth a visible warning (field diagnosis 2026-08-27:
+        // this was LogDebug, invisible in every field log).
         if (WcPrefill(entry->Handle) != ERROR_SUCCESS)
-            LogDebug("WcPrefill(0x%x) failed", entry->Handle);
+            LogWarning("WcPrefill(0x%x) failed - window starts black in dom0 until the "
+                "first successful capture", entry->Handle);
     }
 
     status = SendWindowDump(entry->Handle, entry->Width, entry->Height,

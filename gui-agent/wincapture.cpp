@@ -29,6 +29,8 @@
 
 #include "wincapture.h"
 
+#include <log.h>
+
 #ifndef PW_RENDERFULLCONTENT
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
@@ -56,6 +58,12 @@ struct Channel
     std::atomic<bool> ddaOwned{ false };
     int failures = 0;
     bool dead = false;
+    // Telemetry (added for the 2026-08-27 field black-window diagnosis: this engine
+    // previously logged NOTHING, so a dead channel and a black-rendering one were both
+    // indistinguishable from healthy in every agent log).
+    DWORD lastErr = 0;      // last PrintWindow/GetWindowRect failure code
+    int blackRun = 0;       // consecutive successful captures that were all-black
+    bool blackLogged = false;
     // Buffer-relative regions this channel must NOT write: they are owned by
     // synthesized child windows and are patched in from the composited desktop by
     // the frame loop (see PwPatchSynthChildren in main.c). Without the mask, each
@@ -114,7 +122,10 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
         return true;
     RECT wr;
     if (!GetWindowRect(c.hwnd, &wr))
+    {
+        c.lastErr = GetLastError();
         return false;
+    }
     int capW = wr.right - wr.left, capH = wr.bottom - wr.top;
     if (capW < c.cropX + c.width) capW = c.cropX + c.width;
     if (capH < c.cropY + c.height) capH = c.cropY + c.height;
@@ -137,6 +148,8 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
     }
     HGDIOBJ old = SelectObject(memdc, bmp);
     BOOL ok = PrintWindow(c.hwnd, memdc, PW_RENDERFULLCONTENT);
+    if (!ok)
+        c.lastErr = GetLastError();
     GdiFlush();
 
     int y0 = -1, y1 = -1;
@@ -217,6 +230,45 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
                 y1 = y;
             }
         }
+
+        // Black-capture telemetry (field diagnosis 2026-08-27): a PrintWindow that
+        // SUCCEEDS but renders all-black (DirectComposition content it cannot reach)
+        // produced logs identical to a healthy capture - dom0 showed a black window
+        // with nothing to go on. Sample the cropped region (1/64 of pixels, RGB only -
+        // PrintWindow leaves alpha 0); latch one warning per channel after 3
+        // consecutive all-black captures, one info line if content returns.
+        bool allBlack = true;
+        for (int y = 0; y < c.height && allBlack; y += 8)
+        {
+            const DWORD* srow = (const DWORD*)((const BYTE*)bits +
+                (size_t)(y + c.cropY) * capW * 4 + (size_t)c.cropX * 4);
+            for (int x = 0; x < c.width; x += 8)
+            {
+                if (srow[x] & 0x00FFFFFF)
+                {
+                    allBlack = false;
+                    break;
+                }
+            }
+        }
+        if (allBlack)
+        {
+            if (++c.blackRun == 3 && !c.blackLogged)
+            {
+                c.blackLogged = true;
+                LogWarning("WCBLACK 0x%x: PrintWindow succeeds but returns all-black %dx%d "
+                    "content (3 consecutive) - dom0 is showing this window black",
+                    c.hwnd, c.width, c.height);
+            }
+        }
+        else
+        {
+            if (c.blackLogged)
+                LogInfo("WCBLACK 0x%x: content non-black again after %d black captures",
+                    c.hwnd, c.blackRun);
+            c.blackRun = 0;
+            c.blackLogged = false;
+        }
     }
     SelectObject(memdc, old);
     DeleteObject(bmp);
@@ -281,6 +333,11 @@ DWORD WINAPI CaptureThread(LPVOID param)
             else if (++c.failures >= DEAD_AFTER_FAILURES)
             {
                 c.dead = true;
+                // Field diagnosis 2026-08-27: this latch was silent, so a window whose
+                // captures all failed just stayed black in dom0 with a clean-looking log.
+                LogWarning("WCDEAD 0x%x: %d consecutive capture failures (last error 0x%x) - "
+                    "channel dead, dom0 keeps this window's last content (black if none)",
+                    c.hwnd, c.failures, c.lastErr);
             }
             else
             {
