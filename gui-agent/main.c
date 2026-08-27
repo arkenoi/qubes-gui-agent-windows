@@ -7281,8 +7281,9 @@ static ULONG Init(void)
                         uacOff ? uacOff : "absent", cur);
                 }
                 if (wantDisable)
-                    LogWarning("QGAUAC UAC DISABLED by dom0 policy: any code in this qube can "
-                        L"reach admin/kernel, which is guest->host attack surface");
+                    LogWarning("QGAUAC UAC DISABLED by dom0 policy - the Windows equivalent of "
+                        L"passwordless sudo: anything in this qube reaches admin/kernel without "
+                        L"being asked, and that is the surface facing the hypervisor");
                 RegCloseKey(polKey);
                 (void)CfgWriteDword(moduleName, L"UacDisabledByFeature", wantDisable ? 1 : 0, NULL);
             }
