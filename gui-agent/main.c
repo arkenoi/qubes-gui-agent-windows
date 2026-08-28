@@ -77,17 +77,11 @@ BOOL g_SeamlessMode = TRUE;
 // maps window 0 directly and does not go through ShouldAcceptWindow.
 BOOL g_ShowFullscreenScreen = FALSE;
 
-// May this qube show its WHOLE DESKTOP in one window (non-seamless)? Default FALSE. Set by the
-// dom0 feature service.gui-windowed-desktop (or the guest registry AllowWindowedDesktop DWORD),
-// read once in Init - same pattern as above, dom0 wins.
-//
-// SEPARATE FROM g_ShowFullscreenScreen ON PURPOSE (2026-08-28). They shared one feature until a
-// test that enabled the windowed desktop also unlocked fullscreen-sized app windows, one of which
-// covered the owner's display. Nothing about showing a bounded desktop window requires permitting
-// screen-covering windows: window 0 is shrunk on entry and refused at host size unless dom0 asked
-// for that size, so this switch cannot produce a takeover - and must not imply the one that can.
-BOOL g_WindowedDesktopAllowed = FALSE;
-
+// GetTickCount64 of the last return to the Default desktop (0 = not yet this process). Mode 1 in
+// ShouldAcceptWindow uses it: the logon surfaces do not all disappear at the instant the desktop
+// switches, so fullscreen-sized windows stay denied for a moment afterwards.
+volatile ULONGLONG g_SecureDesktopLeftTick = 0;
+#define FS_BOOT_SETTLE_MS 5000
 LONG g_ScreenWinX = 0;
 LONG g_ScreenWinY = 0;
 
@@ -3084,22 +3078,16 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     LogVerbose("start");
     LogDebug("Seamless mode changing to %d", seamlessMode);
 
-    // The WINDOWED DESKTOP (non-seamless, window 0) has its OWN gate - service.gui-windowed-desktop.
-    //
-    // It used to share service.gui-fullscreen, and that coupling was a trap that fired for real
-    // on 2026-08-28: enabling the windowed desktop to test the sign-in-screen route ALSO unlocked
-    // borderless fullscreen-sized app windows in ShouldAcceptWindow, and one of them covered the
-    // owner's display. The two things are unrelated and must not share a switch:
-    //   service.gui-fullscreen        -> may a fullscreen-SIZED app window be mapped (Mode 2).
-    //   service.gui-windowed-desktop  -> may this qube show its whole desktop in ONE window.
-    // The windowed desktop is bounded by construction (shrink-on-entry below, and a host-sized
-    // window 0 is refused unless DOM0 asked for that size), so turning it on cannot produce a
-    // screen-covering window - which is exactly why it must not imply the switch that can.
-    // Both default OFF. Coerce to seamless when off: per-window mapping stays alive (no black
-    // screen), window 0 never mapped.
-    if (!seamlessMode && !g_WindowedDesktopAllowed)
+    // Whole-screen fullscreen MODE (window 0) is feature-gated: a switch OUT of seamless maps
+    // window 0 via SendWindowMap(NULL) below, so refuse it unless service.gui-fullscreen is on.
+    // NOTE: this is NOT the boot/shutdown screen path - that turned out to be per-window LogonUI
+    // (handled UNCONDITIONALLY in ShouldAcceptWindow, class "LogonUI"). This gate only governs
+    // the intentional whole-screen fullscreen mode (dom0 fullscreens the qube window), which is
+    // part of "fullscreen conditionally allowed". Coerce to seamless when off: per-window
+    // mapping stays alive (no black screen), window 0 never mapped.
+    if (!seamlessMode && !g_ShowFullscreenScreen)
     {
-        LogInfo("QGAFSFLASH windowed desktop refused (service.gui-windowed-desktop off) - staying seamless");
+        LogInfo("QGAFSFLASH fullscreen mode refused (service.gui-fullscreen off) - staying seamless");
         seamlessMode = TRUE;
     }
 
@@ -3301,10 +3289,28 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         // desktop through LogonUI (class "LogonUI Logon Window" - measured 2026-08-19 by this
         // filter's own debug log). Match the class substring so any LogonUI variant is caught.
         // Override-redirect fullscreen (a splash/overlay) is denied here too - never legitimate.
-        if (data->IsOverrideRedirect || wcsstr(data->Class, L"LogonUI"))
+        //
+        // MATCHED BY PHASE, NOT ONLY BY CLASS (2026-08-28). "The boot/shutdown screen is never
+        // allowed, feature or not" (README) was enforced by class alone, and that leaked: with
+        // service.gui-fullscreen on, a fullscreen-sized boot-time surface that is neither
+        // LogonUI-classed nor override-redirect fell through to the Mode 2 gate below and was
+        // mapped - it covered the owner's entire display, which is the exact thing this rule
+        // forbids. Startup and shutdown are a PHASE, so test the phase as well as the class:
+        //   * no shell window - true during boot, at the logon screen, and again at shutdown
+        //     once explorer has gone;
+        //   * on the secure desktop, or only just off it (FS_BOOT_SETTLE_MS).
+        // In those phases nothing fullscreen-sized is an app the user asked for, whatever its
+        // class, and the feature does not apply. A genuine fullscreen app can only appear later,
+        // when the shell exists.
+        if (data->IsOverrideRedirect || wcsstr(data->Class, L"LogonUI") ||
+            !GetShellWindow() || g_OnSecureDesktop ||
+            (g_SecureDesktopLeftTick != 0 &&
+             GetTickCount64() - g_SecureDesktopLeftTick < FS_BOOT_SETTLE_MS))
         {
-            LogDebug("0x%x: boot/shutdown/logon screen (class %s, %ux%u) - unconditionally denied",
-                data->Handle, data->Class, data->Width, data->Height);
+            LogDebug("0x%x: boot/shutdown/logon-phase fullscreen (class %s, %ux%u, shell=%d, "
+                L"secure=%d) - unconditionally denied, feature or not",
+                data->Handle, data->Class, data->Width, data->Height,
+                GetShellWindow() ? 1 : 0, g_OnSecureDesktop ? 1 : 0);
             return FALSE;
         }
         // A WINDOWED fullscreen (a maximized normal app - it has a title bar / WS_CAPTION) is
@@ -5040,7 +5046,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     L"of this at boot is normal (autologon). Persisting means the guest is waiting at "
                     L"the Windows sign-in or lock screen, which is not shown in SEAMLESS mode: arm "
                     L"autologon in the guest, or switch this qube to the windowed desktop "
-                    L"(qvm-features <vm> service.gui-windowed-desktop 1, then qubes.SetGuiMode FULLSCREEN) "
+                    L"(qvm-features <vm> service.gui-fullscreen 1, then qubes.SetGuiMode FULLSCREEN) "
                     L"where the sign-in screen IS shown inside the bounded window.",
                     desktopName, (now - s_SecureSince) / 1000);
             }
@@ -5053,6 +5059,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         if (s_WasSecure)
         {
             s_WasSecure = FALSE;
+            // Mode 1 keeps denying fullscreen-sized windows for FS_BOOT_SETTLE_MS after this.
+            g_SecureDesktopLeftTick = GetTickCount64();
             LogInfo("secure desktop left after %I64u s - resuming with a full resync and the frame "
                 L"signature invalidated", (GetTickCount64() - s_SecureSince) / 1000);
             PwInvalidateFramebuffer(); // FrameSigInvalidate + g_FbBits reset; republished just below
@@ -7321,30 +7329,8 @@ static ULONG Init(void)
             }
             qdb_close(qdb);
         }
-        LogInfo("QGAFSFLASH allow fullscreen-SIZED windows: %s",
-            g_ShowFullscreenScreen ? L"on (opt-in - a guest window may cover the screen)"
-                                   : L"off (default, denied)");
-    }
-
-    // WINDOWED DESKTOP gate - independent of the one above, see g_WindowedDesktopAllowed.
-    // Same dom0-wins pattern: service.gui-windowed-desktop over the AllowWindowedDesktop DWORD.
-    {
-        DWORD allowWd = 0;
-        (void)CfgReadDword(moduleName, REG_CONFIG_ALLOW_WINDOWED_DESKTOP_VALUE, &allowWd, NULL);
-        g_WindowedDesktopAllowed = (allowWd != 0);
-        qdb_handle_t qdb = qdb_open(NULL);
-        if (qdb)
-        {
-            char *v = qdb_read(qdb, "/qubes-service/gui-windowed-desktop", NULL);
-            if (v)
-            {
-                g_WindowedDesktopAllowed = (v[0] != '0');
-                free(v);
-            }
-            qdb_close(qdb);
-        }
-        LogInfo("QGAFSFLASH windowed desktop (whole guest desktop in ONE bounded window): %s",
-            g_WindowedDesktopAllowed ? L"allowed (opt-in)" : L"off (default, staying seamless)");
+        LogInfo("QGAFSFLASH show full-desktop at boot/shutdown: %s",
+            g_ShowFullscreenScreen ? L"on (opt-in)" : L"off (default, hidden)");
     }
 
     // UAC FROM DOM0 (owner design 2026-08-27), deliberately ONE knob:
