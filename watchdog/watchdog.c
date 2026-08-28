@@ -35,6 +35,10 @@
 SERVICE_STATUS g_Status;
 SERVICE_STATUS_HANDLE g_StatusHandle;
 
+// Set when the SCM tells us the service (or the machine) is going down. See
+// AgentRespawnPointless below.
+volatile LONG g_ServiceStopping = 0;
+
 void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[]);
 DWORD WINAPI ControlHandlerEx(IN DWORD controlCode, IN DWORD eventType, IN void *eventData, IN void *context);
 
@@ -140,6 +144,48 @@ DWORD StartTargetProcess(IN WCHAR *exePath) // non-const because it can be modif
     return ERROR_SUCCESS;
 }
 
+// DO NOT RESPAWN INTO A MACHINE THAT IS SHUTTING DOWN (2026-08-28).
+//
+// At shutdown the session-1 agent is torn down first, so this loop sees "not running", restarts
+// it, that instance dies too (the daemon is gone: "QioReadBuffer ... The pipe has been ended"),
+// and the loop restarts it again - all in the last seconds before the SCM stops us. The result is
+// a cluster of two dead agents plus "The guest has NO GUI while this lasts" written into the log
+// on every single normal shutdown.
+//
+// That noise is not cosmetic: it is indistinguishable from a real failure, and it sent this
+// project chasing a non-existent boot-time double-spawn race. GWeck's field log (posts 96-98)
+// shows the identical cluster at uptime 412 s and 414 s followed by a reboot - a shutdown, not a
+// boot. Whatever we suppress here, we LOG the signals we looked at, so the next occurrence says
+// which of them actually fired instead of leaving the next reader to guess as I did.
+//
+// Acted on: the SCM control (STOP/SHUTDOWN/PRESHUTDOWN) and SM_SHUTTINGDOWN. The WTS console
+// session state is recorded but NOT acted on - at the sign-in screen (pre-logon) the session is
+// legitimately not "active" and the agent must still be started there.
+static BOOL AgentRespawnPointless(OUT WCHAR *why, IN size_t whyChars)
+{
+    BOOL shuttingDown = (GetSystemMetrics(SM_SHUTTINGDOWN) != 0);
+    BOOL serviceStopping = (InterlockedCompareExchange(&g_ServiceStopping, 0, 0) != 0);
+
+    DWORD sessionId = WTSGetActiveConsoleSessionId();
+    int state = -1;
+    WTS_CONNECTSTATE_CLASS *sessionState = NULL;
+    DWORD size = 0;
+    if (sessionId != 0xFFFFFFFF &&
+        WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, sessionId, WTSConnectState,
+            (LPWSTR*)&sessionState, &size) &&
+        sessionState && size >= sizeof(*sessionState))
+    {
+        state = (int)*sessionState;
+    }
+    if (sessionState)
+        WTSFreeMemory(sessionState);
+
+    StringCchPrintf(why, whyChars, L"servicestop=%d sm_shuttingdown=%d console=0x%x wtsstate=%d",
+        serviceStopping ? 1 : 0, shuttingDown ? 1 : 0, sessionId, state);
+
+    return serviceStopping || shuttingDown;
+}
+
 // Restarts gui agent in active session if it's dead for too long.
 DWORD WINAPI WatchdogThread(void *param)
 {
@@ -171,6 +217,14 @@ DWORD WINAPI WatchdogThread(void *param)
         // Check if the gui agent is running.
         if (!IsProcessRunning(exeName, NULL, NULL))
         {
+            WCHAR why[128] = L"";
+            if (AgentRespawnPointless(why, RTL_NUMBER_OF(why)))
+            {
+                LogInfo("Process '%s' not running and the system is going down (%s) - "
+                    L"not restarting it", exeName, why);
+                continue;
+            }
+
             if (startedAt != 0 && GetTickCount64() - startedAt < QUICK_DEATH_MS)
             {
                 quickDeaths++;
@@ -181,9 +235,9 @@ DWORD WINAPI WatchdogThread(void *param)
                         backoffMs = BACKOFF_MAX_MS;
                 }
                 LogWarning("Process '%s' died within %u ms of starting, %u time(s) in a row - "
-                    L"backing off to %u ms. The guest has NO GUI while this lasts; the agent log "
-                    L"names the failure (grant-table exhaustion, 0x5aa, needs a reboot).",
-                    exeName, QUICK_DEATH_MS, quickDeaths, backoffMs);
+                    L"backing off to %u ms (%s). The guest has NO GUI while this lasts; the agent "
+                    L"log names the failure (grant-table exhaustion, 0x5aa, needs a reboot).",
+                    exeName, QUICK_DEATH_MS, quickDeaths, backoffMs, why);
             }
             else
             {
@@ -192,7 +246,7 @@ DWORD WINAPI WatchdogThread(void *param)
                         L"as healthy, restart delay reset to 1000 ms", exeName);
                 quickDeaths = 0;
                 backoffMs = 1000;
-                LogWarning("Process '%s' not running, restarting it", exeName);
+                LogWarning("Process '%s' not running, restarting it (%s)", exeName, why);
             }
 
             StartTargetProcess(cmdline);
@@ -262,7 +316,10 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
 
     g_Status.dwServiceType = SERVICE_WIN32;
     g_Status.dwCurrentState = SERVICE_START_PENDING;
-    g_Status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN;
+    // PRESHUTDOWN arrives BEFORE the ordinary shutdown notifications, which is the only chance to
+    // know the machine is going down early enough to stop respawning the agent into it.
+    g_Status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN |
+        SERVICE_ACCEPT_PRESHUTDOWN;
     g_Status.dwWin32ExitCode = 0;
     g_Status.dwServiceSpecificExitCode = 0;
     g_Status.dwCheckPoint = 0;
@@ -311,8 +368,15 @@ DWORD WINAPI ControlHandlerEx(IN DWORD controlCode, IN DWORD eventType, IN void 
 {
     switch (controlCode)
     {
+    case SERVICE_CONTROL_PRESHUTDOWN:
+        // Earliest reliable "the machine is going down" signal. Only latch the flag: the SCM
+        // follows this with SHUTDOWN/STOP, which is where the state transition belongs.
+        InterlockedExchange(&g_ServiceStopping, 1);
+        LogInfo("preshutdown - the agent will not be restarted from here on");
+        break;
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
+        InterlockedExchange(&g_ServiceStopping, 1);
         g_Status.dwWin32ExitCode = 0;
         g_Status.dwCurrentState = SERVICE_STOPPED;
         LogInfo("stopping...");

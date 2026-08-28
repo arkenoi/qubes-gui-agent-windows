@@ -4960,15 +4960,64 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         // the user's entire screen. A window that covers the whole display IS a takeover to
         // the person in front of it, whatever the window manager calls it. There is no mode
         // in which secure-desktop content may reach dom0.
+        //
+        // FIELD CONSEQUENCE, measured 2026-08-28 and NOT yet decided by the owner: this also
+        // hides the SIGN-IN screen, so a guest without autologon shows dom0 nothing at all and
+        // cannot be logged into (forum posts 98/101; upstream QWT has no such filter and shows
+        // it). Note the rationale above has also aged: since 4.3.12 the non-seamless window is
+        // shrunk on entry (1280x800 default), so "as large as the user's entire screen" is no
+        // longer what non-seamless means. The rule stands as the owner set it until they say
+        // otherwise; what is added below is only that the state stops being silent.
+        //
+        // SAY SO WHEN THE FREEZE IS NOT TRANSIENT (2026-08-28). At boot the agent starts on
+        // Winlogon and stays frozen until autologon completes - 15-17 s on this testbed, entirely
+        // normal. But on a guest WITHOUT autologon the freeze never ends: the guest waits at the
+        // sign-in screen, dom0 is shown nothing at all, and the log went completely silent about
+        // it. Two field reports ("absolutely nothing is visible", forum posts 98/101) cost days
+        // because nothing in any log named this state. The freeze stays - what changes is that it
+        // announces itself.
+        #define SECURE_DESKTOP_FIRST_WARN_MS 30000
+        #define SECURE_DESKTOP_REWARN_MS 120000
+        static ULONGLONG s_SecureSince = 0;
+        static ULONGLONG s_SecureNextWarn = 0;
         if (g_OnSecureDesktop)
         {
+            ULONGLONG now = GetTickCount64();
+            if (!s_WasSecure)
+            {
+                s_SecureSince = now;
+                s_SecureNextWarn = now + SECURE_DESKTOP_FIRST_WARN_MS;
+            }
             s_WasSecure = TRUE;
+
+            if (now >= s_SecureNextWarn)
+            {
+                s_SecureNextWarn = now + SECURE_DESKTOP_REWARN_MS;
+
+                WCHAR desktopName[64] = L"?";
+                HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
+                if (desktop)
+                {
+                    DWORD needed = 0;
+                    if (!GetUserObjectInformation(desktop, UOI_NAME, desktopName,
+                        sizeof(desktopName), &needed))
+                        StringCchCopy(desktopName, RTL_NUMBER_OF(desktopName), L"?");
+                }
+
+                LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s - dom0 is being shown "
+                    L"NOTHING and will keep seeing nothing until this desktop goes away. A few seconds "
+                    L"of this at boot is normal (autologon). Persisting means the guest is waiting at "
+                    L"the Windows sign-in or lock screen, which is never granted to dom0 (owner rule): "
+                    L"arm autologon in the guest, or log in over the guest console.",
+                    desktopName, (now - s_SecureSince) / 1000);
+            }
             return ERROR_SUCCESS;
         }
         if (s_WasSecure)
         {
             s_WasSecure = FALSE;
-            LogInfo("secure desktop left - resuming with a full resync and the frame signature invalidated");
+            LogInfo("secure desktop left after %I64u s - resuming with a full resync and the frame "
+                L"signature invalidated", (GetTickCount64() - s_SecureSince) / 1000);
             PwInvalidateFramebuffer(); // FrameSigInvalidate + g_FbBits reset; republished just below
             QueueWindowEvent(NULL, 0, TRUE); // full re-enumeration: catch up on everything frozen out
         }
