@@ -7131,7 +7131,44 @@ static ULONG Init(void)
 
     LogDebug("start");
 
-    // This needs to be done first as a safeguard to not start multiple instances of this process.
+    // SINGLE INSTANCE, enforced for real (2026-08-28).
+    //
+    // The comment here used to claim the shutdown event was "a safeguard to not start multiple
+    // instances", but nothing ever checked ERROR_ALREADY_EXISTS, so the guard did nothing. The
+    // cost is measured, on this testbed and in the field: at boot the watchdog launches an
+    // agent, it dies within a second, the watchdog launches another, and for a while TWO
+    // agents run at once. Only one can own the vchan, so the loser dies with
+    // "QioReadBuffer: ReadFile failed with error 0x6d: The pipe has been ended" - and which
+    // one loses is a race. Measured on win11-app: agents at 02:34:35 and 02:34:36, both dead
+    // within a second, no GUI until a third came up 55 s later. GWeck's field log shows the
+    // same shape (two agents 2 s apart, both dead).
+    //
+    // A mutex, not an event: ownership is released by the kernel when the holder dies, so a
+    // crashed agent cannot lock out its replacement. Taking it with a 0 ms wait, WAIT_ABANDONED
+    // counts as acquired (previous owner died holding it).
+    {
+        HANDLE instanceMutex = CreateMutex(NULL, FALSE, QGA_INSTANCE_MUTEX_NAME);
+        if (instanceMutex)
+        {
+            DWORD wait = WaitForSingleObject(instanceMutex, 0);
+            if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
+            {
+                LogWarning("another gui-agent instance is already running (mutex wait %lu) - "
+                    L"exiting so it keeps the vchan; two instances fight for it and the loser "
+                    L"dies with a pipe error, leaving the qube without a GUI", wait);
+                CloseHandle(instanceMutex);
+                return ERROR_ALREADY_EXISTS;
+            }
+            // Held for the process lifetime; never released explicitly.
+        }
+        else
+        {
+            // Non-fatal: without the guard we are exactly as exposed as before this change.
+            LogWarning("could not create the single-instance mutex (0x%x) - starting anyway",
+                GetLastError());
+        }
+    }
+
     g_ShutdownEvent = CreateNamedEvent(QGA_SHUTDOWN_EVENT_NAME);
     if (!g_ShutdownEvent)
     {

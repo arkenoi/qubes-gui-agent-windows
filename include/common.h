@@ -93,6 +93,11 @@
 
 // When signaled, causes agent to shutdown gracefully.
 #define QGA_SHUTDOWN_EVENT_NAME L"Global\\QGA_SHUTDOWN"
+// Single-instance guard. A MUTEX, not an event, deliberately: mutex ownership is released by
+// the kernel when the owning process dies, so a crashed agent can never lock out its
+// replacement. An event would persist while any handle lived and could strand the qube
+// without a GUI - the opposite of what this protects against.
+#define QGA_INSTANCE_MUTEX_NAME L"Global\\QGA_SINGLE_INSTANCE"
 
 // these are hardcoded
 #define	MIN_RESOLUTION_WIDTH	320UL
