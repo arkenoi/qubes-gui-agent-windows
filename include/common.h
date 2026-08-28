@@ -53,6 +53,10 @@
 // service.gui-fullscreen (guest qubesdb /qubes-service/gui-fullscreen) overrides this
 // guest-local base, and dom0 wins. Does not affect true fullscreen MODE.
 #define REG_CONFIG_SHOW_FS_VALUE            L"ShowFullscreenScreen"
+// May the qube show its WHOLE DESKTOP in one (bounded) window - non-seamless mode. Deliberately
+// NOT the value above: enabling the windowed desktop must never imply permission for
+// screen-covering windows. service.gui-windowed-desktop overrides this base, dom0 wins.
+#define REG_CONFIG_ALLOW_WINDOWED_DESKTOP_VALUE L"AllowWindowedDesktop"
 // How long the agent waits for its FIRST gui-daemon client before deciding the vchan
 // server it opened is dead and exiting for the watchdog to respawn it, and how many times
 // it may do that before giving up and staying quiet. See the FIRST-BOOT SELF-HEAL note in
