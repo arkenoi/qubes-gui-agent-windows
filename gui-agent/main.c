@@ -4951,23 +4951,24 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         EnsureOnInputDesktop();
 
         static BOOL s_WasSecure = FALSE;
-        // UNCONDITIONAL. The secure desktop is never granted to dom0 in ANY mode (owner rule
-        // 2026-08-19, re-affirmed 2026-08-27 after a demo of the non-seamless case put a
-        // screen-sized window on the owner's display).
+        static BOOL s_ShownNonSeamless = FALSE;
+        // SEAMLESS ONLY (owner decision 2026-08-28, superseding "unconditional" here).
         //
-        // The "it is only a bounded window" argument does not survive contact with reality:
-        // the guest desktop is sized to the HOST, so the non-seamless window is as large as
-        // the user's entire screen. A window that covers the whole display IS a takeover to
-        // the person in front of it, whatever the window manager calls it. There is no mode
-        // in which secure-desktop content may reach dom0.
+        // SEAMLESS: the secure desktop is never granted. Each secure surface would become its
+        // OWN standalone dom0 window - a consent box or a full-screen dimming backdrop
+        // indistinguishable from dom0's own UI (that backdrop WAS GWeck's black window,
+        // root-caused 2026-08-27). Freeze everything: no publish of the secure framebuffer, no
+        // tracking pass, no damage.
         //
-        // FIELD CONSEQUENCE, measured 2026-08-28 and NOT yet decided by the owner: this also
-        // hides the SIGN-IN screen, so a guest without autologon shows dom0 nothing at all and
-        // cannot be logged into (forum posts 98/101; upstream QWT has no such filter and shows
-        // it). Note the rationale above has also aged: since 4.3.12 the non-seamless window is
-        // shrunk on entry (1280x800 default), so "as large as the user's entire screen" is no
-        // longer what non-seamless means. The rule stands as the owner set it until they say
-        // otherwise; what is added below is only that the state stops being silent.
+        // NON-SEAMLESS: show it, secure or not. The guest desktop is ONE bounded window there,
+        // so the sign-in screen appears inside it exactly as any other guest content, and the
+        // safety rule is unchanged and enforced elsewhere - no fullscreen unless DOM0 asked for
+        // the size (the geometry guard + shrink-on-entry in SetSeamlessMode), and no
+        // override-redirect. This is what makes a guest that does not log itself in reachable
+        // at all: measured 2026-08-28, autologon off meant 0 windows mapped and no password box
+        // anywhere (forum posts 98/101; upstream QWT shows the sign-in screen and defaults to
+        // this mode). Entering non-seamless still requires service.gui-fullscreen - a guest
+        // cannot put itself into this mode unasked.
         //
         // SAY SO WHEN THE FREEZE IS NOT TRANSIENT (2026-08-28). At boot the agent starts on
         // Winlogon and stays frozen until autologon completes - 15-17 s on this testbed, entirely
@@ -4987,10 +4988,22 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             {
                 s_SecureSince = now;
                 s_SecureNextWarn = now + SECURE_DESKTOP_FIRST_WARN_MS;
+                s_ShownNonSeamless = FALSE;
             }
             s_WasSecure = TRUE;
 
-            if (now >= s_SecureNextWarn)
+            if (!g_SeamlessMode)
+            {
+                // Bounded desktop window: show it and carry on with normal processing.
+                if (!s_ShownNonSeamless)
+                {
+                    s_ShownNonSeamless = TRUE;
+                    LogInfo("QGADESK secure desktop shown inside the bounded desktop window "
+                        L"(non-seamless, %lux%lu) - this is the way in for a guest that does not "
+                        L"log itself in", g_ScreenWidth, g_ScreenHeight);
+                }
+            }
+            else if (now >= s_SecureNextWarn)
             {
                 s_SecureNextWarn = now + SECURE_DESKTOP_REWARN_MS;
 
@@ -5007,11 +5020,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s - dom0 is being shown "
                     L"NOTHING and will keep seeing nothing until this desktop goes away. A few seconds "
                     L"of this at boot is normal (autologon). Persisting means the guest is waiting at "
-                    L"the Windows sign-in or lock screen, which is never granted to dom0 (owner rule): "
-                    L"arm autologon in the guest, or log in over the guest console.",
+                    L"the Windows sign-in or lock screen, which is not shown in SEAMLESS mode: arm "
+                    L"autologon in the guest, or switch this qube to the windowed desktop "
+                    L"(qvm-features <vm> service.gui-fullscreen 1, then qubes.SetGuiMode FULLSCREEN) "
+                    L"where the sign-in screen IS shown inside the bounded window.",
                     desktopName, (now - s_SecureSince) / 1000);
             }
-            return ERROR_SUCCESS;
+
+            // Seamless: nothing may flow while this desktop is up. Non-seamless falls through
+            // and is processed like any other frame.
+            if (g_SeamlessMode)
+                return ERROR_SUCCESS;
         }
         if (s_WasSecure)
         {
