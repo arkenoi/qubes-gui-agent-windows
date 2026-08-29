@@ -1229,7 +1229,40 @@ BOOL IsPopup(IN const WINDOW_DATA* entry)
         // Metro apps without WS_CAPTION.
         // MSDN says that windows with WS_SYSMENU *should* have WS_CAPTION,
         // but I guess MS doesn't adhere to its own standards...
-        (HasFlags(entry->Style, WS_SYSMENU) && HasFlags(entry->ExStyle, WS_EX_APPWINDOW)));
+        (HasFlags(entry->Style, WS_SYSMENU) && HasFlags(entry->ExStyle, WS_EX_APPWINDOW)) ||
+        // STANDALONE SYSTEM DIALOGS (added 2026-08-30). A caption-less window that asks to be
+        // on the TASKBAR (WS_EX_APPWINDOW) is a real top-level window - an app or a dialog -
+        // not a transient popup, even when it omits WS_SYSMENU. The pair test above missed
+        // exactly that case.
+        //
+        // MEASURED, this window (guest/dialog-catch.ps1, win10-clean, 2026-08-30):
+        //   proc=MusNotificationUx  class='Shell_SystemDialogProxy'
+        //   title="We've got an update for you"
+        //   style=0x94000000  exstyle=0x00040000  owner=0
+        //   caption=0 sysmenu=0 popup=0 toolwindow=0 noactivate=0 topmost=0 layered=0 cloaked=0
+        // It sets WS_EX_APPWINDOW but NOT WS_SYSMENU, so it fell through to override-redirect
+        // and reached dom0 with NO TRUST BORDER - a full system dialog, centred, undecorated.
+        // The class name says what it is: a system dialog proxy.
+        //
+        // WHY THIS IS SAFE FOR INLINE APP POPUPS, which must stay override-redirect (owner:
+        // "make sure we won't break regular app inline pop-ups"; "they ARE override redirect if
+        // we fail to synthesize them, but standalone stuff should not be granted this
+        // capability"). Combo dropdowns, context menus, autocomplete lists and tooltips are
+        // owned transients that never ask for a taskbar button, so they do not set
+        // WS_EX_APPWINDOW and are untouched by this clause. The extra TOOLWINDOW/NOACTIVATE
+        // exclusions below make that explicit rather than implicit: a tool window is by
+        // definition not a taskbar window, and a non-activatable window cannot be a dialog the
+        // user is meant to answer.
+        //
+        // Verified against every window measured on that guest - Shell_TrayWnd (exstyle 0x88),
+        // Progman (0x80), the UWP CoreWindows (0x00200000), the DWM listener and EdgeUi
+        // surfaces (0x08200080), and the Store's ApplicationFrameWindow (already captioned).
+        // NONE of them carries WS_EX_APPWINDOW, so this clause flips the dialog and nothing
+        // else. Shell_TrayWnd and Progman are in any case excluded earlier by identity in
+        // ShouldAcceptWindow (g_TaskbarWindow / GetShellWindow()), never by this predicate.
+        (HasFlags(entry->ExStyle, WS_EX_APPWINDOW) &&
+         !HasFlags(entry->ExStyle, WS_EX_TOOLWINDOW) &&
+         !HasFlags(entry->ExStyle, WS_EX_NOACTIVATE)));
 
     // FIXME: better prevention of large popup windows that can obscure dom0 screen
     if (isPopup && (entry->Width >= g_HostScreenWidth || entry->Height >= g_HostScreenHeight))
