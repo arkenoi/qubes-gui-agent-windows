@@ -1262,7 +1262,60 @@ static DWORD HandleFocus(IN HWND window)
         {
             if (data->IsIconic)
                 ShowWindow(window, SW_RESTORE);
-            SetForegroundWindow(window);
+
+            // FOREGROUND LOCK. SetForegroundWindow SILENTLY FAILS - returns FALSE, changes
+            // nothing - when another process owns the foreground and Windows' foreground lock is
+            // in force. Its result was previously ignored, so the failure was invisible: dom0
+            // said "focus this window", the guest quietly did nothing, and the user got the
+            // rejection beep with no trace anywhere.
+            //
+            // Measured 2026-08-30, Windows Update's dialog (MusNotificationUx,
+            // class Shell_SystemDialogProxy): clicking any other guest window in dom0 did nothing
+            // and Windows chimed. It LOOKED modal, but it is not Win32-modal at all - the dialog
+            // has NO owner (owner=0) and enumerating every visible top-level window showed all of
+            // them enabled=True, nothing WS_DISABLED. So nothing was blocking input structurally;
+            // the shell simply held the foreground and our SetForegroundWindow could not take it.
+            //
+            // dom0 is the window manager. When the user clicks a guest window there, the guest
+            // must honour it - a guest process must not be able to veto dom0's focus decisions,
+            // which is both a usability defect ("i do not want it to be modal") and the wrong
+            // authority relationship.
+            //
+            // AttachThreadInput is the documented way through: while our thread shares an input
+            // queue with the current foreground thread, we are inside the same foreground context
+            // and the call is permitted. Attach only on failure, and always detach - a leaked
+            // attachment couples our input queue to another process's for good, so a hang there
+            // would become our hang.
+            if (!SetForegroundWindow(window))
+            {
+                HWND fg = GetForegroundWindow();
+                DWORD fgThread = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+                DWORD ourThread = GetCurrentThreadId();
+                BOOL recovered = FALSE;
+
+                if (fgThread && fgThread != ourThread &&
+                    AttachThreadInput(ourThread, fgThread, TRUE))
+                {
+                    recovered = SetForegroundWindow(window);
+                    if (recovered)
+                        BringWindowToTop(window);
+                    AttachThreadInput(ourThread, fgThread, FALSE);
+                }
+
+                if (recovered)
+                {
+                    LogDebug("0x%x: foreground was locked by 0x%x, taken via AttachThreadInput",
+                        window, fg);
+                }
+                else
+                {
+                    // Do not fail the message: focus is advisory and the guest is still usable.
+                    // But say so, because a silently ignored focus request is exactly what made
+                    // this defect invisible until a human noticed the chiming.
+                    LogWarning("0x%x: dom0 focus NOT applied - foreground held by 0x%x (thread %u)",
+                        window, fg, fgThread);
+                }
+            }
 
             // Z-ORDER SYNC, runtime-switchable (registry DWORD "FocusRaise", default 0 =
             // historic behaviour). MSG_FOCUS is the only stacking-adjacent thing dom0 sends:
