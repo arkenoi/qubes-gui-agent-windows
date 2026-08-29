@@ -626,6 +626,64 @@ static DWORD HandleButton(IN HWND window)
     return ERROR_SUCCESS;
 }
 
+// MSG_CROSSING (127): the pointer ENTERED or LEFT this window in dom0.
+//
+// This message was previously UNHANDLED. It fell to the default branch of the dispatch switch,
+// which logged "got unknown msg type 127, ignoring" - at input rate, roughly 10 lines per second
+// while the pointer moves. Two costs, both real:
+//
+//   1. LOST SEMANTICS. Enter/leave is how the agent learns the pointer is no longer over a
+//      window. Without it the guest is never told, so state that should be released on leave
+//      simply is not. Found 2026-08-30 while the owner reported Explorer showing "occlusion and
+//      cursor artifacts"; the log was full of exactly this message.
+//   2. FILE I/O ON THE INPUT PATH. A LogWarning per crossing event writes to disk at input rate,
+//      which is squarely against Track A's purpose of finding what makes the guest feel slow.
+//
+// The body was at least DRAINED correctly by the default branch (it consumes untrusted_len), so
+// the vchan never desynchronised - checked before writing this, because a stream desync would
+// have been a far worse bug than the one being fixed.
+//
+// WHAT THIS HANDLER DOES, deliberately conservatively: it does not synthesise pointer input.
+// Faking a WM_MOUSELEAVE or warping the cursor to force one would be guesswork about what each
+// app expects, and would be visible to the user if it moved the cursor. What it DOES do is
+// release the drag latch, which is a state machine we own and can reason about exactly:
+//
+//   The latch (g_InputDragWindow, set in HandleButton on a Button1 press) suppresses the
+//   per-frame PrintWindow re-capture for the duration of a drag. It is documented as "cleared on
+//   ANY release so the latch can never stick" - but that only holds if the release ARRIVES. A
+//   pointer that has left the window cannot still be dragging it, so LeaveNotify is an
+//   independent, authoritative signal that the drag is over. This closes the "a Button1 release
+//   can be lost, leaving the window frozen until the next Button1 event anywhere" hole already
+//   noted in main.c.
+//
+// Anything further (actual hover/cursor-ownership release) needs measurement of what the guest
+// does on leave before it is written - see the FINDINGS entry. Recognising the message and
+// dropping the flood is correct and safe on its own.
+static DWORD HandleCrossing(IN HWND window)
+{
+    struct msg_crossing crossingMsg;
+
+    if (!VchanReceiveBuffer(g_Vchan, &crossingMsg, sizeof(crossingMsg), L"msg_crossing"))
+    {
+        LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF
+        return ERROR_UNIDENTIFIED_ERROR;
+    }
+
+    LogVerbose("0x%x: crossing type=%u at (%d,%d) mode=%u detail=%u",
+        window, crossingMsg.type, crossingMsg.x, crossingMsg.y, crossingMsg.mode, crossingMsg.detail);
+
+    if (crossingMsg.type == LeaveNotify && window && window == g_InputDragWindow)
+    {
+        LogDebug("0x%x: pointer left the window while the drag latch was held - releasing it",
+            window);
+        g_InputDragWindow = NULL;
+        g_InputDragOriginValid = FALSE;
+        DragAnnounceClear();
+    }
+
+    return ERROR_SUCCESS;
+}
+
 static DWORD HandleMotion(IN HWND window)
 {
     struct msg_motion motionMsg;
@@ -1298,6 +1356,9 @@ DWORD HandleServerData(BOOL replyToMessages, IN OUT struct _CAPTURE_CONTEXT* cap
         break;
     case MSG_MOTION:
         status = HandleMotion((HWND)header.window);
+        break;
+    case MSG_CROSSING:
+        status = HandleCrossing((HWND)header.window);
         break;
     case MSG_CONFIGURE:
         status = HandleConfigure((HWND)header.window, replyToMessages);

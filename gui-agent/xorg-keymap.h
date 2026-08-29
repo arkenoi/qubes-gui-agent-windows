@@ -29,6 +29,9 @@ extern const char* g_KeycodeName[256];
 /* From X.h */
 #define KeyPress            2
 #define ButtonPress         4
+/* msg_crossing.type carries these two: the pointer entered or left the window in dom0. */
+#define EnterNotify         7
+#define LeaveNotify         8
 #define Button1             1
 #define Button2             2
 #define Button3             3
