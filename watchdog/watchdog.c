@@ -369,10 +369,29 @@ DWORD WINAPI ControlHandlerEx(IN DWORD controlCode, IN DWORD eventType, IN void 
     switch (controlCode)
     {
     case SERVICE_CONTROL_PRESHUTDOWN:
-        // Earliest reliable "the machine is going down" signal. Only latch the flag: the SCM
-        // follows this with SHUTDOWN/STOP, which is where the state transition belongs.
+        // Earliest reliable "the machine is going down" signal: latch the flag so the watchdog
+        // stops respawning the agent into a dying machine.
+        //
+        // THEN REPORT STOPPED, IMMEDIATELY. The previous version only latched the flag, on the
+        // assumption that "the SCM follows this with SHUTDOWN/STOP, which is where the state
+        // transition belongs". That assumption is wrong and it cost ~3 minutes on EVERY clean
+        // shutdown: the SCM does not send SHUTDOWN until preshutdown COMPLETES, and a service that
+        // never reports a terminal state is waited out for the full preshutdown timeout (180 s by
+        // default) before the SCM gives up and logs
+        //     Event 7043: "The Qubes GUI agent watchdog service did not shut down properly after
+        //                  receiving a preshutdown control."
+        // That event was observed on this rig and traced here (2026-08-29). ServiceMain blocks
+        // INFINITE on a worker thread that never exits, so no other path can report the state.
+        //
+        // There is nothing to flush: this service's entire shutdown obligation is "stop respawning",
+        // which the flag above satisfies synchronously. So acknowledge and go STOPPED at once.
         InterlockedExchange(&g_ServiceStopping, 1);
         LogInfo("preshutdown - the agent will not be restarted from here on");
+        g_Status.dwWin32ExitCode = 0;
+        g_Status.dwCurrentState = SERVICE_STOPPED;
+        g_Status.dwCheckPoint = 0;
+        g_Status.dwWaitHint = 0;
+        SetServiceStatus(g_StatusHandle, &g_Status);
         break;
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
