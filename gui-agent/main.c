@@ -3352,11 +3352,18 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         // over the whole screen) is the feature-gated MODE 2. NOTE: many normal apps (Edge,
         // Explorer, UWP) carry WS_CAPTION while painting their own header (main.c ~1757), which
         // is exactly what we want - they count as windowed and are always allowed.
+        // ##### DIAG BUILD - NOT SHIPPABLE #####################################################
+        // The Mode 2 deny is REMOVED so a borderless fullscreen window is ACCEPTED. This exists
+        // only to earn SG2's fail-proof (H5: a check counts as evidence once it has been seen to
+        // FAIL with the defect deliberately present). SG2 asserts that such a window never reaches
+        // dom0; with this clause gone it must, and the check must go RED. If it does not, the check
+        // is not a check.
+        // NEVER MERGE. Branch diag/sg2-mode2-gate-removed exists to be thrown away.
         if (!(data->Style & WS_CAPTION) && !g_ShowFullscreenScreen)
         {
-            LogDebug("0x%x: borderless fullscreen (class %s, %ux%u, style 0x%08x) hidden (set service.gui-fullscreen to allow)",
+            LogDebug("0x%x: DIAGBUILD borderless fullscreen (class %s, %ux%u, style 0x%08x) WOULD have been hidden - Mode 2 gate removed for the SG2 fail-proof",
                 data->Handle, data->Class, data->Width, data->Height, data->Style);
-            return FALSE;
+            /* return FALSE;  <-- the gate under test, deliberately disabled */
         }
     }
 
