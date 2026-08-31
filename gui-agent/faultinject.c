@@ -345,8 +345,15 @@ BOOL FiShouldCaptureExit(void)
     if (!FiTakeShot(&g_FiCaptureExit))
         return FALSE;
 
-    LogWarning("QGAFAULT FI_CAPTURE_EXIT firing: the capture thread returns WITHOUT "
-        L"signalling error_event - the main loop will never be told capture stopped");
+    // DELIBERATELY AVOIDS THE WORDS "capture thread". rnd8-resolution.sh counts real deaths by
+    // grepping the agent log for /capture thread|thread exiting|giving up/, and the previous
+    // wording of THIS message matched it. Measured 2026-08-31: with the fault armed, the only
+    // line in the whole log matching that pattern was this one, so the check scored a "thread
+    // death" it had detected from the injector announcing itself - a self-referential red that
+    // proves nothing. An injector that trips the very check it is meant to validate is worse
+    // than no injector: it manufactures the evidence.
+    LogWarning("QGAFAULT FI_CAPTURE_EXIT firing: the DDA worker returns WITHOUT signalling "
+        L"error_event - the main loop will never be told duplication stopped");
     return TRUE;
 }
 
