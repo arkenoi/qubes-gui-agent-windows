@@ -1779,7 +1779,15 @@ static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
     SynthUpdateMask(owner);
     // Paint it NOW: a menu paints once, before it is tracked, and a static screen
     // produces no further frames - waiting for damage would leave it invisible.
-    PwPatchSynthRect(owner, entry);
+    //
+    // FI_NOSYNTHPAINT suppresses exactly this paint. Menus are synthesized onto the owner
+    // rather than mapped, so no ShouldAcceptWindow bit can falsify the checks that assert a
+    // menu REACHES THE USER (measured 2026-08-31: with FI_DROP_SHELLSURFACE armed, RND-4 went
+    // FAIL while RND-3 stayed PASS). Skipping the paint leaves the SYNTH bookkeeping intact and
+    // the owner's pixels UNCHANGED - which is the defect those checks exist to catch, and it
+    // shows up as output, not as a log line.
+    if (!FiGateOff(FI_NOSYNTHPAINT))
+        PwPatchSynthRect(owner, entry);
     owner->SynthLastFullPatch = GetTickCount();
     LogInfo("QGAPROTO,msg=SYNTH,hwnd=0x%x,owner=0x%x,x=%d,y=%d,w=%u,h=%u",
         (uint32_t)(ULONG_PTR)entry->Handle, (uint32_t)(ULONG_PTR)owner->Handle,

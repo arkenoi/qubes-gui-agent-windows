@@ -135,6 +135,10 @@ extern const char g_FaultInjectionMarker[];
 // shadow strips, would have silently killed every Windows notification.
 #define FI_DROP_CAPTIONED    0x00000020u  // drop captioned windows the release build maps
 #define FI_DROP_SHELLSURFACE 0x00000040u  // drop toast/menu shell surfaces the release build maps
+// Not an accept-predicate bit at all: menus are SYNTHESIZED onto their owner's surface rather
+// than mapped as windows, so no reject bit can falsify a check asserting a menu reaches the
+// user. This suppresses the synth PAINT, leaving the owner's pixels unchanged.
+#define FI_NOSYNTHPAINT      0x00000080u  // skip PwPatchSynthRect in SynthActivate
 
 #if QGA_FAULT_INJECTION
 
