@@ -100,7 +100,13 @@
          compiles it out; a fault-capable build is requested explicitly with
              msbuild ... -p:QgaFaultInjection=1
          and identifies itself in the log and in the binary (g_FaultInjectionMarker). -->
-    <QgaFaultInjection Condition="'$(QgaFaultInjection)' == ''">0</QgaFaultInjection>
+    <!-- DIAG BUILD ONLY (branch diag/faultinject). Default flipped 0 -> 1 so CI produces a
+         fault-injection agent WITHOUT a workflow input. NEVER merge this to a release branch:
+         the header's own rule is that a binary which can be made to break itself on purpose is
+         not a shipping binary. Every fault still defaults to OFF at runtime and must be armed
+         by an explicit registry value, so this binary behaves exactly like the release until
+         one is set - which is what makes it usable as an H5 fail-proof vehicle. -->
+    <QgaFaultInjection Condition="'$(QgaFaultInjection)' == ''">1</QgaFaultInjection>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
     <IncludePath>$(VC_IncludePath);$(WindowsSDK_IncludePath);$(ProjectDir)\..\..\include;$(QUBES_INCLUDES);$(QUBES_REPO)\vmm-xen-windows-pvdrivers\inc;$(QUBES_REPO)\core-vchan-xen\inc;$(QUBES_REPO)\windows-utils\inc;$(QUBES_REPO)\core-qubesdb\inc;$(ProjectDir)\..\..\..\gui-common\include;$(ProjectDir)\..\..\..\qubes-gui-common\include</IncludePath>
