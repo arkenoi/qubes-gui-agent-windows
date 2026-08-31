@@ -6772,6 +6772,19 @@ static ULONG WINAPI WatchForEvents(void)
                             // Echo dom0's own last-reported window position - never
                             // (0,0), which would MOVE the window and clip its left
                             // border (see HandleConfigure).
+                            // FI_NOSCREENCONFIG suppresses the screen-window CONFIGURE after a
+                            // resolution change. dom0 then keeps the OLD screen geometry while
+                            // the guest has already switched - which is the defect the
+                            // mode-followed-* checks assert against, and they read exactly the
+                            // A6CONFIGURE line this branch emits, taking the LAST one, so a
+                            // suppressed emission leaves them reading a stale size.
+                            if (FiGateOff(FI_NOSCREENCONFIG))
+                            {
+                                LogWarning("QGAFAULT FI_NOSCREENCONFIG: NOT telling dom0 the screen "
+                                    L"is now %ux%u", capture->width, capture->height);
+                            }
+                            else
+                            {
                             ULONG cfgStatus = SendWindowConfigure(NULL,
                                 g_ScreenWinX, g_ScreenWinY,
                                 capture->width, capture->height, FALSE);
@@ -6779,6 +6792,7 @@ static ULONG WINAPI WatchForEvents(void)
                                 win_perror2(cfgStatus, "SendWindowConfigure (screen, after recreate)");
                             else
                                 LogInfo("A6CONFIGURE window 0 -> %ux%u", capture->width, capture->height);
+                            }
                         }
                     }
 

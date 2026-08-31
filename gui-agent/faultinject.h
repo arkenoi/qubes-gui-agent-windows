@@ -138,7 +138,11 @@ extern const char g_FaultInjectionMarker[];
 // Not an accept-predicate bit at all: menus are SYNTHESIZED onto their owner's surface rather
 // than mapped as windows, so no reject bit can falsify a check asserting a menu reaches the
 // user. This suppresses the synth PAINT, leaving the owner's pixels unchanged.
-#define FI_NOSYNTHPAINT      0x00000080u  // skip PwPatchSynthRect in SynthActivate
+#define FI_NOSYNTHPAINT      0x00000080u  // skip the synth paint chokepoint (PwPatchSynthChildClipped)
+// Suppresses the screen-window CONFIGURE after a resolution change, so dom0 keeps the OLD
+// geometry while the guest has already switched. The mode-followed-* checks read the
+// A6CONFIGURE line this emits and take the LAST one, so suppressing it leaves them stale.
+#define FI_NOSCREENCONFIG    0x00000100u  // do not tell dom0 the screen resolution changed
 
 #if QGA_FAULT_INJECTION
 
