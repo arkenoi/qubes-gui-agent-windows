@@ -3392,7 +3392,11 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // surface whose measurement FINISHED and found no card is not a window. In-flight
     // measurements are never rejected, so an opening menu still maps as soon as its card
     // resolves (toastcrop pokes the tracking pass when it does).
-    if (ShellSurfaceCardless(data))
+    // FI_GATE_NOCARD. `start-not-presented` could not be earned by bypassing FI_GATE_START
+    // alone: measured 2026-08-31, with that bit live and Start opened, the Start clause logged
+    // 0 rejects and THIS gate logged 5, so the surface never reached dom0 anyway. The two
+    // clauses defend the same property, and a proof needs both out of the way.
+    if (!FiGateOff(FI_GATE_NOCARD) && ShellSurfaceCardless(data))
     {
         LogDebug("0x%x: shell surface with no card - not presenting a menu, rejecting",
             data->Handle);
@@ -3611,6 +3615,28 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // DWM-cloaked windows are the third 2A-chrome case; they are rejected by the
     // !data->IsVisible test at the top of this function, because GetWindowData() folds
     // DWMWA_CLOAKED into IsVisible. No separate rule needed here.
+
+    // ---------------- FI_DROP_* : the ONLY injected defects that ADD a reject ----------------
+    // Every other FI_GATE_* bit REMOVES a safeguard, to falsify a check that asserts something
+    // is DENIED. The checks below assert the opposite - that a window IS presented - and no
+    // amount of gate-removal can falsify those. Re-introducing "the filter is too aggressive",
+    // which is a real regression class this project has shipped before (the 2A-chrome predicate
+    // nearly killed all Windows notifications), needs a bit that DROPS instead.
+    //
+    // Placed at the very END of the predicate, so a dropped window is one the release build
+    // would certainly have accepted - no interaction with any earlier clause.
+    if (FiGateOff(FI_DROP_CAPTIONED) && (data->Style & WS_CAPTION))
+    {
+        LogDebug("0x%x: FI_DROP_CAPTIONED - dropping a captioned window the release build maps",
+            data->Handle);
+        return FALSE;
+    }
+    if (FiGateOff(FI_DROP_SHELLSURFACE) && ShellSurfaceKind(data) != ShellSurfaceNone)
+    {
+        LogDebug("0x%x: FI_DROP_SHELLSURFACE - dropping a shell surface (toast/menu) the release build maps",
+            data->Handle);
+        return FALSE;
+    }
 
     return TRUE;
 }

@@ -125,6 +125,16 @@ extern const char g_FaultInjectionMarker[];
 #define FI_GATE_MODE2        0x00000002u  // borderless-fullscreen feature gate (Mode 2)
 #define FI_GATE_START        0x00000004u  // "Start surface not presented in seamless mode"
 #define FI_GATE_SHELLOVERLAY 0x00000008u  // click-through uncapturable shell overlay reject
+#define FI_GATE_NOCARD       0x00000010u  // the genuine-open ("shell surface with no card") reject
+//
+// FI_DROP_* invert the direction. Every bit above REMOVES a safeguard, which falsifies a check
+// asserting a window is DENIED. Checks that assert a window IS presented - the negative control,
+// a maximized app, a toast surviving the chrome filter - cannot be falsified that way, so these
+// two ADD a reject at the very end of the predicate instead. The regression they reproduce is
+// real and this project has come close to shipping it: the 2A-chrome filter, aimed at Office
+// shadow strips, would have silently killed every Windows notification.
+#define FI_DROP_CAPTIONED    0x00000020u  // drop captioned windows the release build maps
+#define FI_DROP_SHELLSURFACE 0x00000040u  // drop toast/menu shell surfaces the release build maps
 
 #if QGA_FAULT_INJECTION
 
