@@ -1786,8 +1786,7 @@ static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
     // FAIL while RND-3 stayed PASS). Skipping the paint leaves the SYNTH bookkeeping intact and
     // the owner's pixels UNCHANGED - which is the defect those checks exist to catch, and it
     // shows up as output, not as a log line.
-    if (!FiGateOff(FI_NOSYNTHPAINT))
-        PwPatchSynthRect(owner, entry);
+    PwPatchSynthRect(owner, entry);   // FI_NOSYNTHPAINT is enforced inside the paint chokepoint
     owner->SynthLastFullPatch = GetTickCount();
     LogInfo("QGAPROTO,msg=SYNTH,hwnd=0x%x,owner=0x%x,x=%d,y=%d,w=%u,h=%u",
         (uint32_t)(ULONG_PTR)entry->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
@@ -4498,6 +4497,15 @@ static BOOL PwDragSliceRefresh(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRAME
 static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA* c,
                                      IN const RECT* area)
 {
+    // FI_NOSYNTHPAINT guards the SINGLE function every synth paint goes through. Guarding only
+    // SynthActivate's one-shot call was measured insufficient on 2026-08-31: the bit fired
+    // (banner gateoff=0x80, announce 1) yet RND-3 still passed, because the ongoing paint path
+    // repainted the menu - the log showed SYNTH=1 AND SYNTHPAINT=1. A menu reaching its owner is
+    // defended by two paint paths, the same defence-in-depth pattern as the fullscreen and Start
+    // clauses; suppressing it needs the chokepoint, not one caller.
+    if (FiGateOff(FI_NOSYNTHPAINT))
+        return;
+
     if (!g_FbBits || g_FbPitch <= 0 || !owner->PwBuffer)
     {
         LogWarning("synth paint 0x%x: no source (fb=%p pitch=%d buf=%p)",
