@@ -106,6 +106,26 @@
 // waiting for a log line (CLAUDE.md: verify the artefact under test is actually installed).
 extern const char g_FaultInjectionMarker[];
 
+// [FI_GATE_OFF] bits for FiGateOff(), set as the DWORD FaultGateOff (env
+// QUBES_GUI_FAULT_GATE_OFF). Each bit BYPASSES one ShouldAcceptWindow safeguard so the
+// corresponding acceptance check can be seen to FAIL - H5's requirement that a check counts
+// as evidence only once it has gone red on a build with the defect re-introduced.
+//
+// WHY A RUNTIME BITMASK RATHER THAN ONE DIAG BRANCH PER CLAUSE. The first such proof (SG2,
+// 2026-08-31) removed the Mode-2 gate on a branch and built a second binary. That works, but
+// leaves a sceptic room to ask whether the red came from the gate removal or from some other
+// difference between two builds, and it costs a CI round trip per clause with ~19 clauses
+// left. With a bitmask, BOTH sides of every proof come from ONE artifact and differ only by a
+// registry value, which is a strictly stronger pairing and needs no further builds.
+//
+// The bits are deliberately NOT contiguous with main.c's shipped DiagWindowFilterOff: that
+// one is a field-diagnosis knob present in release binaries, these are deliberate defects
+// that must not be. Keep them here so they compile out.
+#define FI_GATE_MODE1        0x00000001u  // boot/shutdown/logon-phase fullscreen deny (Mode 1)
+#define FI_GATE_MODE2        0x00000002u  // borderless-fullscreen feature gate (Mode 2)
+#define FI_GATE_START        0x00000004u  // "Start surface not presented in seamless mode"
+#define FI_GATE_SHELLOVERLAY 0x00000008u  // click-through uncapturable shell overlay reject
+
 #if QGA_FAULT_INJECTION
 
 #ifdef __cplusplus
@@ -156,6 +176,12 @@ BOOL FiShouldLegacySend(void);
 // fault to another.
 BOOL FiPrintWindowFail(void);
 
+// [FI_GATE_OFF] TRUE while this safeguard clause is bypassed for the run. Not a shot and not
+// subject to the arming delay: a gate bypass is a mode, and it cannot disturb the handshake
+// because it changes only which windows are offered. Logs once per bit, so the run's own log
+// proves the bypass was in force.
+BOOL FiGateOff(IN DWORD gateBit);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif
@@ -172,5 +198,6 @@ static __forceinline BOOL  FiShouldCaptureExit(void) { return FALSE; }
 static __forceinline BOOL  FiShouldDupCreate(IN HWND window) { UNREFERENCED_PARAMETER(window); return FALSE; }
 static __forceinline BOOL  FiShouldLegacySend(void) { return FALSE; }
 static __forceinline BOOL  FiPrintWindowFail(void) { return FALSE; }
+static __forceinline BOOL  FiGateOff(IN DWORD gateBit) { UNREFERENCED_PARAMETER(gateBit); return FALSE; }
 
 #endif

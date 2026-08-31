@@ -3335,10 +3335,14 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         // In those phases nothing fullscreen-sized is an app the user asked for, whatever its
         // class, and the feature does not apply. A genuine fullscreen app can only appear later,
         // when the shell exists.
-        if (data->IsOverrideRedirect || wcsstr(data->Class, L"LogonUI") ||
-            !GetShellWindow() || g_OnSecureDesktop ||
-            (g_SecureDesktopLeftTick != 0 &&
-             GetTickCount64() - g_SecureDesktopLeftTick < FS_BOOT_SETTLE_MS))
+        // FI_GATE_MODE1 bypasses this whole clause on a fault-injection build, so the
+        // acceptance checks that assert "the boot/shutdown screen is never allowed" can be
+        // seen to fail. Compiles to a constant FALSE in release.
+        if (!FiGateOff(FI_GATE_MODE1) &&
+            (data->IsOverrideRedirect || wcsstr(data->Class, L"LogonUI") ||
+             !GetShellWindow() || g_OnSecureDesktop ||
+             (g_SecureDesktopLeftTick != 0 &&
+              GetTickCount64() - g_SecureDesktopLeftTick < FS_BOOT_SETTLE_MS)))
         {
             LogDebug("0x%x: boot/shutdown/logon-phase fullscreen (class %s, %ux%u, shell=%d, "
                 L"secure=%d) - unconditionally denied, feature or not",
@@ -3352,7 +3356,9 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         // over the whole screen) is the feature-gated MODE 2. NOTE: many normal apps (Edge,
         // Explorer, UWP) carry WS_CAPTION while painting their own header (main.c ~1757), which
         // is exactly what we want - they count as windowed and are always allowed.
-        if (!(data->Style & WS_CAPTION) && !g_ShowFullscreenScreen)
+        // FI_GATE_MODE2 reproduces, as a registry value on ONE binary, the defect that
+        // diag/sg2-mode2-gate-removed reproduced by building a second one (2026-08-31).
+        if (!FiGateOff(FI_GATE_MODE2) && !(data->Style & WS_CAPTION) && !g_ShowFullscreenScreen)
         {
             LogDebug("0x%x: borderless fullscreen (class %s, %ux%u, style 0x%08x) hidden (set service.gui-fullscreen to allow)",
                 data->Handle, data->Class, data->Width, data->Height, data->Style);
@@ -3369,7 +3375,8 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // the Super key is already dropped in seamless (BlockMenuKey), so the usual way to
     // summon it is closed too. Toasts are NOT affected: they render correctly and stay.
     // Re-enable with SeamlessStart=1 to work on it; see docs/PLAN-start-menu.md.
-    if (g_SeamlessMode && !g_SeamlessStart && ShellSurfaceKind(data) == ShellSurfaceStart)
+    if (!FiGateOff(FI_GATE_START) &&
+        g_SeamlessMode && !g_SeamlessStart && ShellSurfaceKind(data) == ShellSurfaceStart)
     {
         LogDebug("0x%x: Start surface not presented in seamless mode (SeamlessStart=0)",
             data->Handle);
@@ -3429,7 +3436,8 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // Narrow on purpose: all three of click-through + uncapturable + toolwindow must hold,
     // so ordinary DirectComposition app windows (NOREDIRECTIONBITMAP alone, e.g. the XAML
     // popups this build synthesizes) are untouched.
-    if ((data->ExStyle & WS_EX_TRANSPARENT) &&
+    if (!FiGateOff(FI_GATE_SHELLOVERLAY) &&
+        (data->ExStyle & WS_EX_TRANSPARENT) &&
         (data->ExStyle & WS_EX_NOREDIRECTIONBITMAP) &&
         (data->ExStyle & WS_EX_TOOLWINDOW))
     {

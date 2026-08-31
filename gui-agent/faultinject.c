@@ -48,6 +48,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define REG_CONFIG_FAULT_DUP_CREATE_VALUE   L"FaultDupCreate"
 #define REG_CONFIG_FAULT_LEGACY_SEND_VALUE  L"FaultLegacySend"
 #define REG_CONFIG_FAULT_PW_FAIL_VALUE      L"FaultPrintWindowFail"
+#define REG_CONFIG_FAULT_GATE_OFF_VALUE     L"FaultGateOff"
 
 #define FAULT_DELAY_ENV_VALUE        L"QUBES_GUI_FAULT_DELAY"
 #define FAULT_NEG_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_NEG_CREATE"
@@ -59,6 +60,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define FAULT_DUP_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_DUP_CREATE"
 #define FAULT_LEGACY_SEND_ENV_VALUE  L"QUBES_GUI_FAULT_LEGACY_SEND"
 #define FAULT_PW_FAIL_ENV_VALUE      L"QUBES_GUI_FAULT_PRINTWINDOW_FAIL"
+#define FAULT_GATE_OFF_ENV_VALUE     L"QUBES_GUI_FAULT_GATE_OFF"
 
 // Seconds between FiInit() and the first fault that may fire. See faultinject.h: every
 // failure being reproduced is a failure of a CONNECTED agent, so a fault landing during
@@ -78,6 +80,24 @@ static volatile LONG g_FiLegacySend  = 0;
 static volatile LONG g_FiCaptureExit = 0;
 static volatile LONG g_FiPumpStall   = 0;
 static volatile LONG g_FiPrintWindowFail = 0;
+
+// [FI_GATE_OFF] Bitmask of ShouldAcceptWindow safeguard clauses to BYPASS.
+//
+// Not a shot and not delayed. A gate bypass is a MODE, and unlike the timing faults it is
+// harmless during the handshake: it changes only which windows the agent offers, never the
+// protocol. Written once by FiInit, read-only afterwards.
+//
+// WHY THESE ARE HERE AND NOT NEXT TO g_DiagWindowFilterOff. main.c already ships a two-bit
+// DiagWindowFilterOff for field diagnosis, and the obvious move was to widen it. That would
+// have put every new safeguard bypass into the RELEASE binary. These bits exist only to
+// re-introduce defects for H5 proofs, so they belong where the rest of the deliberate defects
+// live - behind QGA_FAULT_INJECTION, compiled out of anything shipped.
+static DWORD g_FiGateOff = 0;
+
+// Which bits have already announced themselves. ShouldAcceptWindow runs for every window on
+// every pass, so logging per call would bury the log; once per bit is still enough to prove
+// the bypass was in force during THIS run, which is what a proof has to show.
+static volatile LONG g_FiGateLogged = 0;
 
 // Only the CREATE for this window id is inverted; 0 means "whichever comes next".
 // Compared as ULONG_PTR against the low half of the HWND, the same 32-bit id the
@@ -168,6 +188,7 @@ void FiInit(void)
     g_FiLegacySend  = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_LEGACY_SEND_VALUE,  FAULT_LEGACY_SEND_ENV_VALUE,  0);
     g_FiCaptureExit = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_CAPTURE_EXIT_VALUE, FAULT_CAPTURE_EXIT_ENV_VALUE, 0);
     g_FiPrintWindowFail = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_PW_FAIL_VALUE, FAULT_PW_FAIL_ENV_VALUE, 0);
+    g_FiGateOff         = FiReadDword(moduleName, REG_CONFIG_FAULT_GATE_OFF_VALUE, FAULT_GATE_OFF_ENV_VALUE, 0);
 
     g_FiArmAt = GetTickCount64() + (ULONGLONG)delaySec * 1000ULL;
 
@@ -187,21 +208,39 @@ void FiInit(void)
     // cause is a measurement run attributed to the wrong build, so every log file from a
     // fault-capable binary has to say so on its first page whether or not anything is armed.
     LogWarning("QGAFAULT-INIT build=%S armdelay=%us negcreate=%d(hwnd=0x%x) ringstall=%us "
-        L"pumpstall=%us captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d",
+        L"pumpstall=%us captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d gateoff=0x%x",
         g_FaultInjectionMarker,
         delaySec,
         g_FiNegCreate, g_FiNegCreateHwnd,
         ringStallSec,
         pumpStallSec,
-        g_FiCaptureExit, g_FiDupCreate, g_FiLegacySend, g_FiRawCreate, g_FiPrintWindowFail);
+        g_FiCaptureExit, g_FiDupCreate, g_FiLegacySend, g_FiRawCreate, g_FiPrintWindowFail,
+        g_FiGateOff);
 
     if (g_FiNegCreate > 0 || g_FiDupCreate > 0 || g_FiLegacySend > 0 ||
         g_FiCaptureExit > 0 || g_FiPumpStall > 0 || g_FiRingStallArmed || g_FiRawCreate ||
-        g_FiPrintWindowFail > 0)
+        g_FiPrintWindowFail > 0 || g_FiGateOff != 0)
     {
         LogWarning("QGAFAULT-INIT FAULTS ARE ARMED - this agent will break itself on purpose "
             L"in %u s; results from this run describe the INJECTED defect, not the build", delaySec);
     }
+}
+
+BOOL FiGateOff(IN DWORD gateBit)
+{
+    if ((g_FiGateOff & gateBit) == 0)
+        return FALSE;
+
+    // Announce each bypassed clause exactly once. A red run that cannot show the bypass was
+    // actually in force is not a proof - it is a run that happened to fail.
+    if ((InterlockedOr(&g_FiGateLogged, (LONG)gateBit) & (LONG)gateBit) == 0)
+    {
+        LogWarning("QGAFAULT FI_GATE_OFF bit 0x%x is set: a ShouldAcceptWindow safeguard is "
+            L"BYPASSED for this run. What this build maps is NOT what the release maps.",
+            gateBit);
+    }
+
+    return TRUE;
 }
 
 BOOL FiShouldNegCreate(IN HWND window)
