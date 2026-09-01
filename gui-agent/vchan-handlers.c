@@ -659,37 +659,48 @@ DWORD ProcessButtonEvent(IN HWND window, IN int bx, IN int by, IN unsigned int b
 
 // MSG_CROSSING (127): the pointer ENTERED or LEFT this window in dom0.
 //
-// This message was previously UNHANDLED. It fell to the default branch of the dispatch switch,
-// which logged "got unknown msg type 127, ignoring" - at input rate, roughly 10 lines per second
-// while the pointer moves. Two costs, both real:
+// THIS HANDLER CHANGES NO STATE, ON PURPOSE. It receives the message and, under the drag
+// trace, records it. That is all.
 //
-//   1. LOST SEMANTICS. Enter/leave is how the agent learns the pointer is no longer over a
-//      window. Without it the guest is never told, so state that should be released on leave
-//      simply is not. Found 2026-08-30 while the owner reported Explorer showing "occlusion and
-//      cursor artifacts"; the log was full of exactly this message.
-//   2. FILE I/O ON THE INPUT PATH. A LogWarning per crossing event writes to disk at input rate,
-//      which is squarely against Track A's purpose of finding what makes the guest feel slow.
+// WHY IT IS WRITTEN THAT WAY - the history is the specification here:
 //
-// The body was at least DRAINED correctly by the default branch (it consumes untrusted_len), so
-// the vchan never desynchronised - checked before writing this, because a stream desync would
-// have been a far worse bug than the one being fixed.
+// The message was unhandled and fell to the dispatch default, which logged "got unknown msg
+// type 127, ignoring" at input rate, ~10 lines/s while the pointer moves: file I/O on the INPUT
+// path, in a project whose whole subject is what makes the guest feel slow. Recognising the
+// message and dropping that flood is the ONLY thing that was wrong and the only thing fixed
+// here. (The body was already drained correctly by the default branch via untrusted_len, so the
+// vchan never desynchronised - checked at the time.)
 //
-// WHAT THIS HANDLER DOES, deliberately conservatively: it does not synthesise pointer input.
-// Faking a WM_MOUSELEAVE or warping the cursor to force one would be guesswork about what each
-// app expects, and would be visible to the user if it moved the cursor. What it DOES do is
-// release the drag latch, which is a state machine we own and can reason about exactly:
+// The same commit (b71f611, 2026-08-30) ALSO made this handler release the drag latch, on the
+// reasoning that "a pointer that has left the window cannot still be dragging it". Nobody asked
+// for it; the task in hand was an owner report of Explorer showing occlusion and cursor
+// artifacts, which this does not address and which that commit explicitly disclaimed fixing. The
+// FINDINGS entry that raised the message had said, in as many words, "Not yet fixed. The right
+// handler behaviour needs deciding (on leave: release hover/capture and stop asserting a cursor
+// for that window), and the Linux agent's treatment of XCrossingEvent is the reference." The
+// handler was written anyway, and did something else entirely.
 //
-//   The latch (g_InputDragWindow, set in HandleButton on a Button1 press) suppresses the
-//   per-frame PrintWindow re-capture for the duration of a drag. It is documented as "cleared on
-//   ANY release so the latch can never stick" - but that only holds if the release ARRIVES. A
-//   pointer that has left the window cannot still be dragging it, so LeaveNotify is an
-//   independent, authoritative signal that the drag is over. This closes the "a Button1 release
-//   can be lost, leaving the window frozen until the next Button1 event anywhere" hole already
-//   noted in main.c.
+// It cost a two-day wobble regression. MEASURED 2026-09-01 on a hand drag: 569 ms into a 5.0 s
+// guest-native drag dom0 delivered LeaveNotify mode=0 (NotifyNormal), detail=3 (NotifyNonlinear)
+// - a real crossing, not grab bookkeeping - and the latch went with it:
 //
-// Anything further (actual hover/cursor-ownership release) needs measurement of what the guest
-// does on leave before it is written - see the FINDINGS entry. Recognising the message and
-// dropping the flood is correct and safe on its own.
+//     before: 50 motion events, 50/50 on the interpolated origin,  8% window-path reversals
+//     after: 490 motion events, 489/490 on the LIVE origin,       20% window-path reversals
+//
+// with announced positions then swinging 867 <-> 2475 px at ~15 Hz. 16-19% is the wobble exactly
+// as first measured, so that one event restores it in full - and it disables InputDragFreezeContent,
+// DragEventPriority and the announce pacing too, since all four gate on g_InputDragWindow.
+//
+// The premise was simply false. In a guest-native drag the WINDOW moves, not the pointer, and the
+// button stayed down for another 4.4 s with 490 further motion events for that same window
+// arriving after the "leave". Worse, the hole it claimed to close - a lost Button1 release
+// freezing a window - had already been closed 17 days earlier by INPUT_DRAG_STUCK_MS and the
+// DaemonSettleSweep disarm (cef692a, 2026-08-13).
+//
+// So: no latch release, no state, nothing speculative. If enter/leave semantics are ever wanted
+// (hover state, cursor-shape ownership), that is a separate piece of work with the Linux agent as
+// its reference and a measurement of what the guest actually does on leave - not something to
+// bolt onto a log-flood fix.
 static DWORD HandleCrossing(IN HWND window)
 {
     struct msg_crossing crossingMsg;
@@ -700,99 +711,18 @@ static DWORD HandleCrossing(IN HWND window)
         return ERROR_UNIDENTIFIED_ERROR;
     }
 
-    LogVerbose("0x%x: crossing type=%u at (%d,%d) mode=%u detail=%u",
-        window, crossingMsg.type, crossingMsg.x, crossingMsg.y, crossingMsg.mode, crossingMsg.detail);
+    LogVerbose("0x%x: crossing type=%u at (%d,%d) mode=%u detail=%u state=0x%x",
+        window, crossingMsg.type, crossingMsg.x, crossingMsg.y,
+        crossingMsg.mode, crossingMsg.detail, crossingMsg.state);
 
-    // MODE MATTERS, and ignoring it was a regression (2026-09-01). X synthesises crossing events
-    // for GRAB BOOKKEEPING as well as for real pointer motion, and gui-daemon forwards the mode
-    // verbatim (xside.c process_xevent_crossing: `k.mode = ev->mode`) without filtering. A drag
-    // IS a pointer grab: activating it delivers LeaveNotify with mode=NotifyGrab to the windows
-    // below the grab window, and releasing it delivers the matching NotifyUngrab.
-    //
-    // Treating those as "the pointer left" tore down the drag state at the very moment a drag
-    // began - clearing g_InputDragWindow (so InputDragFreezeContent stopped suppressing the
-    // per-frame PrintWindow, bringing back the 193-211 ms startup stall) and calling
-    // DragAnnounceClear(), which empties the ring the QUANTISED ORIGIN translates against. With
-    // no ring the reconstruction falls back to the live origin - which is precisely the gain-1
-    // oscillator that InputDragQuantise exists to remove. Net effect: both shipped drag fixes
-    // silently disabled mid-drag, i.e. the wobble back at full strength.
-    //
-    // Only NotifyNormal means the pointer actually went somewhere. This is the standard X guard.
-    //
-    // AND IT IS NOT ENOUGH. MEASURED 2026-09-01 on a hand drag, which is the only thing that can
-    // produce these events: 569 ms into a 5.0 s guest-native drag, dom0 delivered LeaveNotify
-    // with mode=0 (NotifyNormal) - a REAL crossing, not grab bookkeeping - and this handler
-    // tore the drag down. The trace shows the consequence exactly:
-    //
-    //     before the crossing:  50 motion events, 50/50 on the interpolated origin, 8% reversals
-    //     after  the crossing: 490 motion events, 489/490 on the LIVE origin,       20% reversals
-    //
-    // 16-19% is the wobble as originally measured, so this single event restores it in full.
-    // It also silently disables InputDragFreezeContent, DragEventPriority and the announce
-    // pacing, all of which gate on the same latch - the announce rate went to 33.5/s against
-    // the ~14/s the tuning was fitted at.
-    //
-    // WHAT THE EVENT ACTUALLY WAS: mode=0 (NotifyNormal), detail=3 (NotifyNonlinear) - X's
-    // label for a real move between windows in different branches of the hierarchy, not
-    // bookkeeping. Why X labelled it that way rather than NotifyWhileGrabbed is NOT established
-    // here and is not worth guessing about; the plausible reading is that in a guest-native drag
-    // the WINDOW is what moves - every position we announce makes dom0's WM move the frame under
-    // a hand that is barely moving in root coordinates - so the pointer genuinely does end up
-    // outside it. What IS established is that it arrived 569 ms into a drag whose button was
-    // held for another 4.4 s, so whatever X meant by it, the drag was manifestly still live.
-    // The premise "a pointer that has left the window cannot still be dragging it" is false
-    // whenever the window is the thing that left, and it is false under a pointer grab, which
-    // is why motion for this window kept arriving after the leave (490 more events).
-    //
-    // THE DISCRIMINATOR IS THE BUTTON, and dom0 already sends it: msg_crossing.state carries X's
-    // button mask (xside.c process_xevent_crossing: `k.state = ev->state`). While button 1 is
-    // held there is no such thing as "the drag ended", whatever the pointer did - so the only
-    // case this release was ever written for, a LOST Button1 release, is precisely the case
-    // where the mask is clear. A truly stuck latch is still caught twice over: by the next
-    // Button1 event anywhere, and by the INPUT_DRAG_STUCK_MS sweep in DaemonSettleSweep.
-    // NotifyInferior is excluded for the same reason as the grab modes: the pointer moved to a
-    // CHILD window, i.e. it is still inside.
-    //
-    // TWO INDEPENDENT WITNESSES, because one of them is a field this code has never yet seen a
-    // value of. dom0's `state` is the principled answer, but if it arrived as 0 for a held
-    // button the guard would fail OPEN and put the wobble straight back - so the guest is asked
-    // as well. The agent injected the LEFTDOWN itself and has sent no LEFTUP, so
-    // GetAsyncKeyState(VK_LBUTTON) on the input desktop is a local, independent statement that
-    // the button is still down. Both must say "no button" before a latch is torn down. Both
-    // values are logged either way, so the next trace shows which witness said what instead of
-    // leaving it to be re-derived.
-    if (crossingMsg.type == LeaveNotify && crossingMsg.mode == NotifyNormal &&
-        crossingMsg.detail != NotifyInferior &&
-        !(crossingMsg.state & Button1Mask) && !IsKeyDown(VK_LBUTTON) &&
-        window && window == g_InputDragWindow)
-    {
-        LogDebug("0x%x: pointer left the window with no button held while the drag latch was "
-            L"held - the release was lost; releasing the latch", window);
-        if (ProtoDragOn())
-            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=0,mode=%u,detail=%u,"
-                L"state=0x%x,lbtn=%d",
-                (uint32_t)(ULONG_PTR)window, crossingMsg.mode, crossingMsg.detail,
-                crossingMsg.state, IsKeyDown(VK_LBUTTON) ? 1 : 0);
-        g_InputDragWindow = NULL;
-        g_InputDragOriginValid = FALSE;
-        DragAnnounceClear();
-    }
-    else if (crossingMsg.type == LeaveNotify && window && window == g_InputDragWindow)
-    {
-        // Not a departure from a drag: a grab/ungrab crossing, a move to a child window, or -
-        // the case that cost this project the whole 2026-08-30..09-01 regression - the window
-        // moving out from under a hand that is still holding button 1. Logged with the fields
-        // that decided it, so the next person suspecting this path can read the reason instead
-        // of re-deriving it.
-        LogDebug("0x%x: crossing mode=%u detail=%u state=0x%x on the dragged window - not a "
-            L"departure (button held / grab bookkeeping / child window), latch KEPT",
-            window, crossingMsg.mode, crossingMsg.detail, crossingMsg.state);
-        if (ProtoDragOn())
-            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=1,mode=%u,detail=%u,"
-                L"state=0x%x,lbtn=%d",
-                (uint32_t)(ULONG_PTR)window, crossingMsg.mode, crossingMsg.detail,
-                crossingMsg.state, IsKeyDown(VK_LBUTTON) ? 1 : 0);
-    }
+    // Recorded, not acted on: a crossing arriving for the window a drag is holding is exactly
+    // what this handler used to destroy the drag over, so the trace keeps naming it. armed=1
+    // because the latch is now never touched here.
+    if (ProtoDragOn() && crossingMsg.type == LeaveNotify && window && window == g_InputDragWindow)
+        LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=1,mode=%u,detail=%u,"
+            L"state=0x%x,lbtn=%d - recorded only, the latch is not touched here",
+            (uint32_t)(ULONG_PTR)window, crossingMsg.mode, crossingMsg.detail,
+            crossingMsg.state, IsKeyDown(VK_LBUTTON) ? 1 : 0);
 
     return ERROR_SUCCESS;
 }
