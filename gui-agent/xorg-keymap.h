@@ -41,6 +41,17 @@ extern const char* g_KeycodeName[256];
 #define NotifyGrab          1
 #define NotifyUngrab        2
 #define NotifyWhileGrabbed  3
+/* msg_crossing.DETAIL. NotifyInferior on a LeaveNotify means the pointer moved to a CHILD of
+ * this window - it is still inside, and reading it as a departure is a second false positive
+ * on top of the grab modes above. */
+#define NotifyAncestor          0
+#define NotifyVirtual           1
+#define NotifyInferior          2
+#define NotifyNonlinear         3
+#define NotifyNonlinearVirtual  4
+/* msg_crossing.STATE carries X's button/modifier mask at the instant of the crossing. A held
+ * button 1 is the fact that decides whether a "leave" can possibly mean the drag is over. */
+#define Button1Mask         (1 << 8)
 #define Button1             1
 #define Button2             2
 #define Button3             3

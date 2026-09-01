@@ -718,24 +718,64 @@ static DWORD HandleCrossing(IN HWND window)
     // silently disabled mid-drag, i.e. the wobble back at full strength.
     //
     // Only NotifyNormal means the pointer actually went somewhere. This is the standard X guard.
+    //
+    // AND IT IS NOT ENOUGH. MEASURED 2026-09-01 on a hand drag, which is the only thing that can
+    // produce these events: 569 ms into a 5.0 s guest-native drag, dom0 delivered LeaveNotify
+    // with mode=0 (NotifyNormal) - a REAL crossing, not grab bookkeeping - and this handler
+    // tore the drag down. The trace shows the consequence exactly:
+    //
+    //     before the crossing:  50 motion events, 50/50 on the interpolated origin, 8% reversals
+    //     after  the crossing: 490 motion events, 489/490 on the LIVE origin,       20% reversals
+    //
+    // 16-19% is the wobble as originally measured, so this single event restores it in full.
+    // It also silently disables InputDragFreezeContent, DragEventPriority and the announce
+    // pacing, all of which gate on the same latch - the announce rate went to 33.5/s against
+    // the ~14/s the tuning was fitted at.
+    //
+    // WHY A GENUINE NotifyNormal LEAVE HAPPENS MID-DRAG, and why the premise of this release
+    // was wrong: in a guest-native drag the WINDOW is what moves, not the pointer. Every
+    // position we announce makes dom0's WM move the frame under a hand that is (relative to the
+    // root) barely moving, and a window moving out from under the pointer is exactly what X
+    // reports as a normal-mode LeaveNotify. "A pointer that has left the window cannot still be
+    // dragging it" is false whenever the window is the thing that left.
+    //
+    // THE DISCRIMINATOR IS THE BUTTON, and dom0 already sends it: msg_crossing.state carries X's
+    // button mask (xside.c process_xevent_crossing: `k.state = ev->state`). While button 1 is
+    // held there is no such thing as "the drag ended", whatever the pointer did - so the only
+    // case this release was ever written for, a LOST Button1 release, is precisely the case
+    // where the mask is clear. A truly stuck latch is still caught twice over: by the next
+    // Button1 event anywhere, and by the INPUT_DRAG_STUCK_MS sweep in DaemonSettleSweep.
+    // NotifyInferior is excluded for the same reason as the grab modes: the pointer moved to a
+    // CHILD window, i.e. it is still inside.
     if (crossingMsg.type == LeaveNotify && crossingMsg.mode == NotifyNormal &&
+        crossingMsg.detail != NotifyInferior &&
+        !(crossingMsg.state & Button1Mask) &&
         window && window == g_InputDragWindow)
     {
-        LogDebug("0x%x: pointer left the window while the drag latch was held - releasing it",
-            window);
+        LogDebug("0x%x: pointer left the window with no button held while the drag latch was "
+            L"held - the release was lost; releasing the latch", window);
         if (ProtoDragOn())
-            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=0,mode=%u,detail=%u",
-                (uint32_t)(ULONG_PTR)window, crossingMsg.mode, crossingMsg.detail);
+            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=0,mode=%u,detail=%u,state=0x%x",
+                (uint32_t)(ULONG_PTR)window, crossingMsg.mode, crossingMsg.detail,
+                crossingMsg.state);
         g_InputDragWindow = NULL;
         g_InputDragOriginValid = FALSE;
         DragAnnounceClear();
     }
     else if (crossingMsg.type == LeaveNotify && window && window == g_InputDragWindow)
     {
-        // Grab/ungrab crossing on the dragged window: bookkeeping, not a departure. Logged so
-        // the frequency is visible if this is ever suspected again.
-        LogDebug("0x%x: crossing mode=%u on the dragged window - grab bookkeeping, latch KEPT",
-            window, crossingMsg.mode);
+        // Not a departure from a drag: a grab/ungrab crossing, a move to a child window, or -
+        // the case that cost this project the whole 2026-08-30..09-01 regression - the window
+        // moving out from under a hand that is still holding button 1. Logged with the fields
+        // that decided it, so the next person suspecting this path can read the reason instead
+        // of re-deriving it.
+        LogDebug("0x%x: crossing mode=%u detail=%u state=0x%x on the dragged window - not a "
+            L"departure (button held / grab bookkeeping / child window), latch KEPT",
+            window, crossingMsg.mode, crossingMsg.detail, crossingMsg.state);
+        if (ProtoDragOn())
+            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=1,mode=%u,detail=%u,state=0x%x",
+                (uint32_t)(ULONG_PTR)window, crossingMsg.mode, crossingMsg.detail,
+                crossingMsg.state);
     }
 
     return ERROR_SUCCESS;
