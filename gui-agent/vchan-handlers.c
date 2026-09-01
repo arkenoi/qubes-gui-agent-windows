@@ -672,13 +672,36 @@ static DWORD HandleCrossing(IN HWND window)
     LogVerbose("0x%x: crossing type=%u at (%d,%d) mode=%u detail=%u",
         window, crossingMsg.type, crossingMsg.x, crossingMsg.y, crossingMsg.mode, crossingMsg.detail);
 
-    if (crossingMsg.type == LeaveNotify && window && window == g_InputDragWindow)
+    // MODE MATTERS, and ignoring it was a regression (2026-09-01). X synthesises crossing events
+    // for GRAB BOOKKEEPING as well as for real pointer motion, and gui-daemon forwards the mode
+    // verbatim (xside.c process_xevent_crossing: `k.mode = ev->mode`) without filtering. A drag
+    // IS a pointer grab: activating it delivers LeaveNotify with mode=NotifyGrab to the windows
+    // below the grab window, and releasing it delivers the matching NotifyUngrab.
+    //
+    // Treating those as "the pointer left" tore down the drag state at the very moment a drag
+    // began - clearing g_InputDragWindow (so InputDragFreezeContent stopped suppressing the
+    // per-frame PrintWindow, bringing back the 193-211 ms startup stall) and calling
+    // DragAnnounceClear(), which empties the ring the QUANTISED ORIGIN translates against. With
+    // no ring the reconstruction falls back to the live origin - which is precisely the gain-1
+    // oscillator that InputDragQuantise exists to remove. Net effect: both shipped drag fixes
+    // silently disabled mid-drag, i.e. the wobble back at full strength.
+    //
+    // Only NotifyNormal means the pointer actually went somewhere. This is the standard X guard.
+    if (crossingMsg.type == LeaveNotify && crossingMsg.mode == NotifyNormal &&
+        window && window == g_InputDragWindow)
     {
         LogDebug("0x%x: pointer left the window while the drag latch was held - releasing it",
             window);
         g_InputDragWindow = NULL;
         g_InputDragOriginValid = FALSE;
         DragAnnounceClear();
+    }
+    else if (crossingMsg.type == LeaveNotify && window && window == g_InputDragWindow)
+    {
+        // Grab/ungrab crossing on the dragged window: bookkeeping, not a departure. Logged so
+        // the frequency is visible if this is ever suspected again.
+        LogDebug("0x%x: crossing mode=%u on the dragged window - grab bookkeeping, latch KEPT",
+            window, crossingMsg.mode);
     }
 
     return ERROR_SUCCESS;

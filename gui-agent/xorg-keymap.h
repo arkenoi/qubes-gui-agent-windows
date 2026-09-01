@@ -32,6 +32,14 @@ extern const char* g_KeycodeName[256];
 /* msg_crossing.type carries these two: the pointer entered or left the window in dom0. */
 #define EnterNotify         7
 #define LeaveNotify         8
+/* msg_crossing.MODE. X generates crossing events for grab bookkeeping as well as for real
+ * pointer movement, and only NotifyNormal means the pointer actually went somewhere. A drag is
+ * a pointer grab, so a drag START and a drag END each synthesise crossings with these modes on
+ * the windows below the grab window - they must never be read as "the pointer left". */
+#define NotifyNormal        0
+#define NotifyGrab          1
+#define NotifyUngrab        2
+#define NotifyWhileGrabbed  3
 #define Button1             1
 #define Button2             2
 #define Button3             3
