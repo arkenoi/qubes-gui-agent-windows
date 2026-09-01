@@ -621,6 +621,26 @@ static BOOL StagingEnsure(void)
         return FALSE;
     }
 
+    if (g_NoScreenGrant)
+    {
+        // P2 probe: the staging buffer is the LOCAL pixel source only (slice-fed windows,
+        // the DDA-owned channel and synth patches all read it) - dom0 never maps it. refs
+        // stay zeroed and are never sent (SendScreenGrants is suppressed under the same
+        // flag); xc==NULL marks the ungranted state for the exit path.
+        ZeroMemory(refs, page_count * sizeof(ULONG));
+        g_Staging.xc = NULL;
+        g_Staging.buffer = buffer;
+        g_Staging.size = size;
+        g_Staging.page_count = page_count;
+        g_Staging.refs = refs;
+        g_Staging.handle = buffer; // liveness marker only on this path
+        g_Staging.cap_width = capW;
+        g_Staging.cap_height = capH;
+        LogInfo("STAGING allocated UNGRANTED %lu pages capacity %ux%u (P2NOGRANT)",
+            (ULONG)page_count, capW, capH);
+        return TRUE;
+    }
+
     PXENCONTROL_CONTEXT xc = NULL;
     DWORD status = XcOpen(XcLogger, &xc);
     if (status != ERROR_SUCCESS || !xc)
@@ -679,6 +699,16 @@ void CaptureStagingRevokeOnExit(void)
 {
     if (!g_Staging.handle)
         return;
+
+    if (!g_Staging.xc)
+    {
+        // P2NOGRANT: nothing was granted - plain local release, no revoke handshake.
+        LogInfo("STAGING ungranted buffer released on exit (%lu pages)", (ULONG)g_Staging.page_count);
+        free(g_Staging.refs);
+        VirtualFree(g_Staging.buffer, 0, MEM_RELEASE);
+        ZeroMemory(&g_Staging, sizeof(g_Staging));
+        return;
+    }
 
     ULONG status = XcGnttabRevokeForeignAccess(g_Staging.xc, g_Staging.handle);
     if (status != ERROR_SUCCESS)

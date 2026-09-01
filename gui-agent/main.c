@@ -136,6 +136,13 @@ DWORD g_HostScreenHeight = 0;
 // gives the A/B against the direct-map path.
 BOOL g_StagingGrant = TRUE;
 
+// Registry gate REG_CONFIG_NO_SCREEN_GRANT_VALUE ("SeamlessNoScreenGrant", default OFF):
+// P2 probe (DESIGN-pure-per-window.md) - the staging buffer is allocated and filled but
+// never granted, and the window-0 dump is suppressed, so dom0 renders exclusively from
+// per-window grants. Requires g_StagingGrant (the direct-map path grants the mapped DXGI
+// surface itself and has no ungranted form). One registry flip + agent restart per arm.
+BOOL g_NoScreenGrant = FALSE;
+
 // minimal acceptable window dimensions
 DWORD g_MinWindowWidth = 0;
 DWORD g_MinWindowHeight = 0;
@@ -6202,10 +6209,23 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
     // grant_refs was actually allocated for - the exact per-geometry count on the
     // direct-map path, the CONSTANT staging capacity under StagingGrant (the daemon
     // accepts a larger-than-needed count; only a too-small one is exit(1), see capture.h).
-    status = SendScreenGrants(CaptureGrantPageCount(*capture), (*capture)->grant_refs,
-        (*capture)->width, (*capture)->height);
-    if (ERROR_SUCCESS != status)
-        return win_perror2(status, "SendScreenGrants");
+    if (g_NoScreenGrant)
+    {
+        // P2 probe: no refs exist to send (StagingEnsure skipped the grant). gui-daemon
+        // never requires a screen image - every g->screen_window use is NULL-guarded and
+        // damage for a window with no image is a safe no-op (xside.c:2352-2367) - and the
+        // CREATE(0) above keeps window 0 announced so the rest of the protocol state
+        // machine is unchanged.
+        LogInfo("P2NOGRANT window-0 dump suppressed (%lu pages stay local)",
+            (ULONG)CaptureGrantPageCount(*capture));
+    }
+    else
+    {
+        status = SendScreenGrants(CaptureGrantPageCount(*capture), (*capture)->grant_refs,
+            (*capture)->width, (*capture)->height);
+        if (ERROR_SUCCESS != status)
+            return win_perror2(status, "SendScreenGrants");
+    }
 
     // this (re)initializes watched windows list
     // Complete a non-seamless switch that was deferred until the desktop shrank (see the
@@ -6755,6 +6775,16 @@ static ULONG WINAPI WatchForEvents(void)
                     LogInfo("A6DUMP suppressed (transitional %ux%u during exact-obtain/settle)",
                         capture->width, capture->height);
                     ResolutionNoteTransitSize(capture->width, capture->height);
+                }
+                else if (capture->grants_changed && g_NoScreenGrant)
+                {
+                    // P2 probe: nothing was granted, so there is nothing to republish.
+                    // Keep the cursor re-blank (externally-driven mode changes reload the
+                    // cursor scheme); the A6 window-0 configure echo is dump-coupled and
+                    // is skipped with the dump.
+                    capture->grants_changed = FALSE;
+                    LogInfo("P2NOGRANT window-0 re-dump suppressed after duplication recovery");
+                    HideCursors();
                 }
                 else if (capture->grants_changed)
                 {
@@ -7567,6 +7597,19 @@ static ULONG Init(void)
     {
         g_StagingGrant = (stagingGrant != 0);
     }
+
+    DWORD noScreenGrant;
+    status = CfgReadDword(moduleName, REG_CONFIG_NO_SCREEN_GRANT_VALUE, &noScreenGrant, NULL);
+    g_NoScreenGrant = (ERROR_SUCCESS == status) && (noScreenGrant != 0);
+    if (g_NoScreenGrant && !g_StagingGrant)
+    {
+        // The probe needs the staging buffer as the LOCAL pixel source; the direct-map
+        // path grants the mapped DXGI surface itself and has no ungranted form.
+        LogWarning("P2NOGRANT requires StagingGrant=1 - ignoring SeamlessNoScreenGrant");
+        g_NoScreenGrant = FALSE;
+    }
+    if (g_NoScreenGrant)
+        LogInfo("P2NOGRANT active: desktop framebuffer stays ungranted, window-0 dump suppressed (probe, seamless-only)");
 
     SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, SPIF_UPDATEINIFILE);
 

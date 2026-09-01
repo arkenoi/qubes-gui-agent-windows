@@ -47,6 +47,13 @@
 // is granted to dom0 once per agent lifetime and frames are copied into it; 0 restores
 // the legacy direct-map per-geometry grant (A/B switch, see gui-agent/capture.c)
 #define REG_CONFIG_STAGING_VALUE            L"StagingGrant"
+// P2 probe (DWORD, default 0; needs StagingGrant=1): never grant the desktop framebuffer
+// to dom0 and suppress the window-0 MSG_WINDOW_DUMP - dom0 renders exclusively from
+// per-window grants. The staging buffer is still allocated and filled (it stays the LOCAL
+// pixel source for slice-fed windows, the DDA-owned channel and synth patches). With this
+// ON, paths that need dom0 to read the screen image (non-seamless window 0, the daemon-side
+// legacy slice for unattached windows) render border-only. See DESIGN-pure-per-window.md P2.
+#define REG_CONFIG_NO_SCREEN_GRANT_VALUE    L"SeamlessNoScreenGrant"
 // Allow fullscreen-sized windows in seamless mode (DWORD, default 0 = deny). Denying them
 // hides the boot/shutdown full-desktop "flash" (a fullscreen window mapped during the seamless
 // transition; override-redirect fullscreen is denied unconditionally). The dom0 opt-in feature

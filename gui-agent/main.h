@@ -37,6 +37,7 @@ extern DWORD g_HostScreenWidth;
 extern DWORD g_HostScreenHeight;
 extern BOOL g_VchanClientConnected;
 extern BOOL g_StagingGrant;
+extern BOOL g_NoScreenGrant;
 extern HWND g_DesktopWindow;
 extern volatile BOOL g_OnSecureDesktop;
 // Window currently being dragged with a held mouse button (input path); NULL when none.
