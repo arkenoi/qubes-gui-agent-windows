@@ -14,6 +14,7 @@
     <ClCompile Include="..\..\gui-agent\capture.c" />
     <ClCompile Include="..\..\gui-agent\main.c" />
     <ClCompile Include="..\..\gui-agent\perf.c" />
+    <ClCompile Include="..\..\gui-agent\dragsim.c" />
     <ClCompile Include="..\..\gui-agent\faultinject.c" />
     <ClCompile Include="..\..\gui-agent\resolution.c" />
     <ClCompile Include="..\..\gui-agent\send.c" />
@@ -39,6 +40,7 @@
     <ClInclude Include="..\..\gui-agent\capture.h" />
     <ClInclude Include="..\..\gui-agent\main.h" />
     <ClInclude Include="..\..\gui-agent\perf.h" />
+    <ClInclude Include="..\..\gui-agent\dragsim.h" />
     <ClInclude Include="..\..\gui-agent\faultinject.h" />
     <ClInclude Include="..\..\gui-agent\resolution.h" />
     <ClInclude Include="..\..\gui-agent\resource.h" />

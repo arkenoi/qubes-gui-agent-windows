@@ -45,6 +45,7 @@
 #include "perf.h"
 #include "toastcrop.h"
 #include "faultinject.h"
+#include "dragsim.h"
 #include "qubes-io.h"
 
 // windows-utils
@@ -2183,6 +2184,10 @@ static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
         // latched window must be recorded at its send tick.
         if (entry->Handle == g_InputDragWindow && g_InputDragOriginValid)
             DragAnnounceRecord(entry->X, entry->Y);
+        // Independent copy for the synthetic-drag model (dragsim.h): unconditional, because
+        // feeding the simulator from the agent's own estimator would cancel the loop it is
+        // meant to observe.
+        DragSimNoteAnnounce(entry->X, entry->Y);
     }
 }
 
@@ -2308,6 +2313,7 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         // path a mid-drag position announce normally takes (through the 16 ms limiter).
         if (entry->Handle == g_InputDragWindow && g_InputDragOriginValid)
             DragAnnounceRecord(entry->X, entry->Y);
+        DragSimNoteAnnounce(entry->X, entry->Y);
 
         // A WM-managed shell surface (or=0 with a crop) must be DRAGGABLE but not
         // RESIZEABLE. The size-lock hint (PMinSize==PMaxSize) is sent HERE, on the
@@ -2407,6 +2413,23 @@ void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry)
     int ty = entry->DaemonMoveY - entry->CropTop - entry->DaemonOffY;
 
     entry->DaemonMovePending = FALSE;
+
+    // THE MOVE ITSELF, traced. A daemon-dictated SetWindowPos on a window the user is
+    // dragging by hand inside the guest is a window yanked out from under the cursor, and
+    // nothing in any log said whether it was happening. `drag=1` here during a guest-native
+    // drag is the defect, not a diagnostic detail. `cur` is where the window was BEFORE the
+    // move, so the size of the yank is readable directly.
+    if (ProtoDragOn())
+    {
+        RECT cur = { 0 };
+        (void)GetWindowRect(entry->Handle, &cur);
+        LogInfo("QGAPROTO,msg=DAEMONMOVE,hwnd=0x%x,tx=%d,ty=%d,curx=%d,cury=%d,drag=%d,"
+            L"nomove=%d,nosize=%d",
+            (uint32_t)(ULONG_PTR)entry->Handle, tx, ty, cur.left, cur.top,
+            (entry->Handle == g_InputDragWindow && g_InputDragOriginValid) ? 1 : 0,
+            (flags & SWP_NOMOVE) ? 1 : 0, (flags & SWP_NOSIZE) ? 1 : 0);
+    }
+
     if (SetWindowPos(entry->Handle, NULL, tx, ty,
             entry->DaemonMoveW, entry->DaemonMoveH, flags))
     {
@@ -2465,6 +2488,9 @@ void DaemonSettleSweep(void)
     {
         LogWarning("input drag latch stuck on 0x%x for >%u ms with no input - disarming",
             (uint32_t)(ULONG_PTR)g_InputDragWindow, INPUT_DRAG_STUCK_MS);
+        if (ProtoDragOn())
+            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=stuck,armed=0",
+                (uint32_t)(ULONG_PTR)g_InputDragWindow);
         g_InputDragWindow = NULL;
         g_InputDragOriginValid = FALSE;
         DragAnnounceClear(); // the servo's history dies with the latch it belongs to
@@ -2528,6 +2554,13 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
     // window gets the handle next (same hazard as the toast-crop slot above).
     if (entry->Handle == g_InputDragWindow)
     {
+        // A window that stops being tracked mid-drag disarms the fixed translation law for
+        // the rest of the gesture (every later motion event falls through to the live
+        // origin). Named in the trace so "the latch died and nobody said so" is not a
+        // hypothesis anyone has to re-derive from code.
+        if (ProtoDragOn())
+            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=removed,armed=0",
+                (uint32_t)(ULONG_PTR)entry->Handle);
         g_InputDragWindow = NULL;
         g_InputDragOriginValid = FALSE;
         DragAnnounceClear(); // recycled HWND must not inherit the dead drag's history
@@ -7372,6 +7405,9 @@ static ULONG Init(void)
     // Compiles to nothing unless the build was made with -p:QgaFaultInjection=1.
     FiInit();
     PwInit();
+    // Synthetic guest-native drag, opt-in via the DragSim registry value. Not a verdict
+    // instrument - see dragsim.h for the owner's standing rule about scripted drags.
+    DragSimStart();
 
     EnableUIAccess();
     status = CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName));

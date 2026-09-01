@@ -422,7 +422,6 @@ static DWORD HandleKeypress(IN HWND window)
 static DWORD HandleButton(IN HWND window)
 {
     struct msg_button buttonMsg;
-    INPUT inputEvent;
 
     LogVerbose("0x%x", window);
     if (!VchanReceiveBuffer(g_Vchan, &buttonMsg, sizeof(buttonMsg), L"msg_button"))
@@ -430,6 +429,21 @@ static DWORD HandleButton(IN HWND window)
         LogError("VchanReceiveBuffer failed"); // KEEP-FATAL: vchan broken/EOF - case (a), see NEVEREXIT policy above
         return ERROR_UNIDENTIFIED_ERROR;
     }
+
+    return ProcessButtonEvent(window, buttonMsg.x, buttonMsg.y, buttonMsg.button, buttonMsg.type);
+}
+
+DWORD ProcessButtonEvent(IN HWND window, IN int bx, IN int by, IN unsigned int button,
+    IN unsigned int type)
+{
+    struct msg_button buttonMsg;
+    INPUT inputEvent;
+
+    buttonMsg.type = type;
+    buttonMsg.x = bx;
+    buttonMsg.y = by;
+    buttonMsg.button = button;
+    buttonMsg.state = 0;
 
     int32_t x = buttonMsg.x;
     int32_t y = buttonMsg.y;
@@ -618,7 +632,24 @@ static DWORD HandleButton(IN HWND window)
             DragAnnounceReset(trackedX, trackedY);
         else
             DragAnnounceClear();
+
+        // The single most important fact about any drag, and the trace had no line for it:
+        // did the press ARM the fixed translation law? g_InputDragOriginValid is FALSE
+        // whenever the press did not find the window tracked, and that silently disables the
+        // whole drag fix for the gesture that follows - every motion event then falls through
+        // to the live origin. `armed=0` here and `br=0` on the motion lines are the same fact
+        // seen from both ends; either alone would be an inference.
+        if (ProtoDragOn())
+            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=%s,armed=%d,ox=%d,oy=%d,gx=%d,gy=%d",
+                (uint32_t)(ULONG_PTR)window,
+                (buttonMsg.type == ButtonPress) ? L"press" : L"release",
+                g_InputDragOriginValid ? 1 : 0, trackedX, trackedY, buttonMsg.x, buttonMsg.y);
     }
+
+    if (ProtoDragOn())
+        LogInfo("QGAPROTO,msg=BUTTON,hwnd=0x%x,btn=%u,type=%u,rx=%d,ry=%d,ax=%d,ay=%d",
+            (uint32_t)(ULONG_PTR)window, buttonMsg.button, buttonMsg.type,
+            buttonMsg.x, buttonMsg.y, x, y);
 
     LogDebug("window 0x%x, (%d,%d), flags 0x%x", window, buttonMsg.x, buttonMsg.y, inputEvent.mi.dwFlags);
     InjectInput(&inputEvent, "SendInput");
@@ -692,6 +723,9 @@ static DWORD HandleCrossing(IN HWND window)
     {
         LogDebug("0x%x: pointer left the window while the drag latch was held - releasing it",
             window);
+        if (ProtoDragOn())
+            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=0,mode=%u,detail=%u",
+                (uint32_t)(ULONG_PTR)window, crossingMsg.mode, crossingMsg.detail);
         g_InputDragWindow = NULL;
         g_InputDragOriginValid = FALSE;
         DragAnnounceClear();
@@ -710,7 +744,6 @@ static DWORD HandleCrossing(IN HWND window)
 static DWORD HandleMotion(IN HWND window)
 {
     struct msg_motion motionMsg;
-    INPUT inputEvent;
 
     LogVerbose("0x%x", window);
     if (!VchanReceiveBuffer(g_Vchan, &motionMsg, sizeof(motionMsg), L"msg_motion"))
@@ -719,8 +752,26 @@ static DWORD HandleMotion(IN HWND window)
         return ERROR_UNIDENTIFIED_ERROR;
     }
 
+    return ProcessMotionEvent(window, motionMsg.x, motionMsg.y, motionMsg.is_hint != 0);
+}
+
+DWORD ProcessMotionEvent(IN HWND window, IN int mx, IN int my, IN BOOL isHint)
+{
+    struct msg_motion motionMsg;
+    INPUT inputEvent;
+
+    motionMsg.x = mx;
+    motionMsg.y = my;
+    motionMsg.state = 0;
+    motionMsg.is_hint = isHint ? 1 : 0;
+
     int32_t x = motionMsg.x;
     int32_t y = motionMsg.y;
+
+    // Which translation law this event actually took. The three fixed laws are the drag-wobble
+    // fix; PTB_LIVE means the event fell through to the live tracked origin, i.e. the gain-1
+    // oscillator - which is what the fix exists to prevent and what a broken latch restores.
+    BYTE traceBranch = PTB_LIVE;
 
     g_InputDragLastEventTick = GetTickCount();
     if (motionMsg.is_hint)
@@ -748,6 +799,7 @@ static DWORD HandleMotion(IN HWND window)
         if (g_InputDragFreeze && window == g_InputDragWindow && g_InputDragOriginValid)
         {
             haveTracked = TRUE;
+            traceBranch = PTB_FREEZE;
             trackedX = g_InputDragOriginX;
             trackedY = g_InputDragOriginY;
         }
@@ -763,11 +815,13 @@ static DWORD HandleMotion(IN HWND window)
                  DragAnnounceOriginAt(GetTickCount() - g_InputDragLagMs, &trackedX, &trackedY))
         {
             haveTracked = TRUE;
+            traceBranch = PTB_INTERP;
         }
         else if (g_InputDragQuantise && window == g_InputDragWindow && g_InputDragOriginValid &&
                  DragAnnounceAppliedOrigin(g_InputDragAdoptMs, &trackedX, &trackedY))
         {
             haveTracked = TRUE;
+            traceBranch = PTB_QUANT;
         }
         else
         {
@@ -893,6 +947,7 @@ static DWORD HandleMotion(IN HWND window)
                         // applies to the window-relative (x,y).
                         trackedX = g_DragLastInjectedX - x;
                         trackedY = g_DragLastInjectedY - y;
+                        traceBranch = PTB_SERVO;
                     }
                 }
             }
@@ -910,6 +965,9 @@ static DWORD HandleMotion(IN HWND window)
             {
                 x += rect.left;
                 y += rect.top;
+                trackedX = rect.left;
+                trackedY = rect.top;
+                traceBranch = PTB_RAWRECT;
             }
             else
             {
@@ -927,11 +985,27 @@ static DWORD HandleMotion(IN HWND window)
         // path's reversals is dom0's real lag. InputDragAdoptMs (70 ms) was never measured
         // against it - it was chosen conservatively - and the announce pacing is bounded
         // below by that choice, so this is the measurement that could tighten both.
-        if (g_ProtoTrace)
+        //
+        // TWO FIELDS ADDED 2026-09-01, because the drag question could not be answered from
+        // the line as it stood:
+        //   br= WHICH TRANSLATION LAW this event actually took (PTB_* in perf.h). `trk` only
+        //       said "an origin was found"; it is 1 for the live origin too, and the live
+        //       origin IS the gain-1 oscillator the fix exists to remove. Without br a trace
+        //       cannot distinguish "the fix applied and still wobbles" from "the fix was
+        //       never armed", which is precisely the fork the 2026-09-01 session was stuck on.
+        //   wx/wy WHERE THE WINDOW ACTUALLY IS at this event. Announces are paced (50 ms)
+        //       while motion arrives at ~45 Hz, so the announce stream alone cannot show a
+        //       window moving backwards between announces - and moving backwards is the
+        //       symptom being chased.
+        if (ProtoDragOn())
         {
-            LogInfo("QGAPROTO,msg=MOTION,hwnd=0x%x,rx=%d,ry=%d,ox=%d,oy=%d,ax=%d,ay=%d,trk=%d",
+            RECT wr = { 0 };
+            (void)GetWindowRect(window, &wr);
+            LogInfo("QGAPROTO,msg=MOTION,hwnd=0x%x,rx=%d,ry=%d,ox=%d,oy=%d,ax=%d,ay=%d,trk=%d,"
+                L"br=%u,wx=%d,wy=%d",
                 (uint32_t)(ULONG_PTR)window, motionMsg.x, motionMsg.y,
-                haveTracked ? trackedX : 0, haveTracked ? trackedY : 0, x, y, haveTracked ? 1 : 0);
+                haveTracked ? trackedX : 0, haveTracked ? trackedY : 0, x, y, haveTracked ? 1 : 0,
+                traceBranch, wr.left, wr.top);
         }
     }
 
@@ -985,7 +1059,40 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 
         if (data != NULL)
         {
-            if (data->IsIconic)
+            // Is a GUEST-NATIVE drag holding this window right now? Both the trace line and
+            // the guard below need it, and it is the fact the inbound path never considered.
+            const BOOL dragHeld = (window == g_InputDragWindow && g_InputDragOriginValid);
+
+            // WHAT THE DAEMON JUST TOLD US, next to what we believe. `cx-tx` is the whole
+            // story of the suspected defect: during a fast guest-native drag our own announce
+            // comes back after the window has already moved on, so the agent sees a position
+            // that differs from data->X - reads it as a dom0 ORDER rather than as its own echo
+            // - and ApplyPendingDaemonMove then SetWindowPos'es the window BACKWARDS, out from
+            // under the user's cursor. Whether that actually happens was unobservable: there
+            // was no line here at all, only the ACK line further down, which is emitted for
+            // every configure and says nothing about what was decided.
+            if (ProtoDragOn())
+                LogInfo("QGAPROTO,msg=CONFIGURE-IN,hwnd=0x%x,cx=%d,cy=%d,cw=%u,ch=%u,"
+                    L"tx=%d,ty=%d,drag=%d,iconic=%d",
+                    (uint32_t)(ULONG_PTR)window, configureMsg.x, configureMsg.y,
+                    configureMsg.width, configureMsg.height, data->X, data->Y,
+                    dragHeld ? 1 : 0, data->IsIconic ? 1 : 0);
+
+            // INPUT-DRAG CONFIGURE GUARD (InputDragCfgGuard, default off until measured).
+            // The mirror of DAEMON-DRIVE SUPPRESSION: whoever owns the drag owns the
+            // position. While the user's hand drags this window inside the guest, geometry
+            // arriving from the daemon is not an instruction - it is either our own announce
+            // coming back late or dom0's WM constraining a position the hand has already left.
+            // Applying it fights the modal move loop. The ACK below is still sent, so the
+            // daemon's queued-configure bookkeeping clears exactly as before, and the
+            // tracking pass announces the true resting place when the drag ends.
+            if (g_InputDragCfgGuard && dragHeld)
+            {
+                LogDebug("0x%x: configure (%d,%d) ignored - a guest-native drag owns this "
+                    L"window's position (tracked %d,%d)",
+                    window, configureMsg.x, configureMsg.y, data->X, data->Y);
+            }
+            else if (data->IsIconic)
             {
                 LogVerbose("0x%x is minimized, ignoring", window);
             }
@@ -1182,7 +1289,7 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
             // KEEP-FATAL (propagated): SendWindowConfigure only fails when the vchan
             // write fails (VchanSendBuffer blocks rather than failing on a full
             // ring), i.e. the vchan is broken - case (a).
-            if (g_ProtoTrace)
+            if (ProtoDragOn())
                 LogInfo("QGAPROTO,msg=CONFIGURE-ACK,hwnd=0x%x,x=%d,y=%d",
                     (uint32_t)(ULONG_PTR)window, configureMsg.x, configureMsg.y);
             ULONG ackStatus = SendWindowConfigure(window,

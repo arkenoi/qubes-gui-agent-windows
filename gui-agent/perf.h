@@ -229,6 +229,40 @@ extern BOOL     g_InputDragServo;
 extern BOOL     g_InputDragQuantise;
 extern DWORD    g_InputDragAdoptMs;
 extern DWORD    g_InputDragAnnounceMs;
+
+// InputDragCfgGuard: while a GUEST-NATIVE drag holds the latch, ignore geometry the daemon
+// dictates for that window instead of applying it with SetWindowPos. The user's hand owns the
+// position during such a drag; a daemon configure arriving mid-drag is either the daemon
+// re-asserting a position our own announce raced past, or dom0's WM constraining it, and
+// applying it yanks the window out from under the cursor. This is the exact mirror of the
+// suppression the announce path already does for a dom0-WM drag (DAEMON-DRIVE SUPPRESSION in
+// SendWindowConfigureIfChanged): whoever owns the drag owns the position, and the other side
+// stays quiet until it ends. The ACK is still sent, so the daemon's queued-configure state
+// clears normally.
+extern BOOL     g_InputDragCfgGuard;
+
+// DRAG-ONLY PROTOCOL TRACE (registry "ProtoTraceDrag", or dom0 feature service.gui-agent-drag).
+//
+// ProtoTrace is all-or-nothing, and its expensive half is the per-DAMAGE-rect and per-paint
+// lines: measured, they multiply the frame-walk tail (tot max 580 ms vs 66 ms off), which is
+// why docs/PLAN-drag-quality.md forbids judging latency with it on - and why the 2026-09-01
+// hand drag was measured on a poisoned build and had to be voided.
+//
+// The drag question needs only the INPUT-RATE messages: motion, buttons, the latch, outgoing
+// position announces, and inbound configures. That is ~50 lines/s, not thousands. This switch
+// turns exactly those on and leaves DAMAGE/SYNTHPAINT off, so feel and mechanism can be judged
+// in the SAME run instead of in two runs that then have to be argued to be comparable.
+extern BOOL     g_ProtoTraceDrag;
+#define ProtoDragOn() (g_ProtoTrace || g_ProtoTraceDrag)
+
+// QGAPROTO msg=MOTION `br=` - which translation law the event took. Anything but INTERP/QUANT/
+// FREEZE means the drag fix did not apply to that event.
+#define PTB_LIVE     0  // live tracked origin: the gain-1 oscillator (stock behaviour)
+#define PTB_FREEZE   1  // InputDragFreeze: origin frozen at the press
+#define PTB_INTERP   2  // InputDragOriginInterp: ramped between bracketing announces
+#define PTB_QUANT    3  // InputDragQuantise: newest announce older than AdoptMs
+#define PTB_SERVO    4  // InputDragServo (default off)
+#define PTB_RAWRECT  5  // untracked window: GetWindowRect fallback, a different coord space
 extern DWORD    g_InputDragServoGainPct;
 extern DWORD    g_InputDragServoTauMs;
 extern DWORD    g_InputDragServoDeadband;

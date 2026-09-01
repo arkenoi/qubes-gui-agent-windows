@@ -928,7 +928,10 @@ ULONG SendWindowConfigure(HANDLE window, int x, int y, int width, int height, BO
     }
 
     // Traced AFTER sanitizing, so the trace shows what actually went on the wire.
-    if (g_ProtoTrace)
+    // ProtoDragOn(): the outgoing announce stream IS the drag's feedback path - it is what
+    // moves dom0's origin, which is the quantity the input translation reconstructs. A drag
+    // trace without it can show the symptom but never the loop.
+    if (ProtoDragOn())
         LogInfo("QGAPROTO,msg=CONFIGURE,hwnd=0x%x,x=%d,y=%d,w=%u,h=%u,ovr=%d",
             (uint32_t)(ULONG_PTR)window, configureMsg.x, configureMsg.y,
             configureMsg.width, configureMsg.height, popup);

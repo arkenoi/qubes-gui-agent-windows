@@ -28,6 +28,7 @@
 BOOL     g_PerfEnabled = FALSE;
 BOOL     g_ProtoTrace  = FALSE;
 BOOL     g_ProtoTraceWobble = FALSE;
+BOOL     g_ProtoTraceDrag = FALSE;
 BOOL     g_ButtonAbsolute = TRUE;
 // DEFAULT NONE (2026-08-12 verdict, wf_82456c4a): every classified shell surface stays an
 // override-redirect corner popup. A WM-managed Start is announced at a MOVED rect, but its
@@ -136,6 +137,9 @@ BOOL     g_InputDragOriginInterp = TRUE;   // ON: user-approved baseline 2026-08
 DWORD    g_InputDragLagMs = 10;            // dom0 apply lag; measured L < 18 ms, median 0, p75 17
 DWORD    g_InputDragAdoptMs = 25;
 DWORD    g_InputDragAnnounceMs = 50;   // 0 = natural rate, which DESTROYS the quantised origin
+// DEFAULT OFF until measured. See perf.h for what it does; it changes behaviour on the
+// inbound configure path, so it ships dark and is turned on by the A/B that earns it.
+BOOL     g_InputDragCfgGuard = FALSE;
 DWORD    g_InputDragServoGainPct = 85;  // user-accepted on the guest 2026-08-13 (was 60):
                                        // damped enough to absorb predictor error, snappy
                                        // enough that slow drags track cleanly
@@ -228,6 +232,10 @@ void PerfInit(void)
             DWORD lv = 0;
             if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragLagMs", &lv, NULL))
                 g_InputDragLagMs = lv;
+            DWORD cg = 0;
+            if (ERROR_SUCCESS == CfgReadDword(moduleName, L"InputDragCfgGuard", &cg, NULL))
+                g_InputDragCfgGuard = (cg != 0);
+            LogInfo("QGADRAGCFGGUARD %s", g_InputDragCfgGuard ? L"on" : L"off");
             LogInfo("QGADRAGQUANT %s (adopt=%lu ms, announce pacing=%lu ms)",
                 g_InputDragQuantise ? L"on" : L"off", g_InputDragAdoptMs, g_InputDragAnnounceMs);
             LogInfo("QGAHIDETITLE %s", g_HideGuestTitleBar ? L"on" : L"off");
@@ -266,8 +274,16 @@ void PerfInit(void)
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_PROTO_WOBBLE_VALUE, &wv, NULL))
             wobble = (wv != 0);
         g_ProtoTraceWobble = wobble;
-        LogInfo("QGAPROTO %s (wobble probe %s)", g_ProtoTrace ? L"on" : L"off",
-            g_ProtoTraceWobble ? L"on" : L"off");
+
+        // Drag-only trace: the input-rate half of the protocol trace WITHOUT the per-rect
+        // damage/paint lines that make ProtoTrace unusable for a latency verdict (see perf.h).
+        DWORD dv = 0;
+        if (ERROR_SUCCESS == CfgReadDword(moduleName, L"ProtoTraceDrag", &dv, NULL))
+            g_ProtoTraceDrag = (dv != 0);
+
+        LogInfo("QGAPROTO %s (wobble probe %s, drag-only trace %s)",
+            g_ProtoTrace ? L"on" : L"off", g_ProtoTraceWobble ? L"on" : L"off",
+            g_ProtoTraceDrag ? L"on" : L"off");
     }
 
     // ONE dom0 switch for full diagnostic logging (added 4.3.10, when the defaults went

@@ -73,6 +73,9 @@ BOOL DragAnnounceOriginAt(IN DWORD atTick, OUT int* x, OUT int* y);
 extern char g_DomainName[256];
 extern USHORT g_GuiDomainId;
 extern CRITICAL_SECTION g_csWatchedWindows;
+// The watched-window list itself. Walk it ONLY under g_csWatchedWindows: RemoveWindow free()s
+// entries from the tracking thread.
+extern LIST_ENTRY g_WatchedWindowsList;
 
 typedef struct _WINDOW_DATA
 {
