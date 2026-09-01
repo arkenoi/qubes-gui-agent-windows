@@ -732,12 +732,17 @@ static DWORD HandleCrossing(IN HWND window)
     // pacing, all of which gate on the same latch - the announce rate went to 33.5/s against
     // the ~14/s the tuning was fitted at.
     //
-    // WHY A GENUINE NotifyNormal LEAVE HAPPENS MID-DRAG, and why the premise of this release
-    // was wrong: in a guest-native drag the WINDOW is what moves, not the pointer. Every
-    // position we announce makes dom0's WM move the frame under a hand that is (relative to the
-    // root) barely moving, and a window moving out from under the pointer is exactly what X
-    // reports as a normal-mode LeaveNotify. "A pointer that has left the window cannot still be
-    // dragging it" is false whenever the window is the thing that left.
+    // WHAT THE EVENT ACTUALLY WAS: mode=0 (NotifyNormal), detail=3 (NotifyNonlinear) - X's
+    // label for a real move between windows in different branches of the hierarchy, not
+    // bookkeeping. Why X labelled it that way rather than NotifyWhileGrabbed is NOT established
+    // here and is not worth guessing about; the plausible reading is that in a guest-native drag
+    // the WINDOW is what moves - every position we announce makes dom0's WM move the frame under
+    // a hand that is barely moving in root coordinates - so the pointer genuinely does end up
+    // outside it. What IS established is that it arrived 569 ms into a drag whose button was
+    // held for another 4.4 s, so whatever X meant by it, the drag was manifestly still live.
+    // The premise "a pointer that has left the window cannot still be dragging it" is false
+    // whenever the window is the thing that left, and it is false under a pointer grab, which
+    // is why motion for this window kept arriving after the leave (490 more events).
     //
     // THE DISCRIMINATOR IS THE BUTTON, and dom0 already sends it: msg_crossing.state carries X's
     // button mask (xside.c process_xevent_crossing: `k.state = ev->state`). While button 1 is
