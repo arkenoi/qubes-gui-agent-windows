@@ -747,17 +747,27 @@ static DWORD HandleCrossing(IN HWND window)
     // Button1 event anywhere, and by the INPUT_DRAG_STUCK_MS sweep in DaemonSettleSweep.
     // NotifyInferior is excluded for the same reason as the grab modes: the pointer moved to a
     // CHILD window, i.e. it is still inside.
+    //
+    // TWO INDEPENDENT WITNESSES, because one of them is a field this code has never yet seen a
+    // value of. dom0's `state` is the principled answer, but if it arrived as 0 for a held
+    // button the guard would fail OPEN and put the wobble straight back - so the guest is asked
+    // as well. The agent injected the LEFTDOWN itself and has sent no LEFTUP, so
+    // GetAsyncKeyState(VK_LBUTTON) on the input desktop is a local, independent statement that
+    // the button is still down. Both must say "no button" before a latch is torn down. Both
+    // values are logged either way, so the next trace shows which witness said what instead of
+    // leaving it to be re-derived.
     if (crossingMsg.type == LeaveNotify && crossingMsg.mode == NotifyNormal &&
         crossingMsg.detail != NotifyInferior &&
-        !(crossingMsg.state & Button1Mask) &&
+        !(crossingMsg.state & Button1Mask) && !IsKeyDown(VK_LBUTTON) &&
         window && window == g_InputDragWindow)
     {
         LogDebug("0x%x: pointer left the window with no button held while the drag latch was "
             L"held - the release was lost; releasing the latch", window);
         if (ProtoDragOn())
-            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=0,mode=%u,detail=%u,state=0x%x",
+            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=0,mode=%u,detail=%u,"
+                L"state=0x%x,lbtn=%d",
                 (uint32_t)(ULONG_PTR)window, crossingMsg.mode, crossingMsg.detail,
-                crossingMsg.state);
+                crossingMsg.state, IsKeyDown(VK_LBUTTON) ? 1 : 0);
         g_InputDragWindow = NULL;
         g_InputDragOriginValid = FALSE;
         DragAnnounceClear();
@@ -773,9 +783,10 @@ static DWORD HandleCrossing(IN HWND window)
             L"departure (button held / grab bookkeeping / child window), latch KEPT",
             window, crossingMsg.mode, crossingMsg.detail, crossingMsg.state);
         if (ProtoDragOn())
-            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=1,mode=%u,detail=%u,state=0x%x",
+            LogInfo("QGAPROTO,msg=DRAGLATCH,hwnd=0x%x,ev=crossing,armed=1,mode=%u,detail=%u,"
+                L"state=0x%x,lbtn=%d",
                 (uint32_t)(ULONG_PTR)window, crossingMsg.mode, crossingMsg.detail,
-                crossingMsg.state);
+                crossingMsg.state, IsKeyDown(VK_LBUTTON) ? 1 : 0);
     }
 
     return ERROR_SUCCESS;
