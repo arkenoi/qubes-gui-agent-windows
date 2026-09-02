@@ -495,6 +495,11 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwDumpSent = TRUE;
     entry->PwSliceFed = sliceFed;
     entry->PwSliceNeedsFull = sliceFed; // first frame does one full-window copy
+    // WGC broker (24H2+): if this is an occluded NRB app window, source its pixels from the
+    // user-session broker's per-HWND WGC capture instead of the composited-desktop slice.
+    // No-op unless the broker is active and the window is the eligible class; falls back to
+    // the slice otherwise. Toasts/o-r menus are excluded inside BrokerRegister.
+    BrokerRegister(entry);
     // Fresh channel: no mask has been pushed to it yet, and no move state carries
     // over from a previous buffer (a resize rebuild lands here mid-drag).
     entry->SynthMaskLastCount = 0;
@@ -538,6 +543,8 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->PwDumpSent)
         return;
+    if (entry->PwBrokerSourced)
+        BrokerUnregister(entry);   // release the broker slot before tearing the buffer down
     LogInfo("0x%x: per-window buffer %ux%u detached%s", entry->Handle,
             entry->PwWidth, entry->PwHeight, entry->PwSliceFed ? L" (slice-fed)" : L"");
     if (!entry->PwSliceFed)

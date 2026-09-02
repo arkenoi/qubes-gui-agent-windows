@@ -248,6 +248,14 @@ typedef struct _WINDOW_DATA
     BOOL PwSliceFed;
     BOOL PwSliceNeedsFull; // one full-window copy pending (fresh attach/remap)
 
+    // WGC broker (24H2+): this sliceFed window's pixels come from the user-session broker's
+    // per-HWND WGC capture instead of the composited-desktop slice. See BrokerRegister/
+    // BrokerFreshFrame in main.c. Falls back to the slice whenever no fresh broker frame.
+    BOOL   PwBrokerSourced;   // registered with the broker (occluded NRB app window)
+    LONG   PwBrokerSlot;      // index into WGCBRK_SLOTS(g_WgcBase); -1 if none
+    UINT64 PwBrokerLastId;    // last WGCBRK_SLOT.FrameId consumed (change detection)
+    UINT64 PwBrokerArenaOff;  // this window's ring[0] arena offset (for release); 0 if none
+
     // Move-only drag fast path (ProcessNewFrame, PrintWindow-fed branch): a pure
     // position change does not alter the window's own content - the per-window buffer
     // is position-invariant and dom0 repositions it from MSG_CONFIGURE alone - so the
@@ -362,6 +370,13 @@ void MonitorCacheInvalidate(void);
 // SetWindowPos is still in flight (latest-wins; see DaemonMove* in WINDOW_DATA).
 // Call with g_csWatchedWindows held.
 void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry);
+
+// WGC broker (main.c): register/deregister a sliceFed window with the user-session broker.
+// Called from perwindow.c PwAttachWindow/PwDetachWindow. No-ops unless the broker is active
+// and the window is the eligible class (NRB, non-o-r, non-topmost app window).
+BOOL WgcBrokerActive(void);
+BOOL BrokerRegister(IN OUT WINDOW_DATA* entry);
+void BrokerUnregister(IN OUT WINDOW_DATA* entry);
 
 // ApplyPendingDaemonMove for every watched window; takes g_csWatchedWindows itself.
 // Called after a vchan drain so a configure flood collapses to one move per window.

@@ -163,6 +163,7 @@ static DWORD  g_WgcSession = 0xFFFFFFFF;
 static ULONGLONG g_WgcNextPoll = 0;
 static UINT64 g_WgcNonce = 0;
 static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
+static ULONGLONG g_WgcArenaNext = 0;   // bump allocator within the arena (offset past ArenaOffset)
 
 // minimal acceptable window dimensions
 DWORD g_MinWindowWidth = 0;
@@ -2041,6 +2042,124 @@ static void BrokerShutdown(void)
         WaitForSingleObject(g_WgcBrokerProc, 1500);
         CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
     }
+}
+
+// ---- WGC broker stage 2b: register occluded NRB app windows, consume their frames --------
+BOOL WgcBrokerActive(void)
+{
+    return g_WgcBroker && g_OsBuild >= 26100 && PwEnabled() && g_BrokerReady && g_WgcBase;
+}
+
+static ULONGLONG WgcArenaAlloc(ULONGLONG bytes)   // 64-aligned bump; 0 == out of arena
+{
+    ULONGLONG off = (g_WgcArenaNext + 63) & ~(ULONGLONG)63;
+    if (off + bytes > (ULONGLONG)g_WgcArenaBytes) return 0;
+    g_WgcArenaNext = off + bytes;
+    return (ULONGLONG)WGCBRK_HEADER_BYTES + off;   // absolute offset from section base
+}
+
+// Register a sliceFed window with the broker IFF it is the class the broker actually helps:
+// an NRB (DirectComposition) app window that is NOT override-redirect and NOT topmost - i.e.
+// UWP/Terminal-style windows where the composited slice bleeds occluders and per-HWND WGC
+// works. Toasts (topmost shell CoreWindows) and o-r menus are EXCLUDED (CreateForWindow fails
+// on CoreWindows; menus are topmost/slice-correct/short-lived). Returns TRUE if registered.
+BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
+{
+    entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1;
+    entry->PwBrokerLastId = 0; entry->PwBrokerArenaOff = 0;
+    if (!WgcBrokerActive() || !entry->PwSliceFed) return FALSE;
+    if (entry->Width == 0 || entry->Height == 0) return FALSE;
+
+    LONG ex = GetWindowLong(entry->Handle, GWL_EXSTYLE);
+    if ((ex & WS_EX_NOREDIRECTIONBITMAP) == 0) return FALSE;   // only NRB/DComp windows
+    if (ex & WS_EX_TOPMOST) return FALSE;                       // exclude toasts/flyouts
+    if (entry->IsOverrideRedirect) return FALSE;                // exclude o-r menus
+
+    WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
+    WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
+    int slot = -1;
+    for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
+        if (slots[i].Hwnd == 0 && slots[i].ReqState == WGCBRK_FREE) { slot = i; break; }
+    if (slot < 0) return FALSE;
+
+    ULONGLONG one = ((ULONGLONG)entry->Width * entry->Height * 4 + 63) & ~(ULONGLONG)63;
+    ULONGLONG off0 = WgcArenaAlloc(one);
+    ULONGLONG off1 = WgcArenaAlloc(one);
+    if (!off0 || !off1) return FALSE;   // arena full -> stays on the DDA slice
+
+    WGCBRK_SLOT* s = &slots[slot];
+    s->BufOffset[0] = (LONGLONG)off0; s->BufOffset[1] = (LONGLONG)off1;
+    s->BufBytes = (LONGLONG)one;
+    s->ReqWidth = (LONG)entry->Width; s->ReqHeight = (LONG)entry->Height;
+    s->ReqCropX = 0; s->ReqCropY = 0;
+    s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
+    MemoryBarrier();
+    s->Hwnd = (UINT64)(ULONG_PTR)entry->Handle;
+    s->ReqState = WGCBRK_REQUESTED;
+    _InterlockedIncrement(&s->ControlSeq);
+    _InterlockedIncrement(&h->ControlGen);
+    entry->PwBrokerSlot = slot; entry->PwBrokerSourced = TRUE; entry->PwBrokerArenaOff = off0;
+    if (g_WgcCtl) SetEvent(g_WgcCtl);
+    LogVerbose("BROKER register slot %d hwnd 0x%x %ux%u", slot, (DWORD)(ULONG_PTR)entry->Handle,
+               entry->Width, entry->Height);
+    return TRUE;
+}
+
+void BrokerUnregister(IN OUT WINDOW_DATA* entry)
+{
+    if (!g_WgcBase || entry->PwBrokerSlot < 0) { entry->PwBrokerSourced = FALSE; return; }
+    WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
+    s->ReqState = WGCBRK_FREE;
+    s->Hwnd = 0;                         // v1: free the slot immediately (broker closes on reconcile)
+    _InterlockedIncrement(&s->ControlSeq);
+    _InterlockedIncrement(&WGCBRK_HDR(g_WgcBase)->ControlGen);
+    if (g_WgcCtl) SetEvent(g_WgcCtl);
+    // Arena regions are bump-allocated and not individually reclaimed in v1 (128 MB budget,
+    // 64-window ceiling); the whole arena resets when the section is recreated on broker restart.
+    entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1; entry->PwBrokerArenaOff = 0;
+}
+
+// Read a fresh, fully-BOUNDS-CHECKED broker frame for this window. Every broker-written field
+// is validated before use (a user-IL process shares the section R/W); the frame is accepted
+// ONLY if its dims exactly match the slab and its arena region is fully in-bounds, so the
+// window-relative copy in PwSliceCopyAndDamageSrc cannot read outside the arena.
+static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* pitch, OUT UINT64* id)
+{
+    if (!g_WgcBase || e->PwBrokerSlot < 0 || e->PwBrokerSlot >= WGCBRK_MAX_SLOTS) return FALSE;
+    WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
+    WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[e->PwBrokerSlot];
+    if (s->Hwnd != (UINT64)(ULONG_PTR)e->Handle) return FALSE;
+    if (s->AckState != WGCBRK_ACTIVE) return FALSE;
+    if (!h->Producing) return FALSE;   // broker paused (secure desktop)
+
+    for (int t = 0; t < 4; t++)
+    {
+        LONG s0 = s->Seq;
+        if (s0 & 1) { YieldProcessor(); continue; }   // write in progress
+        MemoryBarrier();
+        LONG b = s->ActiveBuffer, fw = s->FrameWidth, fh = s->FrameHeight, stride = s->Stride;
+        UINT64 fid = (UINT64)s->FrameId;
+        LONGLONG tick = s->CaptureTick, boff;
+        if (b < 0 || b >= WGCBRK_RING) return FALSE;
+        boff = s->BufOffset[b];
+        // dims must EXACTLY match the slab (so the dest-bounds check covers the source too)
+        if (fw != (LONG)e->PwWidth || fh != (LONG)e->PwHeight || stride != fw * 4) return FALSE;
+        // arena residency: [boff, boff + fh*stride) fully within [ArenaOffset, ArenaOffset+ArenaBytes)
+        ULONGLONG need = (ULONGLONG)fh * (ULONGLONG)stride;
+        if (boff < h->ArenaOffset ||
+            (ULONGLONG)boff + need > (ULONGLONG)h->ArenaOffset + (ULONGLONG)h->ArenaBytes)
+            return FALSE;
+        // never present a frame captured before the last secure-desktop exit
+        if ((ULONGLONG)tick < g_SecureDesktopLeftTick) return FALSE;
+        const BYTE* front = WGCBRK_ARENA(g_WgcBase, boff);
+        MemoryBarrier();
+        if (s->Seq == s0)   // stable across the read: not torn
+        {
+            *base = front; *pitch = (int)stride; *id = fid;
+            return TRUE;
+        }
+    }
+    return FALSE;   // torn/starved -> caller falls back to the desktop slice this frame
 }
 
 // Guest-native window shadows off in seamless, restored in fullscreen. The shell window gives us a
@@ -4574,14 +4693,16 @@ static HWND g_LastPopupDamageWindow = NULL;
 // per-window buffer and send the matching window-relative damage. Clips to the screen,
 // the window rect, and the granted buffer geometry; silently skips when the frame is
 // not mapped (content then arrives with the next mapped frame).
-static BOOL PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRAME* frame,
-                                 IN const BYTE* fb, IN const RECT* area)
+// Source-parameterized slice copy. srcOrigin is the SCREEN coordinate that maps to source
+// pixel (0,0): (0,0) for the full-screen desktop mirror (screen-relative indexing, the legacy
+// behavior), or (entry->X, entry->Y) for a WGC broker frame (window-relative). The DESTINATION
+// bounds check is unchanged; when the broker path is used, BrokerFreshFrame has already proven
+// the source is exactly PwWidth x PwHeight and arena-resident, so the same bounds cover it.
+static BOOL PwSliceCopyAndDamageSrc(IN OUT WINDOW_DATA* entry, IN const BYTE* srcBase,
+                                    IN int srcPitch, IN int srcOriginX, IN int srcOriginY,
+                                    IN const RECT* area)
 {
-    // fb is the persistently-granted desktop image (ctx->framebuffer): its address is
-    // constant for the life of the duplication and the daemon reads it live, so it is
-    // always current here - do NOT gate on frame->mapped, which is only TRUE on the
-    // very first frame (MapDesktopSurface runs once, for the pointer to grant).
-    if (!fb || frame->rect.Pitch <= 0 || !entry->PwBuffer)
+    if (!srcBase || srcPitch <= 0 || !entry->PwBuffer)
         return FALSE;
 
     RECT screenR = { 0, 0, (LONG)min(g_ScreenWidth, g_FbWidth), (LONG)min(g_ScreenHeight, g_FbHeight) };
@@ -4602,19 +4723,28 @@ static BOOL PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRA
     if ((ULONG)(relX + w) > entry->PwWidth || (ULONG)(relY + h) > entry->PwHeight)
         return FALSE; // buffer geometry changed underneath; next full copy repaints
 
-    const BYTE* src = fb +
-        (size_t)r.top * frame->rect.Pitch + (size_t)r.left * 4;
+    const BYTE* src = srcBase +
+        (size_t)(r.top - srcOriginY) * srcPitch + (size_t)(r.left - srcOriginX) * 4;
     BYTE* dst = (BYTE*)entry->PwBuffer +
         ((size_t)relY * entry->PwWidth + (size_t)relX) * 4;
     for (int row = 0; row < h; row++)
     {
         memcpy(dst, src, (size_t)w * 4);
-        src += frame->rect.Pitch;
+        src += srcPitch;
         dst += (size_t)entry->PwWidth * 4;
     }
 
     (void)SendWindowDamageEvent(entry->Handle, relX, relY, w, h);
     return TRUE;
+}
+
+// Legacy wrapper: copy from the persistently-granted composited desktop image (screen-relative).
+// fb is ctx->framebuffer, constant for the life of the duplication (daemon reads it live) - do
+// NOT gate on frame->mapped, which is only TRUE on the very first frame.
+static BOOL PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRAME* frame,
+                                 IN const BYTE* fb, IN const RECT* area)
+{
+    return PwSliceCopyAndDamageSrc(entry, fb, frame ? frame->rect.Pitch : 0, 0, 0, area);
 }
 
 // DRAG-SLICE refresh (InputDragSlice): full-rect, ROW-DIFFED copy of the dragged
@@ -5551,12 +5681,30 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             RECT pwHit;
             if (entry->PwSliceFed)
             {
-                // Agent-side slice: copy the changed region of the composited screen
-                // into the window's own buffer. Content becomes window-relative, so
-                // dom0 renders it correctly wherever it places the window - the
-                // daemon-side legacy slice misregisters as soon as dom0 repositions
-                // the window (force_on_screen on a fullscreen overlay, measured 31px).
-                if (entry->PwSliceNeedsFull)
+                // WGC BROKER (24H2+): if this window has a fresh, bounds-checked per-HWND
+                // WGC frame from the user-session broker, copy from THAT (occlusion-independent,
+                // window-relative) instead of the composited-desktop slice. Any failure -
+                // broker down, no fresh frame, secure desktop, torn read, size mismatch -
+                // falls through to the exact legacy slice path below, so the window is never
+                // blank. Broker frames are window-relative: source origin = (entry->X, entry->Y).
+                const BYTE* bsrc = NULL; int bpitch = 0; UINT64 bid = 0;
+                if (entry->PwBrokerSourced && WgcBrokerActive() &&
+                    BrokerFreshFrame(entry, &bsrc, &bpitch, &bid))
+                {
+                    if (bid != entry->PwBrokerLastId || entry->PwSliceNeedsFull)
+                    {
+                        entry->PwSliceNeedsFull = FALSE;
+                        entry->PwBrokerLastId = bid;
+                        PwSliceCopyAndDamageSrc(entry, bsrc, bpitch, entry->X, entry->Y, &pwRect);
+                    }
+                    // else: no new broker frame this pass -> nothing changed, skip
+                }
+                // Agent-side slice (fallback / broker-inactive): copy the changed region of the
+                // composited screen into the window's own buffer. Content becomes window-relative,
+                // so dom0 renders it correctly wherever it places the window - the daemon-side
+                // legacy slice misregisters as soon as dom0 repositions the window (force_on_screen
+                // on a fullscreen overlay, measured 31px).
+                else if (entry->PwSliceNeedsFull)
                 {
                     entry->PwSliceNeedsFull = FALSE;
                     PwSliceCopyAndDamage(entry, frame, framebuffer, &pwRect);
