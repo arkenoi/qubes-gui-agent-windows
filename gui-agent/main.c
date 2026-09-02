@@ -5693,9 +5693,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 {
                     if (bid != entry->PwBrokerLastId || entry->PwSliceNeedsFull)
                     {
+                        BOOL firstBrokerFrame = (entry->PwBrokerLastId == 0);
                         entry->PwSliceNeedsFull = FALSE;
                         entry->PwBrokerLastId = bid;
                         PwSliceCopyAndDamageSrc(entry, bsrc, bpitch, entry->X, entry->Y, &pwRect);
+                        if (firstBrokerFrame)
+                            LogInfo("BROKERFRAME first WGC frame consumed hwnd 0x%x slot %d %ux%u",
+                                    (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+                                    entry->PwWidth, entry->PwHeight);
                     }
                     // else: no new broker frame this pass -> nothing changed, skip
                 }
