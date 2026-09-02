@@ -880,7 +880,17 @@ BOOL IsShellToastWindow(IN const WINDOW_DATA* data)
 // classic GDI menus (#32768) are already tight and deliberately excluded (nothing to crop).
 BOOL IsMenuPopupWindow(IN const WINDOW_DATA* data)
 {
-    if (!data || !data->IsOverrideRedirect || !data->Class)
+    // Keyed on CLASS + VISIBILITY, deliberately NOT on data->IsOverrideRedirect. This runs from
+    // the crop gate in GetWindowData(), which ZeroMemory()s the entry at entry and only assigns
+    // IsOverrideRedirect much further down (post-crop, by design - the cropped size has to clear
+    // the popup guard). Reading IsOverrideRedirect here therefore always saw FALSE, so the menu
+    // crop NEVER ran (found 2026-09-03: no crop measurement was ever logged for a materialized
+    // WinUI menu body, black shadow band left uncropped). These two classes are XAML-island
+    // windowed-popup hosts - always override-redirect transient popups (context menus / flyouts),
+    // never normal top-level windows - so the class alone is a sound and sufficient signal. Both
+    // fields ARE populated before the gate (Class at GetClassName, IsVisible just above it).
+    // Classic GDI menus (#32768) are already tight and deliberately excluded (nothing to crop).
+    if (!data || !data->IsVisible || !data->Class)
         return FALSE;
     return wcsstr(data->Class, L"PopupWindowSiteBridge") != NULL ||   // Microsoft.UI.Content.PopupWindowSiteBridge
            wcsstr(data->Class, L"Xaml_WindowedPopup")   != NULL;      // older WinUI windowed popup class

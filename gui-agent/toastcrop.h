@@ -49,10 +49,12 @@ BOOL IsShellToastWindow(
     IN const WINDOW_DATA* data
     );
 
-// TRUE for a Win11 WinUI windowed popup menu/flyout (class *PopupWindowSiteBridge /
-// *Xaml_WindowedPopup*, override-redirect). Same "shadow inside the window" shape as toasts, so
-// the same UIA card crop squares off the transparent (black-when-materialized) margin. Classic
-// GDI menus (#32768) are already tight and excluded.
+// TRUE for a Win11 WinUI windowed popup menu/flyout, keyed on CLASS (*PopupWindowSiteBridge /
+// *Xaml_WindowedPopup*) + visibility - NOT on IsOverrideRedirect, which the crop gate's caller has
+// not yet assigned (see the .c). Those classes are XAML-island popup hosts, inherently
+// override-redirect. Same "shadow inside the window" shape as toasts, so the same UIA card crop
+// squares off the transparent (black-when-materialized) margin. Classic GDI menus (#32768) are
+// already tight and excluded.
 BOOL IsMenuPopupWindow(
     IN const WINDOW_DATA* data
     );
