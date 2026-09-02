@@ -41,6 +41,8 @@
 #include <sddl.h>
 #include <wtsapi32.h>
 #pragma comment(lib, "wtsapi32.lib")   // WTSQueryUserToken for the broker's session token
+#include <userenv.h>
+#pragma comment(lib, "userenv.lib")    // CreateEnvironmentBlock for the broker's session env
 #include "wgcbroker_ipc.h"
 #include "wincapture.h"
 #include "vchan-handlers.h"
@@ -2025,15 +2027,24 @@ static BOOL WgcLaunch(void)
                     self, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce);
                 STARTUPINFO si = { 0 }; PROCESS_INFORMATION pi = { 0 };
                 si.cb = sizeof(si); si.lpDesktop = L"winsta0\\default";
+                // Build the user's environment block. A CreateProcessAsUser process without it
+                // lacks the session state a Task-Scheduler-launched process gets - and WGC's
+                // CreateForMonitor (DWM interop) FAILS with E_HANDLE without that full session
+                // context, even on the correct WTS token. The schtasks /ru user /it probe (which
+                // captured the monitor fine) always had this environment.
+                LPVOID env = NULL;
+                BOOL haveEnv = CreateEnvironmentBlock(&env, primary, FALSE);
                 if (CreateProcessAsUser(primary, NULL, cmd, NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+                        CREATE_NO_WINDOW | (haveEnv ? CREATE_UNICODE_ENVIRONMENT : 0),
+                        haveEnv ? env : NULL, NULL, &si, &pi))
                 {
                     CloseHandle(pi.hThread);
                     g_WgcBrokerProc = pi.hProcess;   // KEEP for instant death detection
                     ok = TRUE;
-                    LogInfo("WGCBROKER launched pid %lu", pi.dwProcessId);
+                    LogInfo("WGCBROKER launched pid %lu (env=%d)", pi.dwProcessId, haveEnv);
                 }
                 else win_perror("CreateProcessAsUser(wgcbroker)");
+                if (haveEnv) DestroyEnvironmentBlock(env);
             }
         }
     }
