@@ -154,7 +154,14 @@ BOOL g_NoScreenGrant = FALSE;
 // never affect rendering. Toasts/o-r menus are NOT routed here (topmost, slice-correct; the
 // toast interceptor handles toasts). See wgcbroker_ipc.h for the contract.
 #define REG_CONFIG_WGC_BROKER_VALUE L"WgcBroker"
+// SliceRetire (DWORD, default 0, DIAGNOSTIC): with the broker active, make sliceFed windows
+// BROKER-ONLY - skip the composited-desktop slice fallback entirely, and let the broker attempt
+// EVERY sliceFed window (not just NRB app windows). This is the "retire the slicer" test: whatever
+// the broker cannot capture (shell CoreWindows) goes blank, mapping the residual gap. Toasts are
+// covered separately by the notifhost interceptor (normal windows, not sliceFed).
+#define REG_CONFIG_SLICE_RETIRE_VALUE L"SliceRetire"
 BOOL          g_WgcBroker   = FALSE;
+BOOL          g_SliceRetire = FALSE;   // diagnostic: broker-only sliceFed, no slice fallback
 DWORD         g_OsBuild     = 0;
 volatile LONG g_BrokerReady = 0;
 static HANDLE g_WgcMap = NULL, g_WgcCtl = NULL, g_WgcBrokerProc = NULL;
@@ -2071,9 +2078,16 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     if (entry->Width == 0 || entry->Height == 0) return FALSE;
 
     LONG ex = GetWindowLong(entry->Handle, GWL_EXSTYLE);
-    if ((ex & WS_EX_NOREDIRECTIONBITMAP) == 0) return FALSE;   // only NRB/DComp windows
-    if (ex & WS_EX_TOPMOST) return FALSE;                       // exclude toasts/flyouts
-    if (entry->IsOverrideRedirect) return FALSE;                // exclude o-r menus
+    if (!g_SliceRetire)
+    {
+        // Normal scope: only occluded NRB app windows (where the slice bleeds and per-HWND WGC
+        // works). SliceRetire broadens this to EVERY sliceFed window so the retirement test can
+        // see which classes the broker can/cannot capture (e.g. explorer o-r menus).
+        if ((ex & WS_EX_NOREDIRECTIONBITMAP) == 0) return FALSE;   // only NRB/DComp windows
+        if (ex & WS_EX_TOPMOST) return FALSE;                       // exclude toasts/flyouts
+        if (entry->IsOverrideRedirect) return FALSE;                // exclude o-r menus
+    }
+    (void)ex;
 
     WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
     WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
@@ -5704,8 +5718,16 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     }
                     // else: no new broker frame this pass -> nothing changed, skip
                 }
-                // Agent-side slice (fallback / broker-inactive): copy the changed region of the
-                // composited screen into the window's own buffer. Content becomes window-relative,
+                // SliceRetire (diagnostic): with the broker active, DO NOT fall back to the
+                // composited-desktop slice - sliceFed windows are broker-only. Whatever the
+                // broker cannot capture stays unpainted, which is exactly what the retirement
+                // test measures (does an explorer o-r menu still render, or go blank?).
+                else if (g_SliceRetire && WgcBrokerActive())
+                {
+                    // broker-only: nothing to do (no slice). Window shows its last content or blank.
+                }
+                // Agent-side slice (normal fallback / broker-inactive): copy the changed region of
+                // the composited screen into the window's own buffer. Content becomes window-relative,
                 // so dom0 renders it correctly wherever it places the window - the daemon-side
                 // legacy slice misregisters as soon as dom0 repositions the window (force_on_screen
                 // on a fullscreen overlay, measured 31px).
@@ -7793,7 +7815,13 @@ static ULONG Init(void)
             qdb_close(q);
         }
     }
-    LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu (floor 26100)", g_WgcBroker, g_OsBuild);
+    {
+        DWORD sr = 0;
+        (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_RETIRE_VALUE, &sr, NULL);
+        g_SliceRetire = (sr != 0);
+    }
+    LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d (floor 26100)",
+            g_WgcBroker, g_OsBuild, g_SliceRetire);
 
     // Diagnostic-only window-filter override; absent (the normal case) means 0 = all
     // filters active. See g_DiagWindowFilterOff.
