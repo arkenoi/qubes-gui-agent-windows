@@ -8283,6 +8283,17 @@ static int SetShadowsMain(LPSTR cmdLine)
         RegCloseKey(ve);
     }
 
+    // The UserPreferencesMask bit governs the DWM "show shadows under windows" effect, but the
+    // CLASSIC per-window drop shadow (CS_DROPSHADOW - what menus/context-menus/tooltips draw, and
+    // what surfaces to dom0 as a separate o-r shadow companion window) is governed by
+    // SPI_SETDROPSHADOW. That is a PER-USER setting, so it must be set HERE (this helper runs on
+    // the interactive user's token) - the agent's own DisableEffects() runs as SYSTEM and does not
+    // reach the user session. Setting it off globally drops menu shadows without any per-window
+    // filtering (verified: a context menu drops from 2 o-r windows to 1). Restored (TRUE) on the
+    // fullscreen direction, mirroring the mask above.
+    SystemParametersInfo(SPI_SETDROPSHADOW, 0, (void*)(INT_PTR)(enable ? TRUE : FALSE),
+                         SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+
     // Make it live without a logoff.
     // SPI_SETUSERPREFERENCESMASK (0x1045) is not in this SDK's headers; the broadcast only needs
     // the numeric wParam, and "WindowMetrics" is the section name listeners match on.
