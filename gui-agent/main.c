@@ -2036,7 +2036,16 @@ static void BrokerSupervise(void)
             LogInfo("WGCBROKER ready (heartbeat live)");
         }
         if (g_BrokerReady && g_SliceRetire)
+        {
             BrokerRegisterMonitor();   // monitor slice source for o-r/static windows under retirement
+            if (g_WgcMonitorSlot >= 0)
+            {
+                WGCBRK_SLOT* ms = &WGCBRK_SLOTS(g_WgcBase)[g_WgcMonitorSlot];
+                LogInfo("MONITOR slot %d ack=%d fail=0x%x frameId=%llu %dx%d",
+                        g_WgcMonitorSlot, ms->AckState, (unsigned)ms->FailHr,
+                        (unsigned long long)ms->FrameId, ms->FrameWidth, ms->FrameHeight);
+            }
+        }
         return;
     }
     if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL; }
@@ -5795,7 +5804,15 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 else if (g_SliceRetire && WgcBrokerActive())
                 {
                     const BYTE* mb = NULL; int mp = 0, mw = 0, mh = 0;
-                    if (BrokerMonitorFrame(&mb, &mp, &mw, &mh))
+                    BOOL monOk = BrokerMonitorFrame(&mb, &mp, &mw, &mh);
+                    if (!entry->PwBrokerLastId)   // one-shot per window
+                    {
+                        entry->PwBrokerLastId = 1;
+                        LogInfo("MONSLICE hwnd 0x%x monAvail=%d mon=%dx%d rect=%d,%d,%d,%d",
+                                (DWORD)(ULONG_PTR)entry->Handle, monOk, mw, mh,
+                                pwRect.left, pwRect.top, pwRect.right, pwRect.bottom);
+                    }
+                    if (monOk)
                     {
                         if (entry->PwSliceNeedsFull)
                         {
