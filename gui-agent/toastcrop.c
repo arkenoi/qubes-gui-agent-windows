@@ -48,6 +48,13 @@
 // no-card measurements at >=250 ms spacing give ~1.5 s of coverage at worker speed.
 #define TOAST_CROP_MAX_ATTEMPTS 6
 #define TOAST_CROP_RETRY_MS     250
+// Crop-before-show: how many measurement attempts a toast/menu's map is DEFERRED for while its
+// crop resolves (CropPending). Shorter than MAX_ATTEMPTS on purpose - once this many attempts
+// have completed without a card the surface maps UNCROPPED (and the remaining attempts, up to
+// MAX_ATTEMPTS, still land the crop async), so a slow/unmeasurable surface is hidden briefly,
+// never for the full budget. Each attempt pokes a re-examination (TcApplyResult) so the defer
+// releases within ~attempts x measurement-time, not the 2 s resync interval.
+#define TOAST_CROP_DEFER_ATTEMPTS 3
 
 // XAML depth to search for the card. 4 covers the measured toast tree; Start's card sits
 // near its root. Deeper costs cross-process RPC for no gain.
@@ -445,14 +452,17 @@ static void TcValidateInsets(IN HWND window, IN LONG rawWidth, IN LONG rawHeight
 // Depth is capped because this walks a live XAML tree over cross-process RPC: the toast tree is
 // 4 levels deep, Start's is deeper but its card is near the root, and an unbounded walk on a
 // pathological tree would cost exactly the per-frame stall the timeouts exist to prevent.
-static BOOL TcFindCardRect(IN IUIAutomation* uia, IN IUIAutomationElement* element,
+static BOOL TcFindCardRect(IN IUIAutomationTreeWalker* walker, IN IUIAutomationElement* element,
     IN RECT raw, IN int depth, IN ULONGLONG deadline, OUT RECT* best, IN OUT LONG* bestArea)
 {
-    IUIAutomationTreeWalker* walker = NULL;
     IUIAutomationElement* child = NULL;
     BOOL found = FALSE;
 
-    if (depth > TOAST_CROP_MAX_DEPTH)
+    // The walker is CALLER-OWNED (control view preferred, raw view as fallback - see
+    // TcQueryCore). Passing it in, rather than creating a RawViewWalker here at every node,
+    // is what lets the caller pick the view: the raw view includes a structural padding
+    // container ~5 px outside the drawn card, which left a thin black strip along the crop.
+    if (!walker || depth > TOAST_CROP_MAX_DEPTH)
         return FALSE;
 
     // Whole-walk deadline: the depth cap bounds the tree SHAPE but not the RPC time - a
@@ -462,14 +472,8 @@ static BOOL TcFindCardRect(IN IUIAutomation* uia, IN IUIAutomationElement* eleme
     if (GetTickCount64() > deadline)
         return FALSE;
 
-    if (FAILED(IUIAutomation_get_RawViewWalker(uia, &walker)) || !walker)
-        return FALSE;
-
     if (FAILED(IUIAutomationTreeWalker_GetFirstChildElement(walker, element, &child)) || !child)
-    {
-        IUIAutomationTreeWalker_Release(walker);
         return FALSE;
-    }
 
     while (child)
     {
@@ -507,7 +511,7 @@ static BOOL TcFindCardRect(IN IUIAutomation* uia, IN IUIAutomationElement* eleme
             }
         }
 
-        if (TcFindCardRect(uia, child, raw, depth + 1, deadline, best, bestArea))
+        if (TcFindCardRect(walker, child, raw, depth + 1, deadline, best, bestArea))
             found = TRUE;
 
         if (FAILED(IUIAutomationTreeWalker_GetNextSiblingElement(walker, child, &next)))
@@ -516,7 +520,6 @@ static BOOL TcFindCardRect(IN IUIAutomation* uia, IN IUIAutomationElement* eleme
         child = next;
     }
 
-    IUIAutomationTreeWalker_Release(walker);
     return found;
 }
 
@@ -559,7 +562,34 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, OUT
         // 2 s covers a healthy walk (4-6 levels, tens of RPCs) many times over while
         // bounding a pathological one to a small multiple of the per-call timeout.
         ULONGLONG deadline = GetTickCount64() + 2000;
-        if (!TcFindCardRect(uia, windowElement, raw, 0, deadline, &cardRect, &bestArea))
+        IUIAutomationTreeWalker* walker = NULL;
+        BOOL found = FALSE;
+
+        // Prefer the CONTROL view. The RAW view includes a structural padding container that
+        // sits ~5 px outside the drawn card (measured on a WinUI menu body 2026-09-03: raw
+        // union L=11 R=11 B=19, control L=16 R=16 B=22 = the visible card), which is exactly
+        // what left a thin black strip down the crop's left/right edge and along the bottom.
+        // Fall back to the RAW view if the control view finds no card, so a surface whose card
+        // is raw-only still crops (this is the pre-2026-09-03 behaviour): the required-kept
+        // toasts can never regress below what they crop to today.
+        if (SUCCEEDED(IUIAutomation_get_ControlViewWalker(uia, &walker)) && walker)
+        {
+            found = TcFindCardRect(walker, windowElement, raw, 0, deadline, &cardRect, &bestArea);
+            IUIAutomationTreeWalker_Release(walker);
+            walker = NULL;
+        }
+        if (!found)
+        {
+            bestArea = 0;
+            deadline = GetTickCount64() + 2000;
+            if (SUCCEEDED(IUIAutomation_get_RawViewWalker(uia, &walker)) && walker)
+            {
+                found = TcFindCardRect(walker, windowElement, raw, 0, deadline, &cardRect, &bestArea);
+                IUIAutomationTreeWalker_Release(walker);
+                walker = NULL;
+            }
+        }
+        if (!found)
         {
             // Expected while the XAML tree is still being built; the caller retries a bounded
             // number of times and then leaves the window uncropped.
@@ -684,6 +714,7 @@ static TOAST_CROP_ENTRY* TcFindSlotLocked(IN HWND window, IN DWORD rawWidth, IN 
 static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
 {
     BOOL resolvedNonZero = FALSE;
+    BOOL attemptDone = FALSE;   // an attempt was processed on THIS call (drives the defer poke)
 
     EnterCriticalSection(&g_TcLock);
 
@@ -691,6 +722,7 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
     if (slot && !slot->Resolved)
     {
         slot->Insets = *insets;
+        attemptDone = TRUE;
 
         // The attempt is counted HERE, on a completed measurement - counting at lookup
         // time let event-driven lookups burn the whole budget before the XAML tree
@@ -723,10 +755,14 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
 
     LeaveCriticalSection(&g_TcLock);
 
-    // The window was announced UNCROPPED while the measurement ran; make the tracking pass
-    // re-read it now instead of waiting for the surface's next natural event, so the crop
-    // lands within one pass rather than one animation frame.
-    if (resolvedNonZero)
+    // Re-examine the surface after EVERY completed attempt, not just the final verdict. Two
+    // reasons: (1) it lands the crop within one pass of a successful measurement rather than one
+    // animation frame; (2) while a toast/menu is DEFERRED for crop-before-show, the deferred
+    // window is otherwise only re-driven by the 2 s resync - poking here re-runs the tracking
+    // pass (and thus the next measurement attempt, paced by RetryAt) so the defer resolves in
+    // ~attempts x measurement-time and releases (mapped cropped, or uncropped once the defer
+    // budget is spent) instead of stalling for seconds.
+    if (attemptDone)
         PokeWindowTracking();
 }
 
@@ -1142,6 +1178,40 @@ BOOL ShellSurfaceCardless(IN const WINDOW_DATA* data)
     }
     LeaveCriticalSection(&g_TcLock);
     return noCard;
+}
+
+BOOL CropPending(IN const WINDOW_DATA* data)
+{
+    if (!data)
+        return FALSE;
+
+    TcInit();
+    if (g_TcDisabled || g_TcForced)
+        return FALSE;                       // measurement not the async path: never defer
+
+    // CROP BEFORE SHOW. A TOAST or WinUI MENU popup whose shadow-crop has not resolved yet is
+    // NOT mapped, so it appears already cropped instead of flashing its uncropped transparent
+    // (black/wallpaper) shadow margin for a frame and then re-announcing at the cropped size.
+    // BOUNDED, and DIFFERENT from ShellSurfaceCardless (Start): the moment the measurement
+    // RESOLVES - a card found, OR given up after MAX_ATTEMPTS - this returns FALSE and the
+    // surface maps (cropped, or uncropped as the required-kept fallback so a toast/menu is
+    // NEVER lost). Start/Search keep the opposite policy (suppress the card-less phantom).
+    BOOL isToast = (ShellSurfaceKind(data) == ShellSurfaceToast);
+    if (!isToast && !IsMenuPopupWindow(data))
+        return FALSE;
+
+    BOOL pending = TRUE;
+    EnterCriticalSection(&g_TcLock);
+    {
+        RECT lastGood;
+        TOAST_CROP_ENTRY* slot = TcFindSlotLocked(data->Handle, data->Width, data->Height);
+        if (slot && (slot->Resolved || slot->Attempts >= TOAST_CROP_DEFER_ATTEMPTS))
+            pending = FALSE;                // resolved, or defer budget spent: map it now
+        else if (TcRecallLastGood(data->Handle, &lastGood))
+            pending = FALSE;                // sticky card from an earlier open of this hwnd
+    }
+    LeaveCriticalSection(&g_TcLock);
+    return pending;
 }
 
 void ToastCropEvict(IN HWND window)

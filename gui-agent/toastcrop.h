@@ -88,6 +88,17 @@ BOOL ShellSurfaceCardless(
     IN const WINDOW_DATA* data
     );
 
+// TRUE while a TOAST or WinUI MENU popup's shadow-crop is still being measured, so the caller
+// DEFERS its first map until the crop resolves ("crop before show") - the surface then appears
+// already cropped rather than flashing its uncropped transparent margin and re-announcing.
+// Bounded: once the measurement resolves (card found, or given up after the attempt cap) this
+// returns FALSE and the surface maps - cropped, or uncropped as the required-kept fallback so a
+// toast/menu is never lost. START/Search are NOT gated here (see ShellSurfaceCardless, which
+// SUPPRESSES their card-less phantom instead). No-op when crop is disabled or forced.
+BOOL CropPending(
+    IN const WINDOW_DATA* data
+    );
+
 // Insets to subtract from this window's raw rect, from the (hwnd, raw size) cache;
 // measures via UIA on a miss. Always writes *insets (all zero = do not crop) and returns
 // TRUE only when a nonzero, validated crop applies. Safe to call for any window.

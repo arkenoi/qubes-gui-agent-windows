@@ -4012,6 +4012,18 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         return FALSE;
     }
 
+    // CROP BEFORE SHOW: defer mapping a toast/WinUI-menu popup until its shadow-crop resolves,
+    // so it appears already cropped instead of flashing its uncropped transparent margin and
+    // re-announcing. Bounded (CropPending goes FALSE once the measurement gives up), so a
+    // toast/menu is never lost - it just maps uncropped in the worst case. Shares FI_GATE_NOCARD
+    // with the card gate above (both are crop-measurement gates a fail-proof build can disable).
+    if (!FiGateOff(FI_GATE_NOCARD) && CropPending(data))
+    {
+        LogVerbose("0x%x: crop in flight - deferring map until it resolves (crop-before-show)",
+            data->Handle);
+        return FALSE;
+    }
+
     // hide search regardless of its state if start is being shown
     // FIXME: this is a workaround for search being detected as visible and not DWM-cloaked
     // even if it's really invisible/transparent
