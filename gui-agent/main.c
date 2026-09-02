@@ -165,6 +165,12 @@ BOOL g_NoScreenGrant = FALSE;
 // fresh WGC monitor frames for this long, so a repaint whose WGC frame arrives after the DDA damage
 // (the two clocks are independent) is not left stale. WGC FrameArrived latency is well under this.
 #define WGC_MON_CHASE_MS 250
+// FlattenCorners (DWORD, default 0, EXPERIMENTAL): Win11 rounds window corners at DWM composition;
+// broker WGC capture grabs that composited result, so the rounded-out corner triangles come through
+// as transparent -> BLACK in dom0. When set, replace ONLY the near-black pixels in each corner block
+// with the window's own sampled background (never touches real content), squaring off the ugly black.
+#define REG_CONFIG_FLATTEN_CORNERS_VALUE L"FlattenCorners"
+BOOL          g_FlattenCorners = FALSE;
 BOOL          g_WgcBroker   = FALSE;
 BOOL          g_SliceRetire = FALSE;   // diagnostic: broker-only sliceFed, no slice fallback
 DWORD         g_OsBuild     = 0;
@@ -5189,6 +5195,57 @@ static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child)
     PwPatchSynthChildClipped(owner, child, NULL);
 }
 
+// EXPERIMENTAL (g_FlattenCorners): square off the ugly black rounded-corner triangles that Win11's
+// DWM corner rounding leaves in the broker's WGC capture. For each of the 4 corners, sample the
+// window's own background just inside the corner and replace ONLY near-black pixels in the corner
+// triangle with it - never touches real content (a corner with content there stays put), and it is
+// a no-op on windows whose corners aren't black (synthesized menus blend onto their owner, dark apps
+// sample dark). Idempotent: once flattened the corner is no longer near-black, so no re-damage. Sends
+// a small per-corner damage rect only on the frame it actually changes something.
+#define FLATTEN_CORNER_R 12
+static void FlattenBufferCorners(IN OUT WINDOW_DATA* entry)
+{
+    if (!g_FlattenCorners || !entry->PwBuffer) return;
+    int W = (int)entry->PwWidth, H = (int)entry->PwHeight;
+    const int R = FLATTEN_CORNER_R;
+    if (W < 2 * R || H < 2 * R) return;
+    BYTE* buf = (BYTE*)entry->PwBuffer;
+    // corner origin (buffer coords) + inward step + sample point (past the arc, window bg)
+    const struct { int ox, oy, dirx, diry, sx, sy; } C[4] = {
+        { 0,     0,      1,  1,  R,       R       },   // top-left
+        { W - 1, 0,     -1,  1,  W - 1-R, R       },   // top-right
+        { 0,     H - 1,  1, -1,  R,       H - 1-R },   // bottom-left
+        { W - 1, H - 1, -1, -1,  W - 1-R, H - 1-R },   // bottom-right
+    };
+    for (int c = 0; c < 4; c++)
+    {
+        const BYTE* s = buf + ((size_t)C[c].sy * W + C[c].sx) * 4;
+        // Need an opaque, non-dark background to fill with; if the sample point itself is dark or
+        // transparent (a genuinely dark/empty window) there is nothing clean to square with.
+        if ((s[0] < 24 && s[1] < 24 && s[2] < 24) || s[3] < 128) continue;
+        BOOL changed = FALSE;
+        for (int j = 0; j < R; j++)
+            for (int i = 0; i < R - j; i++)                  // the corner triangle (i + j < R)
+            {
+                int x = C[c].ox + C[c].dirx * i, y = C[c].oy + C[c].diry * j;
+                if (x < 0 || x >= W || y < 0 || y >= H) continue;
+                BYTE* p = buf + ((size_t)y * W + x) * 4;
+                // The rounded-out corner reads as near-black RGB OR transparent alpha (which dom0
+                // renders as its black backdrop). Either way, fill with the window bg, force opaque.
+                if ((p[0] < 24 && p[1] < 24 && p[2] < 24) || p[3] < 128)
+                {
+                    p[0] = s[0]; p[1] = s[1]; p[2] = s[2]; p[3] = 255;
+                    changed = TRUE;
+                }
+            }
+        if (changed)
+        {
+            int dx = (C[c].ox == 0) ? 0 : (W - R), dy = (C[c].oy == 0) ? 0 : (H - R);
+            (void)SendWindowDamageEvent(entry->Handle, dx, dy, R, R);
+        }
+    }
+}
+
 // Has the SCREEN content over this window's rect changed since the last recapture trigger?
 //
 // WHY THIS EXISTS. Windows 11 presents far more frames than Windows 10 for the same input -
@@ -6546,6 +6603,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     }
                 }
             }
+            // EXPERIMENTAL (g_FlattenCorners): the buffer is fully updated for this window now;
+            // square off any black rounded-corner triangles left by DWM corner rounding in the
+            // capture. No-op unless enabled, and only touches near-black corner pixels.
+            FlattenBufferCorners(entry);
+
             // Per-window-path windows leave the loop here, so they need the same two
             // settle steps the legacy path runs below: flush a withheld position once
             // the window is quiet, and apply the newest daemon-dictated geometry if one
@@ -8155,8 +8217,13 @@ static ULONG Init(void)
         (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_RETIRE_VALUE, &sr, NULL);
         g_SliceRetire = (sr != 0);
     }
-    LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d (floor 26100)",
-            g_WgcBroker, g_OsBuild, g_SliceRetire);
+    {
+        DWORD fc = 0;
+        (void)CfgReadDword(moduleName, REG_CONFIG_FLATTEN_CORNERS_VALUE, &fc, NULL);
+        g_FlattenCorners = (fc != 0);
+    }
+    LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d flattenCorners=%d (floor 26100)",
+            g_WgcBroker, g_OsBuild, g_SliceRetire, g_FlattenCorners);
 
     // Diagnostic-only window-filter override; absent (the normal case) means 0 = all
     // filters active. See g_DiagWindowFilterOff.
