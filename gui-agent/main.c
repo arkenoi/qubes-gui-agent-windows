@@ -40,6 +40,7 @@
 #include "workarea.h"
 #include <sddl.h>
 #include <wtsapi32.h>
+#pragma comment(lib, "wtsapi32.lib")   // WTSQueryUserToken for the broker's session token
 #include "wgcbroker_ipc.h"
 #include "wincapture.h"
 #include "vchan-handlers.h"
@@ -1962,19 +1963,53 @@ static BOOL WgcCreateSection(void)
     return TRUE;
 }
 
-// Launch wgcbroker.exe (sits next to gui-agent.exe) into the interactive user session by
-// borrowing the shell's token - the exact mechanism SpawnHelperAsUser uses - but KEEP the
-// process handle so broker death is an instant signal.
-static BOOL WgcLaunch(void)
+// Obtain a PRIMARY token for the interactive console user. Prefer WTSQueryUserToken (the real
+// session token) - CreateForMonitor in the broker FAILS with E_HANDLE under a merely-borrowed
+// shell token, but works under the WTS session token (proven: the schtasks /ru user /it probe,
+// which runs on exactly this token, captured the monitor fine). Fall back to borrowing the
+// shell's token (SpawnHelperAsUser's mechanism) if WTS is unavailable.
+static HANDLE WgcAcquireUserToken(void)
 {
+    HANDLE primary = NULL;
+    DWORD sid = WTSGetActiveConsoleSessionId();
+    if (sid != 0xFFFFFFFF)
+    {
+        HANDLE wtok = NULL;
+        if (WTSQueryUserToken(sid, &wtok))
+        {
+            // WTSQueryUserToken yields a primary token already; dup to TOKEN_ALL_ACCESS so
+            // CreateProcessAsUser has every right it may need, then release the original.
+            DuplicateTokenEx(wtok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &primary);
+            CloseHandle(wtok);
+            if (primary) { LogInfo("WGCBROKER token: WTS session %lu", sid); return primary; }
+        }
+        else win_perror("WTSQueryUserToken");
+    }
+    // Fallback: borrow the shell's token.
     HWND shell = GetShellWindow();
-    if (!shell) return FALSE;
+    if (!shell) return NULL;
     DWORD pid = 0; GetWindowThreadProcessId(shell, &pid);
     HANDLE proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
-    if (!proc) return FALSE;
-    HANDLE tok = NULL, primary = NULL; BOOL ok = FALSE;
-    if (OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY, &tok) &&
-        DuplicateTokenEx(tok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &primary))
+    if (!proc) return NULL;
+    HANDLE tok = NULL;
+    if (OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY, &tok))
+    {
+        DuplicateTokenEx(tok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &primary);
+        CloseHandle(tok);
+    }
+    CloseHandle(proc);
+    if (primary) LogInfo("WGCBROKER token: shell-borrow (WTS unavailable)");
+    return primary;
+}
+
+// Launch wgcbroker.exe (sits next to gui-agent.exe) into the interactive user session on the
+// real session token (WTSQueryUserToken; shell-borrow fallback) - KEEP the process handle so
+// broker death is an instant signal.
+static BOOL WgcLaunch(void)
+{
+    HANDLE primary = WgcAcquireUserToken();
+    if (!primary) return FALSE;
+    BOOL ok = FALSE;
     {
         WCHAR self[MAX_PATH] = { 0 };
         if (GetModuleFileName(NULL, self, RTL_NUMBER_OF(self)))
@@ -2002,9 +2037,7 @@ static BOOL WgcLaunch(void)
             }
         }
     }
-    if (primary) CloseHandle(primary);
-    if (tok) CloseHandle(tok);
-    CloseHandle(proc);
+    CloseHandle(primary);
     return ok;
 }
 
