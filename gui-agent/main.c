@@ -198,6 +198,7 @@ static int g_WgcPendingCount = 0;
 static LONG   g_WgcMonitorSlot = -1;   // slot capturing the whole monitor (o-r/static slice source)
 static void BrokerRegisterMonitor(void);   // defined after BrokerFreshFrame; called from BrokerSupervise
 static void WgcArenaReapPending(void);      // defined with the arena allocator; called from BrokerSupervise
+static BOOL BrokerOpaqueInsets(IN HWND window, OUT RECT* insets);  // defined after BrokerFreshFrame; used by the crop in GetWindowData
 
 // minimal acceptable window dimensions
 DWORD g_MinWindowWidth = 0;
@@ -1540,7 +1541,27 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     if (IsShellToastWindow(entry) || IsMenuPopupWindow(entry))
     {
         RECT insets;
-        if (ToastCropLookup(entry, &insets))
+        BOOL have = FALSE;
+        // Menus: prefer the broker's PIXEL-EXACT opaque-bounds report (measured from the full
+        // PrintWindow render) over UIA's +/-1-2px estimate. It is shared memory written by the
+        // UNTRUSTED guest broker, so validate hard: non-negative insets that still leave a card at
+        // least half the window in each dim (a real menu's shadow margin is tiny, ~90%+ card; the
+        // 50% floor blocks a malicious broker from cropping the window down to a sliver). All-zero
+        // is a valid "no margin, no crop". Anything implausible falls back to the UIA path.
+        if (IsMenuPopupWindow(entry) && BrokerOpaqueInsets(entry->Handle, &insets))
+        {
+            LONG cw = (LONG)entry->Width  - insets.left - insets.right;
+            LONG ch = (LONG)entry->Height - insets.top  - insets.bottom;
+            if (insets.left >= 0 && insets.top >= 0 && insets.right >= 0 && insets.bottom >= 0 &&
+                cw * 2 >= (LONG)entry->Width && ch * 2 >= (LONG)entry->Height)
+                have = (insets.left || insets.top || insets.right || insets.bottom);
+            else if (ToastCropLookup(entry, &insets))
+                have = TRUE;
+        }
+        else if (ToastCropLookup(entry, &insets))
+            have = TRUE;
+
+        if (have)
         {
             entry->X += (int)insets.left;
             entry->Y += (int)insets.top;
@@ -2294,6 +2315,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     // menus once they were both broker-captured AND cropped). entry->CropLeft/Top are set by the
     // toast/menu crop in GetWindowData before the slice-fed window is (re)registered here.
     s->ReqCropX = (LONG)entry->CropLeft; s->ReqCropY = (LONG)entry->CropTop;
+    s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;  // "not measured yet" until the broker reports
     s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
     MemoryBarrier();
     s->Hwnd = (UINT64)(ULONG_PTR)entry->Handle;
@@ -2367,6 +2389,34 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
         }
     }
     return FALSE;   // torn/starved -> caller falls back to the desktop slice this frame
+}
+
+// Pixel-exact crop: the broker PrintWindow-renders the FULL window (transparent margin = black) and
+// reports the menu's true OPAQUE bounding box as insets from the window rect (WGCBRK_SLOT.Opaque*).
+// Return TRUE + those insets when a live slot for this HWND has published a measurement (Opaque* are
+// initialised to -1 at registration and written >=0 only once measured), so the caller can crop to
+// the menu's exterior edge instead of UIA's +/-1-2px estimate. Scanned by HWND because the crop runs
+// on a fresh WINDOW_DATA with no slot index. All-zero is a valid "no margin" answer, not "unknown".
+static BOOL BrokerOpaqueInsets(IN HWND window, OUT RECT* insets)
+{
+    ZeroMemory(insets, sizeof(*insets));
+    if (!g_WgcBase || !WgcBrokerActive())
+        return FALSE;
+    WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
+    for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
+    {
+        WGCBRK_SLOT* s = &slots[i];
+        if (s->Hwnd != (UINT64)(ULONG_PTR)window)
+            continue;
+        if (s->AckState != WGCBRK_ACTIVE)
+            return FALSE;                      // registered but no frame yet -> caller uses UIA
+        LONG l = s->OpaqueL, t = s->OpaqueT, r = s->OpaqueR, b = s->OpaqueB;
+        if (l < 0 || t < 0 || r < 0 || b < 0)
+            return FALSE;                      // not measured yet -> caller uses UIA
+        insets->left = l; insets->top = t; insets->right = r; insets->bottom = b;
+        return TRUE;                           // measured (may be all-zero = no margin)
+    }
+    return FALSE;
 }
 
 // Register a full-screen MONITOR capture slot with the broker (once). The broker CreateForMonitor()s

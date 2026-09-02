@@ -65,7 +65,11 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG   _pad0;
     volatile UINT64 FrameId;             /* monotonic; agent skips a slot with unchanged FrameId */
     volatile LONGLONG CaptureTick;       /* GetTickCount64 at publish; freshness vs secure-left */
-    BYTE            _pad1[16];
+    /* Pixel-exact crop: the broker PrintWindow-renders the FULL window (transparent margin comes
+     * out black) and reports the menu's true OPAQUE bounding box as insets from the window rect.
+     * The agent tightens the crop to these instead of UIA's +/-1-2px estimate; they never cut
+     * opaque content. 0/0/0/0 = not reported (agent keeps UIA). Occupies the old _pad1[16]. */
+    volatile LONG   OpaqueL, OpaqueT, OpaqueR, OpaqueB;
 } WGCBRK_SLOT;
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))
