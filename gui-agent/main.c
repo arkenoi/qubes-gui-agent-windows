@@ -161,6 +161,10 @@ BOOL g_NoScreenGrant = FALSE;
 // the broker cannot capture (shell CoreWindows) goes blank, mapping the residual gap. Toasts are
 // covered separately by the notifhost interceptor (normal windows, not sliceFed).
 #define REG_CONFIG_SLICE_RETIRE_VALUE L"SliceRetire"
+// After the DDA reports damage over a monitor-sliced (o-r/static) window, keep re-copying it from
+// fresh WGC monitor frames for this long, so a repaint whose WGC frame arrives after the DDA damage
+// (the two clocks are independent) is not left stale. WGC FrameArrived latency is well under this.
+#define WGC_MON_CHASE_MS 250
 BOOL          g_WgcBroker   = FALSE;
 BOOL          g_SliceRetire = FALSE;   // diagnostic: broker-only sliceFed, no slice fallback
 DWORD         g_OsBuild     = 0;
@@ -2263,7 +2267,8 @@ static void BrokerRegisterMonitor(void)
 
 // Read a fresh, bounds-checked MONITOR frame (screen-relative). Source for slicing static/o-r
 // windows out of the broker's composited monitor capture.
-static BOOL BrokerMonitorFrame(OUT const BYTE** base, OUT int* pitch, OUT int* w, OUT int* h)
+static BOOL BrokerMonitorFrame(OUT const BYTE** base, OUT int* pitch, OUT int* w, OUT int* h,
+                               OUT UINT64* id)
 {
     if (!g_WgcBase || g_WgcMonitorSlot < 0) return FALSE;
     WGCBRK_HEADER* hd = WGCBRK_HDR(g_WgcBase);
@@ -2276,7 +2281,7 @@ static BOOL BrokerMonitorFrame(OUT const BYTE** base, OUT int* pitch, OUT int* w
         if (s0 & 1) { YieldProcessor(); continue; }
         MemoryBarrier();
         LONG b = s->ActiveBuffer, fw = s->FrameWidth, fh = s->FrameHeight, stride = s->Stride;
-        LONGLONG tick = s->CaptureTick, boff;
+        LONGLONG tick = s->CaptureTick, boff; UINT64 fid = s->FrameId;
         if (b < 0 || b >= WGCBRK_RING) return FALSE;
         boff = s->BufOffset[b];
         if (fw <= 0 || fh <= 0 || stride != fw * 4) return FALSE;
@@ -2287,7 +2292,7 @@ static BOOL BrokerMonitorFrame(OUT const BYTE** base, OUT int* pitch, OUT int* w
         if ((ULONGLONG)tick < g_SecureDesktopLeftTick) return FALSE;
         const BYTE* front = WGCBRK_ARENA(g_WgcBase, boff);
         MemoryBarrier();
-        if (s->Seq == s0) { *base = front; *pitch = (int)stride; *w = fw; *h = fh; return TRUE; }
+        if (s->Seq == s0) { *base = front; *pitch = (int)stride; *w = fw; *h = fh; *id = fid; return TRUE; }
     }
     return FALSE;
 }
@@ -5841,27 +5846,52 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // the DDA fb. This is the fix that keeps explorer popups from going black.
                 else if (g_SliceRetire && WgcBrokerActive())
                 {
-                    const BYTE* mb = NULL; int mp = 0, mw = 0, mh = 0;
-                    BOOL monOk = BrokerMonitorFrame(&mb, &mp, &mw, &mh);
-                    if (!entry->PwBrokerLastId)   // one-shot per window
+                    const BYTE* mb = NULL; int mp = 0, mw = 0, mh = 0; UINT64 mid = 0;
+                    BOOL monOk = BrokerMonitorFrame(&mb, &mp, &mw, &mh, &mid);
+                    if (!entry->PwMonLogged)   // one-shot diagnostic per window
                     {
-                        entry->PwBrokerLastId = 1;
+                        entry->PwMonLogged = TRUE;
                         LogInfo("MONSLICE hwnd 0x%x monAvail=%d mon=%dx%d rect=%d,%d,%d,%d",
                                 (DWORD)(ULONG_PTR)entry->Handle, monOk, mw, mh,
                                 pwRect.left, pwRect.top, pwRect.right, pwRect.bottom);
                     }
                     if (monOk)
                     {
+                        ULONGLONG now = GetTickCount64();
+                        // Did the DDA damage clock report a change over this window this pass?
+                        BOOL damaged = FALSE;
+                        for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
+                            if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect)) { damaged = TRUE; break; }
+
                         if (entry->PwSliceNeedsFull)
                         {
+                            // Fresh attach/remap: one full-window copy, then chase WGC frames briefly
+                            // (the window may still be painting its initial content).
                             entry->PwSliceNeedsFull = FALSE;
+                            entry->PwMonLastId = mid;
+                            entry->PwMonRefreshUntil = now + WGC_MON_CHASE_MS;
                             PwSliceCopyAndDamageSrc(entry, mb, mp, 0, 0, &pwRect);
                         }
-                        else
+                        else if (damaged)
                         {
+                            // DDA saw damage over the window: copy the changed sub-regions now, and
+                            // (re)arm the catch-up window so lagged WGC frames are picked up below.
+                            entry->PwMonRefreshUntil = now + WGC_MON_CHASE_MS;
+                            entry->PwMonLastId = mid;
                             for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
                                 if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
                                     PwSliceCopyAndDamageSrc(entry, mb, mp, 0, 0, &pwHit);
+                        }
+                        else if (now < entry->PwMonRefreshUntil && mid != entry->PwMonLastId)
+                        {
+                            // Catch-up: within the post-damage window a FRESH monitor frame arrived.
+                            // The WGC frame that reflects the earlier repaint (which the DDA already
+                            // reported and moved on from) is only now available - re-copy the full
+                            // window rect so menus don't keep the stale pre-repaint pixels. Bounded
+                            // to WGC_MON_CHASE_MS after the last damage, so a static window that is
+                            // merely near unrelated on-screen animation is not repeatedly re-copied.
+                            entry->PwMonLastId = mid;
+                            PwSliceCopyAndDamageSrc(entry, mb, mp, 0, 0, &pwRect);
                         }
                     }
                     // else: broker monitor frame not yet available -> leave last content

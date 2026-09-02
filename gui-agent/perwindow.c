@@ -495,6 +495,11 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwDumpSent = TRUE;
     entry->PwSliceFed = sliceFed;
     entry->PwSliceNeedsFull = sliceFed; // first frame does one full-window copy
+    // Monitor-slice chase state: fresh attach starts clean so a reused struct never carries a
+    // stale FrameId/deadline into the SliceRetire catch-up logic (see ProcessNewFrame MONSLICE).
+    entry->PwMonLastId = 0;
+    entry->PwMonRefreshUntil = 0;
+    entry->PwMonLogged = FALSE;
     // WGC broker (24H2+): if this is an occluded NRB app window, source its pixels from the
     // user-session broker's per-HWND WGC capture instead of the composited-desktop slice.
     // No-op unless the broker is active and the window is the eligible class; falls back to

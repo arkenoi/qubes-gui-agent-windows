@@ -256,6 +256,15 @@ typedef struct _WINDOW_DATA
     UINT64 PwBrokerLastId;    // last WGCBRK_SLOT.FrameId consumed (change detection)
     UINT64 PwBrokerArenaOff;  // this window's ring[0] arena offset (for release); 0 if none
 
+    // Monitor-slice (SliceRetire, o-r/static windows fed from the broker's whole-desktop
+    // CreateForMonitor frame). The DDA damage clock and the WGC monitor-frame clock are
+    // independent, so a repaint the DDA reports can land in a WGC frame that arrives LATER with
+    // no further DDA damage - leaving a menu with stale pixels. After any damage over the window
+    // we "chase" fresh monitor frames for a short window and re-copy, so the lagged frame is picked up.
+    UINT64   PwMonLastId;       // last monitor-slot FrameId this window copied from
+    ULONGLONG PwMonRefreshUntil;// GetTickCount64 deadline: keep chasing fresh monitor frames until then
+    BOOL     PwMonLogged;       // one-shot MONSLICE diagnostic emitted (own flag, not PwBrokerLastId)
+
     // Move-only drag fast path (ProcessNewFrame, PrintWindow-fed branch): a pure
     // position change does not alter the window's own content - the per-window buffer
     // is position-invariant and dom0 repositions it from MSG_CONFIGURE alone - so the
