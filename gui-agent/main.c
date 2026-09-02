@@ -5111,17 +5111,33 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
     if (FiGateOff(FI_NOSYNTHPAINT))
         return;
 
-    if (!g_FbBits || g_FbPitch <= 0 || !owner->PwBuffer)
+    if (!owner->PwBuffer)
     {
-        LogWarning("synth paint 0x%x: no source (fb=%p pitch=%d buf=%p)",
-            c->Handle, g_FbBits, g_FbPitch, owner->PwBuffer);
+        LogWarning("synth paint 0x%x: no owner buffer", c->Handle);
+        return;
+    }
+    // Composited-desktop source. Under SliceRetire the agent's own DDA composited desktop
+    // (g_FbBits) is being retired, so source from the broker's monitor capture instead - it is the
+    // same composited desktop in SCREEN coordinates (broker CreateForMonitor), so the clip/copy math
+    // below is identical; only the base+pitch+extent differ. Falls back to the DDA framebuffer when
+    // the broker monitor frame is not available (non-retire, or broker not yet ready). This is what
+    // removes synthesis's dependency on the agent slice - the last synth-path retirement blocker.
+    const BYTE* srcBase = NULL; int srcPitch = 0, srcW = 0, srcH = 0;
+    const BYTE* mb = NULL; int mp = 0, mw = 0, mh = 0; UINT64 mid = 0;
+    if (g_SliceRetire && WgcBrokerActive() && BrokerMonitorFrame(&mb, &mp, &mw, &mh, &mid))
+    { srcBase = mb; srcPitch = mp; srcW = mw; srcH = mh; }
+    else if (g_FbBits && g_FbPitch > 0)
+    { srcBase = g_FbBits; srcPitch = g_FbPitch; srcW = (int)g_FbWidth; srcH = (int)g_FbHeight; }
+    if (!srcBase)
+    {
+        LogWarning("synth paint 0x%x: no composited source (broker monitor + DDA fb both unavailable)", c->Handle);
         return;
     }
 
     RECT childR = { c->X, c->Y, c->X + (int)c->Width, c->Y + (int)c->Height };
     RECT ownerR = { owner->X, owner->Y,
                     owner->X + (int)owner->PwWidth, owner->Y + (int)owner->PwHeight };
-    RECT screenR = { 0, 0, (LONG)min(g_ScreenWidth, g_FbWidth), (LONG)min(g_ScreenHeight, g_FbHeight) };
+    RECT screenR = { 0, 0, (LONG)min((int)g_ScreenWidth, srcW), (LONG)min((int)g_ScreenHeight, srcH) };
     RECT r;
     if (!IntersectRect(&r, &childR, &ownerR) || !IntersectRect(&r, &r, &screenR))
     {
@@ -5151,13 +5167,13 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
             (uint32_t)(ULONG_PTR)c->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
             relX, relY, w, h);
 
-    const BYTE* src = g_FbBits + (size_t)r.top * g_FbPitch + (size_t)r.left * 4;
+    const BYTE* src = srcBase + (size_t)r.top * srcPitch + (size_t)r.left * 4;
     BYTE* dst = (BYTE*)owner->PwBuffer +
         ((size_t)relY * owner->PwWidth + (size_t)relX) * 4;
     for (int row = 0; row < h; row++)
     {
         memcpy(dst, src, (size_t)w * 4);
-        src += g_FbPitch;
+        src += srcPitch;
         dst += (size_t)owner->PwWidth * 4;
     }
     (void)SendWindowDamageEvent(owner->Handle, relX, relY, w, h);
