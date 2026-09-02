@@ -38,6 +38,9 @@
 #include "send.h"
 #include "perwindow.h"
 #include "workarea.h"
+#include <sddl.h>
+#include <wtsapi32.h>
+#include "wgcbroker_ipc.h"
 #include "wincapture.h"
 #include "vchan-handlers.h"
 #include "util.h"
@@ -142,6 +145,24 @@ BOOL g_StagingGrant = TRUE;
 // per-window grants. Requires g_StagingGrant (the direct-map path grants the mapped DXGI
 // surface itself and has no ungranted form). One registry flip + agent restart per arm.
 BOOL g_NoScreenGrant = FALSE;
+
+// WGC capture broker (DESIGN-wgc-broker.md): user-session helper that captures OCCLUDED
+// app/NRB windows via Windows.Graphics.Capture (which the SYSTEM agent itself cannot
+// activate) and streams frames through a cross-session shared section. Win11 24H2+ (26100)
+// only; feature-gated (registry "WgcBroker" / qubesdb /qubes-service/wgc-broker), default
+// OFF (experimental). Stage 2a here is section+spawn+supervise ONLY (no consumer): it can
+// never affect rendering. Toasts/o-r menus are NOT routed here (topmost, slice-correct; the
+// toast interceptor handles toasts). See wgcbroker_ipc.h for the contract.
+#define REG_CONFIG_WGC_BROKER_VALUE L"WgcBroker"
+BOOL          g_WgcBroker   = FALSE;
+DWORD         g_OsBuild     = 0;
+volatile LONG g_BrokerReady = 0;
+static HANDLE g_WgcMap = NULL, g_WgcCtl = NULL, g_WgcBrokerProc = NULL;
+static BYTE*  g_WgcBase = NULL;
+static DWORD  g_WgcSession = 0xFFFFFFFF;
+static ULONGLONG g_WgcNextPoll = 0;
+static UINT64 g_WgcNonce = 0;
+static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
 
 // minimal acceptable window dimensions
 DWORD g_MinWindowWidth = 0;
@@ -1885,6 +1906,138 @@ static BOOL SpawnHelperAsUser(IN HWND tokenSource, IN const WCHAR* args)
     if (tok) CloseHandle(tok);
     CloseHandle(proc);
     return ok;
+}
+
+// ---- WGC broker (stage 2a: section + spawn + supervise; NO frame consumer yet) ----------
+// SYSTEM creates the Global\ section (SeCreateGlobalPrivilege), so a user-IL process can only
+// OPEN it, never squat the name. SDDL grants SYSTEM full, the interactive user R/W, Medium IL
+// no-write-up. The nonce only makes the name unpredictable per launch; it is not a security
+// boundary (the ACL is).
+static BOOL WgcCreateSection(void)
+{
+    LARGE_INTEGER pc; QueryPerformanceCounter(&pc);
+    g_WgcNonce = ((UINT64)GetTickCount64() << 20) ^ (UINT64)pc.QuadPart
+               ^ ((UINT64)GetCurrentProcessId() << 3);
+    WCHAR nmShm[128], nmCtl[128];
+    StringCchPrintf(nmShm, RTL_NUMBER_OF(nmShm), L"Global\\QubesWgcBrk_%llx_shm", g_WgcNonce);
+    StringCchPrintf(nmCtl, RTL_NUMBER_OF(nmCtl), L"Global\\QubesWgcBrk_%llx_ctl", g_WgcNonce);
+
+    PSECURITY_DESCRIPTOR sdS = NULL, sdE = NULL;
+    // section: SY GENERIC_ALL, IU GENERIC_READ|WRITE; event: SY all, IU SYNCHRONIZE|MODIFY_STATE
+    ConvertStringSecurityDescriptorToSecurityDescriptor(
+        L"D:P(A;;GA;;;SY)(A;;GRGW;;;IU)S:(ML;;NW;;;ME)", SDDL_REVISION_1, &sdS, NULL);
+    ConvertStringSecurityDescriptorToSecurityDescriptor(
+        L"D:P(A;;GA;;;SY)(A;;0x100002;;;IU)S:(ML;;NW;;;ME)", SDDL_REVISION_1, &sdE, NULL);
+    if (!sdS || !sdE) { if (sdS) LocalFree(sdS); if (sdE) LocalFree(sdE); return FALSE; }
+    SECURITY_ATTRIBUTES saS = { sizeof(saS), sdS, FALSE }, saE = { sizeof(saE), sdE, FALSE };
+
+    ULONGLONG total = (ULONGLONG)WGCBRK_HEADER_BYTES + g_WgcArenaBytes;
+    g_WgcMap = CreateFileMapping(INVALID_HANDLE_VALUE, &saS, PAGE_READWRITE,
+        (DWORD)(total >> 32), (DWORD)(total & 0xFFFFFFFF), nmShm);
+    if (g_WgcMap && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(g_WgcMap); g_WgcMap = NULL; }
+    if (g_WgcMap) g_WgcBase = (BYTE*)MapViewOfFile(g_WgcMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+    g_WgcCtl = CreateEvent(&saE, FALSE, FALSE, nmCtl);
+    LocalFree(sdS); LocalFree(sdE);
+    if (!g_WgcBase || !g_WgcCtl) return FALSE;
+
+    WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
+    ZeroMemory(g_WgcBase, WGCBRK_HEADER_BYTES);
+    h->AbiVersion = WGCBRK_ABI_VERSION; h->SlotCount = WGCBRK_MAX_SLOTS;
+    h->ArenaOffset = WGCBRK_HEADER_BYTES; h->ArenaBytes = g_WgcArenaBytes;
+    h->AgentPid = (LONG)GetCurrentProcessId();
+    h->AgentHeartbeat = (LONGLONG)GetTickCount64();
+    MemoryBarrier();
+    _InterlockedExchange(&h->Magic, (LONG)WGCBRK_MAGIC);   // publish readiness LAST
+    LogInfo("WGCBROKER section created (%llu bytes, arena %lu)", total, g_WgcArenaBytes);
+    return TRUE;
+}
+
+// Launch wgcbroker.exe (sits next to gui-agent.exe) into the interactive user session by
+// borrowing the shell's token - the exact mechanism SpawnHelperAsUser uses - but KEEP the
+// process handle so broker death is an instant signal.
+static BOOL WgcLaunch(void)
+{
+    HWND shell = GetShellWindow();
+    if (!shell) return FALSE;
+    DWORD pid = 0; GetWindowThreadProcessId(shell, &pid);
+    HANDLE proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
+    if (!proc) return FALSE;
+    HANDLE tok = NULL, primary = NULL; BOOL ok = FALSE;
+    if (OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY, &tok) &&
+        DuplicateTokenEx(tok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &primary))
+    {
+        WCHAR self[MAX_PATH] = { 0 };
+        if (GetModuleFileName(NULL, self, RTL_NUMBER_OF(self)))
+        {
+            WCHAR* sl = wcsrchr(self, L'\\');
+            if (sl)
+            {
+                *sl = 0;
+                WCHAR cmd[MAX_PATH * 2];
+                StringCchPrintf(cmd, RTL_NUMBER_OF(cmd),
+                    L"\"%s\\wgcbroker.exe\" --serve --agent-pid %lu "
+                    L"--shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl",
+                    self, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce);
+                STARTUPINFO si = { 0 }; PROCESS_INFORMATION pi = { 0 };
+                si.cb = sizeof(si); si.lpDesktop = L"winsta0\\default";
+                if (CreateProcessAsUser(primary, NULL, cmd, NULL, NULL, FALSE,
+                        CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+                {
+                    CloseHandle(pi.hThread);
+                    g_WgcBrokerProc = pi.hProcess;   // KEEP for instant death detection
+                    ok = TRUE;
+                    LogInfo("WGCBROKER launched pid %lu", pi.dwProcessId);
+                }
+                else win_perror("CreateProcessAsUser(wgcbroker)");
+            }
+        }
+    }
+    if (primary) CloseHandle(primary);
+    if (tok) CloseHandle(tok);
+    CloseHandle(proc);
+    return ok;
+}
+
+// ~1 Hz supervisor. Creates the section on first eligible pass, keeps the heartbeat fresh,
+// (re)launches the broker when it is absent/dead or the console session changed, and marks it
+// ready once its heartbeat advances. Called from the frame path and the idle sweep. Cannot
+// affect rendering in stage 2a - nothing consumes broker frames yet.
+static void BrokerSupervise(void)
+{
+    if (!g_WgcBroker || g_OsBuild < 26100 || !PwEnabled()) return;
+    ULONGLONG now = GetTickCount64();
+    if (now < g_WgcNextPoll) return;
+    g_WgcNextPoll = now + 1000;
+    if (!g_WgcBase && !WgcCreateSection()) return;
+    WGCBRK_HDR(g_WgcBase)->AgentHeartbeat = (LONGLONG)now;
+
+    DWORD sid = WTSGetActiveConsoleSessionId();
+    BOOL alive = g_WgcBrokerProc &&
+        WaitForSingleObject(g_WgcBrokerProc, 0) == WAIT_TIMEOUT && g_WgcSession == sid;
+    if (alive)
+    {
+        if (!g_BrokerReady &&
+            (LONGLONG)now - WGCBRK_HDR(g_WgcBase)->BrokerHeartbeat < 3000)
+        {
+            _InterlockedExchange(&g_BrokerReady, 1);
+            LogInfo("WGCBROKER ready (heartbeat live)");
+        }
+        return;
+    }
+    if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL; }
+    _InterlockedExchange(&g_BrokerReady, 0);
+    if (sid != 0xFFFFFFFF && GetShellWindow() && WgcLaunch())
+        g_WgcSession = sid;
+}
+
+static void BrokerShutdown(void)
+{
+    if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->Shutdown = 1;
+    if (g_WgcBrokerProc)
+    {
+        WaitForSingleObject(g_WgcBrokerProc, 1500);
+        CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
+    }
 }
 
 // Guest-native window shadows off in seamless, restored in fullscreen. The shell window gives us a
@@ -6729,6 +6882,8 @@ static ULONG WINAPI WatchForEvents(void)
         if (WAIT_TIMEOUT == signaledEvent && g_VchanClientConnected)
             DaemonSettleSweep();
 
+        BrokerSupervise();   // ~1 Hz self-throttled; no-op unless the WgcBroker gate is on
+
         switch (signaledEvent)
         {
         case 1: // new frame available
@@ -7203,6 +7358,9 @@ static ULONG WINAPI WatchForEvents(void)
 
     LogDebug("main loop finished");
 
+    // Signal the user-session WGC broker to exit and reap it (harmless no-op if never started).
+    BrokerShutdown();
+
     // --- A6 (approved design, 2.2): bounded, leak-free exit. Previously the exit order
     // was PwShutdown -> libvchan_close -> StopFrameProcessing -> CaptureTeardown: no
     // per-window teardown ever ran (every attached buffer leaked its grant silently) and
@@ -7448,6 +7606,32 @@ static ULONG Init(void)
         LogWarning("Failed to read '%s' config value, using default (TRUE)", REG_CONFIG_CURSOR_VALUE);
         g_DisableCursor = TRUE;
     }
+
+    // WGC broker gate (24H2+ occluded-window capture, experimental). OS build via RtlGetVersion
+    // (GetVersionEx lies without a manifest); registry "WgcBroker" default 0, dom0 override
+    // /qubes-service/wgc-broker wins (mirrors the staging/seamless gates).
+    {
+        // OSVERSIONINFOW is layout-compatible with RTL_OSVERSIONINFOW for the fields RtlGetVersion
+        // fills (avoids pulling <winternl.h>); GetVersionEx would lie without a manifest.
+        OSVERSIONINFOW rovi; ZeroMemory(&rovi, sizeof(rovi)); rovi.dwOSVersionInfoSize = sizeof(rovi);
+        HMODULE nt = GetModuleHandle(L"ntdll.dll");
+        LONG(WINAPI * pRtlGetVersion)(OSVERSIONINFOW*) = nt ?
+            (LONG(WINAPI*)(OSVERSIONINFOW*))GetProcAddress(nt, "RtlGetVersion") : NULL;
+        if (pRtlGetVersion && pRtlGetVersion(&rovi) == 0) g_OsBuild = rovi.dwBuildNumber;
+    }
+    {
+        DWORD wgc = 0;
+        (void)CfgReadDword(moduleName, REG_CONFIG_WGC_BROKER_VALUE, &wgc, NULL);
+        g_WgcBroker = (wgc != 0);
+        qdb_handle_t q = qdb_open(NULL);
+        if (q)
+        {
+            char* v = qdb_read(q, "/qubes-service/wgc-broker", NULL);
+            if (v) { g_WgcBroker = (v[0] != '0'); free(v); }
+            qdb_close(q);
+        }
+    }
+    LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu (floor 26100)", g_WgcBroker, g_OsBuild);
 
     // Diagnostic-only window-filter override; absent (the normal case) means 0 = all
     // filters active. See g_DiagWindowFilterOff.
