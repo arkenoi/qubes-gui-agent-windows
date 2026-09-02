@@ -2287,7 +2287,13 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     s->BufOffset[0] = (LONGLONG)off0; s->BufOffset[1] = (LONGLONG)off1;
     s->BufBytes = (LONGLONG)one;
     s->ReqWidth = (LONG)entry->Width; s->ReqHeight = (LONG)entry->Height;
-    s->ReqCropX = 0; s->ReqCropY = 0;
+    // ReqWidth/Height are the CROPPED (card) size; ReqCropX/Y tell the broker WHERE that card
+    // sits inside the full window, so PrintWindow lifts out the card sub-rect instead of the
+    // window's top-left corner (which is the transparent shadow margin - announcing that shifts
+    // the card right/down by the crop and clips its far edges, the exact defect seen on WinUI
+    // menus once they were both broker-captured AND cropped). entry->CropLeft/Top are set by the
+    // toast/menu crop in GetWindowData before the slice-fed window is (re)registered here.
+    s->ReqCropX = (LONG)entry->CropLeft; s->ReqCropY = (LONG)entry->CropTop;
     s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
     MemoryBarrier();
     s->Hwnd = (UINT64)(ULONG_PTR)entry->Handle;
@@ -4012,17 +4018,11 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         return FALSE;
     }
 
-    // CROP BEFORE SHOW: defer mapping a toast/WinUI-menu popup until its shadow-crop resolves,
-    // so it appears already cropped instead of flashing its uncropped transparent margin and
-    // re-announcing. Bounded (CropPending goes FALSE once the measurement gives up), so a
-    // toast/menu is never lost - it just maps uncropped in the worst case. Shares FI_GATE_NOCARD
-    // with the card gate above (both are crop-measurement gates a fail-proof build can disable).
-    if (!FiGateOff(FI_GATE_NOCARD) && CropPending(data))
-    {
-        LogVerbose("0x%x: crop in flight - deferring map until it resolves (crop-before-show)",
-            data->Handle);
-        return FALSE;
-    }
+    // (Crop-before-show was tried here as a map-reject until the crop resolved, but rejecting a
+    // window from ShouldAcceptWindow drops it from the eligible set and the re-accept-on-resolve
+    // path did not fire - the menu never appeared. Reverted 2026-09-03. A proper crop-before-show
+    // must DEFER THE MAP for an accepted+tracked window, not reject it; until then a toast/menu
+    // maps immediately and the crop lands one pass later, cropped correctly and unshifted.)
 
     // hide search regardless of its state if start is being shown
     // FIXME: this is a workaround for search being detected as visible and not DWM-cloaked
