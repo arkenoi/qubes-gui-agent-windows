@@ -40,9 +40,7 @@
 #include "workarea.h"
 #include <sddl.h>
 #include <wtsapi32.h>
-#pragma comment(lib, "wtsapi32.lib")   // WTSQueryUserToken for the broker's session token
-#include <userenv.h>
-#pragma comment(lib, "userenv.lib")    // CreateEnvironmentBlock for the broker's session env
+#pragma comment(lib, "wtsapi32.lib")   // WTSQuerySessionInformation for the broker's launch user
 #include "wgcbroker_ipc.h"
 #include "wincapture.h"
 #include "vchan-handlers.h"
@@ -171,6 +169,11 @@ static HANDLE g_WgcMap = NULL, g_WgcCtl = NULL, g_WgcBrokerProc = NULL;
 static BYTE*  g_WgcBase = NULL;
 static DWORD  g_WgcSession = 0xFFFFFFFF;
 static ULONGLONG g_WgcNextPoll = 0;
+// The broker is launched via the Task Scheduler (see WgcLaunch), so there is no child process
+// HANDLE to wait on - liveness is inferred from the broker's shared-memory heartbeat advancing.
+static LONGLONG  g_WgcBrokerHbLast = 0;    // last BrokerHeartbeat value observed
+static ULONGLONG g_WgcBrokerHbSeenAt = 0;  // wall time we last saw it ADVANCE
+static ULONGLONG g_WgcLastLaunch = 0;      // throttle: don't relaunch while one is starting
 static UINT64 g_WgcNonce = 0;
 static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
 static ULONGLONG g_WgcArenaNext = 0;   // bump allocator within the arena (offset past ArenaOffset)
@@ -1965,91 +1968,78 @@ static BOOL WgcCreateSection(void)
     return TRUE;
 }
 
-// Obtain a PRIMARY token for the interactive console user. Prefer WTSQueryUserToken (the real
-// session token) - CreateForMonitor in the broker FAILS with E_HANDLE under a merely-borrowed
-// shell token, but works under the WTS session token (proven: the schtasks /ru user /it probe,
-// which runs on exactly this token, captured the monitor fine). Fall back to borrowing the
-// shell's token (SpawnHelperAsUser's mechanism) if WTS is unavailable.
-static HANDLE WgcAcquireUserToken(void)
+#define WGC_TASK_NAME L"Qubes-WgcBroker"
+
+// Run schtasks.exe with the given argument tail, as the agent's own (SYSTEM) token, no window,
+// and wait for it. Returns TRUE iff schtasks exited 0.
+static BOOL WgcRunSchtasks(const WCHAR* argtail)
 {
-    HANDLE primary = NULL;
-    DWORD sid = WTSGetActiveConsoleSessionId();
-    if (sid != 0xFFFFFFFF)
-    {
-        HANDLE wtok = NULL;
-        if (WTSQueryUserToken(sid, &wtok))
-        {
-            // WTSQueryUserToken yields a primary token already; dup to TOKEN_ALL_ACCESS so
-            // CreateProcessAsUser has every right it may need, then release the original.
-            DuplicateTokenEx(wtok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &primary);
-            CloseHandle(wtok);
-            if (primary) { LogInfo("WGCBROKER token: WTS session %lu", sid); return primary; }
-        }
-        else win_perror("WTSQueryUserToken");
-    }
-    // Fallback: borrow the shell's token.
-    HWND shell = GetShellWindow();
-    if (!shell) return NULL;
-    DWORD pid = 0; GetWindowThreadProcessId(shell, &pid);
-    HANDLE proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
-    if (!proc) return NULL;
-    HANDLE tok = NULL;
-    if (OpenProcessToken(proc, TOKEN_DUPLICATE | TOKEN_QUERY, &tok))
-    {
-        DuplicateTokenEx(tok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &primary);
-        CloseHandle(tok);
-    }
-    CloseHandle(proc);
-    if (primary) LogInfo("WGCBROKER token: shell-borrow (WTS unavailable)");
-    return primary;
+    WCHAR sys[MAX_PATH];
+    if (!GetSystemDirectory(sys, RTL_NUMBER_OF(sys))) return FALSE;
+    WCHAR cmd[2048];
+    StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\\schtasks.exe\" %s", sys, argtail);
+    STARTUPINFO si = { 0 }; PROCESS_INFORMATION pi = { 0 };
+    si.cb = sizeof(si);
+    if (!CreateProcess(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    { win_perror("CreateProcess(schtasks)"); return FALSE; }
+    CloseHandle(pi.hThread);
+    WaitForSingleObject(pi.hProcess, 15000);
+    DWORD ec = 1; GetExitCodeProcess(pi.hProcess, &ec);
+    CloseHandle(pi.hProcess);
+    return ec == 0;
 }
 
-// Launch wgcbroker.exe (sits next to gui-agent.exe) into the interactive user session on the
-// real session token (WTSQueryUserToken; shell-borrow fallback) - KEEP the process handle so
-// broker death is an instant signal.
+// Launch wgcbroker.exe into the interactive user session via the TASK SCHEDULER (/ru <user> /it).
+// This is the only launch method under which WGC's CreateForMonitor succeeds on this guest:
+// CreateProcessAsUser - even on the correct WTS session token WITH the user's environment block -
+// fails CreateForMonitor with E_HANDLE, while a schtasks /ru user /it launch captures the monitor
+// fine (proven directly by wgcprobe "mon" mode: content 5120x1440, hr 0). There is no child HANDLE
+// to keep; liveness is inferred from the broker's shared-memory heartbeat (see BrokerSupervise).
 static BOOL WgcLaunch(void)
 {
-    HANDLE primary = WgcAcquireUserToken();
-    if (!primary) return FALSE;
-    BOOL ok = FALSE;
-    {
-        WCHAR self[MAX_PATH] = { 0 };
-        if (GetModuleFileName(NULL, self, RTL_NUMBER_OF(self)))
-        {
-            WCHAR* sl = wcsrchr(self, L'\\');
-            if (sl)
-            {
-                *sl = 0;
-                WCHAR cmd[MAX_PATH * 2];
-                StringCchPrintf(cmd, RTL_NUMBER_OF(cmd),
-                    L"\"%s\\wgcbroker.exe\" --serve --agent-pid %lu "
-                    L"--shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl",
-                    self, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce);
-                STARTUPINFO si = { 0 }; PROCESS_INFORMATION pi = { 0 };
-                si.cb = sizeof(si); si.lpDesktop = L"winsta0\\default";
-                // Build the user's environment block. A CreateProcessAsUser process without it
-                // lacks the session state a Task-Scheduler-launched process gets - and WGC's
-                // CreateForMonitor (DWM interop) FAILS with E_HANDLE without that full session
-                // context, even on the correct WTS token. The schtasks /ru user /it probe (which
-                // captured the monitor fine) always had this environment.
-                LPVOID env = NULL;
-                BOOL haveEnv = CreateEnvironmentBlock(&env, primary, FALSE);
-                if (CreateProcessAsUser(primary, NULL, cmd, NULL, NULL, FALSE,
-                        CREATE_NO_WINDOW | (haveEnv ? CREATE_UNICODE_ENVIRONMENT : 0),
-                        haveEnv ? env : NULL, NULL, &si, &pi))
-                {
-                    CloseHandle(pi.hThread);
-                    g_WgcBrokerProc = pi.hProcess;   // KEEP for instant death detection
-                    ok = TRUE;
-                    LogInfo("WGCBROKER launched pid %lu (env=%d)", pi.dwProcessId, haveEnv);
-                }
-                else win_perror("CreateProcessAsUser(wgcbroker)");
-                if (haveEnv) DestroyEnvironmentBlock(env);
-            }
-        }
-    }
-    CloseHandle(primary);
-    return ok;
+    DWORD sid = WTSGetActiveConsoleSessionId();
+    if (sid == 0xFFFFFFFF) return FALSE;
+
+    // Interactive user name for /ru (bare name, e.g. "user").
+    WCHAR* user = NULL; DWORD userLen = 0;
+    if (!WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, sid, WTSUserName, &user, &userLen) ||
+        !user || !*user)
+    { if (user) WTSFreeMemory(user); win_perror("WTSQuerySessionInformation(UserName)"); return FALSE; }
+
+    // Broker path next to gui-agent.exe, taken as an 8.3 SHORT path so the /tr value carries no
+    // spaces in the program token and needs no embedded quoting (the long path has spaces).
+    WCHAR self[MAX_PATH] = { 0 };
+    if (!GetModuleFileName(NULL, self, RTL_NUMBER_OF(self))) { WTSFreeMemory(user); return FALSE; }
+    WCHAR* sl = wcsrchr(self, L'\\'); if (sl) *(sl + 1) = 0;   // keep the trailing backslash
+    WCHAR longExe[MAX_PATH];
+    StringCchPrintf(longExe, RTL_NUMBER_OF(longExe), L"%swgcbroker.exe", self);
+    WCHAR shortExe[MAX_PATH] = { 0 };
+    if (!GetShortPathName(longExe, shortExe, RTL_NUMBER_OF(shortExe)))
+        StringCchCopy(shortExe, RTL_NUMBER_OF(shortExe), longExe);
+
+    // /tr command: "<exe> --serve --agent-pid <pid> --shm ... --ctl ...". If 8.3 was unavailable
+    // and the path still has spaces, escape-quote the program token for schtasks.
+    WCHAR tr[1024];
+    if (wcschr(shortExe, L' '))
+        StringCchPrintf(tr, RTL_NUMBER_OF(tr),
+            L"\\\"%s\\\" --serve --agent-pid %lu --shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl",
+            shortExe, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce);
+    else
+        StringCchPrintf(tr, RTL_NUMBER_OF(tr),
+            L"%s --serve --agent-pid %lu --shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl",
+            shortExe, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce);
+
+    // Recreate the task fresh each launch (idempotent), then run it now.
+    WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
+    WCHAR args[2048];
+    StringCchPrintf(args, RTL_NUMBER_OF(args),
+        L"/create /tn " WGC_TASK_NAME L" /tr \"%s\" /sc once /st 00:00 /ru %s /it /f", tr, user);
+    WTSFreeMemory(user);
+    if (!WgcRunSchtasks(args)) { LogWarning("WGCBROKER schtasks /create failed"); return FALSE; }
+    if (!WgcRunSchtasks(L"/run /tn " WGC_TASK_NAME)) { LogWarning("WGCBROKER schtasks /run failed"); return FALSE; }
+    g_WgcBrokerProc = NULL;   // no child handle under Task Scheduler; heartbeat is the liveness signal
+    LogInfo("WGCBROKER launched via Task Scheduler (user session %lu)", sid);
+    return TRUE;
 }
 
 // ~1 Hz supervisor. Creates the section on first eligible pass, keeps the heartbeat fresh,
@@ -2069,12 +2059,14 @@ static void BrokerSupervise(void)
     g_WgcNextPoll = now + 1000;
 
     DWORD sid = WTSGetActiveConsoleSessionId();
-    BOOL alive = g_WgcBrokerProc &&
-        WaitForSingleObject(g_WgcBrokerProc, 0) == WAIT_TIMEOUT && g_WgcSession == sid;
+    // Task-Scheduler-launched broker: no child HANDLE. Liveness = the shared-memory heartbeat
+    // has ADVANCED within the last ~6 s (and the console session is unchanged).
+    LONGLONG hb = WGCBRK_HDR(g_WgcBase)->BrokerHeartbeat;
+    if (hb != 0 && hb != g_WgcBrokerHbLast) { g_WgcBrokerHbLast = hb; g_WgcBrokerHbSeenAt = now; }
+    BOOL alive = (g_WgcSession == sid) && g_WgcBrokerHbSeenAt && (now - g_WgcBrokerHbSeenAt < 6000);
     if (alive)
     {
-        if (!g_BrokerReady &&
-            (LONGLONG)now - WGCBRK_HDR(g_WgcBase)->BrokerHeartbeat < 3000)
+        if (!g_BrokerReady)
         {
             _InterlockedExchange(&g_BrokerReady, 1);
             LogInfo("WGCBROKER ready (heartbeat live)");
@@ -2092,20 +2084,22 @@ static void BrokerSupervise(void)
         }
         return;
     }
-    if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL; }
     _InterlockedExchange(&g_BrokerReady, 0);
-    if (sid != 0xFFFFFFFF && GetShellWindow() && WgcLaunch())
-        g_WgcSession = sid;
+    // Throttle relaunch: a freshly launched broker needs a few seconds to attach and heartbeat;
+    // don't re-fire schtasks every second in the meantime.
+    if (now - g_WgcLastLaunch < 8000) return;
+    if (sid != 0xFFFFFFFF && GetShellWindow())
+    {
+        g_WgcLastLaunch = now;
+        g_WgcBrokerHbLast = 0; g_WgcBrokerHbSeenAt = 0;   // await a fresh heartbeat from the new broker
+        if (WgcLaunch()) g_WgcSession = sid;
+    }
 }
 
 static void BrokerShutdown(void)
 {
-    if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->Shutdown = 1;
-    if (g_WgcBrokerProc)
-    {
-        WaitForSingleObject(g_WgcBrokerProc, 1500);
-        CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
-    }
+    if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->Shutdown = 1;   // broker self-exits on this flag
+    WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
 }
 
 // ---- WGC broker stage 2b: register occluded NRB app windows, consume their frames --------
