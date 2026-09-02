@@ -2005,11 +2005,14 @@ static BOOL WgcLaunch(void)
 static void BrokerSupervise(void)
 {
     if (!g_WgcBroker || g_OsBuild < 26100 || !PwEnabled()) return;
+    if (!g_WgcBase && !WgcCreateSection()) return;
     ULONGLONG now = GetTickCount64();
+    // Bump the agent heartbeat on EVERY call (not gated by the 1 Hz launch throttle) so the
+    // broker's staleness backstop never trips while the main loop is merely idle. The main
+    // loop caps its wait to ~1 s while the broker is active, so this runs at least ~1/s.
+    WGCBRK_HDR(g_WgcBase)->AgentHeartbeat = (LONGLONG)now;
     if (now < g_WgcNextPoll) return;
     g_WgcNextPoll = now + 1000;
-    if (!g_WgcBase && !WgcCreateSection()) return;
-    WGCBRK_HDR(g_WgcBase)->AgentHeartbeat = (LONGLONG)now;
 
     DWORD sid = WTSGetActiveConsoleSessionId();
     BOOL alive = g_WgcBrokerProc &&
@@ -6705,6 +6708,12 @@ static ULONG WINAPI WatchForEvents(void)
             ULONGLONG now64 = GetTickCount64();
             waitTimeout = (captureRetryDue > now64) ? (DWORD)(captureRetryDue - now64) : 0;
         }
+
+        // While the WGC broker is active, wake the loop ~1/s even when idle so BrokerSupervise
+        // keeps the agent heartbeat fresh and relaunches a dead broker promptly. Only tightens
+        // an otherwise-INFINITE (or longer) idle wait; never lengthens a shorter one.
+        if (g_WgcBroker && g_WgcBase && (waitTimeout == INFINITE || waitTimeout > 1000))
+            waitTimeout = 1000;
 
         // [CaptureGateFaultInject bit 4] Raise one capture error, once, to open the gate.
         if ((captureGateFault & 4) && !captureGateFaultFired &&
