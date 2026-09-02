@@ -532,7 +532,9 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, OUT
     IUIAutomationElement* windowElement = NULL;
     ULONG status = ERROR_NOT_FOUND;
     HRESULT hr;
-    RECT cardRect;
+    RECT cardRect = { 0, 0, 0, 0 };   // written by TcFindCardRect when it returns TRUE; the
+                                      // control-then-raw two-call path defeats the compiler's
+                                      // "found => written" flow analysis, so seed it explicitly.
 
     ZeroMemory(insets, sizeof(*insets));
 
