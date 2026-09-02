@@ -49,6 +49,14 @@ BOOL IsShellToastWindow(
     IN const WINDOW_DATA* data
     );
 
+// TRUE for a Win11 WinUI windowed popup menu/flyout (class *PopupWindowSiteBridge /
+// *Xaml_WindowedPopup*, override-redirect). Same "shadow inside the window" shape as toasts, so
+// the same UIA card crop squares off the transparent (black-when-materialized) margin. Classic
+// GDI menus (#32768) are already tight and excluded.
+BOOL IsMenuPopupWindow(
+    IN const WINDOW_DATA* data
+    );
+
 // Which shell-host process a classified surface belongs to. The per-surface ShellManaged
 // policy needs the distinction: the GWeck goal state makes START WM-managed (movable,
 // size-locked) while toasts stay override-redirect corner popups (user spec 2026-08-12).

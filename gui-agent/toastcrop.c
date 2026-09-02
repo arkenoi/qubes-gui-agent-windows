@@ -843,6 +843,20 @@ BOOL IsShellToastWindow(IN const WINDOW_DATA* data)
     return ShellSurfaceKind(data) != ShellSurfaceNone;
 }
 
+// A Win11 WinUI windowed popup MENU/flyout (context menus, app menus). Like the shell surfaces
+// above, these draw their own drop shadow INSIDE their window rect, so the o-r window is larger
+// than the visible menu and the transparent margin shows as black when the menu MATERIALIZES as its
+// own dom0 window (i.e. is not composited into an owner by synthesis). The same TcFindCardRect crop
+// squares them to the visible card. Identified by CLASS (process-agnostic - any app's WinUI menu):
+// classic GDI menus (#32768) are already tight and deliberately excluded (nothing to crop).
+BOOL IsMenuPopupWindow(IN const WINDOW_DATA* data)
+{
+    if (!data || !data->IsOverrideRedirect || !data->Class)
+        return FALSE;
+    return wcsstr(data->Class, L"PopupWindowSiteBridge") != NULL ||   // Microsoft.UI.Content.PopupWindowSiteBridge
+           wcsstr(data->Class, L"Xaml_WindowedPopup")   != NULL;      // older WinUI windowed popup class
+}
+
 SHELL_SURFACE_KIND ShellSurfaceKind(IN const WINDOW_DATA* data)
 {
     if (!data || !data->IsVisible)
@@ -925,7 +939,9 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
     if (g_TcDisabled)
         return FALSE;
 
-    if (!IsShellToastWindow(data))
+    // Shell surfaces (toasts/Start/Search) AND Win11 WinUI menus: all draw a shadow inside the
+    // window rect, all measured + cropped by the same generic TcFindCardRect card finder.
+    if (!IsShellToastWindow(data) && !IsMenuPopupWindow(data))
         return FALSE;
 
     EnterCriticalSection(&g_TcLock);

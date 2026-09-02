@@ -1534,8 +1534,10 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     // daemon's 90% strip.
     //
     // Toasts are REQUIRED-kept (CLAUDE.md 2A-chrome 3c): every failure inside toastcrop
-    // yields zero insets, which leaves the rect exactly as it is today.
-    if (IsShellToastWindow(entry))
+    // yields zero insets, which leaves the rect exactly as it is today. The same crop also
+    // squares Win11 WinUI MENUS (IsMenuPopupWindow) - their transparent shadow margin shows as
+    // black when the menu materializes as its own dom0 window (not synthesized into an owner).
+    if (IsShellToastWindow(entry) || IsMenuPopupWindow(entry))
     {
         RECT insets;
         if (ToastCropLookup(entry, &insets))
