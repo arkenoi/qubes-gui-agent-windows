@@ -48,6 +48,12 @@
 // no-card measurements at >=250 ms spacing give ~1.5 s of coverage at worker speed.
 #define TOAST_CROP_MAX_ATTEMPTS 6
 #define TOAST_CROP_RETRY_MS     250
+// Menus only, LEFT/RIGHT only: back the measured horizontal crop off by this many px per side so
+// the dom0 window's outer edge lands on the menu's OUTER rounded frame rather than the item-content
+// (control-view) edge - the user wants the menu's own left/right border kept, not shaved, and said
+// the vertical crop is already right (2026-09-03), so top/bottom are left exactly as measured.
+// Toasts are NOT backed off at all: their card edge IS the visible edge. Clamped at 0.
+#define TOAST_CROP_MENU_BORDER 4
 // Crop-before-show: how many measurement attempts a toast/menu's map is DEFERRED for while its
 // crop resolves (CropPending). Shorter than MAX_ATTEMPTS on purpose - once this many attempts
 // have completed without a card the surface maps UNCROPPED (and the remaining attempts, up to
@@ -1127,6 +1133,17 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
     }
 
     LeaveCriticalSection(&g_TcLock);
+
+    // Menus: align the crop to the menu's OUTER frame, not the item-content edge. Back the
+    // LEFT/RIGHT insets off by TOAST_CROP_MENU_BORDER (vertical is already right per the user, so
+    // top/bottom are untouched). The reduced insets flow on to entry->CropLeft/Right and thus to
+    // the broker's ReqCropX, so the sub-rect the broker lifts widens to match - no shift. Toasts
+    // are left tight.
+    if (IsMenuPopupWindow(data) && (insets->left || insets->right))
+    {
+        insets->left  = (insets->left  > TOAST_CROP_MENU_BORDER) ? insets->left  - TOAST_CROP_MENU_BORDER : 0;
+        insets->right = (insets->right > TOAST_CROP_MENU_BORDER) ? insets->right - TOAST_CROP_MENU_BORDER : 0;
+    }
 
     return (insets->left || insets->top || insets->right || insets->bottom);
 }
