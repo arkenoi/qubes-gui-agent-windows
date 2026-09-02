@@ -172,6 +172,7 @@ static UINT64 g_WgcNonce = 0;
 static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
 static ULONGLONG g_WgcArenaNext = 0;   // bump allocator within the arena (offset past ArenaOffset)
 static LONG   g_WgcMonitorSlot = -1;   // slot capturing the whole monitor (o-r/static slice source)
+static void BrokerRegisterMonitor(void);   // defined after BrokerFreshFrame; called from BrokerSupervise
 
 // minimal acceptable window dimensions
 DWORD g_MinWindowWidth = 0;
