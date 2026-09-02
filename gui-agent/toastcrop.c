@@ -425,8 +425,22 @@ static void TcValidateInsets(IN HWND window, IN LONG rawWidth, IN LONG rawHeight
     }
 }
 
-// Depth-limited search for the drawn card: the largest descendant fully inside `raw` and
-// strictly smaller than it in both dimensions. Returns TRUE and the winning rect in *best.
+// Depth-limited search for the drawn card: the UNION of every descendant fully inside `raw`
+// and strictly smaller than it in both dimensions. Returns TRUE and the union rect in *best.
+//
+// Why the union and not the single largest such element (which is what this did until
+// 2026-09-03): a Win11 WinUI context-menu BODY (class Microsoft.UI.Content.PopupWindowSiteBridge)
+// has no single element that is the whole card - its MenuFlyoutPresenter spans the full window
+// HEIGHT, so it is NOT strictly smaller in both dims and is excluded, and the largest element
+// that IS strictly smaller is one menu ROW. That produced a card 90% wide but 10% tall - an
+// absurd bottom inset the plausibility guard then rejected - so the body was left uncropped and
+// its transparent bottom shadow rendered as a black band in dom0 (measured live 2026-09-03:
+// single B=287 rejected, union B=22 accepted). The union of the menu-item rects is the true
+// drawn extent. For a toast / Start / the menu's command-bar sub-window the whole card IS one
+// element and every other qualifier nests inside it, so the union EQUALS that card - byte for
+// byte the old result (verified: command bar single==union L10 T2 R10 B18). The shadow contains
+// no elements so it never enters the union, and a full-window-spanning container is still
+// excluded by the strict-smaller test, so it can never wash the union out to the whole window.
 //
 // Depth is capped because this walks a live XAML tree over cross-process RPC: the toast tree is
 // 4 levels deep, Start's is deeper but its card is near the root, and an unbounded walk on a
@@ -471,10 +485,24 @@ static BOOL TcFindCardRect(IN IUIAutomation* uia, IN IUIAutomationElement* eleme
                            r.right <= raw.right && r.bottom <= raw.bottom);
             BOOL strictlySmaller = (w < (raw.right - raw.left)) && (h < (raw.bottom - raw.top));
 
-            if (inside && strictlySmaller && w > 0 && h > 0 && w * h > *bestArea)
+            if (inside && strictlySmaller && w > 0 && h > 0)
             {
-                *bestArea = w * h;
-                *best = r;
+                // Accumulate the UNION of every qualifying element rather than the single
+                // largest one (see the function header for why). *bestArea is repurposed as
+                // an "is the union non-empty yet" flag: 0 until the first qualifier seeds
+                // *best, nonzero once it holds the running union.
+                if (*bestArea == 0)
+                {
+                    *best = r;
+                }
+                else
+                {
+                    if (r.left   < best->left)   best->left   = r.left;
+                    if (r.top    < best->top)    best->top    = r.top;
+                    if (r.right  > best->right)  best->right  = r.right;
+                    if (r.bottom > best->bottom) best->bottom = r.bottom;
+                }
+                *bestArea = 1;
                 found = TRUE;
             }
         }
@@ -519,12 +547,13 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, OUT
     // Start menu, whose card has the identical problem (announced 858x890 for an 832x874 card,
     // measured 2026-08-11; on 24H2 the same menu had no margin at all).
     //
-    // The rule: among all descendants, take the LARGEST one that is fully inside the window and
-    // strictly smaller in BOTH dimensions. That is the drawn card by construction - the shadow
-    // is painted by the window itself and contains no elements, so nothing lives outside the
-    // card, while containers that span the full window width (the toast's ScrollViewer, 396 wide
-    // in a 396-wide window) are excluded by the strictness requirement. Picking the LARGEST also
-    // means a list flyout yields its outer card, never one item inside it.
+    // The rule: among all descendants, take the UNION of those that are fully inside the window
+    // and strictly smaller in BOTH dimensions. That is the drawn card by construction - the shadow
+    // is painted by the window itself and contains no elements, so nothing lives outside the card,
+    // while containers that span the full window width (the toast's ScrollViewer, 396 wide in a
+    // 396-wide window) are excluded by the strictness requirement. The UNION (not the single
+    // largest) is what makes a list/menu flyout whose presenter spans the full window height still
+    // resolve to its item extent instead of collapsing onto one row - see TcFindCardRect's header.
     {
         LONG bestArea = 0;
         // 2 s covers a healthy walk (4-6 levels, tens of RPCs) many times over while
