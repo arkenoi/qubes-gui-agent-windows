@@ -197,6 +197,7 @@ static int g_WgcPendingCount = 0;
 #define WGC_ARENA_FREE_DELAY_MS 2000   // >> broker Reconcile (<=250 ms) + in-flight FrameArrived
 static LONG   g_WgcMonitorSlot = -1;   // slot capturing the whole monitor (o-r/static slice source)
 static void BrokerRegisterMonitor(void);   // defined after BrokerFreshFrame; called from BrokerSupervise
+static void WgcArenaReapPending(void);      // defined with the arena allocator; called from BrokerSupervise
 
 // minimal acceptable window dimensions
 DWORD g_MinWindowWidth = 0;
