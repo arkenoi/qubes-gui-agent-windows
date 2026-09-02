@@ -1928,6 +1928,36 @@ static BOOL SpawnHelperAsUser(IN HWND tokenSource, IN const WCHAR* args)
     return ok;
 }
 
+// Spawn <self> <args> in the interactive user's session using the SESSION's own token
+// (WTSQueryUserToken). Unlike SpawnHelperAsUser, which borrows the shell WINDOW's token, this
+// needs only that the user be logged on - which happens BEFORE the shell window exists - so a
+// helper that touches only per-user settings (registry + SystemParametersInfo) runs correctly at
+// seamless entry on a cold boot, with no wait for the shell. Returns FALSE if no session yet.
+static BOOL SpawnHelperInSession(IN const WCHAR* args)
+{
+    DWORD sid = WTSGetActiveConsoleSessionId();
+    if (sid == 0xFFFFFFFF) return FALSE;
+    HANDLE utok = NULL, primary = NULL; BOOL ok = FALSE;
+    if (!WTSQueryUserToken(sid, &utok)) return FALSE;   // no interactive user session yet
+    if (DuplicateTokenEx(utok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &primary))
+    {
+        WCHAR self[MAX_PATH] = { 0 };
+        if (GetModuleFileName(NULL, self, RTL_NUMBER_OF(self)))
+        {
+            WCHAR cmd[MAX_PATH + 64];
+            StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\" %s", self, args);
+            STARTUPINFO si = { 0 }; PROCESS_INFORMATION pi = { 0 };
+            si.cb = sizeof(si); si.lpDesktop = L"winsta0\\default";
+            if (CreateProcessAsUser(primary, NULL, cmd, NULL, NULL, FALSE,
+                    CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+            { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); ok = TRUE; }
+        }
+    }
+    if (primary) CloseHandle(primary);
+    CloseHandle(utok);
+    return ok;
+}
+
 // ---- WGC broker (stage 2a: section + spawn + supervise; NO frame consumer yet) ----------
 // SYSTEM creates the Global\ section (SeCreateGlobalPrivilege), so a user-IL process can only
 // OPEN it, never squat the name. SDDL grants SYSTEM full, the interactive user R/W, Medium IL
@@ -2299,24 +2329,21 @@ static BOOL BrokerMonitorFrame(OUT const BYTE** base, OUT int* pitch, OUT int* w
 
 // Guest-native window shadows off in seamless, restored in fullscreen. The shell window gives us a
 // process that belongs to the interactive user, which is all the helper needs.
-// TRUE only when the helper actually ran. On a cold boot GetShellWindow() is NULL at seamless
-// entry (the shell has not started), so the one-shot call no-ops - hence the retry in
-// DaemonSettleSweep, gated by g_SeamlessShadowsDone, until the shell exists.
+// TRUE once the helper actually ran. Uses the SESSION token (SpawnHelperInSession), which is
+// available as soon as the user is logged on - i.e. before seamless capture even starts - so the
+// single call at seamless entry normally succeeds without waiting for the shell window. The
+// DaemonSettleSweep retry (gated by this flag) is only a fallback for the narrow boot window where
+// the agent enters seamless before the session token is ready.
 static BOOL g_SeamlessShadowsDone = FALSE;
 static BOOL ApplyGuestShadows(IN BOOL enable)
 {
-    HWND shell = GetShellWindow();
-    if (!shell)
-    {
-        LogWarning("no shell window; cannot %s guest shadows (will retry)", enable ? L"restore" : L"disable");
-        return FALSE;
-    }
-    if (SpawnHelperAsUser(shell, enable ? L"--set-shadows 1" : L"--set-shadows 0"))
+    if (SpawnHelperInSession(enable ? L"--set-shadows 1" : L"--set-shadows 0"))
     {
         LogInfo("guest window shadows %s", enable ? L"restored (fullscreen)" : L"disabled (seamless)");
         return TRUE;
     }
-    LogWarning("could not launch the shadow helper as the interactive user");
+    LogWarning("no interactive session token yet; cannot %s guest shadows (will retry)",
+               enable ? L"restore" : L"disable");
     return FALSE;
 }
 
@@ -2907,10 +2934,11 @@ BOOL DaemonSettleWorkPending(void)
 // overdraw beats indefinite staleness in this rare no-frames path.
 void DaemonSettleSweep(void)
 {
-    // Cold-boot shadow retry: ApplyGuestShadows no-ops at seamless entry if the shell hasn't
-    // started yet (GetShellWindow()==NULL). Retry here (~1 Hz) until it lands, so seamless menu/
-    // window shadows are disabled reliably every boot rather than only when timing happens to work.
-    if (g_SeamlessMode && !g_SeamlessShadowsDone && GetShellWindow())
+    // Fallback shadow retry: the session-token disable at seamless entry normally succeeds on the
+    // first try (the user is logged on before capture starts). This only fires in the narrow boot
+    // window where seamless was entered before WTSQueryUserToken had a session - it self-clears on
+    // the first success, so it is not a perpetual poll.
+    if (g_SeamlessMode && !g_SeamlessShadowsDone)
         g_SeamlessShadowsDone = ApplyGuestShadows(FALSE);
 
     if (g_InputDragWindow && g_InputDragLastEventTick != 0 &&
