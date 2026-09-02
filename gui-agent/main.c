@@ -1713,33 +1713,28 @@ static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerO
         if (!SynthOwnerQualifies(owner, entry))
             return FALSE;
     }
-    else if (entry->Owner && FindWindowByHandle(entry->Owner))
+    else if (entry->Owner)
     {
-        // GW_OWNER set AND TRACKED: honor it exclusively. A menu owned by tracked window A must
-        // never be re-homed into an overlapping sibling B of the same app.
+        // GW_OWNER set: honor it exclusively. A menu owned by window A must never be
+        // synthesized into an overlapping window B of the same app.
+        //
+        // "Exclusively" has to include the case where the owner is NOT tracked. Testing
+        // `FindWindowByHandle(entry->Owner) != NULL` in the condition let an owned popup
+        // whose owner the agent does not track fall through to the same-process fallback
+        // below, which then adopted it into whatever topmost sibling happened to contain
+        // it. Measured: Office's MSO_BORDEREFFECT shadow strips around a sign-in DIALOG
+        // were adopted by the maximized OpusApp main window (they do overlap it, so the
+        // geometric guard passes), their pixels patched in from the composited desktop,
+        // and the owner's capture masked those bands out - leaving a frozen L-shaped
+        // shadow ghost burned into the document area that nothing could ever repaint,
+        // outliving the dialog itself. An untracked owner means "not ours to composite
+        // into", so the popup must be refused, never re-homed.
         owner = FindWindowByHandle(entry->Owner);
         if (!owner || !SynthOwnerQualifies(owner, entry))
             return FALSE;
     }
     else if (entry->ProcessId != 0)
     {
-        // Reached with EITHER no GW_OWNER, OR a GW_OWNER pointing at an UNTRACKED helper window.
-        // The untracked case is the Win11 XAML island host that owns explorer/WinUI context menus
-        // (Microsoft.UI.Content.PopupWindowSiteBridge) - relaxed 2026-09-02 to let those synthesize
-        // (owner 2026-09-02) instead of materializing with a shadow margin.
-        //
-        // This condition once caused the Office frozen-ghost bug: MSO_BORDEREFFECT shadow strips
-        // (untracked owner) were adopted by the maximized OpusApp and masked into a permanent ghost.
-        // It is safe to allow now because of a defence in depth that did NOT exist then:
-        //   (1) the chrome filter (ShouldAcceptWindow) drops those strips by class+style before here;
-        //   (2) SynthOwnerQualifies now REQUIRES real overlap with the granted buffer (rejects the
-        //       zero-intersection strip case); and here we additionally
-        //   (3) refuse click-through decorations (WS_EX_TRANSPARENT) - the shadow-strip signature -
-        //       for the untracked-owner path, so a stray strip that slipped past (1) is still refused.
-        // Real menus/flyouts are interactive (not WS_EX_TRANSPARENT), so this excludes only chrome.
-        if (entry->Owner && (GetWindowLong(entry->Handle, GWL_EXSTYLE) & WS_EX_TRANSPARENT))
-            return FALSE;
-
         // Prefer the foreground window: keytips and flyouts belong to the focused
         // window, and with two overlapping windows of the same process the topmost-
         // containing pick below can attach the popup to the wrong sibling.
