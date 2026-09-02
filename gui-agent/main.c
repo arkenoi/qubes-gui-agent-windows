@@ -2299,18 +2299,25 @@ static BOOL BrokerMonitorFrame(OUT const BYTE** base, OUT int* pitch, OUT int* w
 
 // Guest-native window shadows off in seamless, restored in fullscreen. The shell window gives us a
 // process that belongs to the interactive user, which is all the helper needs.
-static void ApplyGuestShadows(IN BOOL enable)
+// TRUE only when the helper actually ran. On a cold boot GetShellWindow() is NULL at seamless
+// entry (the shell has not started), so the one-shot call no-ops - hence the retry in
+// DaemonSettleSweep, gated by g_SeamlessShadowsDone, until the shell exists.
+static BOOL g_SeamlessShadowsDone = FALSE;
+static BOOL ApplyGuestShadows(IN BOOL enable)
 {
     HWND shell = GetShellWindow();
     if (!shell)
     {
-        LogWarning("no shell window; cannot %s guest shadows", enable ? L"restore" : L"disable");
-        return;
+        LogWarning("no shell window; cannot %s guest shadows (will retry)", enable ? L"restore" : L"disable");
+        return FALSE;
     }
     if (SpawnHelperAsUser(shell, enable ? L"--set-shadows 1" : L"--set-shadows 0"))
+    {
         LogInfo("guest window shadows %s", enable ? L"restored (fullscreen)" : L"disabled (seamless)");
-    else
-        LogWarning("could not launch the shadow helper as the interactive user");
+        return TRUE;
+    }
+    LogWarning("could not launch the shadow helper as the interactive user");
+    return FALSE;
 }
 
 static void HideGuestCaption(IN WINDOW_DATA* entry)
@@ -2900,6 +2907,12 @@ BOOL DaemonSettleWorkPending(void)
 // overdraw beats indefinite staleness in this rare no-frames path.
 void DaemonSettleSweep(void)
 {
+    // Cold-boot shadow retry: ApplyGuestShadows no-ops at seamless entry if the shell hasn't
+    // started yet (GetShellWindow()==NULL). Retry here (~1 Hz) until it lands, so seamless menu/
+    // window shadows are disabled reliably every boot rather than only when timing happens to work.
+    if (g_SeamlessMode && !g_SeamlessShadowsDone && GetShellWindow())
+        g_SeamlessShadowsDone = ApplyGuestShadows(FALSE);
+
     if (g_InputDragWindow && g_InputDragLastEventTick != 0 &&
         GetTickCount() - g_InputDragLastEventTick > INPUT_DRAG_STUCK_MS)
     {
@@ -3705,8 +3718,17 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
 
     g_SeamlessMode = seamlessMode;
 
-    // Shadows are dom0's job in seamless and the guest's own in fullscreen.
-    ApplyGuestShadows(!seamlessMode);
+    // Shadows are dom0's job in seamless (disabled — they surface as separate o-r shadow companion
+    // windows and add nothing) and the guest's own in fullscreen (restored). Owner 2026-09-02:
+    // disabled permanently in seamless. The seamless disable may no-op if the shell isn't up yet
+    // (cold boot) — DaemonSettleSweep retries it until it sticks.
+    if (seamlessMode)
+        g_SeamlessShadowsDone = ApplyGuestShadows(FALSE);   // retried by the sweep until applied
+    else
+    {
+        ApplyGuestShadows(TRUE);                            // restore for fullscreen
+        g_SeamlessShadowsDone = TRUE;                       // nothing to retry
+    }
 
     // The published IDD mode set is seamless-dependent (the host size is only in
     // it while seamless is active - resolution.c BuildIddModeSet a1), so a
