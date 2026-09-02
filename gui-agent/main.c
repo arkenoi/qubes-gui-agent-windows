@@ -180,7 +180,21 @@ static ULONGLONG g_WgcBrokerHbSeenAt = 0;  // wall time we last saw it ADVANCE
 static ULONGLONG g_WgcLastLaunch = 0;      // throttle: don't relaunch while one is starting
 static UINT64 g_WgcNonce = 0;
 static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
-static ULONGLONG g_WgcArenaNext = 0;   // bump allocator within the arena (offset past ArenaOffset)
+static ULONGLONG g_WgcArenaNext = 0;   // bump frontier within the arena (offset past ArenaOffset)
+// Arena free-list: reclaim regions freed on BrokerUnregister so high-churn windows (menus open/
+// close constantly) don't exhaust the 128 MB arena. Agent-thread-only (register/unregister/supervise
+// all run on the main loop) so no locking. Offsets are ABSOLUTE section offsets, matching the slot's
+// BufOffset and the agent's own bounds-checks (reused regions stay inside the arena, so the checks
+// hold). Frees are DEFERRED (see g_WgcPending): the user-session broker can still write a slot's
+// buffers for up to its Reconcile interval after unregister, so a region must not be reused until
+// well past that or the broker would corrupt the window that reused it.
+typedef struct { ULONGLONG off, size; } WGC_FREEBLK;
+static WGC_FREEBLK g_WgcFree[WGCBRK_MAX_SLOTS * WGCBRK_RING + 4];
+static int g_WgcFreeCount = 0;
+typedef struct { ULONGLONG off0, off1, size, freeAtTick; } WGC_PENDINGFREE;
+static WGC_PENDINGFREE g_WgcPending[WGCBRK_MAX_SLOTS * 2];
+static int g_WgcPendingCount = 0;
+#define WGC_ARENA_FREE_DELAY_MS 2000   // >> broker Reconcile (<=250 ms) + in-flight FrameArrived
 static LONG   g_WgcMonitorSlot = -1;   // slot capturing the whole monitor (o-r/static slice source)
 static void BrokerRegisterMonitor(void);   // defined after BrokerFreshFrame; called from BrokerSupervise
 
@@ -2092,6 +2106,8 @@ static void BrokerSupervise(void)
     if (now < g_WgcNextPoll) return;
     g_WgcNextPoll = now + 1000;
 
+    WgcArenaReapPending();   // return deferred-free arena regions once the broker can no longer touch them
+
     DWORD sid = WTSGetActiveConsoleSessionId();
     // Task-Scheduler-launched broker: no child HANDLE. Liveness = the shared-memory heartbeat
     // has ADVANCED within the last ~6 s (and the console session is unchanged).
@@ -2142,12 +2158,77 @@ BOOL WgcBrokerActive(void)
     return g_WgcBroker && g_OsBuild >= 26100 && PwEnabled() && g_BrokerReady && g_WgcBase;
 }
 
-static ULONGLONG WgcArenaAlloc(ULONGLONG bytes)   // 64-aligned bump; 0 == out of arena
+static ULONGLONG WgcArenaAlloc(ULONGLONG bytes)   // best-fit free-list, else 64-aligned bump; 0 == full
 {
+    bytes = (bytes + 63) & ~(ULONGLONG)63;
+    // Best-fit reuse of a reclaimed region (minimizes fragmentation vs first-fit).
+    int best = -1;
+    for (int i = 0; i < g_WgcFreeCount; i++)
+        if (g_WgcFree[i].size >= bytes && (best < 0 || g_WgcFree[i].size < g_WgcFree[best].size))
+            best = i;
+    if (best >= 0)
+    {
+        ULONGLONG off = g_WgcFree[best].off;
+        if (g_WgcFree[best].size == bytes)
+            g_WgcFree[best] = g_WgcFree[--g_WgcFreeCount];   // consumed whole block
+        else { g_WgcFree[best].off += bytes; g_WgcFree[best].size -= bytes; }  // split
+        return off;
+    }
+    // Bump the frontier.
     ULONGLONG off = (g_WgcArenaNext + 63) & ~(ULONGLONG)63;
     if (off + bytes > (ULONGLONG)g_WgcArenaBytes) return 0;
     g_WgcArenaNext = off + bytes;
     return (ULONGLONG)WGCBRK_HEADER_BYTES + off;   // absolute offset from section base
+}
+
+// Return a region to the free-list, coalescing with any adjacent free block (bounded n, cheap).
+static void WgcArenaFree(ULONGLONG off, ULONGLONG size)
+{
+    if (!off || !size) return;
+    size = (size + 63) & ~(ULONGLONG)63;
+    if (g_WgcFreeCount >= (int)RTL_NUMBER_OF(g_WgcFree)) return;   // list full: drop (leak) - never expected
+    g_WgcFree[g_WgcFreeCount].off = off;
+    g_WgcFree[g_WgcFreeCount].size = size;
+    g_WgcFreeCount++;
+    BOOL merged = TRUE;
+    while (merged)
+    {
+        merged = FALSE;
+        for (int i = 0; i < g_WgcFreeCount && !merged; i++)
+            for (int j = i + 1; j < g_WgcFreeCount; j++)
+            {
+                if (g_WgcFree[i].off + g_WgcFree[i].size == g_WgcFree[j].off)
+                { g_WgcFree[i].size += g_WgcFree[j].size; g_WgcFree[j] = g_WgcFree[--g_WgcFreeCount]; merged = TRUE; break; }
+                if (g_WgcFree[j].off + g_WgcFree[j].size == g_WgcFree[i].off)
+                { g_WgcFree[j].size += g_WgcFree[i].size; g_WgcFree[i] = g_WgcFree[--g_WgcFreeCount]; merged = TRUE; break; }
+            }
+    }
+}
+
+// Queue a slot's two buffers for DEFERRED reclaim - not reusable until the broker has certainly
+// stopped writing them (past its Reconcile interval). Reaped in BrokerSupervise.
+static void WgcArenaFreeDeferred(ULONGLONG off0, ULONGLONG off1, ULONGLONG size)
+{
+    if (g_WgcPendingCount >= (int)RTL_NUMBER_OF(g_WgcPending))
+    { WgcArenaFree(off0, size); WgcArenaFree(off1, size); return; }   // overflow: accept the small race over a leak
+    g_WgcPending[g_WgcPendingCount].off0 = off0;
+    g_WgcPending[g_WgcPendingCount].off1 = off1;
+    g_WgcPending[g_WgcPendingCount].size = size;
+    g_WgcPending[g_WgcPendingCount].freeAtTick = GetTickCount64() + WGC_ARENA_FREE_DELAY_MS;
+    g_WgcPendingCount++;
+}
+
+static void WgcArenaReapPending(void)
+{
+    ULONGLONG now = GetTickCount64();
+    for (int i = 0; i < g_WgcPendingCount; )
+        if (now >= g_WgcPending[i].freeAtTick)
+        {
+            WgcArenaFree(g_WgcPending[i].off0, g_WgcPending[i].size);
+            WgcArenaFree(g_WgcPending[i].off1, g_WgcPending[i].size);
+            g_WgcPending[i] = g_WgcPending[--g_WgcPendingCount];
+        }
+        else i++;
 }
 
 // Register a sliceFed window with the broker IFF it is the class the broker actually helps:
@@ -2184,7 +2265,14 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     ULONGLONG one = ((ULONGLONG)entry->Width * entry->Height * 4 + 63) & ~(ULONGLONG)63;
     ULONGLONG off0 = WgcArenaAlloc(one);
     ULONGLONG off1 = WgcArenaAlloc(one);
-    if (!off0 || !off1) return FALSE;   // arena full -> stays on the DDA slice
+    if (!off0 || !off1)
+    {
+        // Arena full for the second buffer -> return the first (never published to the broker, so
+        // safe to reclaim immediately) and stay on the slice for this window.
+        if (off0) WgcArenaFree(off0, one);
+        if (off1) WgcArenaFree(off1, one);
+        return FALSE;
+    }
 
     WGCBRK_SLOT* s = &slots[slot];
     s->BufOffset[0] = (LONGLONG)off0; s->BufOffset[1] = (LONGLONG)off1;
@@ -2208,13 +2296,18 @@ void BrokerUnregister(IN OUT WINDOW_DATA* entry)
 {
     if (!g_WgcBase || entry->PwBrokerSlot < 0) { entry->PwBrokerSourced = FALSE; return; }
     WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
+    ULONGLONG off0 = (ULONGLONG)s->BufOffset[0];   // capture the arena regions before freeing the slot
+    ULONGLONG off1 = (ULONGLONG)s->BufOffset[1];
+    ULONGLONG bsz  = (ULONGLONG)s->BufBytes;
     s->ReqState = WGCBRK_FREE;
-    s->Hwnd = 0;                         // v1: free the slot immediately (broker closes on reconcile)
+    s->Hwnd = 0;                         // free the slot immediately (broker closes on reconcile)
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&WGCBRK_HDR(g_WgcBase)->ControlGen);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
-    // Arena regions are bump-allocated and not individually reclaimed in v1 (128 MB budget,
-    // 64-window ceiling); the whole arena resets when the section is recreated on broker restart.
+    // Reclaim the two arena buffers so high-churn windows (menus) don't exhaust the arena - but
+    // DEFERRED: the broker may still publish to this slot until its next Reconcile, so the regions
+    // must not become reusable until well past that (WgcArenaReapPending, called from supervise).
+    WgcArenaFreeDeferred(off0, off1, bsz);
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1; entry->PwBrokerArenaOff = 0;
 }
 
