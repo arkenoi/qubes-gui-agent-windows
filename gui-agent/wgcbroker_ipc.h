@@ -18,6 +18,13 @@
 
 typedef enum { WGCBRK_FREE=0, WGCBRK_REQUESTED=1, WGCBRK_ACTIVE=2, WGCBRK_FAILED=3 } WGCBRK_STATE;
 
+// A slot whose Hwnd is this sentinel means "capture the PRIMARY MONITOR" (CreateForMonitor)
+// instead of a window. The agent slices static/override-redirect windows (menus, popups,
+// toasts) out of this composited monitor frame by screen rect - the user-session WGC
+// replacement for the SYSTEM agent's DDA slice. ReqWidth/Height = full screen; content is
+// screen-relative (srcOrigin 0,0), unlike per-window slots (window-relative).
+#define WGCBRK_MONITOR_HWND  ((UINT64)0xFFFFFFFFFFFFFFFFULL)
+
 typedef struct _WGCBRK_HEADER {          /* 128 bytes */
     volatile LONG      Magic;            /* written LAST by agent to publish readiness */
     volatile LONG      AbiVersion;

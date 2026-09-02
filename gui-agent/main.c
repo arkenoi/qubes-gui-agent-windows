@@ -171,6 +171,7 @@ static ULONGLONG g_WgcNextPoll = 0;
 static UINT64 g_WgcNonce = 0;
 static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
 static ULONGLONG g_WgcArenaNext = 0;   // bump allocator within the arena (offset past ArenaOffset)
+static LONG   g_WgcMonitorSlot = -1;   // slot capturing the whole monitor (o-r/static slice source)
 
 // minimal acceptable window dimensions
 DWORD g_MinWindowWidth = 0;
@@ -2033,6 +2034,8 @@ static void BrokerSupervise(void)
             _InterlockedExchange(&g_BrokerReady, 1);
             LogInfo("WGCBROKER ready (heartbeat live)");
         }
+        if (g_BrokerReady && g_SliceRetire)
+            BrokerRegisterMonitor();   // monitor slice source for o-r/static windows under retirement
         return;
     }
     if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL; }
@@ -2174,6 +2177,71 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
         }
     }
     return FALSE;   // torn/starved -> caller falls back to the desktop slice this frame
+}
+
+// Register a full-screen MONITOR capture slot with the broker (once). The broker CreateForMonitor()s
+// the primary output in the user session (proven to work where the SYSTEM agent's DDA is the only
+// other composited source). Static/o-r windows (menus, popups, toasts) are then sliced from this
+// composited frame by screen rect - the user-session WGC replacement for the agent's DDA slice.
+static void BrokerRegisterMonitor(void)
+{
+    if (!g_WgcBase || g_WgcMonitorSlot >= 0) return;
+    UINT w = g_HostScreenWidth ? g_HostScreenWidth : g_ScreenWidth;
+    UINT h = g_HostScreenHeight ? g_HostScreenHeight : g_ScreenHeight;
+    if (!w || !h) return;
+    WGCBRK_HEADER* hd = WGCBRK_HDR(g_WgcBase);
+    WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
+    int slot = -1;
+    for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
+        if (slots[i].Hwnd == 0 && slots[i].ReqState == WGCBRK_FREE) { slot = i; break; }
+    if (slot < 0) return;
+    ULONGLONG one = ((ULONGLONG)w * h * 4 + 63) & ~(ULONGLONG)63;
+    ULONGLONG off0 = WgcArenaAlloc(one), off1 = WgcArenaAlloc(one);
+    if (!off0 || !off1) return;   // arena too small for a full-screen double buffer
+    WGCBRK_SLOT* s = &slots[slot];
+    s->BufOffset[0] = (LONGLONG)off0; s->BufOffset[1] = (LONGLONG)off1;
+    s->BufBytes = (LONGLONG)one;
+    s->ReqWidth = (LONG)w; s->ReqHeight = (LONG)h; s->ReqCropX = 0; s->ReqCropY = 0;
+    s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
+    MemoryBarrier();
+    s->Hwnd = WGCBRK_MONITOR_HWND;
+    s->ReqState = WGCBRK_REQUESTED;
+    _InterlockedIncrement(&s->ControlSeq);
+    _InterlockedIncrement(&hd->ControlGen);
+    g_WgcMonitorSlot = slot;
+    if (g_WgcCtl) SetEvent(g_WgcCtl);
+    LogInfo("BROKER monitor slot %d requested (%ux%u)", slot, w, h);
+}
+
+// Read a fresh, bounds-checked MONITOR frame (screen-relative). Source for slicing static/o-r
+// windows out of the broker's composited monitor capture.
+static BOOL BrokerMonitorFrame(OUT const BYTE** base, OUT int* pitch, OUT int* w, OUT int* h)
+{
+    if (!g_WgcBase || g_WgcMonitorSlot < 0) return FALSE;
+    WGCBRK_HEADER* hd = WGCBRK_HDR(g_WgcBase);
+    WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[g_WgcMonitorSlot];
+    if (s->Hwnd != WGCBRK_MONITOR_HWND || s->AckState != WGCBRK_ACTIVE) return FALSE;
+    if (!hd->Producing) return FALSE;
+    for (int t = 0; t < 4; t++)
+    {
+        LONG s0 = s->Seq;
+        if (s0 & 1) { YieldProcessor(); continue; }
+        MemoryBarrier();
+        LONG b = s->ActiveBuffer, fw = s->FrameWidth, fh = s->FrameHeight, stride = s->Stride;
+        LONGLONG tick = s->CaptureTick, boff;
+        if (b < 0 || b >= WGCBRK_RING) return FALSE;
+        boff = s->BufOffset[b];
+        if (fw <= 0 || fh <= 0 || stride != fw * 4) return FALSE;
+        ULONGLONG need = (ULONGLONG)fh * (ULONGLONG)stride;
+        if (boff < hd->ArenaOffset ||
+            (ULONGLONG)boff + need > (ULONGLONG)hd->ArenaOffset + (ULONGLONG)hd->ArenaBytes)
+            return FALSE;
+        if ((ULONGLONG)tick < g_SecureDesktopLeftTick) return FALSE;
+        const BYTE* front = WGCBRK_ARENA(g_WgcBase, boff);
+        MemoryBarrier();
+        if (s->Seq == s0) { *base = front; *pitch = (int)stride; *w = fw; *h = fh; return TRUE; }
+    }
+    return FALSE;
 }
 
 // Guest-native window shadows off in seamless, restored in fullscreen. The shell window gives us a
@@ -5718,13 +5786,29 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     }
                     // else: no new broker frame this pass -> nothing changed, skip
                 }
-                // SliceRetire (diagnostic): with the broker active, DO NOT fall back to the
-                // composited-desktop slice - sliceFed windows are broker-only. Whatever the
-                // broker cannot capture stays unpainted, which is exactly what the retirement
-                // test measures (does an explorer o-r menu still render, or go blank?).
+                // SliceRetire: no per-HWND broker frame (o-r/static window). Instead of the
+                // agent's DDA slice, slice this window's screen rect out of the broker's
+                // user-session MONITOR capture (composited, so it contains menus/popups even
+                // when WGC per-HWND yields no frame). Screen-relative source (origin 0,0), like
+                // the DDA fb. This is the fix that keeps explorer popups from going black.
                 else if (g_SliceRetire && WgcBrokerActive())
                 {
-                    // broker-only: nothing to do (no slice). Window shows its last content or blank.
+                    const BYTE* mb = NULL; int mp = 0, mw = 0, mh = 0;
+                    if (BrokerMonitorFrame(&mb, &mp, &mw, &mh))
+                    {
+                        if (entry->PwSliceNeedsFull)
+                        {
+                            entry->PwSliceNeedsFull = FALSE;
+                            PwSliceCopyAndDamageSrc(entry, mb, mp, 0, 0, &pwRect);
+                        }
+                        else
+                        {
+                            for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
+                                if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
+                                    PwSliceCopyAndDamageSrc(entry, mb, mp, 0, 0, &pwHit);
+                        }
+                    }
+                    // else: broker monitor frame not yet available -> leave last content
                 }
                 // Agent-side slice (normal fallback / broker-inactive): copy the changed region of
                 // the composited screen into the window's own buffer. Content becomes window-relative,
