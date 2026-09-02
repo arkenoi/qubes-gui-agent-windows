@@ -1713,41 +1713,47 @@ static BOOL SynthQualifies(IN const WINDOW_DATA* entry, OUT WINDOW_DATA** ownerO
         if (!SynthOwnerQualifies(owner, entry))
             return FALSE;
     }
-    else if (entry->Owner)
+    else if (entry->Owner && FindWindowByHandle(entry->Owner))
     {
-        // GW_OWNER set: honor it exclusively. A menu owned by window A must never be
-        // synthesized into an overlapping window B of the same app.
-        //
-        // "Exclusively" has to include the case where the owner is NOT tracked. Testing
-        // `FindWindowByHandle(entry->Owner) != NULL` in the condition let an owned popup
-        // whose owner the agent does not track fall through to the same-process fallback
-        // below, which then adopted it into whatever topmost sibling happened to contain
-        // it. Measured: Office's MSO_BORDEREFFECT shadow strips around a sign-in DIALOG
-        // were adopted by the maximized OpusApp main window (they do overlap it, so the
-        // geometric guard passes), their pixels patched in from the composited desktop,
-        // and the owner's capture masked those bands out - leaving a frozen L-shaped
-        // shadow ghost burned into the document area that nothing could ever repaint,
-        // outliving the dialog itself. An untracked owner means "not ours to composite
-        // into", so the popup must be refused, never re-homed.
+        // GW_OWNER set AND TRACKED: honor it exclusively. A menu owned by tracked window A must
+        // never be re-homed into an overlapping sibling B of the same app.
         owner = FindWindowByHandle(entry->Owner);
         if (!owner || !SynthOwnerQualifies(owner, entry))
             return FALSE;
     }
     else if (entry->ProcessId != 0)
     {
-        // Prefer the foreground window: keytips and flyouts belong to the focused
-        // window, and with two overlapping windows of the same process the topmost-
-        // containing pick below can attach the popup to the wrong sibling.
+        // Reached with EITHER no GW_OWNER, OR an UNTRACKED GW_OWNER. The untracked case is the
+        // Win11 XAML island host that owns explorer/WinUI context menus - synthesizing those is
+        // the nice-looking result the owner wants, but it caused mis-attribution ("synthesized
+        // window that does not belong") when adopted into the wrong sibling. So the untracked case
+        // is guarded TIGHTLY: the FOREGROUND same-process window ONLY (a menu belongs to the
+        // focused window), and it must FULLY contain the popup - no overhang, no topmost-sibling
+        // guessing. Anything that fails this materializes and is cropped instead (still clean).
+        // The no-GW_OWNER case (keytips/flyouts) keeps the original foreground + topmost fallback.
+        const BOOL untracked = (entry->Owner != NULL);
         HWND fgHandle = GetForegroundWindow();
         if (fgHandle)
         {
             WINDOW_DATA* fg = FindWindowByHandle(fgHandle);
             if (fg && fg->ProcessId == entry->ProcessId && !fg->IsOverrideRedirect &&
                 SynthOwnerQualifies(fg, entry))
-                owner = fg;
+            {
+                BOOL fits = TRUE;
+                if (untracked)
+                {
+                    // Full containment: the popup entirely within the foreground window's granted
+                    // buffer, no overhang. This is the tight discriminator against wrong-window adoption.
+                    int oL = fg->X, oT = fg->Y, oR = oL + (int)fg->PwWidth, oB = oT + (int)fg->PwHeight;
+                    int cL = entry->X, cT = entry->Y, cR = cL + (int)entry->Width, cB = cT + (int)entry->Height;
+                    fits = (cL >= oL && cT >= oT && cR <= oR && cB <= oB);
+                }
+                if (fits)
+                    owner = fg;
+            }
         }
 
-        if (!owner)
+        if (!owner && !untracked)   // topmost-sibling fallback ONLY for the no-GW_OWNER case
         {
             int bestZ = INT_MAX;
             for (LIST_ENTRY* e = g_WatchedWindowsList.Flink;
