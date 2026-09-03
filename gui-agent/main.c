@@ -161,12 +161,18 @@ BOOL g_NoScreenGrant = FALSE;
 // the broker cannot capture (shell CoreWindows) goes blank, mapping the residual gap. Toasts are
 // covered separately by the notifhost interceptor (normal windows, not sliceFed).
 #define REG_CONFIG_SLICE_RETIRE_VALUE L"SliceRetire"
+#define REG_CONFIG_DESLICE_VALUE L"DeSlice"
 // After the DDA reports damage over a monitor-sliced (o-r/static) window, keep re-copying it from
 // fresh WGC monitor frames for this long, so a repaint whose WGC frame arrives after the DDA damage
 // (the two clocks are independent) is not left stale. WGC FrameArrived latency is well under this.
 #define WGC_MON_CHASE_MS 250
 BOOL          g_WgcBroker   = FALSE;
 BOOL          g_SliceRetire = FALSE;   // diagnostic: broker-only sliceFed, no slice fallback
+BOOL          g_DeSlice = FALSE;       // de-slice step 3: do not create/use the whole-desktop
+                                       // monitor composite at all (CreateForMonitor). Every surface
+                                       // is per-window (synth + materialized deferred until ready);
+                                       // toggles the composite off so it can be proven unneeded
+                                       // before the code is deleted. Registry DeSlice=1.
 DWORD         g_OsBuild     = 0;
 volatile LONG g_BrokerReady = 0;
 static HANDLE g_WgcMap = NULL, g_WgcCtl = NULL, g_WgcBrokerProc = NULL;
@@ -2157,7 +2163,7 @@ static void BrokerSupervise(void)
             _InterlockedExchange(&g_BrokerReady, 1);
             LogInfo("WGCBROKER ready (heartbeat live)");
         }
-        if (g_BrokerReady && g_SliceRetire)
+        if (g_BrokerReady && g_SliceRetire && !g_DeSlice)
         {
             BrokerRegisterMonitor();   // monitor slice source for o-r/static windows under retirement
             if (g_WgcMonitorSlot >= 0)
@@ -2441,6 +2447,12 @@ static BOOL CropReadyForMap(IN const WINDOW_DATA* entry)
         return BrokerOpaqueInsets(entry->Handle, &tmp) || !CropPending(entry);
     if (IsShellToastWindow(entry))
         return !CropPending(entry);
+    // DE-SLICE: with the whole-desktop composite retired there is no MONSLICE to fill a slice-fed
+    // window's transitional first frame, so hold its map until its own per-window frame has been
+    // consumed (else it would map black until the broker's first frame). Owner OK'd the ~100 ms
+    // new-window penalty. Non-DeSlice keeps the old behaviour (MONSLICE covers the first frame).
+    if (g_DeSlice && entry->PwSliceFed)
+        return entry->PwBrokerLastId != 0;
     return TRUE;
 }
 
@@ -2483,6 +2495,7 @@ static void BrokerRegisterMonitor(void)
 static BOOL BrokerMonitorFrame(OUT const BYTE** base, OUT int* pitch, OUT int* w, OUT int* h,
                                OUT UINT64* id)
 {
+    if (g_DeSlice) return FALSE;   // de-slice: the whole-desktop composite is retired; no MONSLICE
     if (!g_WgcBase || g_WgcMonitorSlot < 0) return FALSE;
     WGCBRK_HEADER* hd = WGCBRK_HDR(g_WgcBase);
     WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[g_WgcMonitorSlot];
@@ -2709,12 +2722,13 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
         // flashing uncropped for a frame; UpdateWindowData maps it once the crop resolves or the
         // timeout elapses.
         if (entry->IsVisible && !entry->IsIconic &&
-            (IsMenuPopupWindow(entry) || IsShellToastWindow(entry)) &&
+            (IsMenuPopupWindow(entry) || IsShellToastWindow(entry) ||
+             (g_DeSlice && entry->PwSliceFed)) &&
             !CropReadyForMap(entry))
         {
             entry->MapDeferred = TRUE;
             entry->MapDeferSince = GetTickCount64();
-            LogVerbose("0x%x: crop-before-show - MAP deferred until crop resolves", entry->Handle);
+            LogVerbose("0x%x: map deferred until first per-window frame / crop resolves", entry->Handle);
         }
         else if (entry->IsIconic || entry->IsVisible)
         {
@@ -5318,12 +5332,20 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
         const BYTE* mb = NULL; int mp = 0, mw = 0, mh = 0; UINT64 mid = 0;
         if (g_SliceRetire && WgcBrokerActive() && BrokerMonitorFrame(&mb, &mp, &mw, &mh, &mid))
         { srcBase = mb; srcPitch = mp; srcW = mw; srcH = mh; }
-        else if (g_FbBits && g_FbPitch > 0)
+        else if (!g_DeSlice && g_FbBits && g_FbPitch > 0)
         { srcBase = g_FbBits; srcPitch = g_FbPitch; srcW = (int)g_FbWidth; srcH = (int)g_FbHeight; }
+        // else (DeSlice, no per-window frame yet): leave srcBase NULL - do not paint this pass; the
+        // owner's own pixels show through until the child's per-window frame arrives (no composite).
     }
     if (!srcBase)
     {
-        LogWarning("synth paint 0x%x: no source (child per-window + broker monitor + DDA fb all unavailable)", c->Handle);
+        // Under DeSlice this is the EXPECTED transitional state (child's per-window frame not ready
+        // yet, no composite by design) - the owner shows through until it arrives, so it is not a
+        // fault. Only warn when a composite was supposed to be available.
+        if (g_DeSlice)
+            LogVerbose("synth paint 0x%x: no per-window frame yet (DeSlice, owner shows through)", c->Handle);
+        else
+            LogWarning("synth paint 0x%x: no source (child per-window + broker monitor + DDA fb all unavailable)", c->Handle);
         return;
     }
 
@@ -8348,9 +8370,12 @@ static ULONG Init(void)
         DWORD sr = 0;
         (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_RETIRE_VALUE, &sr, NULL);
         g_SliceRetire = (sr != 0);
+        DWORD ds = 0;
+        (void)CfgReadDword(moduleName, REG_CONFIG_DESLICE_VALUE, &ds, NULL);
+        g_DeSlice = (ds != 0);
     }
-    LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d (floor 26100)",
-            g_WgcBroker, g_OsBuild, g_SliceRetire);
+    LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d deSlice=%d (floor 26100)",
+            g_WgcBroker, g_OsBuild, g_SliceRetire, g_DeSlice);
 
     // Diagnostic-only window-filter override; absent (the normal case) means 0 = all
     // filters active. See g_DiagWindowFilterOff.
