@@ -8355,7 +8355,10 @@ static ULONG Init(void)
         if (pRtlGetVersion && pRtlGetVersion(&rovi) == 0) g_OsBuild = rovi.dwBuildNumber;
     }
     {
-        DWORD wgc = 0;
+        // WGC broker ships DEFAULT-ON for 24H2+ (build >= 26100): it is the capture path for the
+        // win11 shell surfaces, and the win11 de-slice benchmark shows no penalty vs the composite.
+        // Registry "WgcBroker" / qubesdb /qubes-service/wgc-broker override it (0 forces it off).
+        DWORD wgc = (g_OsBuild >= 26100) ? 1u : 0u;
         (void)CfgReadDword(moduleName, REG_CONFIG_WGC_BROKER_VALUE, &wgc, NULL);
         g_WgcBroker = (wgc != 0);
         qdb_handle_t q = qdb_open(NULL);
@@ -8367,15 +8370,19 @@ static ULONG Init(void)
         }
     }
     {
-        DWORD sr = 0;
+        // SliceRetire (broker-only per-window slice) ships DEFAULT-ON for 24H2+, tracking the broker.
+        DWORD sr = (g_OsBuild >= 26100) ? 1u : 0u;
         (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_RETIRE_VALUE, &sr, NULL);
         g_SliceRetire = (sr != 0);
         // De-slice defaults ON wherever the slice is being retired (SliceRetire): the whole-desktop
         // composite is validated unneeded, so the shipped build is de-sliced. The registry value,
         // when present, overrides (DeSlice=0 is the safety switch back to the composite fallback).
+        // HARD-GATED on the broker floor (26100): below it WgcBrokerActive() is never true, so a set
+        // DeSlice would only "retire" a composite the classic DDA path never used - keep it inert by
+        // construction there, which is exactly the win10 config the benchmark validated.
         DWORD ds = g_SliceRetire ? 1u : 0u;
         (void)CfgReadDword(moduleName, REG_CONFIG_DESLICE_VALUE, &ds, NULL);
-        g_DeSlice = (ds != 0);
+        g_DeSlice = (ds != 0) && (g_OsBuild >= 26100);
     }
     LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d deSlice=%d (floor 26100)",
             g_WgcBroker, g_OsBuild, g_SliceRetire, g_DeSlice);
