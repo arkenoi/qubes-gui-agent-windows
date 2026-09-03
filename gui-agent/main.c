@@ -2419,6 +2419,25 @@ static BOOL BrokerOpaqueInsets(IN HWND window, OUT RECT* insets)
     return FALSE;
 }
 
+// Crop-before-show fallback ceiling: map a held toast/menu after this long even if the crop never
+// resolves, so it can never stay hidden. Typical maps happen far sooner (when the broker reports,
+// ~100-150 ms); this only bounds a broker-slow / broker-down case. Owner OK'd a ~100 ms new-window
+// penalty; 400 ms is the worst case, not the norm.
+#define CROP_BEFORE_SHOW_TIMEOUT_MS 400
+
+// Crop-before-show readiness: is the shadow-crop for this toast/menu resolved enough to map it
+// already cropped? Menu -> the broker has reported opaque bounds (preferred) OR the UIA measurement
+// resolved; toast -> UIA resolved. A non-cropped surface is always ready.
+static BOOL CropReadyForMap(IN const WINDOW_DATA* entry)
+{
+    RECT tmp;
+    if (IsMenuPopupWindow(entry))
+        return BrokerOpaqueInsets(entry->Handle, &tmp) || !CropPending(entry);
+    if (IsShellToastWindow(entry))
+        return !CropPending(entry);
+    return TRUE;
+}
+
 // Register a full-screen MONITOR capture slot with the broker (once). The broker CreateForMonitor()s
 // the primary output in the user session (proven to work where the SYSTEM agent's DDA is the only
 // other composited source). Static/o-r windows (menus, popups, toasts) are then sliced from this
@@ -2678,8 +2697,20 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             (void)PwAttachWindow(entry);
         }
 
-        // map (show) the window if it's visible OR minimized
-        if (entry->IsIconic || entry->IsVisible)
+        // map (show) the window if it's visible OR minimized -- unless crop-before-show holds it.
+        // A visible (non-iconic) toast/menu whose shadow-crop has not resolved is CREATE'd and
+        // buffer-attached above, but its MAP is DEFERRED so it appears already cropped rather than
+        // flashing uncropped for a frame; UpdateWindowData maps it once the crop resolves or the
+        // timeout elapses.
+        if (entry->IsVisible && !entry->IsIconic &&
+            (IsMenuPopupWindow(entry) || IsShellToastWindow(entry)) &&
+            !CropReadyForMap(entry))
+        {
+            entry->MapDeferred = TRUE;
+            entry->MapDeferSince = GetTickCount64();
+            LogVerbose("0x%x: crop-before-show - MAP deferred until crop resolves", entry->Handle);
+        }
+        else if (entry->IsIconic || entry->IsVisible)
         {
             status = SendWindowMap(entry);
             if (ERROR_SUCCESS != status)
@@ -4656,6 +4687,32 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             goto end;
     }
 
+    // CROP-BEFORE-SHOW: a toast/menu whose MAP was held in AddWindow now maps, once its crop has
+    // resolved (so it appears already cropped) or the bounded timeout elapses (mapped uncropped,
+    // never lost). CREATE and the per-window buffer are already in place; the cropped geometry has
+    // been announced above via SendWindowConfigureIfChanged, so the map lands at the final rect.
+    if (windowData->MapDeferred && windowData->IsVisible && !windowData->IsIconic &&
+        !windowData->Synthesized)
+    {
+        if (CropReadyForMap(windowData) ||
+            (GetTickCount64() - windowData->MapDeferSince) > CROP_BEFORE_SHOW_TIMEOUT_MS)
+        {
+            windowData->MapDeferred = FALSE;
+            ULONG ms = SendWindowMap(windowData);
+            if (ms == ERROR_SUCCESS)
+                (void)SendWindowDamageEvent(windowData->Handle, 0, 0,
+                    windowData->Width, windowData->Height);
+            else
+                win_perror2(ms, "SendWindowMap(crop-before-show)");
+        }
+    }
+    else if (windowData->MapDeferred)
+    {
+        // No longer a plain visible popup (hidden/iconic/synthesized) - drop the hold; the normal
+        // paths own its mapping now.
+        windowData->MapDeferred = FALSE;
+    }
+
     status = ERROR_SUCCESS;
 
 end:
@@ -6068,6 +6125,12 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                     entry->PwWidth, entry->PwHeight);
                     }
                     // else: no new broker frame this pass -> nothing changed, skip
+
+                    // Crop-before-show: a per-window broker frame is available, so the crop is now
+                    // measurable; if this window's MAP is still held, poke the tracking pass to map
+                    // it promptly rather than waiting for the 2 s resync.
+                    if (entry->MapDeferred)
+                        PokeWindowTracking();
                 }
                 // SliceRetire: no per-HWND broker frame (o-r/static window). Instead of the
                 // agent's DDA slice, slice this window's screen rect out of the broker's

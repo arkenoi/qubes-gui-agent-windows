@@ -106,6 +106,14 @@ typedef struct _WINDOW_DATA
     int CropRight;
     int CropBottom;
 
+    // Crop-before-show: a toast/menu is CREATE'd and buffer-attached immediately, but its MAP is
+    // HELD until its shadow-crop resolves, so it appears already cropped instead of flashing
+    // uncropped for a frame and then tightening. UpdateWindowData maps it once CropReadyForMap()
+    // OR CROP_BEFORE_SHOW_TIMEOUT_MS elapses (the timeout means it can never stay hidden - unlike
+    // the reverted reject-in-ShouldAcceptWindow attempt). MapDeferSince is GetTickCount64 at defer.
+    BOOL MapDeferred;
+    ULONGLONG MapDeferSince;
+
     // Position as of the frame currently being processed. Dirty rects come from a frame
     // captured BEFORE this frame's tracking update ran, so converting them to
     // window-relative coordinates with the freshly-updated X/Y mis-registers the damage by
