@@ -155,24 +155,19 @@ BOOL g_NoScreenGrant = FALSE;
 // never affect rendering. Toasts/o-r menus are NOT routed here (topmost, slice-correct; the
 // toast interceptor handles toasts). See wgcbroker_ipc.h for the contract.
 #define REG_CONFIG_WGC_BROKER_VALUE L"WgcBroker"
-// SliceRetire (DWORD, default 0, DIAGNOSTIC): with the broker active, make sliceFed windows
-// BROKER-ONLY - skip the composited-desktop slice fallback entirely, and let the broker attempt
-// EVERY sliceFed window (not just NRB app windows). This is the "retire the slicer" test: whatever
-// the broker cannot capture (shell CoreWindows) goes blank, mapping the residual gap. Toasts are
-// covered separately by the notifhost interceptor (normal windows, not sliceFed).
-#define REG_CONFIG_SLICE_RETIRE_VALUE L"SliceRetire"
-#define REG_CONFIG_DESLICE_VALUE L"DeSlice"
-// After the DDA reports damage over a monitor-sliced (o-r/static) window, keep re-copying it from
-// fresh WGC monitor frames for this long, so a repaint whose WGC frame arrives after the DDA damage
-// (the two clocks are independent) is not left stale. WGC FrameArrived latency is well under this.
-#define WGC_MON_CHASE_MS 250
+// Slice retirement (broker-only sliceFed handling) is the SHIPPED behaviour on 24H2+ and tracks
+// the broker build floor unconditionally; the SliceRetire diagnostic knob is retired. Field
+// kill-switch: WgcBroker=0 / /qubes-service/wgc-broker=0 - broker inactive routes every sliceFed
+// window to the retained agent DDA slice. Toasts are covered by the notifhost interceptor
+// (normal windows, not sliceFed).
 BOOL          g_WgcBroker   = FALSE;
-BOOL          g_SliceRetire = FALSE;   // diagnostic: broker-only sliceFed, no slice fallback
-BOOL          g_DeSlice = FALSE;       // de-slice step 3: do not create/use the whole-desktop
-                                       // monitor composite at all (CreateForMonitor). Every surface
-                                       // is per-window (synth + materialized deferred until ready);
-                                       // toggles the composite off so it can be proven unneeded
-                                       // before the code is deleted. Registry DeSlice=1.
+BOOL          g_SliceRetire = FALSE;   // broker-era sliceFed handling; set once at init: TRUE iff build >= 26100 (knob retired)
+BOOL          g_DeSlice = FALSE;       // DERIVED at init (g_SliceRetire && build >= 26100), not a
+                                       // knob: every surface is per-window (synth + materialized
+                                       // deferred until ready). The whole-desktop monitor composite
+                                       // (MONSLICE/CreateForMonitor) it used to gate was proven
+                                       // unneeded and DELETED after the de-slice proof window
+                                       // closed; there is nothing left to switch back to.
 DWORD         g_OsBuild     = 0;
 volatile LONG g_BrokerReady = 0;
 static HANDLE g_WgcMap = NULL, g_WgcCtl = NULL, g_WgcBrokerProc = NULL;
@@ -201,8 +196,6 @@ typedef struct { ULONGLONG off0, off1, size, freeAtTick; } WGC_PENDINGFREE;
 static WGC_PENDINGFREE g_WgcPending[WGCBRK_MAX_SLOTS * 2];
 static int g_WgcPendingCount = 0;
 #define WGC_ARENA_FREE_DELAY_MS 2000   // >> broker Reconcile (<=250 ms) + in-flight FrameArrived
-static LONG   g_WgcMonitorSlot = -1;   // slot capturing the whole monitor (o-r/static slice source)
-static void BrokerRegisterMonitor(void);   // defined after BrokerFreshFrame; called from BrokerSupervise
 static void WgcArenaReapPending(void);      // defined with the arena allocator; called from BrokerSupervise
 static BOOL BrokerOpaqueInsets(IN HWND window, OUT RECT* insets);  // defined after BrokerFreshFrame; used by the crop in GetWindowData
 
@@ -2163,17 +2156,6 @@ static void BrokerSupervise(void)
             _InterlockedExchange(&g_BrokerReady, 1);
             LogInfo("WGCBROKER ready (heartbeat live)");
         }
-        if (g_BrokerReady && g_SliceRetire && !g_DeSlice)
-        {
-            BrokerRegisterMonitor();   // monitor slice source for o-r/static windows under retirement
-            if (g_WgcMonitorSlot >= 0)
-            {
-                WGCBRK_SLOT* ms = &WGCBRK_SLOTS(g_WgcBase)[g_WgcMonitorSlot];
-                LogInfo("MONITOR slot %d ack=%d fail=0x%x frameId=%llu %dx%d",
-                        g_WgcMonitorSlot, ms->AckState, (unsigned)ms->FailHr,
-                        (unsigned long long)ms->FrameId, ms->FrameWidth, ms->FrameHeight);
-            }
-        }
         return;
     }
     _InterlockedExchange(&g_BrokerReady, 0);
@@ -2273,29 +2255,18 @@ static void WgcArenaReapPending(void)
         else i++;
 }
 
-// Register a sliceFed window with the broker IFF it is the class the broker actually helps:
-// an NRB (DirectComposition) app window that is NOT override-redirect and NOT topmost - i.e.
-// UWP/Terminal-style windows where the composited slice bleeds occluders and per-HWND WGC
-// works. Toasts (topmost shell CoreWindows) and o-r menus are EXCLUDED (CreateForWindow fails
-// on CoreWindows; menus are topmost/slice-correct/short-lived). Returns TRUE if registered.
+// Register a sliceFed window with the broker. EVERY sliceFed window is attempted (the NRB-only/
+// no-topmost/no-o-r narrowing was the pre-retirement diagnostic scope; retired with the
+// SliceRetire knob). Windows the broker cannot capture (e.g. shell CoreWindows, where
+// CreateForWindow fails) simply never publish a frame and are handled downstream in
+// ProcessNewFrame; toasts are not sliceFed (notifhost interceptor) and never reach here.
+// Returns TRUE if registered.
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
 {
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1;
     entry->PwBrokerLastId = 0; entry->PwBrokerArenaOff = 0;
     if (!WgcBrokerActive() || !entry->PwSliceFed) return FALSE;
     if (entry->Width == 0 || entry->Height == 0) return FALSE;
-
-    LONG ex = GetWindowLong(entry->Handle, GWL_EXSTYLE);
-    if (!g_SliceRetire)
-    {
-        // Normal scope: only occluded NRB app windows (where the slice bleeds and per-HWND WGC
-        // works). SliceRetire broadens this to EVERY sliceFed window so the retirement test can
-        // see which classes the broker can/cannot capture (e.g. explorer o-r menus).
-        if ((ex & WS_EX_NOREDIRECTIONBITMAP) == 0) return FALSE;   // only NRB/DComp windows
-        if (ex & WS_EX_TOPMOST) return FALSE;                       // exclude toasts/flyouts
-        if (entry->IsOverrideRedirect) return FALSE;                // exclude o-r menus
-    }
-    (void)ex;
 
     WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
     WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
@@ -2400,7 +2371,7 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
             return TRUE;
         }
     }
-    return FALSE;   // torn/starved -> caller falls back to the desktop slice this frame
+    return FALSE;   // torn/starved -> slice-fed caller HOLDS last content this frame (synth uses its ladder)
 }
 
 // Pixel-exact crop: the broker PrintWindow-renders the FULL window (transparent margin = black) and
@@ -2447,80 +2418,13 @@ static BOOL CropReadyForMap(IN const WINDOW_DATA* entry)
         return BrokerOpaqueInsets(entry->Handle, &tmp) || !CropPending(entry);
     if (IsShellToastWindow(entry))
         return !CropPending(entry);
-    // DE-SLICE: with the whole-desktop composite retired there is no MONSLICE to fill a slice-fed
+    // DE-SLICE: with the whole-desktop composite retired there is nothing to fill a slice-fed
     // window's transitional first frame, so hold its map until its own per-window frame has been
     // consumed (else it would map black until the broker's first frame). Owner OK'd the ~100 ms
-    // new-window penalty. Non-DeSlice keeps the old behaviour (MONSLICE covers the first frame).
+    // new-window penalty. Non-de-sliced configs (win10 / broker floor) map immediately as before.
     if (g_DeSlice && entry->PwSliceFed)
         return entry->PwBrokerLastId != 0;
     return TRUE;
-}
-
-// Register a full-screen MONITOR capture slot with the broker (once). The broker CreateForMonitor()s
-// the primary output in the user session (proven to work where the SYSTEM agent's DDA is the only
-// other composited source). Static/o-r windows (menus, popups, toasts) are then sliced from this
-// composited frame by screen rect - the user-session WGC replacement for the agent's DDA slice.
-static void BrokerRegisterMonitor(void)
-{
-    if (!g_WgcBase || g_WgcMonitorSlot >= 0) return;
-    UINT w = g_HostScreenWidth ? g_HostScreenWidth : g_ScreenWidth;
-    UINT h = g_HostScreenHeight ? g_HostScreenHeight : g_ScreenHeight;
-    if (!w || !h) return;
-    WGCBRK_HEADER* hd = WGCBRK_HDR(g_WgcBase);
-    WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
-    int slot = -1;
-    for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
-        if (slots[i].Hwnd == 0 && slots[i].ReqState == WGCBRK_FREE) { slot = i; break; }
-    if (slot < 0) return;
-    ULONGLONG one = ((ULONGLONG)w * h * 4 + 63) & ~(ULONGLONG)63;
-    ULONGLONG off0 = WgcArenaAlloc(one), off1 = WgcArenaAlloc(one);
-    if (!off0 || !off1) return;   // arena too small for a full-screen double buffer
-    WGCBRK_SLOT* s = &slots[slot];
-    s->BufOffset[0] = (LONGLONG)off0; s->BufOffset[1] = (LONGLONG)off1;
-    s->BufBytes = (LONGLONG)one;
-    s->ReqWidth = (LONG)w; s->ReqHeight = (LONG)h; s->ReqCropX = 0; s->ReqCropY = 0;
-    s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
-    MemoryBarrier();
-    s->Hwnd = WGCBRK_MONITOR_HWND;
-    s->ReqState = WGCBRK_REQUESTED;
-    _InterlockedIncrement(&s->ControlSeq);
-    _InterlockedIncrement(&hd->ControlGen);
-    g_WgcMonitorSlot = slot;
-    if (g_WgcCtl) SetEvent(g_WgcCtl);
-    LogInfo("BROKER monitor slot %d requested (%ux%u)", slot, w, h);
-}
-
-// Read a fresh, bounds-checked MONITOR frame (screen-relative). Source for slicing static/o-r
-// windows out of the broker's composited monitor capture.
-static BOOL BrokerMonitorFrame(OUT const BYTE** base, OUT int* pitch, OUT int* w, OUT int* h,
-                               OUT UINT64* id)
-{
-    if (g_DeSlice) return FALSE;   // de-slice: the whole-desktop composite is retired; no MONSLICE
-    if (!g_WgcBase || g_WgcMonitorSlot < 0) return FALSE;
-    WGCBRK_HEADER* hd = WGCBRK_HDR(g_WgcBase);
-    WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[g_WgcMonitorSlot];
-    if (s->Hwnd != WGCBRK_MONITOR_HWND || s->AckState != WGCBRK_ACTIVE) return FALSE;
-    if (!hd->Producing) return FALSE;
-    for (int t = 0; t < 4; t++)
-    {
-        LONG s0 = s->Seq;
-        if (s0 & 1) { YieldProcessor(); continue; }
-        MemoryBarrier();
-        LONG b = s->ActiveBuffer, fw = s->FrameWidth, fh = s->FrameHeight, stride = s->Stride;
-        LONGLONG tick = s->CaptureTick, boff; UINT64 fid = s->FrameId;
-        if (b < 0 || b >= WGCBRK_RING) return FALSE;
-        boff = s->BufOffset[b];
-        if (fw <= 0 || fh <= 0 || stride != fw * 4) return FALSE;
-        ULONGLONG need = (ULONGLONG)fh * (ULONGLONG)stride;
-        if (boff < hd->ArenaOffset ||
-            (ULONGLONG)boff + need > (ULONGLONG)hd->ArenaOffset + (ULONGLONG)hd->ArenaBytes)
-            return FALSE;
-        if ((ULONGLONG)tick < g_SecureDesktopLeftTick) return FALSE;
-        const BYTE* front = WGCBRK_ARENA(g_WgcBase, boff);
-        MemoryBarrier();
-        if (s->Seq == s0) { *base = front; *pitch = (int)stride; *w = fw; *h = fh; *id = fid; return TRUE; }
-    }
-    return FALSE;
 }
 
 // Guest-native window shadows off in seamless, restored in fullscreen. The shell window gives us a
@@ -5303,18 +5207,14 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
         LogWarning("synth paint 0x%x: no owner buffer", c->Handle);
         return;
     }
-    // Composited-desktop source. Under SliceRetire the agent's own DDA composited desktop
-    // (g_FbBits) is being retired, so source from the broker's monitor capture instead - it is the
-    // same composited desktop in SCREEN coordinates (broker CreateForMonitor), so the clip/copy math
-    // below is identical; only the base+pitch+extent differ. Falls back to the DDA framebuffer when
-    // the broker monitor frame is not available (non-retire, or broker not yet ready). This is what
-    // removes synthesis's dependency on the agent slice - the last synth-path retirement blocker.
-    // DE-SLICE step 1: prefer the child's OWN per-window broker frame (window-relative, and already
-    // cropped pixel-exact), which removes synthesis's dependency on the whole-desktop monitor
-    // composite - the last synth-path retirement blocker. srcOrigin is the SCREEN coord mapping to
-    // source (0,0): (c->X,c->Y) for the window-relative child frame, (0,0) for the screen-relative
-    // composite. FALL BACK to the monitor composite / DDA fb whenever the child has no per-window
-    // frame yet (bootstrap, mid crop-converge size change, broker down) so synthesis NEVER breaks.
+    // Pixel source. PREFER the child's OWN per-window broker frame (window-relative, already
+    // cropped pixel-exact) - the de-sliced path, shipped default on 24H2+. srcOrigin is the
+    // SCREEN coord mapping to source (0,0): (c->X,c->Y) for the window-relative child frame,
+    // (0,0) for the screen-relative DDA framebuffer. Fallback: the DDA composited desktop
+    // (g_FbBits) on non-de-sliced configs (win10 / broker floor). De-sliced with no per-window
+    // frame yet (bootstrap, mid crop-converge size change, broker down): NO source - the owner's
+    // own pixels show through until the child's frame arrives. The broker's whole-desktop
+    // monitor composite that used to sit between those two rungs was retired and deleted.
     const BYTE* srcBase = NULL; int srcPitch = 0, srcW = 0, srcH = 0;
     int srcOriginX = 0, srcOriginY = 0;
     const BYTE* cb = NULL; int cp = 0; UINT64 cid = 0;
@@ -5329,13 +5229,10 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
     }
     else
     {
-        const BYTE* mb = NULL; int mp = 0, mw = 0, mh = 0; UINT64 mid = 0;
-        if (g_SliceRetire && WgcBrokerActive() && BrokerMonitorFrame(&mb, &mp, &mw, &mh, &mid))
-        { srcBase = mb; srcPitch = mp; srcW = mw; srcH = mh; }
-        else if (!g_DeSlice && g_FbBits && g_FbPitch > 0)
+        if (!g_DeSlice && g_FbBits && g_FbPitch > 0)
         { srcBase = g_FbBits; srcPitch = g_FbPitch; srcW = (int)g_FbWidth; srcH = (int)g_FbHeight; }
-        // else (DeSlice, no per-window frame yet): leave srcBase NULL - do not paint this pass; the
-        // owner's own pixels show through until the child's per-window frame arrives (no composite).
+        // else (de-sliced: no composite by design): leave srcBase NULL - do not paint this pass;
+        // the owner's own pixels show through until the child's per-window frame arrives.
     }
     if (!srcBase)
     {
@@ -6193,10 +6090,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             {
                 // WGC BROKER (24H2+): if this window has a fresh, bounds-checked per-HWND
                 // WGC frame from the user-session broker, copy from THAT (occlusion-independent,
-                // window-relative) instead of the composited-desktop slice. Any failure -
-                // broker down, no fresh frame, secure desktop, torn read, size mismatch -
-                // falls through to the exact legacy slice path below, so the window is never
-                // blank. Broker frames are window-relative: source origin = (entry->X, entry->Y).
+                // window-relative) instead of the composited-desktop slice. Failure splits by
+                // broker state: broker ACTIVE but no usable frame (first frame pending, secure
+                // desktop, torn read, size mismatch) -> the HOLD arm below keeps last content;
+                // broker INACTIVE (down / not ready / pre-24H2) -> the DDA slice fallback
+                // further below. Broker frames are window-relative: source origin = (entry->X, entry->Y).
                 const BYTE* bsrc = NULL; int bpitch = 0; UINT64 bid = 0;
                 if (entry->PwBrokerSourced && WgcBrokerActive() &&
                     BrokerFreshFrame(entry, &bsrc, &bpitch, &bid))
@@ -6220,62 +6118,25 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     if (entry->MapDeferred)
                         PokeWindowTracking();
                 }
-                // SliceRetire: no per-HWND broker frame (o-r/static window). Instead of the
-                // agent's DDA slice, slice this window's screen rect out of the broker's
-                // user-session MONITOR capture (composited, so it contains menus/popups even
-                // when WGC per-HWND yields no frame). Screen-relative source (origin 0,0), like
-                // the DDA fb. This is the fix that keeps explorer popups from going black.
+                // BROKER-ACTIVE HOLD - this arm is the fall-through blocker. The broker is
+                // active but this pass produced no usable per-HWND frame (first frame still
+                // pending, secure desktop Producing=0, torn read, dims mismatch mid-resize,
+                // or the window never got a broker slot). Falling through to the agent's DDA
+                // slice below would reintroduce composited-slice occluder bleed - exactly what
+                // the broker exists to remove - so HOLD: skip this pass, keep last content,
+                // and touch nothing (PwSliceNeedsFull in particular stays set, so the first
+                // broker frame still does its full-window copy). The whole-desktop MONSLICE
+                // composite that used to fill this arm was retired with de-slice and deleted;
+                // the DDA slice below now serves ONLY broker-inactive configs.
                 else if (g_SliceRetire && WgcBrokerActive())
                 {
-                    const BYTE* mb = NULL; int mp = 0, mw = 0, mh = 0; UINT64 mid = 0;
-                    BOOL monOk = BrokerMonitorFrame(&mb, &mp, &mw, &mh, &mid);
-                    if (!entry->PwMonLogged)   // one-shot diagnostic per window
+                    if (!entry->PwHoldLogged)   // one-shot diagnostic per window
                     {
-                        entry->PwMonLogged = TRUE;
-                        LogInfo("MONSLICE hwnd 0x%x monAvail=%d mon=%dx%d rect=%d,%d,%d,%d",
-                                (DWORD)(ULONG_PTR)entry->Handle, monOk, mw, mh,
+                        entry->PwHoldLogged = TRUE;
+                        LogInfo("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d",
+                                (DWORD)(ULONG_PTR)entry->Handle,
                                 pwRect.left, pwRect.top, pwRect.right, pwRect.bottom);
                     }
-                    if (monOk)
-                    {
-                        ULONGLONG now = GetTickCount64();
-                        // Did the DDA damage clock report a change over this window this pass?
-                        BOOL damaged = FALSE;
-                        for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
-                            if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect)) { damaged = TRUE; break; }
-
-                        if (entry->PwSliceNeedsFull)
-                        {
-                            // Fresh attach/remap: one full-window copy, then chase WGC frames briefly
-                            // (the window may still be painting its initial content).
-                            entry->PwSliceNeedsFull = FALSE;
-                            entry->PwMonLastId = mid;
-                            entry->PwMonRefreshUntil = now + WGC_MON_CHASE_MS;
-                            PwSliceCopyAndDamageSrc(entry, mb, mp, 0, 0, &pwRect);
-                        }
-                        else if (damaged)
-                        {
-                            // DDA saw damage over the window: copy the changed sub-regions now, and
-                            // (re)arm the catch-up window so lagged WGC frames are picked up below.
-                            entry->PwMonRefreshUntil = now + WGC_MON_CHASE_MS;
-                            entry->PwMonLastId = mid;
-                            for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
-                                if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
-                                    PwSliceCopyAndDamageSrc(entry, mb, mp, 0, 0, &pwHit);
-                        }
-                        else if (now < entry->PwMonRefreshUntil && mid != entry->PwMonLastId)
-                        {
-                            // Catch-up: within the post-damage window a FRESH monitor frame arrived.
-                            // The WGC frame that reflects the earlier repaint (which the DDA already
-                            // reported and moved on from) is only now available - re-copy the full
-                            // window rect so menus don't keep the stale pre-repaint pixels. Bounded
-                            // to WGC_MON_CHASE_MS after the last damage, so a static window that is
-                            // merely near unrelated on-screen animation is not repeatedly re-copied.
-                            entry->PwMonLastId = mid;
-                            PwSliceCopyAndDamageSrc(entry, mb, mp, 0, 0, &pwRect);
-                        }
-                    }
-                    // else: broker monitor frame not yet available -> leave last content
                 }
                 // Agent-side slice (normal fallback / broker-inactive): copy the changed region of
                 // the composited screen into the window's own buffer. Content becomes window-relative,
@@ -8370,19 +8231,18 @@ static ULONG Init(void)
         }
     }
     {
-        // SliceRetire (broker-only per-window slice) ships DEFAULT-ON for 24H2+, tracking the broker.
-        DWORD sr = (g_OsBuild >= 26100) ? 1u : 0u;
-        (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_RETIRE_VALUE, &sr, NULL);
-        g_SliceRetire = (sr != 0);
-        // De-slice defaults ON wherever the slice is being retired (SliceRetire): the whole-desktop
-        // composite is validated unneeded, so the shipped build is de-sliced. The registry value,
-        // when present, overrides (DeSlice=0 is the safety switch back to the composite fallback).
-        // HARD-GATED on the broker floor (26100): below it WgcBrokerActive() is never true, so a set
-        // DeSlice would only "retire" a composite the classic DDA path never used - keep it inert by
-        // construction there, which is exactly the win10 config the benchmark validated.
-        DWORD ds = g_SliceRetire ? 1u : 0u;
-        (void)CfgReadDword(moduleName, REG_CONFIG_DESLICE_VALUE, &ds, NULL);
-        g_DeSlice = (ds != 0) && (g_OsBuild >= 26100);
+        // Slice retirement (broker-only per-window slice) is the shipped behaviour on 24H2+ and
+        // tracks the broker build floor unconditionally; the SliceRetire registry knob is retired
+        // (rollback = the WgcBroker gate, which routes sliceFed windows to the retained DDA slice).
+        g_SliceRetire = (g_OsBuild >= 26100);
+        // De-slice is DERIVED, not a knob: the whole-desktop composite (MONSLICE) was proven
+        // unneeded and DELETED once the de-slice proof window closed, so a DeSlice=0 would have
+        // nothing to switch back to. De-sliced wherever the slice is being retired, hard-gated on
+        // the broker floor (26100): below it WgcBrokerActive() is never true and the classic DDA
+        // path never used a composite - exactly the win10 config the benchmark validated. Field
+        // kill-switch for the whole broker path: "WgcBroker" / qubesdb /qubes-service/wgc-broker
+        // (0 -> sliceFed windows take the retained agent DDA slice fallback).
+        g_DeSlice = g_SliceRetire && (g_OsBuild >= 26100);
     }
     LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d deSlice=%d (floor 26100)",
             g_WgcBroker, g_OsBuild, g_SliceRetire, g_DeSlice);

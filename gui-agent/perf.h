@@ -25,9 +25,10 @@
  * It answers three questions that decide where the seamless-mode latency goes:
  *   (a) how much of a frame is spent tracking windows (UpdateWindowData + EnumWindows),
  *   (b) how much is spent extracting/intersecting damage,
- *   (c) how much is spent writing messages to the vchan,
- * and it records whether IDXGIOutputDuplication::GetFrameMoveRects ever returns
- * anything (the open TODO in capture.c).
+ *   (c) how much is spent writing messages to the vchan.
+ * (It once also recorded whether IDXGIOutputDuplication::GetFrameMoveRects ever
+ * returned anything - answered 2026-08-15: empty on every one of 300 drag frames,
+ * so that instrumentation was retired. Never build on move-rects.)
  *
  * Everything here is inert when disabled: the only cost on the hot path is a
  * predictable test of a global BOOL. Output goes to the regular agent log
@@ -143,7 +144,9 @@
 
 // Version of the CSV record format, bumped when fields change.
 // v2 added iwn/wev (window tracking became event driven, see PHASE2A-NOTES.md).
-#define PERF_RECORD_VERSION 7
+// v8 removed mrq/mr/mrmax (GetFrameMoveRects instrumentation retired - answered
+// 2026-08-15: empty on all 300 drag frames) and pwnoz (counter had no call site).
+#define PERF_RECORD_VERSION 8
 
 extern BOOL     g_PerfEnabled;  // master switch
 
@@ -317,10 +320,8 @@ extern __declspec(thread) LONG     g_PerfSendCount;
 typedef struct _PERF_CAPTURE
 {
     LONGLONG acquire_ticks;     // AcquireNextFrame() - mostly idle wait, reported but not part of the total
-    LONGLONG moverect_ticks;    // GetFrameMoveRects()
     LONGLONG dirtyrect_ticks;   // GetFrameDirtyRects() (size query + fetch + malloc)
     LONGLONG signal_qpc;        // QPC sampled right before SetEvent(frame_event)
-    UINT     move_rects_count;  // move rects reported for this frame ((UINT)-1 == query failed)
     UINT64   dirty_area;        // sum of dirty rect areas, pixels
 } PERF_CAPTURE;
 
@@ -348,7 +349,6 @@ void PerfNotePwDecision(IN BOOL skipped);
 typedef enum _PW_REFUSE_REASON
 {
     PW_REFUSE_NO_FB = 0,        // no framebuffer / zero pitch - cannot look at the screen
-    PW_REFUSE_NO_ZORDER,        // Z-order unknown - cannot reason about occlusion
     PW_REFUSE_OFFSCREEN,        // window not wholly inside the framebuffer
     PW_REFUSE_OCCLUDED,         // something is stacked above it; screen is not its content
     PW_REFUSE_NOT_FOREGROUND,   // Z-order unknown and this is not the foreground window
@@ -380,11 +380,6 @@ void PerfNoteRedundantFrame(void);
 // composited desktop instead of re-rendering the whole window with PrintWindow. The ratio of
 // this to pwcap is what the typing/scroll gap against stock turns on.
 void PerfNoteDdaCapture(void);
-
-// Capture thread: GetFrameMoveRects returned a non-empty set. Logs the first
-// occurrence loudly (this is the answer to the capture.c move-rects TODO),
-// afterwards only keeps the running maximum.
-void PerfNoteMoveRects(IN UINT count, IN LONG srcX, IN LONG srcY, IN const RECT* dst);
 
 // Main loop: account one processed frame and, every g_PerfEveryN frames, emit the record.
 // All *_ticks are QPC deltas with nested send time already subtracted (except send_ticks).

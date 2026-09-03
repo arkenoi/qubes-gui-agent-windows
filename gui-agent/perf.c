@@ -172,7 +172,6 @@ typedef struct _PERF_ACC
     LONGLONG dt;        // wall time covered by those frames
     LONGLONG acquire;
     LONGLONG wakeup;
-    LONGLONG moverect;
     LONGLONG dirtyrect;
     LONGLONG update;
     LONGLONG enumerate;
@@ -182,7 +181,6 @@ typedef struct _PERF_ACC
     LONGLONG total;
     LONG     sends;
     UINT     dirty_rects;
-    UINT     move_rects;
     UINT64   dirty_area;
     UINT     interrogated;  // windows actually queried
     UINT     events;        // window events applied
@@ -192,8 +190,6 @@ typedef struct _PERF_ACC
 
 static PERF_ACC g_Acc;
 static UINT64   g_Seq = 0;              // processed frames since agent start
-static UINT     g_MoveRectsMax = 0;     // high water mark, survives into every record
-static BOOL     g_MoveRectsReported = FALSE;
 static LONGLONG g_PrevFrameQpc = 0;
 static LONGLONG g_EmitTicks = 0;        // cost of the *previous* emit, reported as "log"
 static volatile LONG g_SkippedFrames = 0;   // capture thread -> main loop
@@ -526,7 +522,7 @@ void PerfInit(void)
 
     LogInfo("QGAPERF on: freq=%I64d everyN=%u qpc_cost_ns=%I64d default=%d (sink %I64d)",
         g_PerfFreq, g_PerfEveryN, qpcCostNs, QGA_PERF_DEFAULT, sink);
-    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,mrq,drq,upd,enu,rem,dmg,snd,tot,dr,mr,mrmax,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwnoz,pwoff,pwocc,pwnofg,pwovl,pwfirst,pwchg,frdrop,ddacap,ddmov,ddgeo,ddoff,ddlay,ddfg,ddovl,log (times in microseconds)",
+    LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,drq,upd,enu,rem,dmg,snd,tot,dr,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwoff,pwocc,pwnofg,pwovl,pwfirst,pwchg,frdrop,ddacap,ddmov,ddgeo,ddoff,ddlay,ddfg,ddovl,log (times in microseconds)",
         PERF_RECORD_VERSION);
 }
 
@@ -570,24 +566,6 @@ void PerfNotePwRefusal(IN PW_REFUSE_REASON reason)
     InterlockedIncrement(&g_PwRefuse[reason]);
 }
 
-void PerfNoteMoveRects(IN UINT count, IN LONG srcX, IN LONG srcY, IN const RECT* dst)
-{
-    if (!g_PerfEnabled || count == 0)
-        return;
-
-    if (count > g_MoveRectsMax)
-        g_MoveRectsMax = count;
-
-    if (!g_MoveRectsReported)
-    {
-        g_MoveRectsReported = TRUE;
-        // This is the answer to the "they seem to always be empty when testing"
-        // TODO in capture.c: if this line ever appears, move rects are usable.
-        LogInfo("QGAPERF-MOVERECTS: first non-empty GetFrameMoveRects: count=%u src=(%d,%d) dst=(%d,%d)-(%d,%d)",
-            count, srcX, srcY, dst->left, dst->top, dst->right, dst->bottom);
-    }
-}
-
 void PerfEmitFrame(
     IN BOOL seamless,
     IN LONGLONG frame_start_qpc,
@@ -615,11 +593,8 @@ void PerfEmitFrame(
 
     g_Acc.acquire += cap->acquire_ticks;
     g_Acc.wakeup += cap->signal_qpc ? (frame_start_qpc - cap->signal_qpc) : 0;
-    g_Acc.moverect += cap->moverect_ticks;
     g_Acc.dirtyrect += cap->dirtyrect_ticks;
     g_Acc.dirty_area += cap->dirty_area;
-    if (cap->move_rects_count != (UINT)-1)
-        g_Acc.move_rects += cap->move_rects_count;
 
     g_Acc.update += update_ticks;
     g_Acc.enumerate += enum_ticks;
@@ -640,10 +615,10 @@ void PerfEmitFrame(
     LONGLONG emitStart = PerfNow();
 
     // One line, integers only, no allocation and no string building of our own.
-    LogInfo("QGAPERF,v=%d,seq=%I64u,n=%u,mode=%c,dt=%I64d,acq=%I64d,wak=%I64d,mrq=%I64d,drq=%I64d,"
+    LogInfo("QGAPERF,v=%d,seq=%I64u,n=%u,mode=%c,dt=%I64d,acq=%I64d,wak=%I64d,drq=%I64d,"
         L"upd=%I64d,enu=%I64d,rem=%I64d,dmg=%I64d,snd=%I64d,tot=%I64d,"
-        L"dr=%u,mr=%u,mrmax=%u,area=%I64u,win=%u,iwn=%u,wev=%u,sends=%d,skip=%d,pwskip=%d,pwcap=%d,"
-        L"pwnofb=%d,pwnoz=%d,pwoff=%d,pwocc=%d,pwnofg=%d,pwovl=%d,pwfirst=%d,pwchg=%d,frdrop=%d,ddacap=%d,"
+        L"dr=%u,area=%I64u,win=%u,iwn=%u,wev=%u,sends=%d,skip=%d,pwskip=%d,pwcap=%d,"
+        L"pwnofb=%d,pwoff=%d,pwocc=%d,pwnofg=%d,pwovl=%d,pwfirst=%d,pwchg=%d,frdrop=%d,ddacap=%d,"
         L"ddmov=%d,ddgeo=%d,ddoff=%d,ddlay=%d,ddfg=%d,ddovl=%d,log=%I64d",
         PERF_RECORD_VERSION,
         g_Seq,
@@ -652,7 +627,6 @@ void PerfEmitFrame(
         PerfUs(g_Acc.dt),
         PerfUs(g_Acc.acquire),
         PerfUs(g_Acc.wakeup),
-        PerfUs(g_Acc.moverect),
         PerfUs(g_Acc.dirtyrect),
         PerfUs(g_Acc.update),
         PerfUs(g_Acc.enumerate),
@@ -661,8 +635,6 @@ void PerfEmitFrame(
         PerfUs(g_Acc.send),
         PerfUs(g_Acc.total),
         g_Acc.dirty_rects,
-        g_Acc.move_rects,
-        g_MoveRectsMax,
         g_Acc.dirty_area,
         g_Acc.windows,
         g_Acc.interrogated,
@@ -672,7 +644,6 @@ void PerfEmitFrame(
         InterlockedExchange(&g_PwSkipped, 0),
         InterlockedExchange(&g_PwCaptured, 0),
         InterlockedExchange(&g_PwRefuse[PW_REFUSE_NO_FB], 0),
-        InterlockedExchange(&g_PwRefuse[PW_REFUSE_NO_ZORDER], 0),
         InterlockedExchange(&g_PwRefuse[PW_REFUSE_OFFSCREEN], 0),
         InterlockedExchange(&g_PwRefuse[PW_REFUSE_OCCLUDED], 0),
         InterlockedExchange(&g_PwRefuse[PW_REFUSE_NOT_FOREGROUND], 0),

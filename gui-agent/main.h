@@ -259,19 +259,14 @@ typedef struct _WINDOW_DATA
     // WGC broker (24H2+): this sliceFed window's pixels come from the user-session broker's
     // per-HWND WGC capture instead of the composited-desktop slice. See BrokerRegister/
     // BrokerFreshFrame in main.c. Falls back to the slice whenever no fresh broker frame.
-    BOOL   PwBrokerSourced;   // registered with the broker (occluded NRB app window)
+    BOOL   PwBrokerSourced;   // registered with the broker (any sliceFed window)
     LONG   PwBrokerSlot;      // index into WGCBRK_SLOTS(g_WgcBase); -1 if none
     UINT64 PwBrokerLastId;    // last WGCBRK_SLOT.FrameId consumed (change detection)
     UINT64 PwBrokerArenaOff;  // this window's ring[0] arena offset (for release); 0 if none
 
-    // Monitor-slice (SliceRetire, o-r/static windows fed from the broker's whole-desktop
-    // CreateForMonitor frame). The DDA damage clock and the WGC monitor-frame clock are
-    // independent, so a repaint the DDA reports can land in a WGC frame that arrives LATER with
-    // no further DDA damage - leaving a menu with stale pixels. After any damage over the window
-    // we "chase" fresh monitor frames for a short window and re-copy, so the lagged frame is picked up.
-    UINT64   PwMonLastId;       // last monitor-slot FrameId this window copied from
-    ULONGLONG PwMonRefreshUntil;// GetTickCount64 deadline: keep chasing fresh monitor frames until then
-    BOOL     PwMonLogged;       // one-shot MONSLICE diagnostic emitted (own flag, not PwBrokerLastId)
+    // One-shot BROKERHOLD diagnostic emitted: broker active but no per-window frame consumable
+    // this pass - the window HOLDS its last content (never the DDA slice) until one arrives.
+    BOOL     PwHoldLogged;
 
     // Move-only drag fast path (ProcessNewFrame, PrintWindow-fed branch): a pure
     // position change does not alter the window's own content - the per-window buffer
