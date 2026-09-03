@@ -8370,7 +8370,10 @@ static ULONG Init(void)
         DWORD sr = 0;
         (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_RETIRE_VALUE, &sr, NULL);
         g_SliceRetire = (sr != 0);
-        DWORD ds = 0;
+        // De-slice defaults ON wherever the slice is being retired (SliceRetire): the whole-desktop
+        // composite is validated unneeded, so the shipped build is de-sliced. The registry value,
+        // when present, overrides (DeSlice=0 is the safety switch back to the composite fallback).
+        DWORD ds = g_SliceRetire ? 1u : 0u;
         (void)CfgReadDword(moduleName, REG_CONFIG_DESLICE_VALUE, &ds, NULL);
         g_DeSlice = (ds != 0);
     }
