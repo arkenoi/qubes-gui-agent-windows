@@ -1893,6 +1893,12 @@ static void SynthDeactivate(IN OUT WINDOW_DATA* entry)
     if (!entry->Synthesized)
         return;
     entry->Synthesized = FALSE;
+    // DE-SLICE step 1: release the synth-only per-window broker capture set up while synthesized.
+    // If it materializes, the normal AddWindow path re-registers it fresh; leaving it would double-
+    // register the same HWND. Also clears PwSliceFed so materialization starts from a clean state.
+    if (entry->PwBrokerSourced)
+        BrokerUnregister(entry);
+    entry->PwSliceFed = FALSE;
     WINDOW_DATA* owner = FindWindowByHandle(entry->SynthOwner);
     entry->SynthOwner = NULL;
     if (owner && owner->SynthChildCount > 0)
@@ -3236,6 +3242,12 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
             e = e->Flink;
             if (c->Synthesized && c->SynthOwner == entry->Handle)
             {
+                // De-slice: release the synth child's per-window broker capture here - clearing
+                // Synthesized first would make SynthDeactivate a no-op at its later removal, leaking
+                // the arena buffers.
+                if (c->PwBrokerSourced)
+                    BrokerUnregister(c);
+                c->PwSliceFed = FALSE;
                 c->Synthesized = FALSE;
                 c->SynthOwner = NULL;
                 c->DeletePending = TRUE; // re-examined from scratch by TrackWindows
@@ -4400,6 +4412,40 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         windowData->IsIconic = data.IsIconic;
         windowData->IsVisible = data.IsVisible;
         windowData->IsOverrideRedirect = data.IsOverrideRedirect;
+        windowData->CropLeft = data.CropLeft;
+        windowData->CropTop = data.CropTop;
+        windowData->CropRight = data.CropRight;
+        windowData->CropBottom = data.CropBottom;
+
+        // DE-SLICE step 1: give the synth child its OWN per-window broker capture (cropped
+        // pixel-exact) so PwPatchSynthChildClipped sources its pixels from the child's own frame
+        // instead of the whole-desktop monitor composite. (Re)register when unregistered or the
+        // captured geometry changed (the crop converges over the first couple passes, like a
+        // materialized menu). It is broker-captured only - never PwAttached/mapped/granted - so the
+        // per-window paint loop (PwIsAttached) skips it; the synth paint falls back to the composite
+        // whenever no per-window frame is ready, so this can never break synthesis.
+        if (g_SliceRetire && WgcBrokerActive() && g_WgcBase &&
+            windowData->IsVisible && windowData->Width > 0 && windowData->Height > 0)
+        {
+            WGCBRK_SLOT* bs = (windowData->PwBrokerSlot >= 0 &&
+                               windowData->PwBrokerSlot < WGCBRK_MAX_SLOTS)
+                ? &WGCBRK_SLOTS(g_WgcBase)[windowData->PwBrokerSlot] : NULL;
+            BOOL needReg = !windowData->PwBrokerSourced || !bs ||
+                bs->Hwnd != (UINT64)(ULONG_PTR)windowData->Handle ||
+                bs->ReqWidth != (LONG)windowData->Width ||
+                bs->ReqHeight != (LONG)windowData->Height ||
+                bs->ReqCropX != (LONG)windowData->CropLeft ||
+                bs->ReqCropY != (LONG)windowData->CropTop;
+            if (needReg)
+            {
+                if (windowData->PwBrokerSourced)
+                    BrokerUnregister(windowData);
+                windowData->PwSliceFed = TRUE;
+                windowData->PwWidth = windowData->Width;
+                windowData->PwHeight = windowData->Height;
+                (void)BrokerRegister(windowData);
+            }
+        }
 
         if (!data.IsVisible || !ShouldAcceptWindow(windowData))
         {
@@ -5249,15 +5295,35 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
     // below is identical; only the base+pitch+extent differ. Falls back to the DDA framebuffer when
     // the broker monitor frame is not available (non-retire, or broker not yet ready). This is what
     // removes synthesis's dependency on the agent slice - the last synth-path retirement blocker.
+    // DE-SLICE step 1: prefer the child's OWN per-window broker frame (window-relative, and already
+    // cropped pixel-exact), which removes synthesis's dependency on the whole-desktop monitor
+    // composite - the last synth-path retirement blocker. srcOrigin is the SCREEN coord mapping to
+    // source (0,0): (c->X,c->Y) for the window-relative child frame, (0,0) for the screen-relative
+    // composite. FALL BACK to the monitor composite / DDA fb whenever the child has no per-window
+    // frame yet (bootstrap, mid crop-converge size change, broker down) so synthesis NEVER breaks.
     const BYTE* srcBase = NULL; int srcPitch = 0, srcW = 0, srcH = 0;
-    const BYTE* mb = NULL; int mp = 0, mw = 0, mh = 0; UINT64 mid = 0;
-    if (g_SliceRetire && WgcBrokerActive() && BrokerMonitorFrame(&mb, &mp, &mw, &mh, &mid))
-    { srcBase = mb; srcPitch = mp; srcW = mw; srcH = mh; }
-    else if (g_FbBits && g_FbPitch > 0)
-    { srcBase = g_FbBits; srcPitch = g_FbPitch; srcW = (int)g_FbWidth; srcH = (int)g_FbHeight; }
+    int srcOriginX = 0, srcOriginY = 0;
+    const BYTE* cb = NULL; int cp = 0; UINT64 cid = 0;
+    if (g_SliceRetire && WgcBrokerActive() && ((const WINDOW_DATA*)c)->PwBrokerSourced &&
+        BrokerFreshFrame((WINDOW_DATA*)c, &cb, &cp, &cid))
+    {
+        srcBase = cb; srcPitch = cp;
+        srcW = c->X + (int)c->Width; srcH = c->Y + (int)c->Height;  // window-relative extent in screen coords
+        srcOriginX = c->X; srcOriginY = c->Y;
+        LogVerbose("SYNTHPERWIN 0x%x sourced from its own per-window frame %ux%u (composite not used)",
+            c->Handle, c->Width, c->Height);
+    }
+    else
+    {
+        const BYTE* mb = NULL; int mp = 0, mw = 0, mh = 0; UINT64 mid = 0;
+        if (g_SliceRetire && WgcBrokerActive() && BrokerMonitorFrame(&mb, &mp, &mw, &mh, &mid))
+        { srcBase = mb; srcPitch = mp; srcW = mw; srcH = mh; }
+        else if (g_FbBits && g_FbPitch > 0)
+        { srcBase = g_FbBits; srcPitch = g_FbPitch; srcW = (int)g_FbWidth; srcH = (int)g_FbHeight; }
+    }
     if (!srcBase)
     {
-        LogWarning("synth paint 0x%x: no composited source (broker monitor + DDA fb both unavailable)", c->Handle);
+        LogWarning("synth paint 0x%x: no source (child per-window + broker monitor + DDA fb all unavailable)", c->Handle);
         return;
     }
 
@@ -5294,7 +5360,7 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
             (uint32_t)(ULONG_PTR)c->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
             relX, relY, w, h);
 
-    const BYTE* src = srcBase + (size_t)r.top * srcPitch + (size_t)r.left * 4;
+    const BYTE* src = srcBase + (size_t)(r.top - srcOriginY) * srcPitch + (size_t)(r.left - srcOriginX) * 4;
     BYTE* dst = (BYTE*)owner->PwBuffer +
         ((size_t)relY * owner->PwWidth + (size_t)relX) * 4;
     for (int row = 0; row < h; row++)
