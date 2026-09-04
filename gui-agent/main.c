@@ -155,11 +155,23 @@ BOOL g_NoScreenGrant = FALSE;
 // never affect rendering. Toasts/o-r menus are NOT routed here (topmost, slice-correct; the
 // toast interceptor handles toasts). See wgcbroker_ipc.h for the contract.
 #define REG_CONFIG_WGC_BROKER_VALUE L"WgcBroker"
+
+// Notification bridge (docs/DESIGN-toast-bridge.md, phase A0): notifhost --bridge runs in the
+// interactive user session, forwards ALLOWLISTED apps' toasts (HKLM gui-agent config,
+// "NotifyBridgeAllow" REG_MULTI_SZ of AUMIDs) to dom0's stock qubes.Notifications service and
+// suppresses their banners; every other app keeps today's window path untouched (fail-open).
+// The agent only launches and supervises the helper - all bridge state lives in notifhost.
+// Gate: registry "NotifyBridge" (default 0) / qubesdb /qubes-service/notify-bridge (dom0
+// wins), read once at init like the broker gate. Liveness = mtime of the bridge's
+// %ProgramData%\qubes-toast-bridge\heartbeat file (no shared section needed).
+#define REG_CONFIG_NOTIF_BRIDGE_VALUE L"NotifyBridge"
+BOOL          g_NotifBridge = FALSE;
 // Slice retirement (broker-only sliceFed handling) is the SHIPPED behaviour on 24H2+ and tracks
 // the broker build floor unconditionally; the SliceRetire diagnostic knob is retired. Field
 // kill-switch: WgcBroker=0 / /qubes-service/wgc-broker=0 - broker inactive routes every sliceFed
-// window to the retained agent DDA slice. Toasts are covered by the notifhost interceptor
-// (normal windows, not sliceFed).
+// window to the retained agent DDA slice. (An earlier comment here claimed toasts are "covered
+// by the notifhost interceptor" - that component was never launched by anything; toasts render
+// on the same o-r shell-surface path as menus, cropped by toastcrop.)
 BOOL          g_WgcBroker   = FALSE;
 BOOL          g_SliceRetire = FALSE;   // broker-era sliceFed handling; set once at init: TRUE iff build >= 26100 (knob retired)
 BOOL          g_DeSlice = FALSE;       // DERIVED at init (g_SliceRetire && build >= 26100), not a
@@ -2176,6 +2188,94 @@ static void BrokerShutdown(void)
     WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
 }
 
+// ---- notification bridge launch/supervise (gate g_NotifBridge) ---------------------------
+#define NOTIF_TASK_NAME L"Qubes-NotifBridge"
+static ULONGLONG g_NotifLastLaunch = 0;
+static ULONGLONG g_NotifNextPoll = 0;
+
+// Same Task Scheduler /ru <user> /it launch as WgcLaunch: proven to put a helper into the
+// interactive session with a full user context (the run-as-user pattern the bridge's
+// listener was demonstrated under); there is no child handle - the heartbeat file is the
+// liveness signal.
+static BOOL NotifBridgeLaunch(void)
+{
+    DWORD sid = WTSGetActiveConsoleSessionId();
+    if (sid == 0xFFFFFFFF) return FALSE;
+
+    WCHAR* user = NULL; DWORD userLen = 0;
+    if (!WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, sid, WTSUserName, &user, &userLen) ||
+        !user || !*user)
+    { if (user) WTSFreeMemory(user); return FALSE; }
+
+    WCHAR self[MAX_PATH] = { 0 };
+    if (!GetModuleFileName(NULL, self, RTL_NUMBER_OF(self))) { WTSFreeMemory(user); return FALSE; }
+    WCHAR* sl = wcsrchr(self, L'\\'); if (sl) *(sl + 1) = 0;   // keep the trailing backslash
+    WCHAR longExe[MAX_PATH];
+    StringCchPrintf(longExe, RTL_NUMBER_OF(longExe), L"%snotifhost.exe", self);
+    WCHAR shortExe[MAX_PATH] = { 0 };
+    if (!GetShortPathName(longExe, shortExe, RTL_NUMBER_OF(shortExe)))
+        StringCchCopy(shortExe, RTL_NUMBER_OF(shortExe), longExe);
+
+    WCHAR tr[1024];
+    if (wcschr(shortExe, L' '))
+        StringCchPrintf(tr, RTL_NUMBER_OF(tr), L"\\\"%s\\\" --bridge --agent-pid %lu",
+                        shortExe, GetCurrentProcessId());
+    else
+        StringCchPrintf(tr, RTL_NUMBER_OF(tr), L"%s --bridge --agent-pid %lu",
+                        shortExe, GetCurrentProcessId());
+
+    WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
+    WCHAR args[2048];
+    StringCchPrintf(args, RTL_NUMBER_OF(args),
+        L"/create /tn " NOTIF_TASK_NAME L" /tr \"%s\" /sc once /st 00:00 /ru %s /it /f", tr, user);
+    WTSFreeMemory(user);
+    if (!WgcRunSchtasks(args)) { LogWarning("NOTIFBRIDGE schtasks /create failed"); return FALSE; }
+    if (!WgcRunSchtasks(L"/run /tn " NOTIF_TASK_NAME)) { LogWarning("NOTIFBRIDGE schtasks /run failed"); return FALSE; }
+    LogInfo("NOTIFBRIDGE launched via Task Scheduler (user session %lu)", sid);
+    return TRUE;
+}
+
+// ~0.2 Hz supervisor: (re)launch notifhost --bridge when its heartbeat file is stale. The
+// bridge fails OPEN by construction (it restores ShowBanner on every exit path and only
+// suppresses while its dom0 connection is up), so a supervision gap costs dom0-native
+// prettiness, never a lost notification.
+static void NotifBridgeSupervise(void)
+{
+    if (!g_NotifBridge) return;
+    ULONGLONG now = GetTickCount64();
+    if (now < g_NotifNextPoll) return;
+    g_NotifNextPoll = now + 5000;
+    if (WTSGetActiveConsoleSessionId() == 0xFFFFFFFF || !GetShellWindow()) return;
+
+    WCHAR hb[MAX_PATH];
+    if (!ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge\\heartbeat", hb, RTL_NUMBER_OF(hb)))
+        return;
+    WIN32_FILE_ATTRIBUTE_DATA fad;
+    if (GetFileAttributesEx(hb, GetFileExInfoStandard, &fad))
+    {
+        FILETIME nowFt; GetSystemTimeAsFileTime(&nowFt);
+        ULARGE_INTEGER wr, cur;
+        wr.LowPart = fad.ftLastWriteTime.dwLowDateTime; wr.HighPart = fad.ftLastWriteTime.dwHighDateTime;
+        cur.LowPart = nowFt.dwLowDateTime; cur.HighPart = nowFt.dwHighDateTime;
+        if (cur.QuadPart > wr.QuadPart && cur.QuadPart - wr.QuadPart < 15ULL * 10000000ULL)
+            return;   // heartbeat fresh within 15 s - bridge alive
+    }
+    // 60 s relaunch throttle: a bridge that exits fatally on purpose (consent revoked,
+    // listener broken) must not become a process treadmill - each retry re-runs its
+    // selftest and exits again until the guest-side cause is fixed.
+    if (now - g_NotifLastLaunch < 60000) return;
+    g_NotifLastLaunch = now;
+    (void)NotifBridgeLaunch();
+}
+
+static void NotifBridgeShutdown(void)
+{
+    // The bridge self-exits when the agent dies (--agent-pid) and restores banners then;
+    // this only removes the scheduled task so a stale definition cannot linger.
+    if (g_NotifBridge)
+        WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
+}
+
 // ---- WGC broker stage 2b: register occluded NRB app windows, consume their frames --------
 BOOL WgcBrokerActive(void)
 {
@@ -2259,7 +2359,8 @@ static void WgcArenaReapPending(void)
 // no-topmost/no-o-r narrowing was the pre-retirement diagnostic scope; retired with the
 // SliceRetire knob). Windows the broker cannot capture (e.g. shell CoreWindows, where
 // CreateForWindow fails) simply never publish a frame and are handled downstream in
-// ProcessNewFrame; toasts are not sliceFed (notifhost interceptor) and never reach here.
+// ProcessNewFrame. (An earlier comment credited toasts to the "notifhost interceptor" -
+// that component was never launched; see toastcrop for how toast surfaces are handled.)
 // Returns TRUE if registered.
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
 {
@@ -7479,6 +7580,7 @@ static ULONG WINAPI WatchForEvents(void)
             DaemonSettleSweep();
 
         BrokerSupervise();   // ~1 Hz self-throttled; no-op unless the WgcBroker gate is on
+        NotifBridgeSupervise();   // ~0.2 Hz; no-op unless the NotifyBridge gate is on
 
         switch (signaledEvent)
         {
@@ -7956,6 +8058,7 @@ static ULONG WINAPI WatchForEvents(void)
 
     // Signal the user-session WGC broker to exit and reap it (harmless no-op if never started).
     BrokerShutdown();
+    NotifBridgeShutdown();
 
     // --- A6 (approved design, 2.2): bounded, leak-free exit. Previously the exit order
     // was PwShutdown -> libvchan_close -> StopFrameProcessing -> CaptureTeardown: no
@@ -8246,6 +8349,22 @@ static ULONG Init(void)
     }
     LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d deSlice=%d (floor 26100)",
             g_WgcBroker, g_OsBuild, g_SliceRetire, g_DeSlice);
+    {
+        // Notification bridge gate: default OFF; registry "NotifyBridge" then qubesdb
+        // /qubes-service/notify-bridge (dom0 wins), mirroring the broker gate. No build
+        // floor - the listener path is proven on win10 (guest/listener-probe.ps1).
+        DWORD nb = 0;
+        (void)CfgReadDword(moduleName, REG_CONFIG_NOTIF_BRIDGE_VALUE, &nb, NULL);
+        g_NotifBridge = (nb != 0);
+        qdb_handle_t q = qdb_open(NULL);
+        if (q)
+        {
+            char* v = qdb_read(q, "/qubes-service/notify-bridge", NULL);
+            if (v) { g_NotifBridge = (v[0] != '0'); free(v); }
+            qdb_close(q);
+        }
+        LogInfo("NOTIFBRIDGE gate: enabled=%d", g_NotifBridge);
+    }
 
     // Diagnostic-only window-filter override; absent (the normal case) means 0 = all
     // filters active. See g_DiagWindowFilterOff.
