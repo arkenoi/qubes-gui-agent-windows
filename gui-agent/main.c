@@ -2248,14 +2248,20 @@ static void BrokerShutdown(void)
 
 // ---- notification bridge launch/supervise (gate g_NotifBridge) ---------------------------
 #define NOTIF_TASK_NAME L"Qubes-NotifBridge"
+#define NOTIF_RESTORE_TASK_NAME L"Qubes-NotifRestore"
 static ULONGLONG g_NotifLastLaunch = 0;
 static ULONGLONG g_NotifNextPoll = 0;
+// Gate-off crash sweep pending: crash-leftover ShowBanner markers exist and the one-shot
+// restore has not been launched yet (see NotifBridgeRestoreSweep). Also keeps the idle wait
+// bounded so the sweep gets loop time on a quiet guest.
+static BOOL g_NotifRestorePending = FALSE;
 
-// Same Task Scheduler /ru <user> /it launch as WgcLaunch: proven to put a helper into the
-// interactive session with a full user context (the run-as-user pattern the bridge's
-// listener was demonstrated under); there is no child handle - the heartbeat file is the
-// liveness signal.
-static BOOL NotifBridgeLaunch(void)
+// Run notifhost.exe with the given arguments inside the interactive user session via a
+// one-shot Task Scheduler task - the same /ru <user> /it launch as WgcLaunch, proven to put a
+// helper into the interactive session with a full user context (the run-as-user pattern the
+// bridge's listener was demonstrated under). There is no child handle; callers watch their own
+// signals (the bridge's heartbeat file, the restore one-shot's marker deletion).
+static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs)
 {
     DWORD sid = WTSGetActiveConsoleSessionId();
     if (sid == 0xFFFFFFFF) return FALSE;
@@ -2276,30 +2282,103 @@ static BOOL NotifBridgeLaunch(void)
 
     WCHAR tr[1024];
     if (wcschr(shortExe, L' '))
-        StringCchPrintf(tr, RTL_NUMBER_OF(tr), L"\\\"%s\\\" --bridge --agent-pid %lu",
-                        shortExe, GetCurrentProcessId());
+        StringCchPrintf(tr, RTL_NUMBER_OF(tr), L"\\\"%s\\\" %s", shortExe, exeArgs);
     else
-        StringCchPrintf(tr, RTL_NUMBER_OF(tr), L"%s --bridge --agent-pid %lu",
-                        shortExe, GetCurrentProcessId());
+        StringCchPrintf(tr, RTL_NUMBER_OF(tr), L"%s %s", shortExe, exeArgs);
 
-    WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
     WCHAR args[2048];
+    StringCchPrintf(args, RTL_NUMBER_OF(args), L"/delete /tn %s /f", taskName);
+    WgcRunSchtasks(args);
     StringCchPrintf(args, RTL_NUMBER_OF(args),
-        L"/create /tn " NOTIF_TASK_NAME L" /tr \"%s\" /sc once /st 00:00 /ru %s /it /f", tr, user);
+        L"/create /tn %s /tr \"%s\" /sc once /st 00:00 /ru %s /it /f", taskName, tr, user);
     WTSFreeMemory(user);
-    if (!WgcRunSchtasks(args)) { LogWarning("NOTIFBRIDGE schtasks /create failed"); return FALSE; }
-    if (!WgcRunSchtasks(L"/run /tn " NOTIF_TASK_NAME)) { LogWarning("NOTIFBRIDGE schtasks /run failed"); return FALSE; }
-    LogInfo("NOTIFBRIDGE launched via Task Scheduler (user session %lu)", sid);
+    if (!WgcRunSchtasks(args)) { LogWarning("NOTIFBRIDGE schtasks /create failed (%s)", taskName); return FALSE; }
+    StringCchPrintf(args, RTL_NUMBER_OF(args), L"/run /tn %s", taskName);
+    if (!WgcRunSchtasks(args)) { LogWarning("NOTIFBRIDGE schtasks /run failed (%s)", taskName); return FALSE; }
+    LogInfo("NOTIFHOST launched via Task Scheduler (user session %lu, args: %s)", sid, exeArgs);
     return TRUE;
+}
+
+static BOOL NotifBridgeLaunch(void)
+{
+    WCHAR args[64];
+    StringCchPrintf(args, RTL_NUMBER_OF(args), L"--bridge --agent-pid %lu", GetCurrentProcessId());
+    return NotifRunInSession(NOTIF_TASK_NAME, args);
+}
+
+// Second stop channel, reaching a RUNNING bridge: write the ProgramData stop file BridgeMain
+// polls every loop pass (what `notifhost --bridge-stop` does); the bridge exits on it and runs
+// BannerRestoreAll on the way out. schtasks /delete alone only removes the task DEFINITION,
+// and the bridge's --agent-pid self-exit handle is denied to its limited user token against
+// this SYSTEM process (it falls back to a PID snapshot poll, which PID reuse can defeat) - so
+// this file is the one channel that deterministically stops a live bridge.
+// Written only when the state dir already exists: it is created by the bridge/notifhost as
+// the user, and creating it from SYSTEM would give the user-mode bridge a directory it cannot
+// delete files in (inherited ProgramData ACLs); a dir that was never created means no bridge
+// ever ran here, so there is nothing to stop.
+static void NotifBridgeRequestStop(void)
+{
+    WCHAR dir[MAX_PATH], f[MAX_PATH];
+    if (!ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge", dir, RTL_NUMBER_OF(dir)))
+        return;
+    if (GetFileAttributes(dir) == INVALID_FILE_ATTRIBUTES)
+        return;
+    StringCchPrintf(f, RTL_NUMBER_OF(f), L"%s\\stop", dir);
+    HANDLE h = CreateFile(f, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE)
+    {
+        DWORD wr;
+        WriteFile(h, "stop", 4, &wr, NULL);
+        CloseHandle(h);
+        LogInfo("NOTIFBRIDGE stop file written - a running bridge will exit and restore banners");
+    }
+}
+
+// Any ShowBanner suppression markers left behind (any SID - the sweep runs as the console
+// user and restores only that user's, but presence alone is what arms it)?
+static BOOL NotifMarkersPresent(void)
+{
+    WCHAR pat[MAX_PATH];
+    WIN32_FIND_DATA fd;
+    if (!ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge\\banner-*.prev",
+                                  pat, RTL_NUMBER_OF(pat)))
+        return FALSE;
+    HANDLE h = FindFirstFile(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return FALSE;
+    FindClose(h);
+    return TRUE;
+}
+
+// Gate-off crash sweep: with the gate OFF (legacy_toasts, or notify-bridge turned off) no
+// bridge will ever start again to run its own startup BannerRestoreAll, so ShowBanner=0
+// markers left by a crashed/hard-killed bridge would stand FOREVER - previously-suppressed
+// apps silently lose their banner with nobody forwarding (the exact
+// bannerless-AND-unforwarded state the fail-open invariant forbids). Launch a one-shot
+// `notifhost --restore-banners` in the interactive session (markers are SID-scoped HKCU
+// state, so the restore must run as that user, not as this SYSTEM process). One launch,
+// retried only until a session+shell exists to run it in.
+static void NotifBridgeRestoreSweep(void)
+{
+    if (!g_NotifRestorePending) return;
+    ULONGLONG now = GetTickCount64();
+    if (now < g_NotifNextPoll) return;
+    g_NotifNextPoll = now + 5000;
+    if (WTSGetActiveConsoleSessionId() == 0xFFFFFFFF || !GetShellWindow()) return;
+    if (NotifRunInSession(NOTIF_RESTORE_TASK_NAME, L"--restore-banners"))
+    {
+        LogInfo("NOTIFBRIDGE gate-off restore sweep launched (crash-leftover banner markers)");
+        g_NotifRestorePending = FALSE;
+    }
 }
 
 // ~0.2 Hz supervisor: (re)launch notifhost --bridge when its heartbeat file is stale. The
 // bridge fails OPEN by construction (it restores ShowBanner on every exit path and only
 // suppresses while its dom0 connection is up), so a supervision gap costs dom0-native
-// prettiness, never a lost notification.
+// prettiness, never a lost notification. Gate OFF: the only supervision left is the
+// crash-leftover banner restore sweep.
 static void NotifBridgeSupervise(void)
 {
-    if (!g_NotifBridge) return;
+    if (!g_NotifBridge) { NotifBridgeRestoreSweep(); return; }
     ULONGLONG now = GetTickCount64();
     if (now < g_NotifNextPoll) return;
     g_NotifNextPoll = now + 5000;
@@ -2331,10 +2410,16 @@ static void NotifBridgeSupervise(void)
 
 static void NotifBridgeShutdown(void)
 {
-    // The bridge self-exits when the agent dies (--agent-pid) and restores banners then;
-    // this only removes the scheduled task so a stale definition cannot linger.
+    // Remove the scheduled task so a stale definition cannot linger, AND write the stop
+    // file: the --agent-pid self-exit is not a reliable channel (OpenProcess(SYNCHRONIZE)
+    // on this SYSTEM process is denied to the bridge's limited token; its snapshot-poll
+    // fallback loses to PID reuse), and /delete cannot reach the already-running process.
+    // The stopped bridge restores every banner suppression on its way out.
     if (g_NotifBridge)
+    {
         WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
+        NotifBridgeRequestStop();
+    }
 }
 
 // ---- WGC broker stage 2b: register occluded NRB app windows, consume their frames --------
@@ -7462,9 +7547,12 @@ static ULONG WINAPI WatchForEvents(void)
         // idle so BrokerSupervise/NotifBridgeSupervise keep heartbeats fresh and relaunch a dead
         // helper promptly. Without the g_NotifBridge clause the bridge had NO idle wakeup on a
         // win10 guest (WgcBroker floors at build 26100), so a crashed bridge stayed down until the
-        // next frame/vchan event - fail-closed while its ShowBanner suppression stood. Only
-        // tightens an otherwise-INFINITE (or longer) idle wait; never lengthens a shorter one.
-        if (((g_WgcBroker && g_WgcBase) || g_NotifBridge) && (waitTimeout == INFINITE || waitTimeout > 1000))
+        // next frame/vchan event - fail-closed while its ShowBanner suppression stood. The
+        // g_NotifRestorePending clause is the gate-OFF mirror of that lesson: the crash-leftover
+        // banner restore sweep must not wait on an unrelated wakeup either. Only tightens an
+        // otherwise-INFINITE (or longer) idle wait; never lengthens a shorter one.
+        if (((g_WgcBroker && g_WgcBase) || g_NotifBridge || g_NotifRestorePending) &&
+            (waitTimeout == INFINITE || waitTimeout > 1000))
             waitTimeout = 1000;
 
         // [CaptureGateFaultInject bit 4] Raise one capture error, once, to open the gate.
@@ -8454,6 +8542,22 @@ static ULONG Init(void)
             LogInfo("NOTIFBRIDGE forced OFF by legacy_toasts - override-redirect toasts (window path)");
         }
         LogInfo("NOTIFBRIDGE gate: enabled=%d legacy_toasts=%d", g_NotifBridge, legacyToasts);
+        if (!g_NotifBridge)
+        {
+            // The opt-out must take effect NOW, not at the next reboot: a bridge launched
+            // under a previous gate-on run is independent of this process (its qrexec
+            // connection is its own, and its --agent-pid self-exit never armed against the
+            // old SYSTEM agent), so left alone it keeps forwarding and keeps holding
+            // ShowBanner=0. Delete its task and stop it via the stop file; its exit path
+            // runs BannerRestoreAll. If instead it CRASHED (markers but no live bridge),
+            // nothing is left to restore the suppressions with the gate off - arm the
+            // one-shot restore sweep, which runs once a user session is up.
+            WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
+            NotifBridgeRequestStop();
+            g_NotifRestorePending = NotifMarkersPresent();
+            if (g_NotifRestorePending)
+                LogInfo("NOTIFBRIDGE gate off with leftover banner markers - restore sweep armed");
+        }
     }
 
     // Diagnostic-only window-filter override; absent (the normal case) means 0 = all
