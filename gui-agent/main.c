@@ -2317,8 +2317,11 @@ static void NotifBridgeSupervise(void)
     }
     // 60 s relaunch throttle: a bridge that exits fatally on purpose (consent revoked,
     // listener broken) must not become a process treadmill - each retry re-runs its
-    // selftest and exits again until the guest-side cause is fixed.
-    if (now - g_NotifLastLaunch < 60000) return;
+    // selftest and exits again until the guest-side cause is fixed. The throttle must NOT
+    // delay the FIRST launch, though: g_NotifLastLaunch starts at 0 and GetTickCount64() is
+    // ms-since-boot, so `now - 0 < 60000` would block the bridge for the first 60 s of uptime
+    // (exactly the cold-boot bring-up window). Gate the throttle on having launched before.
+    if (g_NotifLastLaunch != 0 && now - g_NotifLastLaunch < 60000) return;
     g_NotifLastLaunch = now;
     (void)NotifBridgeLaunch();
 }
@@ -7452,10 +7455,13 @@ static ULONG WINAPI WatchForEvents(void)
             waitTimeout = (captureRetryDue > now64) ? (DWORD)(captureRetryDue - now64) : 0;
         }
 
-        // While the WGC broker is active, wake the loop ~1/s even when idle so BrokerSupervise
-        // keeps the agent heartbeat fresh and relaunches a dead broker promptly. Only tightens
-        // an otherwise-INFINITE (or longer) idle wait; never lengthens a shorter one.
-        if (g_WgcBroker && g_WgcBase && (waitTimeout == INFINITE || waitTimeout > 1000))
+        // While the WGC broker OR the notification bridge is active, wake the loop ~1/s even when
+        // idle so BrokerSupervise/NotifBridgeSupervise keep heartbeats fresh and relaunch a dead
+        // helper promptly. Without the g_NotifBridge clause the bridge had NO idle wakeup on a
+        // win10 guest (WgcBroker floors at build 26100), so a crashed bridge stayed down until the
+        // next frame/vchan event - fail-closed while its ShowBanner suppression stood. Only
+        // tightens an otherwise-INFINITE (or longer) idle wait; never lengthens a shorter one.
+        if (((g_WgcBroker && g_WgcBase) || g_NotifBridge) && (waitTimeout == INFINITE || waitTimeout > 1000))
             waitTimeout = 1000;
 
         // [CaptureGateFaultInject bit 4] Raise one capture error, once, to open the gate.
