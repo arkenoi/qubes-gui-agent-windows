@@ -191,6 +191,14 @@ static ULONGLONG g_WgcNextPoll = 0;
 static LONGLONG  g_WgcBrokerHbLast = 0;    // last BrokerHeartbeat value observed
 static ULONGLONG g_WgcBrokerHbSeenAt = 0;  // wall time we last saw it ADVANCE
 static ULONGLONG g_WgcLastLaunch = 0;      // throttle: don't relaunch while one is starting
+static ULONGLONG g_BrokerDownSince = 0;    // wall time the broker went (or started) DOWN while eligible; 0 = up/ok
+static ULONGLONG g_BrokerNextWarn = 0;     // next QGADESLICEDOWN warning is due (loud-persistent cadence)
+// Machine-readable de-slice health, published under the BASE Qubes Tools config key
+// (HKLM\SOFTWARE\Invisible Things Lab\Qubes Tools\DesliceBrokerDown - the free-function write
+// scope, same as VCHAN_RESTARTS) so health-check / acceptance can assert it without parsing the
+// debug log: 0 = ready (or deliberate opt-out), 1 = broker binary present but not running
+// (launch/capture failure), 2 = broker binary MISSING from the install dir (packaging gap).
+#define REG_CONFIG_DESLICE_DOWN_VALUE L"DesliceBrokerDown"
 static UINT64 g_WgcNonce = 0;
 static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
 static ULONGLONG g_WgcArenaNext = 0;   // bump frontier within the arena (offset past ArenaOffset)
@@ -2168,9 +2176,56 @@ static void BrokerSupervise(void)
             _InterlockedExchange(&g_BrokerReady, 1);
             LogInfo("WGCBROKER ready (heartbeat live)");
         }
+        // Recovered (or first-ever ready): clear the hard-fail state + its machine-readable flag.
+        if (g_BrokerDownSince)
+        {
+            g_BrokerDownSince = 0; g_BrokerNextWarn = 0;
+            (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
+        }
         return;
     }
     _InterlockedExchange(&g_BrokerReady, 0);
+
+    // HARD-FAIL, LOUDLY, ON AN ELIGIBLE SYSTEM (owner 2026-09-04: "I want deslicer to hard fail
+    // on eligible system", "silent fallbacks with no diag" is the exact worry). We are here only
+    // when the WgcBroker gate is ON and the build is >= 26100 - i.e. de-slice is EXPECTED. The
+    // renderer still falls back to the retained DDA slice so the desktop is never black, but that
+    // fallback must never be SILENT: the moment the broker is expected-but-absent, say so at
+    // WARNING level (visible in the default log, like QGADESKSTUCK) AND publish a machine-readable
+    // flag the health-check / acceptance harness fails on. A deliberate opt-out (WgcBroker=0)
+    // never reaches here - g_WgcBroker is false and BrokerSupervise returns at the top - so a quiet
+    // fallback stays quiet ONLY when the operator asked for it.
+    #define DESLICE_FIRST_WARN_MS 30000
+    #define DESLICE_REWARN_MS 120000
+    if (!g_BrokerDownSince) { g_BrokerDownSince = now; g_BrokerNextWarn = now + DESLICE_FIRST_WARN_MS; }
+    if (now >= g_BrokerNextWarn)
+    {
+        g_BrokerNextWarn = now + DESLICE_REWARN_MS;
+        // Name the cause: a MISSING binary is the packaging gap (wgcbroker.exe not shipped);
+        // a present binary that never heartbeats is a launch/capture failure. The distinction is
+        // the difference between "the release is broken" and "this guest cannot capture".
+        WCHAR exe[MAX_PATH] = { 0 };
+        BOOL binPresent = FALSE;
+        if (GetModuleFileName(NULL, exe, RTL_NUMBER_OF(exe)))
+        {
+            WCHAR* sl = wcsrchr(exe, L'\\'); if (sl) *(sl + 1) = 0;
+            StringCchCat(exe, RTL_NUMBER_OF(exe), L"wgcbroker.exe");
+            binPresent = (GetFileAttributes(exe) != INVALID_FILE_ATTRIBUTES);
+        }
+        (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, binPresent ? 1u : 2u, NULL);
+        LogWarning("QGADESLICEDOWN de-slice broker EXPECTED but not running for %I64u s on an "
+            L"eligible system (build %lu, WgcBroker gate ON): wgcbroker.exe %s. Rendering is on the "
+            L"DDA-slice FALLBACK - de-slice/per-window broker capture is NOT active. %s "
+            L"DesliceBrokerDown=%u published under the Qubes Tools config key.",
+            (now - g_BrokerDownSince) / 1000, g_OsBuild,
+            binPresent ? L"IS PRESENT (launch/capture failure - collect wgcbroker + agent logs)"
+                       : L"IS MISSING from the install dir (PACKAGING GAP - the helper was built in "
+                         L"CI but never staged into the installable package; it must ship next to "
+                         L"gui-agent.exe)",
+            binPresent ? L"" : L"This is the 2026-09-04 packaging finding.",
+            binPresent ? 1u : 2u);
+    }
+
     // Throttle relaunch: a freshly launched broker needs a few seconds to attach and heartbeat;
     // don't re-fire schtasks every second in the meantime.
     if (now - g_WgcLastLaunch < 8000) return;
@@ -8349,6 +8404,12 @@ static ULONG Init(void)
     }
     LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d deSlice=%d (floor 26100)",
             g_WgcBroker, g_OsBuild, g_SliceRetire, g_DeSlice);
+    // Publish an authoritative de-slice health flag from the start. When the broker is NOT
+    // expected (win10, or an explicit WgcBroker=0 opt-out) the answer is a definite "not down" =
+    // 0, so acceptance never reads a stale value from a prior config; when it IS expected,
+    // BrokerSupervise owns the flag (0 on ready, 1/2 on the hard-fail path).
+    if (!(g_WgcBroker && g_OsBuild >= 26100))
+        (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
     {
         // Notification bridge gate: default OFF; registry "NotifyBridge" then qubesdb
         // /qubes-service/notify-bridge (dom0 wins), mirroring the broker gate. No build
