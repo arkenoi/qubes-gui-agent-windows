@@ -165,6 +165,9 @@ BOOL g_NoScreenGrant = FALSE;
 // wins), read once at init like the broker gate. Liveness = mtime of the bridge's
 // %ProgramData%\qubes-toast-bridge\heartbeat file (no shared section needed).
 #define REG_CONFIG_NOTIF_BRIDGE_VALUE L"NotifyBridge"
+// legacy_toasts: explicit opt-out that FORCES the bridge off (override-redirect toasts as
+// before), winning over NotifyBridge. Registry "LegacyToasts" / qubesdb /qubes-service/legacy-toasts.
+#define REG_CONFIG_LEGACY_TOASTS_VALUE L"LegacyToasts"
 BOOL          g_NotifBridge = FALSE;
 // Slice retirement (broker-only sliceFed handling) is the SHIPPED behaviour on 24H2+ and tracks
 // the broker build floor unconditionally; the SliceRetire diagnostic knob is retired. Field
@@ -8419,7 +8422,7 @@ static ULONG Init(void)
     {
         // Notification bridge gate: default OFF; registry "NotifyBridge" then qubesdb
         // /qubes-service/notify-bridge (dom0 wins), mirroring the broker gate. No build
-        // floor - the listener path is proven on win10 (guest/listener-probe.ps1).
+        // floor - the listener path is proven on win10.
         DWORD nb = 0;
         (void)CfgReadDword(moduleName, REG_CONFIG_NOTIF_BRIDGE_VALUE, &nb, NULL);
         g_NotifBridge = (nb != 0);
@@ -8430,7 +8433,27 @@ static ULONG Init(void)
             if (v) { g_NotifBridge = (v[0] != '0'); free(v); }
             qdb_close(q);
         }
-        LogInfo("NOTIFBRIDGE gate: enabled=%d", g_NotifBridge);
+        // legacy_toasts: the explicit opt-OUT. When set (registry "LegacyToasts" or qubesdb
+        // /qubes-service/legacy-toasts, dom0 wins) it FORCES the bridge off regardless of the
+        // NotifyBridge gate, so toasts render as override-redirect windows exactly as before
+        // (the seamless window path). It wins over notify-bridge so a user who wants the old
+        // toasts always gets them, even if the bridge is enabled or later becomes default-on.
+        DWORD legacy = 0;
+        (void)CfgReadDword(moduleName, REG_CONFIG_LEGACY_TOASTS_VALUE, &legacy, NULL);
+        BOOL legacyToasts = (legacy != 0);
+        q = qdb_open(NULL);
+        if (q)
+        {
+            char* v = qdb_read(q, "/qubes-service/legacy-toasts", NULL);
+            if (v) { legacyToasts = (v[0] != '0'); free(v); }
+            qdb_close(q);
+        }
+        if (legacyToasts && g_NotifBridge)
+        {
+            g_NotifBridge = FALSE;
+            LogInfo("NOTIFBRIDGE forced OFF by legacy_toasts - override-redirect toasts (window path)");
+        }
+        LogInfo("NOTIFBRIDGE gate: enabled=%d legacy_toasts=%d", g_NotifBridge, legacyToasts);
     }
 
     // Diagnostic-only window-filter override; absent (the normal case) means 0 = all
