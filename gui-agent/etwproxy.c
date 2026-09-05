@@ -314,7 +314,10 @@ static int EtwCtlEnableProviders(TRACEHANDLE session)
 }
 
 // The capability grant: give the consumer account TRACELOG_ACCESS_REALTIME on the session
-// GUID, and nothing else. Two calls, deliberately SET-then-ADD:
+// GUID, and nothing else. CALLER CONTRACT: this MUST run BEFORE EtwCtlSessionStart - the
+// logger snapshots its SD from WMI\Security[GUID] at creation, so a grant issued after
+// StartTrace never reaches the running session and the consumer's realtime connect is denied
+// (the rig-measured exit-5 defect). Two calls, deliberately SET-then-ADD:
 //   1. SET a DACL containing only the SYSTEM full-control ACE. SET (not a bare ADD)
 //      means the registry-persisted WMI\Security value for this GUID is REPLACED on every
 //      launch - it can never accrete drift across account re-creations or old grants
@@ -603,8 +606,12 @@ static HANDLE EtwProxyBuildJob(void)
 // per backoff period, and typically once per boot.
 //
 // The privilege flow per launch (the 2026-09-05 architecture decision, exactly):
-//   1. AGENT as SYSTEM: reap stale session; StartTraceW (fixed GUID); EnableTraceEx2 per
-//      provider (RCs logged); EventAccessControl SET(SYSTEM)+ADD(consumer realtime).
+//   1. AGENT as SYSTEM: EventAccessControl SET(SYSTEM)+ADD(consumer realtime) FIRST, THEN
+//      StartTraceW (fixed GUID) so the freshly-created logger snapshots the granted SD,
+//      THEN EnableTraceEx2 per provider (RCs logged). Grant-before-start is load-bearing:
+//      a real-time logger takes its security descriptor at CREATION; a grant issued after
+//      StartTrace edits only the persisted SD (next start) and never reaches the running
+//      logger, so the consumer's realtime connect is denied (rig-measured exit 5).
 //   2. AGENT: in-memory credential set + validate -> primary token with NO PLU and NO
 //      SeSystemProfilePrivilege (census-verified, logged once); CreateProcessAsUserW
 //      (CREATE_SUSPENDED|CREATE_NO_WINDOW, NO lpDesktop - the console split: etwproxy.exe
@@ -673,10 +680,37 @@ static void EtwProxyTryLaunchLocked(void)
         return;
     }
 
-    // (1) The controller sequence: session up + providers on + capability grant, BEFORE
-    // the consumer exists, so the proxy's OpenTraceW finds a live, authorized session.
+    // (1) The controller sequence. CAPABILITY GRANT FIRST, then StartTrace, then enable.
+    //
+    // ROOT CAUSE FIX (rig-proven 2026-09-05, Win10 19045): a real-time ETW logger snapshots
+    // its security descriptor from the persisted WMI\Security[Wnode.Guid] SD at the instant
+    // StartTraceW creates it. The prior order (StartTrace -> EnableProviders -> grant) issued
+    // the EventAccessControl grant AFTER the logger already existed, so the consumer's ACE
+    // landed only in the persisted registry SD (effective for the NEXT start) and NEVER in the
+    // running logger's in-kernel SD. The proxy's OpenTraceW (by name) then succeeded, but its
+    // ProcessTrace realtime-connect access check ran against that pre-grant snapshot and
+    // returned ERROR_ACCESS_DENIED -> proxy exit 5. The census had already proven the token
+    // held neither PLU nor SeSystemProfilePrivilege (else exit 9), so this was never a
+    // privilege/PLU requirement - only a grant that arrived too late. Granting BEFORE
+    // StartTraceW makes the fresh logger inherit {SYSTEM:full, consumer:TRACELOG_ACCESS_REALTIME}
+    // at creation, which is exactly the ACE PLU membership would have supplied via the default
+    // SD - so the never-PLU / never-SYSTEM consumer architecture holds. (design 10.16.3b /
+    // 10.20.6 follow-up.)
+    ULONG rc = EtwCtlGrantConsumer((PSID)consumerSid);
+    if (rc != ERROR_SUCCESS)
+    {
+        CloseHandle(job); CloseHandle(token);
+        // No session is running yet; EtwProxyBackoffLocked's StopLocked is a no-op
+        // (g_SessLive is still FALSE). SYSTEM being denied WRITE_DAC on its own session GUID
+        // would mean the trace config is broken, but that is vanishingly unlikely for SYSTEM;
+        // treat any grant failure as transient and retry on backoff.
+        LogWarning("ETWPROXYSUP EventAccessControl grant failed (%lu) - consumer not authorized; "
+                   "will retry on backoff", rc);
+        EtwProxyBackoffLocked();
+        return;
+    }
     TRACEHANDLE sess = 0;
-    ULONG rc = EtwCtlSessionStart(&sess);
+    rc = EtwCtlSessionStart(&sess);   // reaps stale, then StartTraceW -> reads the SD just set
     LogInfo("PROXY RC api=StartTrace provider=- rc=%lu", rc);
     if (rc != ERROR_SUCCESS)
     {
@@ -698,15 +732,6 @@ static void EtwProxyTryLaunchLocked(void)
     {
         CloseHandle(job); CloseHandle(token);
         LogWarning("ETWPROXYSUP zero providers enabled - will retry on backoff");
-        EtwProxyBackoffLocked();   // stops the session
-        return;
-    }
-    rc = EtwCtlGrantConsumer((PSID)consumerSid);
-    if (rc != ERROR_SUCCESS)
-    {
-        CloseHandle(job); CloseHandle(token);
-        LogWarning("ETWPROXYSUP EventAccessControl grant failed (%lu) - the consumer could "
-                   "not open the session; will retry on backoff", rc);
         EtwProxyBackoffLocked();   // stops the session
         return;
     }
