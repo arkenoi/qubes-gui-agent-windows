@@ -1,6 +1,7 @@
 /*
  * etwproxy - launch + supervision of the least-privilege ETW acquisition proxy
- * (`notifhost.exe --etw-proxy`), per docs/DESIGN-p3-classifier-impl.md sec 10.14.
+ * (`etwproxy.exe`, the GUI-DLL-free console binary split out of notifhost on 2026-09-05),
+ * per docs/DESIGN-p3-classifier-impl.md sec 10.14.
  *
  * This is DELIBERATELY a separate translation unit from main.c: main.c currently
  * carries an unrelated uncommitted change (slice-map-hold, CropReadyForMap/AddWindow)

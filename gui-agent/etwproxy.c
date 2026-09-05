@@ -1,8 +1,9 @@
 /*
- * etwproxy - launch + exit-wait supervision of `notifhost.exe --etw-proxy`, the
- * least-privilege home of the untrusted ETW/TDH parse (docs/DESIGN-p3-classifier-impl.md
- * sec 10.10/10.14, revised by the 2026-09-05 capability-grant split). See etwproxy.h for
- * why this is a separate file from main.c.
+ * etwproxy - launch + exit-wait supervision of `etwproxy.exe`, the least-privilege home
+ * of the untrusted ETW/TDH parse (docs/DESIGN-p3-classifier-impl.md sec 10.10/10.14,
+ * revised by the 2026-09-05 capability-grant split and the same-day CONSOLE SPLIT: the
+ * proxy is its own GUI-DLL-free binary now, not a notifhost.exe mode). See etwproxy.h
+ * for why this is a separate file from main.c.
  *
  * WHAT RUNS WHERE (capability-grant two-context split, ZERO new processes). This SYSTEM
  * agent is the ETW session CONTROLLER: per launch it reaps any stale session by name,
@@ -12,7 +13,7 @@
  * EventAccessControl. None of these control calls parses one attacker-influenceable byte
  * (fixed session name, fixed GUID, constant provider list, fixed grant SID), so running
  * them at SYSTEM does not violate the never-SYSTEM rule - that rule is about the
- * untrusted-DATA path. `notifhost --etw-proxy` is then a pure CONSUMER: OpenTraceW +
+ * untrusted-DATA path. `etwproxy.exe` is then a pure CONSUMER: OpenTraceW +
  * ProcessTrace + the TDH property location, authorized solely by the per-session DACL
  * grant, under the dedicated local account `qubes-etwproxy` whose token NEVER - at any
  * instant - held SeSystemProfilePrivilege or the Performance Log Users group SID. This
@@ -29,14 +30,15 @@
  *   * session 0 placement (the token is born in this service's session; ETW sessions
  *     and the pipe namespace are machine-global, so session 0 is both sufficient and
  *     the most isolated choice); no user profile is loaded (the proxy needs no HKCU);
- *   * a DEDICATED, private window station + desktop (QubesEtwProxyWS\default, sec
- *     10.20.3): a bare batch token in session 0 has no accessible winsta, and user32
- *     (linked by notifhost) then fails process init with 0xC0000142 before one proxy
- *     instruction runs - the rig-measured L1 failure. The agent creates the pair once
- *     per boot, DACLed {SYSTEM: full, consumer: minimal user32-connect rights}, and the
- *     proxy is launched with si.lpDesktop pointing at it. The objects contain nothing
- *     but the proxy, so this grants access to nothing (no interactive atoms, clipboard,
- *     or input desktop); creation failure PARKS - WinSta0 is never a fallback;
+ *   * NO window station at all (the 2026-09-05 CONSOLE SPLIT, superseding sec 10.20.3's
+ *     dedicated-winsta machinery): the old `notifhost --etw-proxy` died 0xC0000142
+ *     STATUS_DLL_INIT_FAILED because notifhost.exe statically imports user32+gdi32
+ *     (WinRT --bridge code) and their DllMain connects to a window station the bare
+ *     batch token in session 0 does not have. etwproxy.exe links NEITHER (nor WinRT) -
+ *     it never touches a winsta, so the failure is impossible by construction and this
+ *     agent no longer creates, ACLs, or names any window station or desktop for it
+ *     (si.lpDesktop stays NULL; nothing in the proxy ever consumes it). Zero rights
+ *     were widened anywhere to achieve this - that is why the owner chose this option;
  *   * the bridge user's SID on the command line (--client-sid), which the proxy bakes
  *     into its pipe DACL - connect/read for that ONE principal.
  * The agent never touches the pipe and never parses an event (sec 10.10.1).
@@ -83,7 +85,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <sddl.h>
-#include <aclapi.h>      // SetEntriesInAclW - the dedicated-winsta/desktop DACLs (L1 fix)
 #include <wtsapi32.h>
 #include <userenv.h>
 #include <lm.h>          // NetUserSetInfo(1003) - the in-memory password reset
@@ -112,7 +113,7 @@
 // generated fresh in memory at every launch, never stored (no LSA secret any more).
 #define ETWPROXY_ACCOUNT      L"qubes-etwproxy"
 
-// Shared contract with tools/notifhost/notifhost.cpp (kEtwBridgeSession) - change both or
+// Shared contract with tools/notifhost/qtb_shared.h (kEtwBridgeSession) - change both or
 // neither. The name is what the consumer opens (OpenTraceW LoggerName) and what the reap
 // stops; the GUID is the session's Wnode.Guid = the object the EventAccessControl DACL
 // grant attaches to. FIXED so the grant target is deterministic across launches (an
@@ -121,27 +122,12 @@
 static const GUID ETWPROXY_SESSION_GUID = /* generated once for this project, registered nowhere else */
 { 0x7c31f9a2, 0x0d5e, 0x4c8b, { 0x9a, 0x41, 0x5d, 0x2e, 0x8f, 0x66, 0x3b, 0xd4 } };
 
-// Dedicated window station + desktop for the proxy (design sec 10.20.3, the 0xC0000142
-// fix). A plain BATCH-logon token in session 0 has NO accessible window station, and
-// notifhost links user32.dll, whose process-init connect then fails ->
-// STATUS_DLL_INIT_FAILED in ~31 ms, before one proxy instruction runs (rig-measured:
-// etw-proxy.log never appears). The fix is a PRIVATE winsta/desktop pair this agent
-// creates once per boot and ACEs for the consumer SID with the minimal user32-connect
-// rights - never an ACE on WinSta0 or any interactive/service winsta, which would hand
-// the untrusted decode interactive atoms/clipboard adjacency it must not have. The
-// objects contain nothing but the proxy, so access to them grants access to nothing.
-#define ETWPROXY_WINSTA_NAME  L"QubesEtwProxyWS"
-#define ETWPROXY_DESK_NAME    L"default"
-#define ETWPROXY_DESK_PATH    ETWPROXY_WINSTA_NAME L"\\" ETWPROXY_DESK_NAME
-// Minimal connect set for user32 process init (sec 10.20.3 item 2). If some build's
-// user32 still refuses, widen ONLY these two grants - they cover private objects.
-#define ETWPROXY_WINSTA_CONSUMER_RIGHTS  (WINSTA_ACCESSGLOBALATOMS | WINSTA_READATTRIBUTES)
-#define ETWPROXY_DESK_CONSUMER_RIGHTS    (DESKTOP_READOBJECTS | DESKTOP_CREATEWINDOW)
-// Full desktop access for the SYSTEM/controller ACE (winuser.h has no DESKTOP_ALL macro).
-#define ETWPROXY_DESK_ALL_ACCESS  (STANDARD_RIGHTS_REQUIRED | DESKTOP_READOBJECTS | \
-    DESKTOP_CREATEWINDOW | DESKTOP_CREATEMENU | DESKTOP_HOOKCONTROL | \
-    DESKTOP_JOURNALRECORD | DESKTOP_JOURNALPLAYBACK | DESKTOP_ENUMERATE | \
-    DESKTOP_WRITEOBJECTS | DESKTOP_SWITCHDESKTOP)
+// NO ETWPROXY_WINSTA_*/ETWPROXY_DESK_* here anymore (2026-09-05 CONSOLE SPLIT): the
+// dedicated window-station machinery (design sec 10.20.3) existed only because
+// notifhost.exe imported user32/gdi32, whose process-init winsta connect failed
+// 0xC0000142 under the winsta-less batch token. etwproxy.exe links no GUI DLL, so the
+// proxy needs no window station, no desktop, and no winsta ACEs - the whole apparatus
+// (private winsta creation, DACL builder, lpDesktop) is REMOVED, not relocated.
 
 #define ETWPROXY_MEM_LIMIT    (64ull * 1024 * 1024)  // sec 10.14.4: a decode bomb dies, the guest does not
 #define ETWPROXY_BACKOFF_MIN  5000                    // ms; sec 10.14.6 (5 s -> 5 min)
@@ -182,8 +168,6 @@ static ULONGLONG        g_NextPoke;     // Poke throttle (main-loop thread only)
 static WCHAR            g_ClientSid[192]; // SID string the running proxy was launched with
 static BOOL             g_SessLive;     // this agent started the ETW session and owns stopping it
 static BOOL             g_CensusLogged; // token group/priv census printed once per boot
-static HWINSTA          g_ProxyWinsta;  // dedicated winsta (sec 10.20.3) - held open for the
-static HDESK            g_ProxyDesk;    // agent's lifetime so the objects outlive proxy restarts
 
 static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut);
 static VOID CALLBACK EtwProxyRelaunchCb(PVOID context, BOOLEAN timerFired);
@@ -574,137 +558,6 @@ static BOOL EtwProxyClientSid(WCHAR* buf, size_t cch)
     return ok;
 }
 
-// ---- dedicated window station + desktop (sec 10.20.3 - the 0xC0000142 L1 fix) --------
-// Build a two-ACE security descriptor {SYSTEM: systemRights, consumer: consumerRights}.
-// SetEntriesInAclW copies the SIDs into the ACEs, so the stack SIDs may die after this
-// returns; the caller must LocalFree(*aclOut) once the object is created (the SD only
-// points at the ACL, it does not copy it).
-static BOOL EtwProxyObjectSd(PSID consumerSid, DWORD systemRights, DWORD consumerRights,
-                             SECURITY_DESCRIPTOR* sd, PACL* aclOut)
-{
-    BYTE sysSid[SECURITY_MAX_SID_SIZE];
-    DWORD cb = sizeof(sysSid);
-    *aclOut = NULL;
-    if (!CreateWellKnownSid(WinLocalSystemSid, NULL, sysSid, &cb))
-        return FALSE;
-
-    EXPLICIT_ACCESS_W ea[2];
-    ZeroMemory(ea, sizeof(ea));
-    ea[0].grfAccessPermissions = systemRights;
-    ea[0].grfAccessMode = SET_ACCESS;
-    ea[0].grfInheritance = NO_INHERITANCE;
-    ea[0].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    ea[0].Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
-    ea[0].Trustee.ptstrName = (LPWSTR)sysSid;
-    ea[1].grfAccessPermissions = consumerRights;
-    ea[1].grfAccessMode = SET_ACCESS;
-    ea[1].grfInheritance = NO_INHERITANCE;
-    ea[1].Trustee.TrusteeForm = TRUSTEE_IS_SID;
-    ea[1].Trustee.TrusteeType = TRUSTEE_IS_USER;
-    ea[1].Trustee.ptstrName = (LPWSTR)consumerSid;
-
-    PACL acl = NULL;
-    if (SetEntriesInAclW(2, ea, NULL, &acl) != ERROR_SUCCESS)
-        return FALSE;
-    if (!InitializeSecurityDescriptor(sd, SECURITY_DESCRIPTOR_REVISION) ||
-        !SetSecurityDescriptorDacl(sd, TRUE, acl, FALSE))
-    {
-        LocalFree(acl);
-        return FALSE;
-    }
-    *aclOut = acl;
-    return TRUE;
-}
-
-// Create (once per boot) the private winsta + desktop the proxy connects to via
-// si.lpDesktop = "QubesEtwProxyWS\\default". Both handles are cached and held for the
-// agent's lifetime so the kernel objects persist across proxy restarts. DACLs at
-// creation: SYSTEM full (this agent stays the controller), consumer SID the minimal
-// user32-connect set ONLY (sec 10.20.3 item 2) - never an interactive-winsta grant.
-// CreateDesktopW creates in the CALLING PROCESS's window station, so the process winsta
-// is switched to the new one for exactly that call and restored immediately; callers
-// hold g_Lock, and the window is a single bounded syscall (other agent threads resolve
-// desktops via handles they already hold, not via the process winsta).
-// Failure -> FALSE with *parkReason set: the caller PARKS. Falling back to WinSta0 (or
-// any shared winsta) is forbidden - that over-grant is what the split exists to prevent.
-static BOOL EtwProxyEnsureWinstaLocked(PSID consumerSid, const char** parkReason, DWORD* parkCode)
-{
-    *parkReason = NULL;
-    *parkCode = 0;
-    if (g_ProxyWinsta && g_ProxyDesk)
-        return TRUE;   // built earlier this boot
-
-    SECURITY_DESCRIPTOR sd;
-    PACL acl = NULL;
-    SECURITY_ATTRIBUTES sa;
-    sa.nLength = sizeof(sa);
-    sa.lpSecurityDescriptor = &sd;
-    sa.bInheritHandle = FALSE;
-
-    if (!EtwProxyObjectSd(consumerSid, WINSTA_ALL_ACCESS,
-                          ETWPROXY_WINSTA_CONSUMER_RIGHTS, &sd, &acl))
-    {
-        *parkReason = "could not build the dedicated window-station DACL";
-        *parkCode = GetLastError();
-        return FALSE;
-    }
-    // Creates the winsta in this session's (session 0's) winsta namespace - the same
-    // namespace the proxy's lpDesktop resolves in, since its token is born in session 0.
-    // If it already exists (agent restart while a prior proxy still holds a ref) this
-    // OPENS it; the SD argument is then ignored, which is fine - only this code ever
-    // creates it, with this exact SD.
-    HWINSTA ws = CreateWindowStationW(ETWPROXY_WINSTA_NAME, 0, WINSTA_ALL_ACCESS, &sa);
-    DWORD gle = ws ? 0 : GetLastError();
-    LocalFree(acl);
-    if (!ws)
-    {
-        *parkReason = "CreateWindowStation failed for the proxy's dedicated winsta";
-        *parkCode = gle;
-        return FALSE;
-    }
-
-    HWINSTA prev = GetProcessWindowStation();
-    if (!prev || !SetProcessWindowStation(ws))
-    {
-        *parkCode = GetLastError();
-        *parkReason = "could not enter the dedicated winsta to create its desktop";
-        CloseWindowStation(ws);
-        return FALSE;
-    }
-
-    HDESK dk = NULL;
-    if (EtwProxyObjectSd(consumerSid, ETWPROXY_DESK_ALL_ACCESS,
-                         ETWPROXY_DESK_CONSUMER_RIGHTS, &sd, &acl))
-    {
-        dk = CreateDesktopW(ETWPROXY_DESK_NAME, NULL, NULL, 0, ETWPROXY_DESK_ALL_ACCESS, &sa);
-        gle = dk ? 0 : GetLastError();
-        LocalFree(acl);
-    }
-    else
-        gle = GetLastError();
-
-    // Restore the agent's own winsta UNCONDITIONALLY before any other outcome handling.
-    if (!SetProcessWindowStation(prev))
-        LogWarning("ETWPROXYSUP could not restore the agent's window station (%lu) after "
-                   "creating the proxy desktop - agent-side winsta-relative calls may "
-                   "misresolve until restart", GetLastError());
-
-    if (!dk)
-    {
-        *parkReason = "could not create/DACL the proxy's dedicated desktop";
-        *parkCode = gle;
-        CloseWindowStation(ws);
-        return FALSE;
-    }
-
-    g_ProxyWinsta = ws;
-    g_ProxyDesk = dk;
-    LogInfo("ETWPROXYSUP dedicated winsta ready: %s (consumer rights: winsta "
-            "ACCESSGLOBALATOMS|READATTRIBUTES, desktop READOBJECTS|CREATEWINDOW; "
-            "SYSTEM full; handles held for the agent's lifetime)", ETWPROXY_DESK_PATH);
-    return TRUE;
-}
-
 // ---- the sec 10.14.4 sandbox ---------------------------------------------------------
 static HANDLE EtwProxyBuildJob(void)
 {
@@ -753,13 +606,13 @@ static HANDLE EtwProxyBuildJob(void)
 //   1. AGENT as SYSTEM: reap stale session; StartTraceW (fixed GUID); EnableTraceEx2 per
 //      provider (RCs logged); EventAccessControl SET(SYSTEM)+ADD(consumer realtime).
 //   2. AGENT: in-memory credential set + validate -> primary token with NO PLU and NO
-//      SeSystemProfilePrivilege (census-verified, logged once); dedicated winsta/desktop
-//      ensured + ACEd for the consumer SID (sec 10.20.3); CreateProcessAsUserW
-//      (CREATE_SUSPENDED|CREATE_NO_WINDOW, lpDesktop=QubesEtwProxyWS\default) ->
+//      SeSystemProfilePrivilege (census-verified, logged once); CreateProcessAsUserW
+//      (CREATE_SUSPENDED|CREATE_NO_WINDOW, NO lpDesktop - the console split: etwproxy.exe
+//      links no user32/gdi32, so no window station exists, is needed, or is granted) ->
 //      AssignProcessToJobObject -> ResumeThread.
-//   3. PROXY (notifhost --etw-proxy): never-SYSTEM guard, --client-sid validation,
+//   3. PROXY (etwproxy.exe): never-SYSTEM guard, --client-sid validation,
 //      AdjustTokenPrivileges(SE_PRIVILEGE_REMOVED) on everything, then OpenTraceW +
-//      ProcessTrace only - proxy-side, in tools/notifhost.
+//      ProcessTrace only - proxy-side, in tools/notifhost/etwproxy.cpp.
 static void EtwProxyTryLaunchLocked(void)
 {
     if (g_State != EPS_IDLE || g_Shutdown)
@@ -804,17 +657,10 @@ static void EtwProxyTryLaunchLocked(void)
         return;
     }
 
-    // The 0xC0000142 fix (sec 10.20.3): make sure the dedicated winsta/desktop exists
-    // and is ACEd for the consumer SID BEFORE the process is created - user32's process
-    // init connects to si.lpDesktop and dies STATUS_DLL_INIT_FAILED without it. PARK on
-    // failure: launching against WinSta0/an interactive winsta instead is the exact
-    // over-grant the capability split forbids, so there is no fallback.
-    if (!EtwProxyEnsureWinstaLocked((PSID)consumerSid, &parkReason, &parkCode))
-    {
-        CloseHandle(token);
-        EtwProxyParkLocked(parkReason, parkCode);
-        return;
-    }
+    // NO winsta preparation here (the 2026-09-05 console split): etwproxy.exe imports no
+    // user32/gdi32, so nothing in its process init ever connects to a window station -
+    // the 0xC0000142 failure that used to require the dedicated QubesEtwProxyWS is
+    // structurally impossible, and no station is created or ACEd for the consumer.
 
     HANDLE job = EtwProxyBuildJob();
     if (!job)
@@ -877,8 +723,10 @@ static void EtwProxyTryLaunchLocked(void)
     if (slash) *(slash + 1) = 0;   // keep trailing backslash -> agent's own bin directory
 
     WCHAR cmd[MAX_PATH + 256];
+    // etwproxy.exe ships next to gui-agent.exe (bin overlay), like notifhost/wgcbroker.
+    // It IS the proxy - no mode flag needed; --client-sid is its whole command line.
     if (FAILED(StringCchPrintfW(cmd, RTL_NUMBER_OF(cmd),
-                                L"\"%snotifhost.exe\" --etw-proxy --client-sid %s",
+                                L"\"%setwproxy.exe\" --client-sid %s",
                                 exe, clientSid)))
     {
         CloseHandle(job); CloseHandle(token);
@@ -887,7 +735,7 @@ static void EtwProxyTryLaunchLocked(void)
     }
 
     // No LoadUserProfile (the proxy needs no HKCU, sec 10.14.4); environment from the
-    // proxy token so ProgramData etc. resolve (notifhost falls back to C:\ProgramData
+    // proxy token so ProgramData etc. resolve (etwproxy falls back to C:\ProgramData
     // if they do not - env is comfort, not correctness).
     LPVOID env = NULL;
     (void)CreateEnvironmentBlock(&env, token, FALSE);
@@ -895,14 +743,11 @@ static void EtwProxyTryLaunchLocked(void)
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
     si.cb = sizeof(si);
-    // The dedicated private winsta/desktop (sec 10.20.3). NOT empty and NOT NULL: the
-    // old `lpDesktop = L""` was the 0xC0000142 root cause - a plain BATCH logon session
-    // in session 0 gets NO window station of its own (the Service-0x...$ winsta belief
-    // was wrong for a bare batch token), so user32's process init found nothing to
-    // connect to and the proxy died before its first instruction. EtwProxyEnsureWinsta-
-    // Locked() above guarantees this path exists and admits the consumer SID.
-    WCHAR deskPath[] = ETWPROXY_DESK_PATH;   // literal would trip C4090 (const) under /W4 /WX
-    si.lpDesktop = deskPath;
+    // si.lpDesktop stays NULL (the console split). Historical note: `lpDesktop = L""`
+    // then a dedicated winsta path were both about user32's process-init winsta connect,
+    // which etwproxy.exe (no user32/gdi32 imports) never performs - the field is inert
+    // for it, and naming any station here would only re-couple the launch to winsta
+    // state that no longer needs to exist.
 
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
@@ -954,11 +799,11 @@ static void EtwProxyTryLaunchLocked(void)
     g_LaunchTick = GetTickCount64();
     StringCchCopyW(g_ClientSid, RTL_NUMBER_OF(g_ClientSid), clientSid);
     g_State = EPS_RUNNING;
-    LogInfo("ETWPROXYSUP launched notifhost --etw-proxy pid=%lu client_sid=%s "
+    LogInfo("ETWPROXYSUP launched etwproxy.exe pid=%lu client_sid=%s "
             "(session controller: %s live, providers=%d, consumer granted "
             "TRACELOG_ACCESS_REALTIME; job: 64MB/1-proc/UI-restricted/kill-on-close; "
-            "session 0, desktop=%s; exit-wait armed)",
-            pi.dwProcessId, g_ClientSid, ETWPROXY_SESSION_NAME, enabled, deskPath);
+            "session 0, no winsta - GUI-DLL-free console proxy; exit-wait armed)",
+            pi.dwProcessId, g_ClientSid, ETWPROXY_SESSION_NAME, enabled);
 }
 
 // ---- exit-wait callback (thread pool): THE supervision mechanism ---------------------
@@ -1053,7 +898,7 @@ void EtwProxyInit(BOOL bridgeEnabled)
     g_Enabled = bridgeEnabled;
     g_State = bridgeEnabled ? EPS_IDLE : EPS_DISABLED;
     if (bridgeEnabled)
-        LogInfo("ETWPROXYSUP armed (gate on): notifhost --etw-proxy launches once a console "
+        LogInfo("ETWPROXYSUP armed (gate on): etwproxy.exe launches once a console "
                 "user session exists (agent = session controller, proxy = pure consumer)");
     // Gate off: fully inert. No account access, no session, no logs, no timers.
 }
@@ -1129,19 +974,8 @@ void EtwProxyShutdown(void)
         CloseHandle(g_Proc);
         g_Proc = NULL;
     }
-    // Drop the dedicated winsta/desktop refs AFTER the job kill above: with the proxy
-    // gone these are (normally) the last references, so the kernel destroys the private
-    // objects; a fresh agent recreates them next boot/start.
-    if (g_ProxyDesk)
-    {
-        CloseDesktop(g_ProxyDesk);
-        g_ProxyDesk = NULL;
-    }
-    if (g_ProxyWinsta)
-    {
-        CloseWindowStation(g_ProxyWinsta);
-        g_ProxyWinsta = NULL;
-    }
+    // (No winsta/desktop refs to drop since the console split - the proxy owns no
+    // window-station objects and the agent creates none for it.)
     EtwProxySessionStopLocked();
     g_State = g_Enabled ? EPS_IDLE : EPS_DISABLED;
     LeaveCriticalSection(&g_Lock);
