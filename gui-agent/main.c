@@ -48,6 +48,7 @@
 #include "debug.h"
 #include "perf.h"
 #include "toastcrop.h"
+#include "etwproxy.h"
 #include "faultinject.h"
 #include "dragsim.h"
 #include "qubes-io.h"
@@ -183,6 +184,30 @@ BOOL          g_DeSlice = FALSE;       // DERIVED at init (g_SliceRetire && buil
                                        // (MONSLICE/CreateForMonitor) it used to gate was proven
                                        // unneeded and DELETED after the de-slice proof window
                                        // closed; there is nothing left to switch back to.
+// Slice-content map-hold gate (CANDIDATE, DEFAULT OFF; registry "SliceMapHold" under the
+// module key, read once at init exactly like ToastCropDisable; deliberately NO qubesdb
+// service - a guest-local A/B knob only). Scope: the FIRST map of a NON-de-sliced slice-fed
+// window (win10 / broker floor), which today maps immediately with a freshly ZEROED
+// per-window slab (PwSlabAcquire) and therefore shows a black rectangle until the first
+// composite slice copy lands. Gate ON holds that first map until proven content
+// (PwNoteSliceContent), bounded by CROP_BEFORE_SHOW_TIMEOUT_MS. Gate OFF is byte-for-byte
+// today's behavior - only the QGASLICEMAP/QGASLICECONTENT timing lines are new.
+#define REG_CONFIG_SLICE_MAP_HOLD_VALUE L"SliceMapHold"
+BOOL          g_SliceMapHold = FALSE;
+// Chrome (menu/toast) scope of the map-hold above - the flag-on content-hold interplay
+// with the crop-before-show arms, made explicitly A/B-able instead of riding SliceMapHold
+// implicitly (pre-flip item: flag-on silently changed menu/toast map timing on the
+// PROVEN de-slice/win11 configuration, where the broker's crop+first-frame machinery
+// already governs those surfaces and menu rendering is validated pixel-perfect).
+// Registry "SliceMapHoldChrome" (module key, read once at init like SliceMapHold):
+//   0 = chrome never content-holds (menu/toast arms ignore SliceContentReady entirely)
+//   1 = DEFAULT: content-hold applies to chrome only on the NON-de-slice path (win10 /
+//       broker floor) - the path whose zeroed-slab black flash the hold exists to fix;
+//       the de-slice path keeps its proven pre-SliceMapHold chrome behavior
+//   2 = always (the previous flag-on behavior, for A/B on the de-slice path)
+// Irrelevant while SliceMapHold is off (SliceContentReady is then unconditionally TRUE).
+#define REG_CONFIG_SLICE_MAP_HOLD_CHROME_VALUE L"SliceMapHoldChrome"
+DWORD         g_SliceMapHoldChrome = 1;
 DWORD         g_OsBuild     = 0;
 volatile LONG g_BrokerReady = 0;
 static HANDLE g_WgcMap = NULL, g_WgcCtl = NULL, g_WgcBrokerProc = NULL;
@@ -2655,23 +2680,128 @@ static BOOL BrokerOpaqueInsets(IN HWND window, OUT RECT* insets)
 // penalty; 400 ms is the worst case, not the norm.
 #define CROP_BEFORE_SHOW_TIMEOUT_MS 400
 
+// SLICE-CONTENT MAP-HOLD readiness (g_SliceMapHold, DEFAULT OFF). The non-de-sliced slice-fed
+// path has the same black-first-frame defect the de-slice arm below already fixes for 24H2+:
+// AddWindow maps the window and sends a full-rect initial damage while its per-window slab is
+// still the zeroed memory PwSlabAcquire handed out (perwindow.c documents "BLACK until the
+// window painted"), and the first composite copy (PwSliceCopyAndDamage) only lands later, on a
+// captured frame whose composite actually carries the window. Gate ON: not ready until PROVEN
+// content is in the buffer (PwNoteSliceContent - a consumed broker frame, or a composite copy
+// backed by screen damage intersecting the window). Bounded: the crop-before-show release site
+// maps after CROP_BEFORE_SHOW_TIMEOUT_MS regardless, so the worst case is exactly today's
+// behavior and a window (a toast in particular - required-kept) can never stay hidden.
+// Gate OFF: always TRUE - today's behavior, unchanged.
+static BOOL SliceContentReady(IN const WINDOW_DATA* entry)
+{
+    if (!g_SliceMapHold || !entry->PwSliceFed)
+        return TRUE;
+    return entry->PwSliceContentTick != 0 || entry->PwBrokerLastId != 0;
+}
+
+// First-map bookkeeping for a slice-fed window - ALWAYS ON, flag-independent: the
+// QGASLICEMAP / QGASLICECONTENT pair is how the map->first-content gap (the visible black
+// flash) is measured on the rig and how the hold is validated. lead_ms >= 0 here means
+// content preceded the map by that much (no flash possible); lead_ms=-1 means the window
+// mapped with NO content yet - the matching QGASLICECONTENT line then carries the flash
+// duration in flash_ms. Call after every successful FIRST SendWindowMap; the tick guard
+// makes later calls (remaps) no-ops.
+static void PwNoteSliceFedMap(IN OUT WINDOW_DATA* entry)
+{
+    if (!entry->PwSliceFed || entry->PwSliceMapTick != 0)
+        return;
+    entry->PwSliceMapTick = GetTickCount64();
+    LogInfo("QGASLICEMAP hwnd=0x%x t=%llu content=%llu lead_ms=%lld hold=%d",
+        (DWORD)(ULONG_PTR)entry->Handle, entry->PwSliceMapTick, entry->PwSliceContentTick,
+        entry->PwSliceContentTick != 0 ?
+            (LONGLONG)(entry->PwSliceMapTick - entry->PwSliceContentTick) : (LONGLONG)-1,
+        g_SliceMapHold);
+}
+
+// SLICE-MAP-HOLD WAKE GUARANTEE (pre-flip must-fix). MapDeferred is released ONLY inside
+// UpdateWindowData (crop-resolved or the CROP_BEFORE_SHOW_TIMEOUT_MS arm), which runs when
+// a tracking pass examines the window. Every path that gets it there needs a WAKE: the
+// frame-loop backstop is skipped whenever the redundant-frame drop empties the walk
+// (FrameRedundant -> zCount=0), and on a static desktop no frame arrives at all while the
+// main loop's waitTimeout may be INFINITE - either way a held window's 400 ms bound never
+// fired and the window could stay hidden until an unrelated event. Two pieces close it:
+//   * g_MapDeferWake - the earliest pending deadline; ARMED whenever a map is deferred,
+//     and the main loop caps waitTimeout by it, so the loop is GUARANTEED to wake in time.
+//   * MapDeferWakeSweep() - runs at the top of every loop iteration (cheap early-out when
+//     nothing is armed): queues an EVENT_OBJECT_SHOW for every expired hold, which puts
+//     the window in the next tracking batch where the timeout arm releases it.
+// Main-loop-thread only (AddWindow/UpdateWindowData and the pump all run there); the
+// hook thread never touches it.
+static ULONGLONG g_MapDeferWake = 0;   // earliest MapDeferred deadline (tick), 0 = none armed
+
+static void MapDeferWakeSweep(void)
+{
+    if (g_MapDeferWake == 0)
+        return;
+    ULONGLONG now = GetTickCount64();
+    if (now < g_MapDeferWake)
+        return;
+    ULONGLONG next = 0;
+    EnterCriticalSection(&g_csWatchedWindows);
+    for (LIST_ENTRY* le = g_WatchedWindowsList.Flink; le != &g_WatchedWindowsList; le = le->Flink)
+    {
+        WINDOW_DATA* entry = CONTAINING_RECORD(le, WINDOW_DATA, ListEntry);
+        if (!entry->MapDeferred || entry->DeletePending)
+            continue;
+        ULONGLONG due = entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10;
+        if (due <= now)
+        {
+            // Expired: hand it to the tracking pass (the only legal release site) and
+            // keep a short retry armed until the hold actually clears - the queued event
+            // is delivered, but the bound must not be lost even if this one is coalesced.
+            QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
+            due = now + 100;
+        }
+        if (next == 0 || due < next)
+            next = due;
+    }
+    LeaveCriticalSection(&g_csWatchedWindows);
+    g_MapDeferWake = next;   // 0 when no hold remains: fully disarmed, no idle wakes
+}
+
+// Chrome arms' content-hold gate (see REG_CONFIG_SLICE_MAP_HOLD_CHROME_VALUE): whether a
+// menu/toast additionally waits for proven slice content when the SliceMapHold gate is on.
+static BOOL SliceChromeContentReady(IN const WINDOW_DATA* entry)
+{
+    if (g_SliceMapHoldChrome == 0)
+        return TRUE;                     // chrome never content-holds
+    if (g_SliceMapHoldChrome == 1 && g_DeSlice)
+        return TRUE;                     // de-slice path keeps its proven chrome behavior
+    return SliceContentReady(entry);     // no-op unless g_SliceMapHold is on
+}
+
 // Crop-before-show readiness: is the shadow-crop for this toast/menu resolved enough to map it
 // already cropped? Menu -> the broker has reported opaque bounds (preferred) OR the UIA measurement
 // resolved; toast -> UIA resolved. A non-cropped surface is always ready.
+// The chrome arms consult SliceChromeContentReady (no-op with SliceMapHold off, and gated
+// by SliceMapHoldChrome - default: NON-de-slice path only): a toast or menu that IS
+// slice-fed has the same zeroed-buffer first frame as any other slice-fed window, so with
+// the gate on (where it applies) its map waits for content too - still bounded by the same
+// timeout, so required-kept toasts always appear. On the de-slice path the broker's
+// crop+first-frame machinery already governs these surfaces (menu rendering validated
+// there), so the interplay is off by default and explicitly A/B-able.
 static BOOL CropReadyForMap(IN const WINDOW_DATA* entry)
 {
     RECT tmp;
     if (IsMenuPopupWindow(entry))
-        return BrokerOpaqueInsets(entry->Handle, &tmp) || !CropPending(entry);
+        return (BrokerOpaqueInsets(entry->Handle, &tmp) || !CropPending(entry)) &&
+               SliceChromeContentReady(entry);
     if (IsShellToastWindow(entry))
-        return !CropPending(entry);
+        return !CropPending(entry) && SliceChromeContentReady(entry);
     // DE-SLICE: with the whole-desktop composite retired there is nothing to fill a slice-fed
     // window's transitional first frame, so hold its map until its own per-window frame has been
     // consumed (else it would map black until the broker's first frame). Owner OK'd the ~100 ms
-    // new-window penalty. Non-de-sliced configs (win10 / broker floor) map immediately as before.
+    // new-window penalty. This arm is UNCHANGED by SliceMapHold.
     if (g_DeSlice && entry->PwSliceFed)
         return entry->PwBrokerLastId != 0;
-    return TRUE;
+    // Non-de-sliced slice-fed (win10 / broker floor): today "map immediately as before" -
+    // which is the black-rectangle flash. SliceContentReady holds it when the gate is on;
+    // gate off (default) and every non-slice-fed window: TRUE, exactly as before.
+    return SliceContentReady(entry);
 }
 
 // Guest-native window shadows off in seamless, restored in fullscreen. The shell window gives us a
@@ -2871,14 +3001,24 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
         // A visible (non-iconic) toast/menu whose shadow-crop has not resolved is CREATE'd and
         // buffer-attached above, but its MAP is DEFERRED so it appears already cropped rather than
         // flashing uncropped for a frame; UpdateWindowData maps it once the crop resolves or the
-        // timeout elapses.
+        // timeout elapses. With the SliceMapHold gate on, EVERY slice-fed window is a defer
+        // candidate (its slab is zeroed and unfed at this point - see SliceContentReady), not
+        // just the de-slice configuration.
         if (entry->IsVisible && !entry->IsIconic &&
             (IsMenuPopupWindow(entry) || IsShellToastWindow(entry) ||
-             (g_DeSlice && entry->PwSliceFed)) &&
+             (g_DeSlice && entry->PwSliceFed) ||
+             (g_SliceMapHold && entry->PwSliceFed)) &&
             !CropReadyForMap(entry))
         {
             entry->MapDeferred = TRUE;
             entry->MapDeferSince = GetTickCount64();
+            // Wake guarantee: arm the main loop so the CROP_BEFORE_SHOW_TIMEOUT_MS bound
+            // fires even if no frame/event ever wakes it again (see MapDeferWakeSweep).
+            {
+                ULONGLONG due = entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10;
+                if (g_MapDeferWake == 0 || due < g_MapDeferWake)
+                    g_MapDeferWake = due;
+            }
             LogVerbose("0x%x: map deferred until first per-window frame / crop resolves", entry->Handle);
         }
         else if (entry->IsIconic || entry->IsVisible)
@@ -2889,6 +3029,10 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
                 win_perror2(status, "SendWindowMap");
                 goto end;
             }
+            // Timing instrumentation (always on): for a slice-fed window this immediate map
+            // is the start of the potential black flash - the buffer is a zeroed slab until
+            // the frame loop's first composite copy (QGASLICECONTENT closes the pair).
+            PwNoteSliceFedMap(entry);
 
             // Force a full repaint of the window we just mapped.
             //
@@ -3813,7 +3957,16 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
             {
                 g_LastForeground = fg;
                 LogInfo("foreground -> 0x%x, re-mapping to raise it in dom0", fg);
-                SendWindowMap(fgData);
+                if (SendWindowMap(fgData) == ERROR_SUCCESS)
+                {
+                    // Timing instrumentation (always on, pre-flip must-fix): if THIS raise
+                    // is a slice-fed window's first successful map (a held window raised to
+                    // foreground, or one that slipped past the defer arms), record it here -
+                    // otherwise QGASLICEMAP is only stamped at the later crop-before-show
+                    // release and lead_ms over-credits the hold with time the window was
+                    // already mapped (and possibly black). Tick guard makes remaps no-ops.
+                    PwNoteSliceFedMap(fgData);
+                }
             }
         }
     }
@@ -4911,8 +5064,15 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             windowData->MapDeferred = FALSE;
             ULONG ms = SendWindowMap(windowData);
             if (ms == ERROR_SUCCESS)
+            {
+                // Timing instrumentation (always on): held-map release. For a slice-fed
+                // window QGASLICEMAP's lead_ms tells whether content beat the map (hold
+                // worked) or the bounded timeout expired with the buffer still unfed
+                // (lead_ms=-1; the flash then shows up in QGASLICECONTENT).
+                PwNoteSliceFedMap(windowData);
                 (void)SendWindowDamageEvent(windowData->Handle, 0, 0,
                     windowData->Width, windowData->Height);
+            }
             else
                 win_perror2(ms, "SendWindowMap(crop-before-show)");
         }
@@ -5362,6 +5522,33 @@ static BOOL PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRA
                                  IN const BYTE* fb, IN const RECT* area)
 {
     return PwSliceCopyAndDamageSrc(entry, fb, frame ? frame->rect.Pitch : 0, 0, 0, area);
+}
+
+// Slice-content bookkeeping (ALWAYS ON) + map-hold release. Called when REAL content
+// provably landed in a slice-fed window's per-window buffer for the FIRST time: a consumed
+// per-HWND broker frame, or a composite slice copy backed by screen damage intersecting the
+// window (a bare PwSliceNeedsFull copy against an unchanged composite proves nothing - DWM
+// may not have composed the window into the screen yet, and the copy would just be the
+// pixels that were behind it). Emits the QGASLICECONTENT timing line: flash_ms is the
+// map -> first-content gap = the duration dom0 rendered the zeroed (black) buffer; -1 means
+// content arrived before any map (a successful hold, or a window still deferred). With the
+// SliceMapHold gate on it also queues the window for a tracking pass, so a MapDeferred hold
+// releases within one pass (mirrors the de-slice arm's PokeWindowTracking, but targeted:
+// a bare poke does not put this window in TakePendingWindows' batch, so UpdateWindowData -
+// the only release site - might otherwise wait for the window's next natural event or the
+// periodic resync).
+static void PwNoteSliceContent(IN OUT WINDOW_DATA* entry)
+{
+    if (entry->PwSliceContentTick != 0)
+        return;
+    entry->PwSliceContentTick = GetTickCount64();
+    LogInfo("QGASLICECONTENT hwnd=0x%x t=%llu map=%llu flash_ms=%lld hold=%d",
+        (DWORD)(ULONG_PTR)entry->Handle, entry->PwSliceContentTick, entry->PwSliceMapTick,
+        entry->PwSliceMapTick != 0 ?
+            (LONGLONG)(entry->PwSliceContentTick - entry->PwSliceMapTick) : (LONGLONG)-1,
+        g_SliceMapHold);
+    if (g_SliceMapHold && entry->MapDeferred)
+        QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
 }
 
 // DRAG-SLICE refresh (InputDragSlice): full-rect, ROW-DIFFED copy of the dragged
@@ -6352,6 +6539,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         entry->PwSliceNeedsFull = FALSE;
                         entry->PwBrokerLastId = bid;
                         PwSliceCopyAndDamageSrc(entry, bsrc, bpitch, entry->X, entry->Y, &pwRect);
+                        // A per-HWND broker frame IS content by definition - close the
+                        // map/first-content timing pair (and release a SliceMapHold defer).
+                        PwNoteSliceContent(entry);
                         if (firstBrokerFrame)
                             LogInfo("BROKERFRAME first WGC frame consumed hwnd 0x%x slot %d %ux%u",
                                     (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
@@ -6392,15 +6582,41 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // on a fullscreen overlay, measured 31px).
                 else if (entry->PwSliceNeedsFull)
                 {
+                    // Content-present evidence for the map-hold/timing: this full copy only
+                    // PROVES the composite carries the window if the screen actually changed
+                    // under its rect this frame (or the frame is a whole-screen refresh,
+                    // dirty_rects_count == 0). An unconditional copy against an unchanged
+                    // composite may predate the window's DWM composition and hold only the
+                    // pixels that were behind it - real content then arrives via the dirty
+                    // loop below on a later frame.
+                    BOOL sliceEvidence = (frame->dirty_rects_count == 0);
+                    for (UINT pdi = 0; !sliceEvidence && pdi < frame->dirty_rects_count; pdi++)
+                        if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
+                            sliceEvidence = TRUE;
                     entry->PwSliceNeedsFull = FALSE;
-                    PwSliceCopyAndDamage(entry, frame, framebuffer, &pwRect);
+                    if (PwSliceCopyAndDamage(entry, frame, framebuffer, &pwRect) &&
+                        sliceEvidence)
+                        PwNoteSliceContent(entry);
                 }
                 else
                 {
                     for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
                         if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
-                            PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit);
+                            if (PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit))
+                                PwNoteSliceContent(entry);
                 }
+
+                // SliceMapHold timeout backstop: MapDeferred is only ever cleared inside
+                // UpdateWindowData, which runs for windows in the pending-event batch or on
+                // the periodic resync. A held window whose content never arrives (fully
+                // transparent, off-screen, occlusion oddity) might generate no further
+                // events, so once the bound expires queue it explicitly - the next tracking
+                // pass then maps it via the timeout arm of the crop-before-show release.
+                // Worst case is thereby exactly today's behavior, delayed by the bound;
+                // never a window that stays hidden.
+                if (g_SliceMapHold && entry->MapDeferred &&
+                    (GetTickCount64() - entry->MapDeferSince) > CROP_BEFORE_SHOW_TIMEOUT_MS)
+                    QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
             }
             else
             {
@@ -7586,6 +7802,21 @@ static ULONG WINAPI WatchForEvents(void)
         if (waitTimeout == INFINITE && g_VchanClientConnected && DaemonSettleWorkPending())
             waitTimeout = 100;
 
+        // SLICE-MAP-HOLD WAKE GUARANTEE (see MapDeferWakeSweep): release any expired
+        // map-hold NOW (queues the window for the tracking pass that maps it), then cap
+        // the wait by the earliest remaining deadline so the 400 ms bound fires even on a
+        // fully static desktop (no frames, no events) and even when the redundant-frame
+        // drop empties the per-window walk that hosts the in-frame backstop. Only ever
+        // tightens the wait; fully inert (g_MapDeferWake == 0) unless a map is deferred.
+        MapDeferWakeSweep();
+        if (g_MapDeferWake != 0)
+        {
+            ULONGLONG now64 = GetTickCount64();
+            DWORD toDefer = (g_MapDeferWake > now64) ? (DWORD)(g_MapDeferWake - now64) : 0;
+            if (waitTimeout == INFINITE || toDefer < (DWORD)waitTimeout)
+                waitTimeout = toDefer;
+        }
+
         // DRAG SMOOTHNESS. While the user drags a window, its POSITION is the only thing
         // that matters (its content is frozen for the duration), yet g_WindowEventSignal
         // sits LAST in the wait array so a pending frame always wins. Announces are then
@@ -7733,6 +7964,8 @@ static ULONG WINAPI WatchForEvents(void)
 
         BrokerSupervise();   // ~1 Hz self-throttled; no-op unless the WgcBroker gate is on
         NotifBridgeSupervise();   // ~0.2 Hz; no-op unless the NotifyBridge gate is on
+        EtwProxyPoke();   // launch-precondition only (console session / user change); proxy
+                          // DEATH is detected by its exit-wait, not here (etwproxy.c)
 
         switch (signaledEvent)
         {
@@ -8211,6 +8444,7 @@ static ULONG WINAPI WatchForEvents(void)
     // Signal the user-session WGC broker to exit and reap it (harmless no-op if never started).
     BrokerShutdown();
     NotifBridgeShutdown();
+    EtwProxyShutdown();   // exit-wait unregistered, backoff timer cancelled, job terminated
 
     // --- A6 (approved design, 2.2): bounded, leak-free exit. Previously the exit order
     // was PwShutdown -> libvchan_close -> StopFrameProcessing -> CaptureTeardown: no
@@ -8508,6 +8742,25 @@ static ULONG Init(void)
     if (!(g_WgcBroker && g_OsBuild >= 26100))
         (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
     {
+        // Slice-content map-hold gate (CANDIDATE, DEFAULT OFF - Opus A/Bs it on the rig
+        // before any default flips). See SliceContentReady/PwNoteSliceContent for the
+        // mechanism and the QGASLICEMAP/QGASLICECONTENT pair for the measurement. Read
+        // exactly like ToastCropDisable (module key, once at init); deliberately NO qubesdb
+        // service - this is a guest-local A/B knob only. OFF is byte-for-byte today's
+        // mapping behavior; only the timing log lines are new.
+        DWORD smh = 0;
+        (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_MAP_HOLD_VALUE, &smh, NULL);
+        g_SliceMapHold = (smh != 0);
+        // Chrome interplay scope (A/B knob, see the g_SliceMapHoldChrome comment):
+        // 0=never, 1=non-de-slice only (default), 2=always. Clamp anything else to 1.
+        DWORD smhc = g_SliceMapHoldChrome;
+        (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_MAP_HOLD_CHROME_VALUE, &smhc, NULL);
+        g_SliceMapHoldChrome = (smhc <= 2) ? smhc : 1;
+        LogInfo("SLICEMAPHOLD gate: enabled=%d chrome_scope=%lu (default off; hold bounded by %u ms; "
+                "wake-guaranteed via MapDeferWakeSweep)",
+                g_SliceMapHold, g_SliceMapHoldChrome, CROP_BEFORE_SHOW_TIMEOUT_MS);
+    }
+    {
         // Notification bridge gate: default OFF; registry "NotifyBridge" then qubesdb
         // /qubes-service/notify-bridge (dom0 wins), mirroring the broker gate. No build
         // floor - the listener path is proven on win10.
@@ -8558,6 +8811,10 @@ static ULONG Init(void)
             if (g_NotifRestorePending)
                 LogInfo("NOTIFBRIDGE gate off with leftover banner markers - restore sweep armed");
         }
+        // ETW acquisition proxy rides the SAME gate (design sec 10.14.5: no new services,
+        // no new knobs - service.notify-bridge is the single control). All launch and
+        // supervision logic lives in etwproxy.c, deliberately outside this file.
+        EtwProxyInit(g_NotifBridge);
     }
 
     // Diagnostic-only window-filter override; absent (the normal case) means 0 = all

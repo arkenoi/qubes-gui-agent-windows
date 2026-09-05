@@ -268,6 +268,18 @@ typedef struct _WINDOW_DATA
     // this pass - the window HOLDS its last content (never the DDA slice) until one arrives.
     BOOL     PwHoldLogged;
 
+    // Slice-content map-hold (SliceMapHold gate, default OFF) + flash instrumentation
+    // (always on). PwSliceContentTick: GetTickCount64 when REAL content first landed in
+    // this slice-fed window's per-window buffer (a consumed broker frame, or a composite
+    // slice copy backed by screen damage intersecting the window); 0 = never. Set ONCE per
+    // window lifetime, deliberately never reset on buffer re-attach - it answers "has this
+    // window ever been fed", which is all the FIRST-map hold and the one-shot timing log
+    // need. PwSliceMapTick: GetTickCount64 when the window's FIRST map was issued; 0 = not
+    // mapped yet. The QGASLICEMAP/QGASLICECONTENT log pair derives map->first-content (the
+    // visible black flash) or content->map (hold lead) from these two.
+    ULONGLONG PwSliceContentTick;
+    ULONGLONG PwSliceMapTick;
+
     // Move-only drag fast path (ProcessNewFrame, PrintWindow-fed branch): a pure
     // position change does not alter the window's own content - the per-window buffer
     // is position-invariant and dom0 repositions it from MSG_CONFIGURE alone - so the
