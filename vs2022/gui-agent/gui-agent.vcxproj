@@ -26,6 +26,7 @@
     <ClCompile Include="..\..\gui-agent\xorg-keymap.c" />
     <ClCompile Include="..\..\gui-agent\perwindow.c" />
     <ClCompile Include="..\..\gui-agent\toastcrop.c" />
+    <ClCompile Include="..\..\gui-agent\etwproxy.c" />
     <!-- C++/WinRT capture engine: needs C++17 + exceptions; SDK headers are not
          /W4-clean, so warnings-as-errors is relaxed for this one TU only. -->
     <ClCompile Include="..\..\gui-agent\wincapture.cpp">
@@ -55,6 +56,7 @@
     <ClInclude Include="..\..\gui-agent\perwindow.h" />
     <ClInclude Include="..\..\gui-agent\wincapture.h" />
     <ClInclude Include="..\..\gui-agent\toastcrop.h" />
+    <ClInclude Include="..\..\gui-agent\etwproxy.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\gui-agent\blank.cur" />
