@@ -9,7 +9,8 @@
  * agent is the ETW session CONTROLLER: per launch it reaps any stale session by name,
  * starts the real-time session `QubesToastBridgeEtw` with a FIXED private GUID in
  * Wnode.Guid (the deterministic grant target), enables the constant provider list, and
- * grants the consumer account TRACELOG_ACCESS_REALTIME on the session GUID via
+ * grants the consumer account TRACELOG_ACCESS_REALTIME | WMIGUID_QUERY (the least-privilege
+ * realtime-consume pair - see EtwCtlGrantConsumer) on the session GUID via
  * EventAccessControl. None of these control calls parses one attacker-influenceable byte
  * (fixed session name, fixed GUID, constant provider list, fixed grant SID), so running
  * them at SYSTEM does not violate the never-SYSTEM rule - that rule is about the
@@ -136,7 +137,7 @@ static const GUID ETWPROXY_SESSION_GUID = /* generated once for this project, re
 #define ETWPROXY_POKE_MS      5000                    // Poke self-throttle (launch precondition only)
 #define ETWPROXY_EXIT_DENIED    5   // proxy: OpenTrace/consume access denied under the DACL
                                     // grant - sec 10.16.3b's datum as redefined by the split
-                                    // ("does TRACELOG_ACCESS_REALTIME suffice on this build")
+                                    // ("does the per-session realtime+query grant suffice")
 #define ETWPROXY_EXIT_BADTOKEN  9   // proxy: refused its own token - never-SYSTEM/admin
                                     // guard tripped (launch plumbing handed it the wrong
                                     // token) or its census found drift (PLU group /
@@ -313,11 +314,11 @@ static int EtwCtlEnableProviders(TRACEHANDLE session)
     return enabled;
 }
 
-// The capability grant: give the consumer account TRACELOG_ACCESS_REALTIME on the session
-// GUID, and nothing else. CALLER CONTRACT: this MUST run BEFORE EtwCtlSessionStart - the
-// logger snapshots its SD from WMI\Security[GUID] at creation, so a grant issued after
-// StartTrace never reaches the running session and the consumer's realtime connect is denied
-// (the rig-measured exit-5 defect). Two calls, deliberately SET-then-ADD:
+// The capability grant: give the consumer account the least-privilege REALTIME-CONSUME
+// pair on the session GUID, and nothing else. CALLER CONTRACT: this MUST run BEFORE
+// EtwCtlSessionStart - the logger snapshots its SD from WMI\Security[GUID] at creation, so
+// a grant issued after StartTrace never reaches the running session and the consumer's
+// realtime connect is denied (the rig-measured exit-5 defect). Two calls, SET-then-ADD:
 //   1. SET a DACL containing only the SYSTEM full-control ACE. SET (not a bare ADD)
 //      means the registry-persisted WMI\Security value for this GUID is REPLACED on every
 //      launch - it can never accrete drift across account re-creations or old grants
@@ -325,9 +326,23 @@ static int EtwCtlEnableProviders(TRACEHANDLE session)
 //      replaces the default SD outright, and this agent still needs ControlTrace STOP on
 //      the same GUID for reap/shutdown - a consumer-only DACL would lock the controller
 //      out of its own session.
-//   2. ADD the consumer's TRACELOG_ACCESS_REALTIME allow ACE.
+//   2. ADD the consumer's allow ACE: TRACELOG_ACCESS_REALTIME | WMIGUID_QUERY.
+//      TRACELOG_ACCESS_REALTIME alone was PROVEN INSUFFICIENT on the rig (2026-09-06,
+//      Win10 19045: grant rc=0, correctly ordered before StartTrace, OpenTraceW ok,
+//      ProcessTrace ERROR_ACCESS_DENIED -> proxy exit 5). Cause: the consumer-side
+//      realtime path issues an implicit EVENT_TRACE_CONTROL_QUERY on the session
+//      (sechost!EtwpQueryRealTimeTraceProperties, invoked from OpenTrace/ProcessTrace),
+//      and a query is gated by WMIGUID_QUERY on the session's SD - "Allows the user to
+//      query information about the trace session. Set this permission on the session's
+//      GUID" (EventAccessControl docs, evntcons.h). The Performance Log Users route the
+//      same docs offer as the alternative works via default-SD ACEs that carry
+//      WMIGUID_QUERY alongside TRACELOG_ACCESS_REALTIME - a superset of this pair. The
+//      pair is deliberately NOT the PLU set: no TRACELOG_CREATE_REALTIME/ONDISK (could
+//      UPDATE/restart the session), no TRACELOG_GUID_ENABLE/REGISTER_GUIDS/LOG_EVENT
+//      (provider rights), so the consumer can consume + query THIS session and control
+//      nothing.
 // Net effect per launch: a deterministic two-ACE DACL {SYSTEM: full, qubes-etwproxy:
-// realtime-consume}. The consumer can consume THIS session and control nothing.
+// realtime-consume + query}.
 static ULONG EtwCtlGrantConsumer(PSID consumerSid)
 {
     BYTE sysSid[SECURITY_MAX_SID_SIZE];
@@ -341,8 +356,8 @@ static ULONG EtwCtlGrantConsumer(PSID consumerSid)
     if (rc != ERROR_SUCCESS)
         return rc;
     rc = EventAccessControl(&g, (ULONG)EventSecurityAddDACL,
-                            consumerSid, TRACELOG_ACCESS_REALTIME, TRUE);
-    LogInfo("PROXY RC api=EventAccessControl op=AddDACL principal=consumer rights=TRACELOG_ACCESS_REALTIME rc=%lu", rc);
+                            consumerSid, TRACELOG_ACCESS_REALTIME | WMIGUID_QUERY, TRUE);
+    LogInfo("PROXY RC api=EventAccessControl op=AddDACL principal=consumer rights=TRACELOG_ACCESS_REALTIME|WMIGUID_QUERY rc=%lu", rc);
     return rc;
 }
 
@@ -606,12 +621,13 @@ static HANDLE EtwProxyBuildJob(void)
 // per backoff period, and typically once per boot.
 //
 // The privilege flow per launch (the 2026-09-05 architecture decision, exactly):
-//   1. AGENT as SYSTEM: EventAccessControl SET(SYSTEM)+ADD(consumer realtime) FIRST, THEN
-//      StartTraceW (fixed GUID) so the freshly-created logger snapshots the granted SD,
-//      THEN EnableTraceEx2 per provider (RCs logged). Grant-before-start is load-bearing:
-//      a real-time logger takes its security descriptor at CREATION; a grant issued after
-//      StartTrace edits only the persisted SD (next start) and never reaches the running
-//      logger, so the consumer's realtime connect is denied (rig-measured exit 5).
+//   1. AGENT as SYSTEM: EventAccessControl SET(SYSTEM)+ADD(consumer realtime+query) FIRST,
+//      THEN StartTraceW (fixed GUID) so the freshly-created logger snapshots the granted
+//      SD, THEN EnableTraceEx2 per provider (RCs logged). Grant-before-start is
+//      load-bearing (a real-time logger takes its SD at CREATION; a late grant edits only
+//      the persisted SD and never reaches the running logger) AND the mask must include
+//      WMIGUID_QUERY beside TRACELOG_ACCESS_REALTIME (ProcessTrace's implicit session
+//      query) - each omission alone was a rig-measured exit 5.
 //   2. AGENT: in-memory credential set + validate -> primary token with NO PLU and NO
 //      SeSystemProfilePrivilege (census-verified, logged once); CreateProcessAsUserW
 //      (CREATE_SUSPENDED|CREATE_NO_WINDOW, NO lpDesktop - the console split: etwproxy.exe
@@ -682,20 +698,24 @@ static void EtwProxyTryLaunchLocked(void)
 
     // (1) The controller sequence. CAPABILITY GRANT FIRST, then StartTrace, then enable.
     //
-    // ROOT CAUSE FIX (rig-proven 2026-09-05, Win10 19045): a real-time ETW logger snapshots
-    // its security descriptor from the persisted WMI\Security[Wnode.Guid] SD at the instant
-    // StartTraceW creates it. The prior order (StartTrace -> EnableProviders -> grant) issued
-    // the EventAccessControl grant AFTER the logger already existed, so the consumer's ACE
-    // landed only in the persisted registry SD (effective for the NEXT start) and NEVER in the
-    // running logger's in-kernel SD. The proxy's OpenTraceW (by name) then succeeded, but its
-    // ProcessTrace realtime-connect access check ran against that pre-grant snapshot and
-    // returned ERROR_ACCESS_DENIED -> proxy exit 5. The census had already proven the token
-    // held neither PLU nor SeSystemProfilePrivilege (else exit 9), so this was never a
-    // privilege/PLU requirement - only a grant that arrived too late. Granting BEFORE
-    // StartTraceW makes the fresh logger inherit {SYSTEM:full, consumer:TRACELOG_ACCESS_REALTIME}
-    // at creation, which is exactly the ACE PLU membership would have supplied via the default
-    // SD - so the never-PLU / never-SYSTEM consumer architecture holds. (design 10.16.3b /
-    // 10.20.6 follow-up.)
+    // TWO STACKED DEFECTS, both rig-measured as the same exit-5 signature:
+    //   a. ORDERING (fixed 2026-09-05, agent ff1c787): a real-time ETW logger snapshots its
+    //      security descriptor from the persisted WMI\Security[Wnode.Guid] SD at the instant
+    //      StartTraceW creates it. The original order (StartTrace -> EnableProviders ->
+    //      grant) issued the EventAccessControl grant AFTER the logger existed, so the
+    //      consumer's ACE landed only in the persisted registry SD (effective for the NEXT
+    //      start) and never in the running logger. Grant-before-start stays load-bearing.
+    //   b. MASK (found 2026-09-06, after ff1c787 alone STILL failed exit-5 with build
+    //      identity proven): the ordering fix granted only TRACELOG_ACCESS_REALTIME, but
+    //      the consumer-side realtime path also performs an implicit
+    //      EVENT_TRACE_CONTROL_QUERY on the session, gated by WMIGUID_QUERY - see
+    //      EtwCtlGrantConsumer's comment for the citation chain. The 09-05 comment here
+    //      claimed the ordering was THE root cause; that claim was refuted on the rig and
+    //      is retracted - ordering was necessary, not sufficient.
+    // The census had already proven the token held neither PLU nor SeSystemProfilePrivilege
+    // (else exit 9), and per MSDN the per-session EventAccessControl grant IS the documented
+    // non-PLU route to realtime consumption, so the never-PLU / never-SYSTEM consumer
+    // architecture holds. (design 10.16.3b / 10.20.6 follow-up.)
     ULONG rc = EtwCtlGrantConsumer((PSID)consumerSid);
     if (rc != ERROR_SUCCESS)
     {
@@ -826,8 +846,9 @@ static void EtwProxyTryLaunchLocked(void)
     g_State = EPS_RUNNING;
     LogInfo("ETWPROXYSUP launched etwproxy.exe pid=%lu client_sid=%s "
             "(session controller: %s live, providers=%d, consumer granted "
-            "TRACELOG_ACCESS_REALTIME; job: 64MB/1-proc/UI-restricted/kill-on-close; "
-            "session 0, no winsta - GUI-DLL-free console proxy; exit-wait armed)",
+            "TRACELOG_ACCESS_REALTIME|WMIGUID_QUERY; job: 64MB/1-proc/UI-restricted/"
+            "kill-on-close; session 0, no winsta - GUI-DLL-free console proxy; "
+            "exit-wait armed)",
             pi.dwProcessId, g_ClientSid, ETWPROXY_SESSION_NAME, enabled);
 }
 
@@ -860,13 +881,16 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
 
     if (rc == ETWPROXY_EXIT_DENIED)
     {
-        // OpenTrace/consume access-denied UNDER THE GRANT: TRACELOG_ACCESS_REALTIME on
+        // OpenTrace/consume access-denied UNDER THE GRANT: even the realtime+query pair on
         // the session GUID is not sufficient for a bare-token consumer on this build -
         // the sec 10.16.3b datum as redefined by the split. A relaunch cannot change
         // rights; record the finding and stand down (park also stops the session).
+        // Next diagnostic rung if this ever fires again: widen the ADD ACE to the
+        // PLU-equivalent session subset (add WMIGUID_NOTIFICATION) to decide bit-vs-
+        // structural before any owner escalation.
         EtwProxyParkLocked("proxy exit 5: consume access-denied despite the per-session DACL "
-                           "grant - TRACELOG_ACCESS_REALTIME insufficient on this build "
-                           "(a FINDING, see design sec 10.16.3b)", rc);
+                           "grant - TRACELOG_ACCESS_REALTIME|WMIGUID_QUERY insufficient on "
+                           "this build (a FINDING, see design sec 10.16.3b)", rc);
         LeaveCriticalSection(&g_Lock);
         return;
     }
