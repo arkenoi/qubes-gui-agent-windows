@@ -2943,6 +2943,24 @@ static BOOL SliceChromeContentReady(IN const WINDOW_DATA* entry)
     return SliceContentReady(entry);     // no-op unless g_SliceMapHold is on
 }
 
+// WOULD MAPPING THIS WINDOW SHOW A BLACK RECTANGLE? (owner 2026-09-06: "not appearing and error
+// message aloud", then - after the first attempt still produced a black toast - "i see black
+// window".) True when the direct per-window path is required on this guest, the window is fed by
+// it, and its buffer holds no PAINTED pixels yet, with too few frames delivered to conclude the
+// surface is simply dark.
+//
+// This lives here, as a property of the WINDOW, because the first version was a branch inside the
+// crop-before-show release arm - and the toast was mapped anyway by a DIFFERENT site: the
+// foreground-raise re-map (main.c ~4150), which re-maps whatever becomes foreground and knows
+// nothing about a held window. A new toast IS the foreground, so it sailed straight past the
+// guard. Every map site now asks this question.
+static BOOL SliceContentReady(IN const WINDOW_DATA* entry);
+static BOOL DirectWouldShowBlack(IN const WINDOW_DATA* entry)
+{
+    return DirectRequired() && entry->PwSliceFed && !SliceContentReady(entry) &&
+           entry->PwBrokerFrames < DIRECT_DARK_FRAMES;
+}
+
 // Crop-before-show readiness: is the shadow-crop for this toast/menu resolved enough to map it
 // already cropped? Menu -> the broker has reported opaque bounds (preferred) OR the UIA measurement
 // resolved; toast -> UIA resolved. A non-cropped surface is always ready.
@@ -3202,6 +3220,20 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
                     g_MapDeferWake = due;
             }
             LogVerbose("0x%x: map deferred until first per-window frame / crop resolves", entry->Handle);
+        }
+        else if ((entry->IsIconic || entry->IsVisible) && DirectWouldShowBlack(entry))
+        {
+            // Not a defer candidate by class, but mapping it now would paint a black rectangle.
+            // Hand it to the SAME defer machinery rather than dropping it: MapDeferred is what
+            // the crop-before-show arm re-examines, so this is how the window still appears the
+            // moment real pixels arrive instead of being lost.
+            entry->MapDeferred = TRUE;
+            entry->MapDeferSince = GetTickCount64();
+            {
+                ULONGLONG due = entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10;
+                if (g_MapDeferWake == 0 || due < g_MapDeferWake)
+                    g_MapDeferWake = due;
+            }
         }
         else if (entry->IsIconic || entry->IsVisible)
         {
@@ -4135,7 +4167,7 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
         {
             WINDOW_DATA* fgData = FindWindowByHandle(fg);
             if (fgData && fgData->CreateSent && fgData->IsVisible && !fgData->IsIconic &&
-                !fgData->Synthesized)
+                !fgData->Synthesized && !DirectWouldShowBlack(fgData))
             {
                 g_LastForeground = fg;
                 LogInfo("foreground -> 0x%x, re-mapping to raise it in dom0", fg);
@@ -5313,8 +5345,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // unpainted, the feed is demonstrably working and the blackness belongs to the surface,
         // not to us - map it and say so once (QGADIRECTDARK). One black frame is not evidence of
         // a working feed; it is the exact signature of the failure above.
-        if (!cropReady && timedOut && DirectRequired() && windowData->PwSliceFed &&
-            !SliceContentReady(windowData) && windowData->PwBrokerFrames < DIRECT_DARK_FRAMES)
+        if (!cropReady && timedOut && DirectWouldShowBlack(windowData))
         {
             if (!windowData->PwDirectSuppressed)
             {
