@@ -234,6 +234,11 @@ static ULONGLONG g_BrokerNextWarn = 0;     // next QGADESLICEDOWN warning is due
 // debug log: 0 = ready (or deliberate opt-out), 1 = broker binary present but not running
 // (launch/capture failure), 2 = broker binary MISSING from the install dir (packaging gap).
 #define REG_CONFIG_DESLICE_DOWN_VALUE L"DesliceBrokerDown"
+// Count of windows NOT SHOWN because the direct path was required and no per-window frame
+// ever arrived (QGADIRECTSUPPRESS). Published under the same base key so acceptance can
+// assert it is 0 without parsing the log. Any non-zero value is a defect to chase.
+#define REG_CONFIG_DIRECT_SUPPRESSED_VALUE L"DirectSuppressed"
+static DWORD g_DirectSuppressed = 0;
 static UINT64 g_WgcNonce = 0;
 static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
 static ULONGLONG g_WgcArenaNext = 0;   // bump frontier within the arena (offset past ArenaOffset)
@@ -2572,6 +2577,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     entry->PwDimsLogged = FALSE;   // re-arm the one-shot BROKERDIMS diagnostic per registration
     entry->PwDimsSince = 0;
     entry->PwDimsStuck = FALSE;
+    entry->PwDirectSuppressed = FALSE;
     if (!WgcBrokerActive() || !entry->PwSliceFed) return FALSE;
     if (entry->Width == 0 || entry->Height == 0) return FALSE;
 
@@ -5212,10 +5218,43 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     if (windowData->MapDeferred && windowData->IsVisible && !windowData->IsIconic &&
         !windowData->Synthesized)
     {
-        if (CropReadyForMap(windowData) ||
-            (GetTickCount64() - windowData->MapDeferSince) > CROP_BEFORE_SHOW_TIMEOUT_MS)
+        const BOOL cropReady = CropReadyForMap(windowData);
+        const BOOL timedOut =
+            (GetTickCount64() - windowData->MapDeferSince) > CROP_BEFORE_SHOW_TIMEOUT_MS;
+
+        // DIRECT REQUIRED: never map a window we have NO PIXELS for (owner 2026-09-06: "not
+        // appearing and error message aloud"). The timeout arm exists so a held window is never
+        // lost - but on an eligible guest with no composite to fall back on, a slice-fed window
+        // that has not consumed a single per-window frame has nothing in its slab, so releasing
+        // the hold maps a BLACK card. A black card is not a notification; it is a rendering
+        // failure wearing one. Stay deferred, say so out loud, and let the window map the moment
+        // a real frame arrives (cropReady turns TRUE and this same arm runs).
+        if (!cropReady && timedOut && DirectRequired() &&
+            windowData->PwSliceFed && windowData->PwBrokerLastId == 0)
+        {
+            if (!windowData->PwDirectSuppressed)
+            {
+                windowData->PwDirectSuppressed = TRUE;
+                (void)CfgWriteDword(NULL, REG_CONFIG_DIRECT_SUPPRESSED_VALUE,
+                                    ++g_DirectSuppressed, NULL);
+                LogError("QGADIRECTSUPPRESS hwnd 0x%x (class %s, %ux%u) NOT SHOWN: the direct "
+                    L"per-window path is required on this guest and this window has never "
+                    L"received a frame (sliceFed=1 brokerSourced=%d slot=%d brokerActive=%d). "
+                    L"There is no composite fallback, so mapping it would show a BLACK window - "
+                    L"it is suppressed instead. THIS IS A BUG TO FIX, not a degraded mode: check "
+                    L"QGADESLICEDOWN/DesliceBrokerDown for the broker, and BROKERDIMS/BROKERREREG "
+                    L"for a capture desync. DirectSuppressed=%lu published under the Qubes Tools "
+                    L"config key.",
+                    (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
+                    windowData->Width, windowData->Height,
+                    windowData->PwBrokerSourced, windowData->PwBrokerSlot,
+                    WgcBrokerActive(), g_DirectSuppressed);
+            }
+        }
+        else if (cropReady || timedOut)
         {
             windowData->MapDeferred = FALSE;
+            windowData->PwDirectSuppressed = FALSE;
             ULONG ms = SendWindowMap(windowData);
             if (ms == ERROR_SUCCESS)
             {
@@ -6818,7 +6857,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // pass then maps it via the timeout arm of the crop-before-show release.
                 // Worst case is thereby exactly today's behavior, delayed by the bound;
                 // never a window that stays hidden.
-                if (g_SliceMapHold && entry->MapDeferred &&
+                // PwDirectSuppressed windows are deliberately kept unmapped (no pixels, no
+                // composite to fall back on) - re-queueing them every frame would be pure churn.
+                // A real frame clears the flag through the same arm that maps them.
+                if (g_SliceMapHold && entry->MapDeferred && !entry->PwDirectSuppressed &&
                     (GetTickCount64() - entry->MapDeferSince) > CROP_BEFORE_SHOW_TIMEOUT_MS)
                     QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
             }

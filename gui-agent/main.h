@@ -280,6 +280,13 @@ typedef struct _WINDOW_DATA
     // this path has to REPAIR, not merely log.
     ULONGLONG PwDimsSince;
     BOOL      PwDimsStuck;
+    // DIRECT-REQUIRED SUPPRESSION (owner 2026-09-06: "not appearing and error message aloud").
+    // Set when the crop-before-show timeout would have mapped this window while it has no pixels
+    // at all - direct path required, slice-fed, not one per-window frame ever consumed. Mapping
+    // then shows a BLACK card, so the window is NOT mapped and the failure is said out loud
+    // (QGADIRECTSUPPRESS + the DirectSuppressed counter). Cleared when a frame finally arrives
+    // (the window maps normally then) and on every fresh broker registration.
+    BOOL      PwDirectSuppressed;
     // One-shot QGASLICEBLACK diagnostic emitted: a copy landed in this window's buffer but the
     // buffer still fails SlicePainted (slicepaint.h) - the hold stays. Re-armed on attach.
     BOOL     PwSliceBlackLogged;
