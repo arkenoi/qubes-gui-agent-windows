@@ -272,6 +272,14 @@ typedef struct _WINDOW_DATA
     // (the window then sits in the hold arm with whatever its slab holds - a feed loss, not a
     // transient). Re-armed on every BrokerRegister.
     BOOL     PwDimsLogged;
+    // BROKERDIMS repair state. PwDimsSince: tick of the FIRST rejected-for-dims frame in the
+    // current run of them (0 = none outstanding; cleared on every accepted frame). PwDimsStuck:
+    // the mismatch outlived BROKER_DIMS_STUCK_MS, i.e. it is a desync and not a resize in
+    // flight, so the tracking pass must re-register the slot. With no composite fallback on an
+    // eligible guest (DirectRequired) a permanent mismatch is a permanently frozen window, so
+    // this path has to REPAIR, not merely log.
+    ULONGLONG PwDimsSince;
+    BOOL      PwDimsStuck;
     // One-shot QGASLICEBLACK diagnostic emitted: a copy landed in this window's buffer but the
     // buffer still fails SlicePainted (slicepaint.h) - the hold stays. Re-armed on attach.
     BOOL     PwSliceBlackLogged;
@@ -410,6 +418,9 @@ void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry);
 // Called from perwindow.c PwAttachWindow/PwDetachWindow. No-ops unless the broker is active
 // and the window is the eligible class (NRB, non-o-r, non-topmost app window).
 BOOL WgcBrokerActive(void);
+// Eligibility (not availability) for the per-window broker path: on a guest where it is TRUE
+// the whole-desktop composite is NOT an allowed source for a per-window window. See main.c.
+BOOL DirectRequired(void);
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry);
 void BrokerUnregister(IN OUT WINDOW_DATA* entry);
 

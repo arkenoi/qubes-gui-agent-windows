@@ -2249,8 +2249,11 @@ static void BrokerSupervise(void)
         }
         (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, binPresent ? 1u : 2u, NULL);
         LogWarning("QGADESLICEDOWN de-slice broker EXPECTED but not running for %I64u s on an "
-            L"eligible system (build %lu, WgcBroker gate ON): wgcbroker.exe %s. Rendering is on the "
-            L"DDA-slice FALLBACK - de-slice/per-window broker capture is NOT active. %s "
+            L"eligible system (build %lu, WgcBroker gate ON): wgcbroker.exe %s. There is NO "
+            L"composite fallback on an eligible guest (owner 2026-09-06): NRB/UWP surfaces "
+            L"(toasts, menus, WinUI windows) HOLD their last content until the broker returns - "
+            L"they are not sliced out of the whole-desktop framebuffer. Fix the broker; do not "
+            L"expect degraded-but-working rendering. %s "
             L"DesliceBrokerDown=%u published under the Qubes Tools config key.",
             (now - g_BrokerDownSince) / 1000, g_OsBuild,
             binPresent ? L"IS PRESENT (launch/capture failure - collect wgcbroker + agent logs)"
@@ -2460,6 +2463,28 @@ BOOL WgcBrokerActive(void)
     return g_WgcBroker && g_OsBuild >= 26100 && PwEnabled() && g_BrokerReady && g_WgcBase;
 }
 
+// DIRECT PATH REQUIRED (owner, 2026-09-06: "no fallback on a system that supports the direct
+// path. just no. fail hard and investigate." - after a single toast was served out of the
+// whole-desktop composite).
+//
+// This is WgcBrokerActive() WITHOUT the runtime-readiness terms (g_BrokerReady, g_WgcBase):
+// ELIGIBILITY, not availability. The distinction is the whole point. Gating the "hold last
+// content" arm on availability meant the composite was read in exactly the case that most
+// needs a hard failure - the broker being down - so a packaging gap or a dead broker
+// degraded silently into whole-desktop slicing, which is what the desktop grant exists for
+// and what de-slice removed. On an eligible guest there is no composite rung: a window
+// either gets its own per-window frame or it holds, loudly (QGADESLICEDOWN + the
+// DesliceBrokerDown flag name the cause).
+//
+// The one quiet path is the DELIBERATE opt-out: WgcBroker=0 / qubesdb
+// /qubes-service/wgc-broker=0 makes the guest not-eligible, and the retained DDA slice
+// serves it exactly as win10 (no direct path there) is served. An operator asking for the
+// fallback gets it; nothing else does.
+BOOL DirectRequired(void)
+{
+    return g_WgcBroker && g_OsBuild >= 26100 && PwEnabled();
+}
+
 static ULONGLONG WgcArenaAlloc(ULONGLONG bytes)   // best-fit free-list, else 64-aligned bump; 0 == full
 {
     bytes = (bytes + 63) & ~(ULONGLONG)63;
@@ -2545,6 +2570,8 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1;
     entry->PwBrokerLastId = 0; entry->PwBrokerArenaOff = 0;
     entry->PwDimsLogged = FALSE;   // re-arm the one-shot BROKERDIMS diagnostic per registration
+    entry->PwDimsSince = 0;
+    entry->PwDimsStuck = FALSE;
     if (!WgcBrokerActive() || !entry->PwSliceFed) return FALSE;
     if (entry->Width == 0 || entry->Height == 0) return FALSE;
 
@@ -2611,6 +2638,10 @@ void BrokerUnregister(IN OUT WINDOW_DATA* entry)
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1; entry->PwBrokerArenaOff = 0;
 }
 
+// How long a broker-frame/slab dimension mismatch may persist before it is treated as a desync
+// to repair rather than a resize in flight. A resize settles within a pass or two (~100 ms).
+#define BROKER_DIMS_STUCK_MS 750
+
 // Read a fresh, fully-BOUNDS-CHECKED broker frame for this window. Every broker-written field
 // is validated before use (a user-IL process shares the section R/W); the frame is accepted
 // ONLY if its dims exactly match the slab and its arena region is fully in-bounds, so the
@@ -2635,22 +2666,39 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
         if (b < 0 || b >= WGCBRK_RING) return FALSE;
         boff = s->BufOffset[b];
         // dims must EXACTLY match the slab (so the dest-bounds check covers the source too).
-        // A mismatch is not transient once the broker has settled: a WGC channel publishes
-        // WINDOW-sized frames, so after the agent re-registers a cropped window at its CARD
-        // size (toast crop resolved -> PwResizeWindow) every frame is rejected here and the
-        // window holds its zeroed slab for ever. Say so once, machine-readably, so a rig log
-        // names the feed loss instead of showing a silent BROKERHOLD.
+        // A mismatch is transient while a resize is in flight (the slot's request and the slab
+        // are updated a pass apart) and PERMANENT if the two ever disagree at rest - and a
+        // permanent one is now a permanently frozen window, because an eligible guest has no
+        // composite to fall back to. So: reject the frame, and if the mismatch outlives
+        // BROKER_DIMS_STUCK_MS, flag the window for re-registration and wake the tracking pass
+        // that performs it (see the BROKERREREG arm in UpdateWindowData).
         if (fw != (LONG)e->PwWidth || fh != (LONG)e->PwHeight || stride != fw * 4)
         {
-            if (!e->PwDimsLogged && fw > 0 && fh > 0)
+            if (fw > 0 && fh > 0)
             {
-                e->PwDimsLogged = TRUE;
-                LogInfo("BROKERDIMS hwnd 0x%x slot %d frame %dx%d stride %d != slab %ux%u - broker frames rejected, window holds",
-                        (DWORD)(ULONG_PTR)e->Handle, e->PwBrokerSlot, fw, fh, stride,
-                        e->PwWidth, e->PwHeight);
+                ULONGLONG nowTick = GetTickCount64();
+                if (e->PwDimsSince == 0)
+                    e->PwDimsSince = nowTick;
+                if (!e->PwDimsLogged)
+                {
+                    e->PwDimsLogged = TRUE;
+                    LogInfo("BROKERDIMS hwnd 0x%x slot %d frame %dx%d stride %d != slab %ux%u - frames rejected",
+                            (DWORD)(ULONG_PTR)e->Handle, e->PwBrokerSlot, fw, fh, stride,
+                            e->PwWidth, e->PwHeight);
+                }
+                if (!e->PwDimsStuck && nowTick - e->PwDimsSince > BROKER_DIMS_STUCK_MS)
+                {
+                    e->PwDimsStuck = TRUE;
+                    LogWarning("BROKERDIMS hwnd 0x%x feed LOST for %I64u ms (frame %dx%d vs slab "
+                            L"%ux%u) - not a resize in flight; forcing broker re-registration",
+                            (DWORD)(ULONG_PTR)e->Handle, nowTick - e->PwDimsSince, fw, fh,
+                            e->PwWidth, e->PwHeight);
+                    PokeWindowTracking();
+                }
             }
             return FALSE;
         }
+        e->PwDimsSince = 0;   // dims agree: any outstanding mismatch run is over
         // arena residency: [boff, boff + fh*stride) fully within [ArenaOffset, ArenaOffset+ArenaBytes)
         ULONGLONG need = (ULONGLONG)fh * (ULONGLONG)stride;
         if (boff < h->ArenaOffset ||
@@ -3037,12 +3085,21 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             (void)SendWindowCreateForced(entry);
 
         // Per-window framebuffer: announce the window's own buffer BEFORE mapping so
-        // the daemon never composites this window from the screen slice. On failure
-        // the window simply stays on the legacy path.
+        // the daemon never composites this window from the screen slice. On failure the window
+        // stays on the legacy path - which on a direct-required guest means dom0 renders it out
+        // of the whole-desktop grant, the escalation the owner ruled out on 2026-09-06. It is
+        // still better than an invisible window, so the window is mapped; what changes is that
+        // the escalation is now NAMED in the log with its status instead of being discarded by
+        // a (void) cast, so it can be investigated rather than silently tolerated.
         if (PwEnabled() && entry->IsVisible && !entry->IsIconic &&
             entry->Width > 0 && entry->Height > 0)
         {
-            (void)PwAttachWindow(entry);
+            ULONG pwStatus = PwAttachWindow(entry);
+            if (pwStatus != ERROR_SUCCESS && DirectRequired())
+                LogWarning("QGADIRECTLEGACY hwnd 0x%x per-window attach failed (0x%x) on a "
+                    L"direct-required guest - it will be composited from the whole-desktop grant. "
+                    L"Investigate: no window on an eligible guest should need that path",
+                    (DWORD)(ULONG_PTR)entry->Handle, pwStatus);
         }
 
         // map (show) the window if it's visible OR minimized -- unless crop-before-show holds it.
@@ -5055,10 +5112,59 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             if (damageStatus != ERROR_SUCCESS)
                 win_perror2(damageStatus, "SendWindowDamageEvent(resize)");
         }
+        else if (DirectRequired())
+        {
+            // On an eligible guest the legacy path means dom0 composites this window out of the
+            // WHOLE-DESKTOP grant - the fallback that is not allowed here (owner 2026-09-06).
+            // We cannot un-fail the rebuild from this arm, but it must never be a DEBUG line
+            // nobody reads: name it so a rig log shows the escalation instead of a window that
+            // merely looks slightly wrong.
+            LogWarning("QGADIRECTLEGACY hwnd 0x%x per-window rebuild FAILED on a direct-required "
+                L"guest - dom0 now composites it from the whole-desktop grant. This is the "
+                L"fallback we do not accept: investigate the attach failure above",
+                (DWORD)(ULONG_PTR)windowData->Handle);
+        }
         else
         {
             LogDebug("0x%x: per-window rebuild failed, window on legacy path",
                 windowData->Handle);
+        }
+    }
+
+    // BROKERREREG - keep the broker slot's REQUEST in step with the slab. The synth path has had
+    // this reconciliation since de-slice step 1; attached windows never did, so a slot registered
+    // before a toast/menu crop resolved kept requesting the pre-crop rect while the slab became
+    // the card, and BrokerFreshFrame then rejected every frame ("BROKERDIMS ... frames rejected").
+    // While the composite fallback existed that merely looked like a slightly wrong window; with
+    // it gone the window freezes, so the desync is repaired here - on a request/slab disagreement,
+    // or when BrokerFreshFrame has flagged the mismatch as outliving a resize (PwDimsStuck).
+    // Guarded on slab == live geometry so this never fights the PwResizeWindow arm above.
+    if (DirectRequired() && WgcBrokerActive() && g_WgcBase &&
+        PwIsAttached(windowData) && windowData->PwSliceFed &&
+        windowData->IsVisible && !windowData->IsIconic &&
+        windowData->PwWidth == windowData->Width && windowData->PwHeight == windowData->Height)
+    {
+        WGCBRK_SLOT* bs = (windowData->PwBrokerSlot >= 0 &&
+                           windowData->PwBrokerSlot < WGCBRK_MAX_SLOTS)
+            ? &WGCBRK_SLOTS(g_WgcBase)[windowData->PwBrokerSlot] : NULL;
+        BOOL reqStale = windowData->PwBrokerSourced &&
+            (!bs || bs->Hwnd != (UINT64)(ULONG_PTR)windowData->Handle ||
+             bs->ReqWidth != (LONG)windowData->PwWidth ||
+             bs->ReqHeight != (LONG)windowData->PwHeight ||
+             bs->ReqCropX != (LONG)windowData->CropLeft ||
+             bs->ReqCropY != (LONG)windowData->CropTop);
+        if (windowData->PwDimsStuck || reqStale)
+        {
+            LogWarning("BROKERREREG hwnd 0x%x re-registering broker capture at %ux%u crop %d,%d "
+                L"(stuck=%d reqStale=%d)", (DWORD)(ULONG_PTR)windowData->Handle,
+                windowData->PwWidth, windowData->PwHeight,
+                windowData->CropLeft, windowData->CropTop, windowData->PwDimsStuck, reqStale);
+            if (windowData->PwBrokerSourced)
+                BrokerUnregister(windowData);
+            windowData->PwDimsStuck = FALSE;
+            windowData->PwDimsSince = 0;
+            windowData->PwSliceNeedsFull = TRUE;   // first frame after re-register: full copy
+            (void)BrokerRegister(windowData);
         }
     }
 
@@ -5738,7 +5844,11 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
     }
     else
     {
-        if (!g_DeSlice && g_FbBits && g_FbPitch > 0)
+        // DirectRequired(), not g_DeSlice: g_DeSlice tracks only the build floor, so with the
+        // deliberate WgcBroker=0 opt-out it stayed TRUE and suppressed the composite for a guest
+        // that has no broker to replace it - the opt-out did not actually opt out. The composite
+        // is available exactly when the direct path is not required.
+        if (!DirectRequired() && g_FbBits && g_FbPitch > 0)
         { srcBase = g_FbBits; srcPitch = g_FbPitch; srcW = (int)g_FbWidth; srcH = (int)g_FbHeight; }
         // else (de-sliced: no composite by design): leave srcBase NULL - do not paint this pass;
         // the owner's own pixels show through until the child's per-window frame arrives.
@@ -5748,7 +5858,7 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
         // Under DeSlice this is the EXPECTED transitional state (child's per-window frame not ready
         // yet, no composite by design) - the owner shows through until it arrives, so it is not a
         // fault. Only warn when a composite was supposed to be available.
-        if (g_DeSlice)
+        if (DirectRequired())
             LogVerbose("synth paint 0x%x: no per-window frame yet (DeSlice, owner shows through)", c->Handle);
         else
             LogWarning("synth paint 0x%x: no source (child per-window + broker monitor + DDA fb all unavailable)", c->Handle);
@@ -6633,24 +6743,40 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     if (entry->MapDeferred)
                         PokeWindowTracking();
                 }
-                // BROKER-ACTIVE HOLD - this arm is the fall-through blocker. The broker is
-                // active but this pass produced no usable per-HWND frame (first frame still
-                // pending, secure desktop Producing=0, torn read, dims mismatch mid-resize,
-                // or the window never got a broker slot). Falling through to the agent's DDA
-                // slice below would reintroduce composited-slice occluder bleed - exactly what
-                // the broker exists to remove - so HOLD: skip this pass, keep last content,
-                // and touch nothing (PwSliceNeedsFull in particular stays set, so the first
-                // broker frame still does its full-window copy). The whole-desktop MONSLICE
-                // composite that used to fill this arm was retired with de-slice and deleted;
-                // the DDA slice below now serves ONLY broker-inactive configs.
-                else if (g_SliceRetire && WgcBrokerActive())
+                // DIRECT-REQUIRED HOLD - this arm is the fall-through blocker, and the gate is
+                // ELIGIBILITY (DirectRequired), not availability (WgcBrokerActive). We are here
+                // because this pass produced no usable per-HWND frame: first frame pending,
+                // secure desktop Producing=0, torn read, dims mismatch, no broker slot - or the
+                // broker is not running at all. Falling through to the agent's DDA slice below
+                // would serve this window out of the WHOLE-DESKTOP composite, which is occluder
+                // bleed, is the grant de-slice exists to retire, and (owner 2026-09-06) is
+                // simply not allowed on a guest that supports the direct path: "no fallback on
+                // a system that supports the direct path. just no. fail hard and investigate."
+                // So HOLD: skip this pass, keep last content, touch nothing (PwSliceNeedsFull in
+                // particular stays set, so the first broker frame still does its full-window
+                // copy).
+                //
+                // The gate used to be WgcBrokerActive(), which inverted the intent: when the
+                // broker was DOWN - the packaging gap, a launch failure, a dead broker - every
+                // NRB/UWP surface silently fell through to the composite and looked fine, so a
+                // tiny toast dragged in the whole desktop map. That is the fallback this build
+                // removes. Broker-down is now visible as held content plus QGADESLICEDOWN and
+                // the DesliceBrokerDown flag; the DDA slice below serves only NOT-eligible
+                // configs (win10 / below the 26100 floor / the explicit WgcBroker=0 opt-out).
+                else if (DirectRequired())
                 {
                     if (!entry->PwHoldLogged)   // one-shot diagnostic per window
                     {
                         entry->PwHoldLogged = TRUE;
-                        LogInfo("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d",
+                        // WARNING, not INFO: on an eligible guest a hold is either the normal
+                        // sub-second wait for a first frame or a feed loss to investigate, and
+                        // the log has to name which. brokerActive=0 is always the latter.
+                        LogWarning("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
+                                L"brokerActive=%d sourced=%d slot=%d (direct required: composite "
+                                L"fallback refused)",
                                 (DWORD)(ULONG_PTR)entry->Handle,
-                                pwRect.left, pwRect.top, pwRect.right, pwRect.bottom);
+                                pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
+                                WgcBrokerActive(), entry->PwBrokerSourced, entry->PwBrokerSlot);
                     }
                 }
                 // Agent-side slice (normal fallback / broker-inactive): copy the changed region of
