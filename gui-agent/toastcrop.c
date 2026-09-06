@@ -87,6 +87,11 @@ extern DWORD g_MinWindowWidth;  // main.c
 extern DWORD g_MinWindowHeight; // main.c
 BOOL HasFlags(DWORD value, DWORD flags); // main.c
 
+// Delay before the one-shot confirmation re-measure of a resolved toast crop. Long enough for a
+// toast to finish laying out (text wrap, late image), short enough that a corrected crop lands
+// while the toast is still on screen. It runs AFTER the map, so it costs nothing before show.
+#define TOAST_CROP_CONFIRM_MS 500
+
 typedef struct _TOAST_CROP_ENTRY
 {
     HWND      Window;
@@ -96,6 +101,20 @@ typedef struct _TOAST_CROP_ENTRY
     BOOL      Resolved;   // measured, or retries exhausted - no more UIA for this key
     UINT      Attempts;
     ULONGLONG RetryAt;    // GetTickCount64() before which no further UIA call is made
+    // CONFIRMATION PASS (owner-observed 2026-09-06: a "back up your pc" toast CUT AT THE BOTTOM).
+    // Resolving latches the FIRST non-zero measurement for this (hwnd, size) key and never looks
+    // again - so a card still laying out inside an ALREADY-FINAL window rect is latched
+    // undersized for the rest of its life. Measured on the rig, same hwnd, two applies:
+    //     toast card in 396x272 window, insets l=16 t=30 r=16 b=13   (card 364x229)
+    //     toast card in 396x397 window, insets l=16 t=30 r=16 b=125  (card 364x242)
+    // the window had reached 397 while the card was still 242 tall, so b=125 cropped ~112 px of
+    // finished card away. The existing race guard only rejects a measurement whose WINDOW RECT
+    // moved; growth of the CARD inside a stationary window is invisible to it.
+    // So: one delayed re-measure per resolved toast, and it may only ever make the card BIGGER
+    // (insets element-wise smaller). Cards grow as they lay out; they do not shrink - so an
+    // enlarge-only rule cannot introduce new cutting, which is what makes this safe to ship.
+    ULONGLONG ConfirmAt;      // when the confirmation re-measure becomes due (0 = none pending)
+    BOOL      ConfirmQueued;  // one-shot: the confirmation has been requested
     ULONGLONG LastUse;    // g_TcClock stamp, for eviction when the cache is full
 } TOAST_CROP_ENTRY;
 
@@ -869,10 +888,36 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
 
         if (resolvedNonZero)
         {
+            slot->ConfirmAt = GetTickCount64() + TOAST_CROP_CONFIRM_MS;   // see ConfirmAt
             TcRememberLastGood(req->Window, insets);
             LogInfo("0x%x: toast card in %ux%u window, insets l=%d t=%d r=%d b=%d",
                 req->Window, req->RawWidth, req->RawHeight,
                 insets->left, insets->top, insets->right, insets->bottom);
+        }
+    }
+    else if (slot && slot->Resolved && slot->ConfirmQueued &&
+             (insets->left || insets->top || insets->right || insets->bottom))
+    {
+        // CONFIRMATION result. ENLARGE-ONLY: accept it only where it reveals more card, never
+        // where it would cut more. A confirmation that measures a SMALLER card is either the
+        // toast collapsing on dismissal or a bad walk - neither is a reason to crop further.
+        RECT n = *insets;
+        if (n.left   > slot->Insets.left)   n.left   = slot->Insets.left;
+        if (n.top    > slot->Insets.top)    n.top    = slot->Insets.top;
+        if (n.right  > slot->Insets.right)  n.right  = slot->Insets.right;
+        if (n.bottom > slot->Insets.bottom) n.bottom = slot->Insets.bottom;
+        if (n.left != slot->Insets.left || n.top != slot->Insets.top ||
+            n.right != slot->Insets.right || n.bottom != slot->Insets.bottom)
+        {
+            LogInfo("QGATOASTGROW 0x%x: card grew after the first measurement in the %ux%u window "
+                L"- insets l=%d t=%d r=%d b=%d -> l=%d t=%d r=%d b=%d (the latched crop would have "
+                L"cut the finished card)",
+                req->Window, req->RawWidth, req->RawHeight,
+                slot->Insets.left, slot->Insets.top, slot->Insets.right, slot->Insets.bottom,
+                n.left, n.top, n.right, n.bottom);
+            slot->Insets = n;
+            TcRememberLastGood(req->Window, &n);
+            attemptDone = TRUE;   // poke the tracking pass so the wider crop lands immediately
         }
     }
 
@@ -1148,6 +1193,23 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
 
     TOAST_CROP_ENTRY* slot = TcGetSlot(data->Handle, data->Width, data->Height);
     slot->LastUse = ++g_TcClock;
+
+    // One-shot confirmation re-measure of a RESOLVED toast (see ConfirmAt). Toasts only; menus
+    // take the broker's pixel-exact opaque bounds and are owner-validated - they are not touched.
+    if (slot->Resolved && !slot->ConfirmQueued && slot->ConfirmAt != 0 &&
+        GetTickCount64() >= slot->ConfirmAt && !IsMenuPopupWindow(data))
+    {
+        // data->X/Y/Width/Height are still the RAW rect here: main.c subtracts the insets only
+        // AFTER this lookup returns. Passing anything else would fail the worker's window-moved
+        // race guard on every confirmation (it rechecks GetRealWindowRect against this rect).
+        RECT rawc;
+        rawc.left = data->X;
+        rawc.top = data->Y;
+        rawc.right = data->X + (LONG)data->Width;
+        rawc.bottom = data->Y + (LONG)data->Height;
+        slot->ConfirmQueued = TRUE;   // one-shot whether or not the enqueue takes
+        (void)TcEnqueueQueryLocked(data->Handle, &rawc, slot->RawWidth, slot->RawHeight, FALSE);
+    }
 
     if (!slot->Resolved && GetTickCount64() >= slot->RetryAt)
     {
