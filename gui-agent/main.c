@@ -205,10 +205,13 @@ BOOL          g_SliceMapHold = TRUE;
 // already governs those surfaces and menu rendering is validated pixel-perfect).
 // Registry "SliceMapHoldChrome" (module key, read once at init like SliceMapHold):
 //   0 = chrome never content-holds (menu/toast arms ignore SliceContentReady entirely)
-//   1 = DEFAULT: content-hold applies to chrome only on the NON-de-slice path (win10 /
-//       broker floor) - the path whose zeroed-slab black flash the hold exists to fix;
-//       the de-slice path keeps its proven pre-SliceMapHold chrome behavior
-//   2 = always (the previous flag-on behavior, for A/B on the de-slice path)
+//   1 = DEFAULT: content-hold applies to slice-fed TOASTS on every path, and to MENUS only
+//       on the NON-de-slice path (win10 / broker floor); de-slice menus keep their proven
+//       pre-SliceMapHold behavior (the broker's PrintWindow path already non-black-checks
+//       their first frame, and their arm waits for it). A de-slice toast is WGC-captured
+//       with a black first frame and a crop-only arm, so exempting it was the black toast
+//       (rig 2026-09-06) - see SliceChromeContentReady.
+//   2 = always (menus too, on the de-slice path - A/B knob)
 // Irrelevant while SliceMapHold is off (SliceContentReady is then unconditionally TRUE).
 #define REG_CONFIG_SLICE_MAP_HOLD_CHROME_VALUE L"SliceMapHoldChrome"
 DWORD         g_SliceMapHoldChrome = 1;
@@ -2794,13 +2797,24 @@ static void MapDeferWakeSweep(void)
 }
 
 // Chrome arms' content-hold gate (see REG_CONFIG_SLICE_MAP_HOLD_CHROME_VALUE): whether a
-// menu/toast additionally waits for proven slice content when the SliceMapHold gate is on.
+// menu/toast additionally waits for painted slice content when the SliceMapHold gate is on.
+//
+// The de-slice exemption at level 1 is for MENUS only. Its justification - "the broker's
+// crop+first-frame machinery already governs those surfaces" - holds for a menu: the menu
+// arm of CropReadyForMap waits for BrokerOpaqueInsets, i.e. a PUBLISHED broker frame, and a
+// menu is broker-captured through the PrintWindow fallback, which has its own non-black
+// check. A slice-fed TOAST has none of that: its arm is crop-only (!CropPending), toasts are
+// WGC-captured (no non-black check on that path) and their first frame is black, so on a
+// de-slice guest the exemption let a toast map on crop-resolve with a black buffer - a
+// map-before-render by construction, and the configuration the black-toast regression was
+// measured in (rig 2026-09-06). Toasts therefore content-hold on EVERY path at level 1;
+// menus on de-slice keep their proven, pixel-validated behavior byte for byte.
 static BOOL SliceChromeContentReady(IN const WINDOW_DATA* entry)
 {
     if (g_SliceMapHoldChrome == 0)
         return TRUE;                     // chrome never content-holds
-    if (g_SliceMapHoldChrome == 1 && g_DeSlice)
-        return TRUE;                     // de-slice path keeps its proven chrome behavior
+    if (g_SliceMapHoldChrome == 1 && g_DeSlice && !IsShellToastWindow(entry))
+        return TRUE;                     // de-slice MENUS keep their proven chrome behavior
     return SliceContentReady(entry);     // no-op unless g_SliceMapHold is on
 }
 
