@@ -2289,6 +2289,72 @@ static void BrokerShutdown(void)
 // ---- notification bridge launch/supervise (gate g_NotifBridge) ---------------------------
 #define NOTIF_TASK_NAME L"Qubes-NotifBridge"
 #define NOTIF_RESTORE_TASK_NAME L"Qubes-NotifRestore"
+#define NOTIF_DIRECT_TASK_NAME L"Qubes-NotifDirect"
+
+// USER-VISIBLE half of the QGADIRECTSUPPRESS report (owner 2026-09-06: a suppressed window needs
+// "something user sees"). A log line is for us; the person at the screen must be TOLD that a
+// window was withheld, otherwise a suppressed notification is indistinguishable from no
+// notification at all - which is the silent failure this whole change exists to remove.
+//
+// Sent as a dom0 notification through notifhost's one-shot --notify-file (the bridge's proven
+// qubes.Notifications path), launched in the interactive session. The text goes through a FILE
+// because the launch is a Task Scheduler /tr string, which cannot carry quoted, space-bearing
+// arguments intact.
+//
+// DELIBERATELY NOT gated by service.notify-bridge: that gate governs forwarding the guest's own
+// app toasts (per-AUMID allowlist, app content). This is the AGENT reporting that it cannot
+// render - the one message that must never be swallowed. dom0 still owns origin labelling, and a
+// policy that denies qubes.Notifications merely makes this fail, logged, never retried in a loop.
+//
+// THROTTLED: once, then at most every DIRECT_NOTIFY_REPEAT_MS, always carrying the running count,
+// so a broken broker produces a report - not a notification storm.
+#define DIRECT_NOTIFY_REPEAT_MS (5u * 60u * 1000u)
+static ULONGLONG g_DirectNotifyNext = 0;
+static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs);   // defined below
+static void DirectSuppressNotifyUser(IN DWORD count)
+{
+    ULONGLONG now = GetTickCount64();
+    if (g_DirectNotifyNext != 0 && now < g_DirectNotifyNext)
+        return;
+    g_DirectNotifyNext = now + DIRECT_NOTIFY_REPEAT_MS;
+
+    WCHAR dir[MAX_PATH] = { 0 }, path[MAX_PATH] = { 0 };
+    if (!ExpandEnvironmentStrings(L"%ProgramData%\\Qubes", dir, RTL_NUMBER_OF(dir)))
+        return;
+    CreateDirectory(dir, NULL);   // ERROR_ALREADY_EXISTS is the normal case
+    StringCchPrintf(path, RTL_NUMBER_OF(path), L"%s\\gui-agent-notify.txt", dir);
+
+    WCHAR text[900];
+    StringCchPrintf(text, RTL_NUMBER_OF(text),
+        L"Qubes: a window could not be shown\r\n"
+        L"The per-window display path is not working, so %lu window(s) - notifications, menus - "
+        L"were withheld rather than shown blank. Nothing is lost from the guest itself; this is a "
+        L"display fault to fix. See the gui-agent log: QGADIRECTSUPPRESS, QGADESLICEDOWN.",
+        count);
+
+    HANDLE h = CreateFile(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        LogWarning("QGADIRECTSUPPRESS: cannot write %s (0x%x) - the failure stays in this log only",
+                   path, GetLastError());
+        return;
+    }
+    static const BYTE bom[2] = { 0xFF, 0xFE };
+    DWORD wr = 0;
+    size_t cch = 0;
+    (void)StringCchLength(text, RTL_NUMBER_OF(text), &cch);
+    WriteFile(h, bom, 2, &wr, NULL);
+    WriteFile(h, text, (DWORD)(cch * sizeof(WCHAR)), &wr, NULL);
+    CloseHandle(h);
+
+    WCHAR args[MAX_PATH + 32];
+    StringCchPrintf(args, RTL_NUMBER_OF(args), L"--notify-file %s", path);
+    if (NotifRunInSession(NOTIF_DIRECT_TASK_NAME, args))
+        LogInfo("QGADIRECTSUPPRESS: user notification queued (%lu suppressed window(s))", count);
+    else
+        LogWarning("QGADIRECTSUPPRESS: could not launch notifhost --notify-file (no interactive "
+            L"session?) - the failure stays in this log only");
+}
 static ULONGLONG g_NotifLastLaunch = 0;
 static ULONGLONG g_NotifNextPoll = 0;
 // Gate-off crash sweep pending: crash-leftover ShowBanner markers exist and the one-shot
@@ -5249,6 +5315,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                     windowData->Width, windowData->Height,
                     windowData->PwBrokerSourced, windowData->PwBrokerSlot,
                     WgcBrokerActive(), g_DirectSuppressed);
+                DirectSuppressNotifyUser(g_DirectSuppressed);
             }
         }
         else if (cropReady || timedOut)
