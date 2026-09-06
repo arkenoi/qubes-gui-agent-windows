@@ -184,16 +184,19 @@ BOOL          g_DeSlice = FALSE;       // DERIVED at init (g_SliceRetire && buil
                                        // (MONSLICE/CreateForMonitor) it used to gate was proven
                                        // unneeded and DELETED after the de-slice proof window
                                        // closed; there is nothing left to switch back to.
-// Slice-content map-hold gate (CANDIDATE, DEFAULT OFF; registry "SliceMapHold" under the
-// module key, read once at init exactly like ToastCropDisable; deliberately NO qubesdb
-// service - a guest-local A/B knob only). Scope: the FIRST map of a NON-de-sliced slice-fed
-// window (win10 / broker floor), which today maps immediately with a freshly ZEROED
-// per-window slab (PwSlabAcquire) and therefore shows a black rectangle until the first
-// composite slice copy lands. Gate ON holds that first map until proven content
-// (PwNoteSliceContent), bounded by CROP_BEFORE_SHOW_TIMEOUT_MS. Gate OFF is byte-for-byte
-// today's behavior - only the QGASLICEMAP/QGASLICECONTENT timing lines are new.
+// Slice-content map-hold gate (DEFAULT ON since 2026-09-06, owner-directed + rig-validated;
+// registry "SliceMapHold" under the module key, read once at init exactly like ToastCropDisable;
+// deliberately NO qubesdb service - a guest-local A/B knob only, set 0 to disable). Scope: the
+// FIRST map of a NON-de-sliced slice-fed window (win10 / broker floor), which OTHERWISE maps
+// immediately with a freshly ZEROED per-window slab (PwSlabAcquire) and therefore shows a black
+// rectangle until the first composite slice copy lands - the "black borders flash before it
+// settles" the owner reported. Gate ON holds that first map until proven content
+// (PwNoteSliceContent), bounded by CROP_BEFORE_SHOW_TIMEOUT_MS so a required-kept toast can never
+// stay hidden (worst case == the old immediate-map behavior). This is the CONTENT half of
+// crop-before-show; MapDeferred (line ~3017) is the GEOMETRY half and was always on. Set the
+// registry value to 0 for the old byte-for-byte immediate-map behavior.
 #define REG_CONFIG_SLICE_MAP_HOLD_VALUE L"SliceMapHold"
-BOOL          g_SliceMapHold = FALSE;
+BOOL          g_SliceMapHold = TRUE;
 // Chrome (menu/toast) scope of the map-hold above - the flag-on content-hold interplay
 // with the crop-before-show arms, made explicitly A/B-able instead of riding SliceMapHold
 // implicitly (pre-flip item: flag-on silently changed menu/toast map timing on the
@@ -8746,13 +8749,13 @@ static ULONG Init(void)
     if (!(g_WgcBroker && g_OsBuild >= 26100))
         (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
     {
-        // Slice-content map-hold gate (CANDIDATE, DEFAULT OFF - Opus A/Bs it on the rig
-        // before any default flips). See SliceContentReady/PwNoteSliceContent for the
-        // mechanism and the QGASLICEMAP/QGASLICECONTENT pair for the measurement. Read
-        // exactly like ToastCropDisable (module key, once at init); deliberately NO qubesdb
-        // service - this is a guest-local A/B knob only. OFF is byte-for-byte today's
-        // mapping behavior; only the timing log lines are new.
-        DWORD smh = 0;
+        // Slice-content map-hold gate (DEFAULT ON since 2026-09-06, owner-directed + rig-validated
+        // - the content half of crop-before-show that kills the zeroed-slab black flash). See
+        // SliceContentReady/PwNoteSliceContent for the mechanism and the QGASLICEMAP/QGASLICECONTENT
+        // pair for the measurement. Read exactly like ToastCropDisable (module key, once at init);
+        // deliberately NO qubesdb service - a guest-local knob only. Set the registry value to 0 for
+        // the old byte-for-byte immediate-map behavior.
+        DWORD smh = 1;
         (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_MAP_HOLD_VALUE, &smh, NULL);
         g_SliceMapHold = (smh != 0);
         // Chrome interplay scope (A/B knob, see the g_SliceMapHoldChrome comment):
@@ -8760,7 +8763,7 @@ static ULONG Init(void)
         DWORD smhc = g_SliceMapHoldChrome;
         (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_MAP_HOLD_CHROME_VALUE, &smhc, NULL);
         g_SliceMapHoldChrome = (smhc <= 2) ? smhc : 1;
-        LogInfo("SLICEMAPHOLD gate: enabled=%d chrome_scope=%lu (default off; hold bounded by %u ms; "
+        LogInfo("SLICEMAPHOLD gate: enabled=%d chrome_scope=%lu (default ON; hold bounded by %u ms; "
                 "wake-guaranteed via MapDeferWakeSweep)",
                 g_SliceMapHold, g_SliceMapHoldChrome, CROP_BEFORE_SHOW_TIMEOUT_MS);
     }
