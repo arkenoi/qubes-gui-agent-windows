@@ -143,6 +143,14 @@ static const GUID ETWPROXY_SESSION_GUID = /* generated once for this project, re
                                     // token) or its census found drift (PLU group /
                                     // SeSystemProfilePrivilege - machine-wide trace
                                     // capability the decode loop must never hold)
+#define ETWPROXY_EXIT_CONSUME   7   // proxy: consumer open/thread/event failure
+#define ETWPROXY_EXIT_PIPE      8   // proxy: pipe creation failed (squatter) or 5
+                                    // consecutive connect failures (transients re-listen)
+// The proxy's COMPLETE exit-code set is {0, 5, 7, 8, 9} (tools/notifhost/etwproxy.cpp
+// header - shared contract, change both or neither). Any other rc CANNOT come from the
+// binary's own paths: it means external termination or a crash (which leaves a CRASH
+// breadcrumb in etw-proxy.log via BridgeCrashFilter). EtwProxyExitCb logs such codes as
+// a LOUD anomaly instead of a routine exit ([[fallbacks-are-anomalies]]).
 
 typedef enum
 {
@@ -655,6 +663,23 @@ static void EtwProxyTryLaunchLocked(void)
         return;
     }
 
+    // SESSION-0 PLACEMENT (rig-measured defect, 2026-09-06 p3a run): the design and the
+    // launch log claim "session 0", but a LogonUserW token inherits the CALLER's session
+    // id, and this agent runs in the INTERACTIVE session - so the proxy landed in the
+    // console session (tasklist: 'etwproxy.exe ... Console 1'), which also broke the
+    // harness's session-0 probes (T1j/T5). Stamp the token back to session 0 before
+    // CreateProcessAsUserW; SYSTEM holds the SE_TCB this needs. ETW and the \\.\pipe\
+    // namespace are machine-global and the proxy touches no window station (console
+    // split), so session 0 costs nothing and is the more isolated placement the design
+    // intended. Failure is logged and tolerated: placement is defense-in-depth, not
+    // correctness.
+    {
+        DWORD sess0 = 0;
+        if (!SetTokenInformation(token, TokenSessionId, &sess0, sizeof(sess0)))
+            LogWarning("ETWPROXYSUP could not stamp the proxy token to session 0 (%lu) - "
+                       "launching in this agent's session instead", GetLastError());
+    }
+
     // Census (never-held invariant, logged) + the consumer SID the grant needs.
     BYTE consumerSid[SECURITY_MAX_SID_SIZE];
     BOOL drifted = FALSE;
@@ -910,8 +935,31 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
     if (uptimeMs > ETWPROXY_HEALTHY_MS)
         g_Backoff = ETWPROXY_BACKOFF_MIN;   // it ran healthily; treat this exit as fresh
 
-    LogWarning("ETWPROXYSUP proxy exited rc=%lu after %llu ms - relaunch in %lu ms",
-               rc, uptimeMs, g_Backoff);
+    // The 'proxy exited rc=<n> after' prefix is a GREP CONTRACT with the p3a gate
+    // (t2-proxy-exits collection + the T8c 'proxy exited rc=8 after' detector) - the
+    // decode/anomaly text goes AFTER it, never inside it.
+    if (rc == 0 || rc == ETWPROXY_EXIT_CONSUME || rc == ETWPROXY_EXIT_PIPE)
+    {
+        LogWarning("ETWPROXYSUP proxy exited rc=%lu after %llu ms (%S) - relaunch in %lu ms",
+                   rc, uptimeMs,
+                   rc == 0 ? "clean stop - session ended externally or console ctrl" :
+                   rc == ETWPROXY_EXIT_CONSUME ? "consumer open/thread failure" :
+                   "pipe failure: squatter or persistent connect faults",
+                   g_Backoff);
+    }
+    else
+    {
+        // NOT a code the proxy can return (its complete set is 0/5/7/8/9): external
+        // termination or a crash. A fallback firing silently is how defects hide -
+        // log the anomaly loudly and machine-readably, then still relaunch (the tier
+        // is not worth wedging over, but the datum must not vanish into a routine line).
+        LogWarning("ETWPROXYSUP proxy exited rc=%lu after %llu ms - ANOMALY "
+                   "EtwProxyUnknownExit (0x%lX): not an ETWPROXY_EXIT_* code (0/5/7/8/9), "
+                   "the proxy binary has no such return path - terminated externally or "
+                   "crashed (check etw-proxy.log for a CRASH line). Diagnose before "
+                   "trusting the tier; relaunch in %lu ms",
+                   rc, uptimeMs, rc, g_Backoff);
+    }
     EtwProxyBackoffLocked();   // stops the session; the relaunch restarts it fresh
     LeaveCriticalSection(&g_Lock);
 }
