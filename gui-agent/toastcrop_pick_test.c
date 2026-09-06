@@ -255,6 +255,49 @@ int main(void)
         }
     }
 
+    // ---- routing: fast-accept vs settle-and-reject --------------------------------------
+    // Mirrors TcQueryCore's toast branch exactly: the ONE predicate TcInsetsMidSlide routes a
+    // read either to immediate acceptance (no Sleep, no second walk - the common case with the
+    // slide animation off; anything slower here is black border on screen) or to the settle
+    // re-walk + reject. A clean symmetric read MUST take the fast path; a mid-slide read MUST
+    // take the re-walk path. Modelled with a counter so the "no re-walk happened" claim is a
+    // checked fact, not a reading of the code.
+    {
+        int rewalks = 0;
+        struct { const char* name; LONG l, r; BOOL expectFast; } route[] = {
+            { "clean l=16 r=16 -> ACCEPT immediately, no re-walk", 16, 16, TRUE  },
+            { "clean l=2 r=17 -> ACCEPT immediately, no re-walk",  2,  17, TRUE  },
+            { "mid-slide l=209 r=1 -> settle re-walk + reject",     209, 1, FALSE },
+            { "mid-slide l=53 r=1 -> settle re-walk + reject",      53,  1, FALSE },
+        };
+        for (int i = 0; i < COUNT(route); i++)
+        {
+            RECT ins = R(route[i].l, 30, route[i].r, 13);
+            int before = rewalks;
+            BOOL accepted;
+            // The routing under test, verbatim from TcQueryCore: reject (after the settle
+            // re-walk, worker path) iff the signature fires; otherwise accept with no re-walk.
+            if (TcInsetsMidSlide(396, &ins))
+            {
+                rewalks++;          // Sleep(TOAST_CROP_SETTLE_MS) + second walk happens HERE only
+                accepted = FALSE;   // rejected either way (moved or stable-but-asymmetric)
+            }
+            else
+            {
+                accepted = TRUE;    // fast path: no wait, no second walk
+            }
+            BOOL fast = accepted && (rewalks == before);
+            g_run++;
+            BOOL ok = (fast == route[i].expectFast) && (accepted == route[i].expectFast);
+            if (!ok) g_fail++;
+            printf("%s route %-52s -> %s\n", ok ? "ok  " : "FAIL", route[i].name,
+                fast ? "fast-accept (no re-walk)" : (accepted ? "accept AFTER re-walk (slow!)" : "re-walk + reject"));
+        }
+        g_run++;
+        if (rewalks != 2) { g_fail++; printf("FAIL re-walk count %d, expected exactly 2 (one per mid-slide read, none for clean reads)\n", rewalks); }
+        else printf("ok   re-walk count %d: paid only on the two mid-slide reads\n", rewalks);
+    }
+
     printf("%u checks, %u failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

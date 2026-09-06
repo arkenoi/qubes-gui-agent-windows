@@ -56,10 +56,11 @@
 // no-card measurements at >=250 ms spacing give ~1.5 s of coverage at worker speed.
 #define TOAST_CROP_MAX_ATTEMPTS 6
 #define TOAST_CROP_RETRY_MS     250
-// Toast card-stability re-read (TcQueryCore, worker thread only): how long to wait between
-// the two walks that must agree before a toast crop is accepted. The slide-in moves the
-// card tens of px per frame, so even one frame apart a travelling card reads differently;
-// 50 ms (~3 frames) is enough to be sure and small against the 250 ms attempt pacing.
+// Toast card-stability re-read (TcQueryCore, worker thread only, and ONLY after a first read
+// that already carries the mid-slide asymmetry - a clean read is accepted with no wait): how
+// long to wait before the second walk that says whether the card was moving. The slide-in
+// moves the card tens of px per frame, so even one frame apart a travelling card reads
+// differently; 50 ms (~3 frames) is enough to be sure and small against the 250 ms pacing.
 #define TOAST_CROP_SETTLE_MS    50
 // Menus only, LEFT/RIGHT only: back the measured horizontal crop off by this many px per side so
 // the dom0 window's outer edge lands on the menu's OUTER rounded frame rather than the item-content
@@ -667,44 +668,6 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
     // and dom0 lost every window of the qube). It compiled cleanly, which is precisely why an
     // artefact must be run on a guest before it is called working.
 
-    // CARD STABILITY (toasts, worker path). The slide-in is a XAML translate of the card
-    // INSIDE a window that does not move, so the window recheck below cannot see it. Wait a
-    // moment and walk again: a card that is still travelling reports a different rect the
-    // second time, and the measurement is discarded (one bounded retry, the toast stays
-    // uncropped meanwhile). Root-caused 2026-09-06 from the agent's own TcApplyResult lines:
-    // the same toast measured l=209/53/105 with r=1 while sliding and l=16 r=16 at rest.
-    // Worker thread only (`settle`): the inline fallback runs on the tracking thread, where a
-    // sleep would stall input; that path keeps the asymmetry guard below, which needs no wait.
-    if (!menu && settle)
-    {
-        TC_CARD_ACC again;
-        RECT cardAgain = { 0, 0, 0, 0 };
-        IUIAutomationTreeWalker* walker = NULL;
-        BOOL foundAgain = FALSE;
-
-        Sleep(TOAST_CROP_SETTLE_MS);
-        TcCardAccInit(&again);
-        // Same view and rule as the accepted first walk, so only MOTION can make them differ.
-        HRESULT hrw = usedControlView ? IUIAutomation_get_ControlViewWalker(uia, &walker)
-                                      : IUIAutomation_get_RawViewWalker(uia, &walker);
-        if (SUCCEEDED(hrw) && walker)
-        {
-            foundAgain = TcFindCardRect(walker, windowElement, raw, 0, GetTickCount64() + 2000, &again);
-            IUIAutomationTreeWalker_Release(walker);
-            walker = NULL;
-        }
-        if (!foundAgain || !TcCardPick(&again, mode, &cardAgain) ||
-            cardAgain.left != cardRect.left || cardAgain.top != cardRect.top ||
-            cardAgain.right != cardRect.right || cardAgain.bottom != cardRect.bottom)
-        {
-            LogDebug("0x%x: card moved during measurement ((%d,%d)-(%d,%d) -> (%d,%d)-(%d,%d)) - sliding, retrying",
-                window, cardRect.left, cardRect.top, cardRect.right, cardRect.bottom,
-                cardAgain.left, cardAgain.top, cardAgain.right, cardAgain.bottom);
-            status = ERROR_NOT_FOUND;
-            goto end;
-        }
-    }
-
     // The card rect and `raw` were sampled at DIFFERENT times, and the toast slide-in is a
     // POSITION-ONLY animation - so the window may have moved between the two reads, and the
     // difference would then be latched as a permanent inset keyed by (hwnd, size), silently
@@ -754,18 +717,61 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
     if (insets->bottom < 0)
         insets->bottom = 0;
 
-    // MID-SLIDE SIGNATURE (toasts, every path). Even a single read can be recognised: a card
-    // caught sliding in from the right has its right margin already at rest and its left
-    // margin far larger (l=209 r=1, l=53 r=1, l=105 r=1 measured; at rest 16/16). Rejected
-    // and retried, not latched - the rule and its threshold live in toastcrop-pick.h, where
-    // the offline suite proves it fires on the measured shapes and stays quiet on every
-    // resting card ever measured. Applies BEFORE the plausibility guard on purpose: a
-    // mid-slide 186x173 passes the 40% floor, which is how it shipped.
+    // MID-SLIDE SIGNATURE (toasts, every path). The slide-in is a XAML translate of the card
+    // INSIDE a window that does not move, so the window recheck above cannot see it - but a
+    // single read can: a card caught sliding in from the right has its right margin already at
+    // rest and its left margin far larger (l=209 r=1, l=53 r=1, l=105 r=1 measured 2026-09-06;
+    // at rest 16/16). Such a read is REJECTED and retried, never latched - the rule and its
+    // threshold live in toastcrop-pick.h, where the offline suite proves it fires on the
+    // measured shapes and stays quiet on every resting card ever measured. Applies BEFORE the
+    // plausibility guard on purpose: a mid-slide 186x173 passes the 40% floor, which is how it
+    // shipped.
+    //
+    // FAST PATH FIRST. A clean, symmetric read is accepted HERE, with no wait and no second
+    // walk: with client-area animation off (main.c SetShadowsMain) that is every toast, and the
+    // crop must land as fast as it ever did - a toast is mapped uncropped first (its transparent
+    // margin renders BLACK until the crop re-announces; SliceMapHold, which would hold the map,
+    // is default-off), so every millisecond spent here is black border on the owner's screen.
+    // An earlier revision re-walked UNCONDITIONALLY (Sleep 50 ms + a full UIA walk on every
+    // toast) and measurably lengthened that flash for no benefit (owner, 2026-09-06).
+    //
+    // Only a read that already LOOKS mid-slide pays for the settle re-walk, and only on the
+    // worker thread (`settle`; the inline fallback runs on the tracking thread, where a sleep
+    // would stall input). The re-walk does not rescue the read - it is rejected either way -
+    // it tells the log WHICH failure it was: a card that moved between the two walks is the
+    // slide (expected on a managed image where the animation cannot be turned off); a card
+    // that is stable yet asymmetric is a shape no toast has produced at rest, worth a look.
     if (!menu && TcInsetsMidSlide(raw.right - raw.left, insets))
     {
-        LogDebug("0x%x: insets l=%d r=%d asymmetric beyond %d px in a %dx%d window - card mid-slide, retrying",
+        const WCHAR* verdict = L"asymmetric (inline path, no settle read)";
+
+        if (settle)
+        {
+            TC_CARD_ACC again;
+            RECT cardAgain = { 0, 0, 0, 0 };
+            IUIAutomationTreeWalker* walker = NULL;
+            BOOL foundAgain = FALSE;
+
+            Sleep(TOAST_CROP_SETTLE_MS);
+            TcCardAccInit(&again);
+            // Same view and rule as the accepted first walk, so only MOTION can make them differ.
+            HRESULT hrw = usedControlView ? IUIAutomation_get_ControlViewWalker(uia, &walker)
+                                          : IUIAutomation_get_RawViewWalker(uia, &walker);
+            if (SUCCEEDED(hrw) && walker)
+            {
+                foundAgain = TcFindCardRect(walker, windowElement, raw, 0, GetTickCount64() + 2000, &again);
+                IUIAutomationTreeWalker_Release(walker);
+                walker = NULL;
+            }
+            BOOL moved = !foundAgain || !TcCardPick(&again, mode, &cardAgain) ||
+                cardAgain.left != cardRect.left || cardAgain.top != cardRect.top ||
+                cardAgain.right != cardRect.right || cardAgain.bottom != cardRect.bottom;
+            verdict = moved ? L"card moved between two reads - SLIDING" : L"card stable yet asymmetric";
+        }
+
+        LogDebug("0x%x: insets l=%d r=%d asymmetric beyond %d px in a %dx%d window - %s, retrying",
             window, insets->left, insets->right, TOAST_CROP_MAX_LR_ASYMMETRY,
-            raw.right - raw.left, raw.bottom - raw.top);
+            raw.right - raw.left, raw.bottom - raw.top, verdict);
         ZeroMemory(insets, sizeof(*insets));
         status = ERROR_NOT_FOUND;
         goto end;

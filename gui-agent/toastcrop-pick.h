@@ -157,6 +157,14 @@ static __inline BOOL TcPickCard(RECT raw, const RECT* rects, int count, TC_PICK_
 #define TOAST_CROP_MAX_LR_ASYMMETRY 32
 
 // TRUE iff `insets` carry the mid-slide signature for a window `rawWidth` wide.
+//
+// This ONE predicate decides both things toastcrop.c does with a toast read:
+//   FALSE -> ACCEPT IMMEDIATELY (the fast path: no wait, no second walk). With client-area
+//            animation off this is every toast, and it must be as fast as ever, because the
+//            toast is on screen uncropped - black margins - until the crop lands.
+//   TRUE  -> REJECT and retry; on the worker thread a 50 ms settle re-walk first says whether
+//            the card was moving (log detail only - the read is rejected either way).
+// The offline suite asserts the routing on the measured shapes (toastcrop_pick_test.c).
 static __inline BOOL TcInsetsMidSlide(LONG rawWidth, const RECT* insets)
 {
 #ifdef TOASTCROP_PICK_DEFECT_NOGUARD
