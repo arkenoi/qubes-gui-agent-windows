@@ -56,6 +56,7 @@
     <ClInclude Include="..\..\gui-agent\perwindow.h" />
     <ClInclude Include="..\..\gui-agent\wincapture.h" />
     <ClInclude Include="..\..\gui-agent\toastcrop.h" />
+    <ClInclude Include="..\..\gui-agent\toastcrop-pick.h" />
     <ClInclude Include="..\..\gui-agent\etwproxy.h" />
   </ItemGroup>
   <ItemGroup>
