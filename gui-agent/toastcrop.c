@@ -56,6 +56,11 @@
 // no-card measurements at >=250 ms spacing give ~1.5 s of coverage at worker speed.
 #define TOAST_CROP_MAX_ATTEMPTS 6
 #define TOAST_CROP_RETRY_MS     250
+// Toast card-stability re-read (TcQueryCore, worker thread only): how long to wait between
+// the two walks that must agree before a toast crop is accepted. The slide-in moves the
+// card tens of px per frame, so even one frame apart a travelling card reads differently;
+// 50 ms (~3 frames) is enough to be sure and small against the 250 ms attempt pacing.
+#define TOAST_CROP_SETTLE_MS    50
 // Menus only, LEFT/RIGHT only: back the measured horizontal crop off by this many px per side so
 // the dom0 window's outer edge lands on the menu's OUTER rounded frame rather than the item-content
 // (control-view) edge - the user wants the menu's own left/right border kept, not shaved, and said
@@ -547,7 +552,12 @@ static BOOL TcFindCardRect(IN IUIAutomationTreeWalker* walker, IN IUIAutomationE
 //            is the measured-good configuration for this surface; the menu's ~5 px raw-only padding
 //            container is a MENU artifact, not something a toast tree has been seen to carry.
 // ToastCropToastUnion=1 forces the menu rule onto toasts - the defect, re-introduced on demand.
-static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN BOOL menu, OUT RECT* insets)
+//
+// `settle`: TRUE on the worker thread, where the toast path may SLEEP briefly and re-walk to
+// confirm the card is at rest (the slide-in race, see below); FALSE on the inline fallback,
+// which runs on the tracking thread and must never wait.
+static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN BOOL menu, IN BOOL settle,
+    OUT RECT* insets)
 {
     IUIAutomationElement* windowElement = NULL;
     ULONG status = ERROR_NOT_FOUND;
@@ -573,10 +583,13 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
     // measured 2026-08-11; on 24H2 the same menu had no margin at all). The qualifier ("fully
     // inside the window, strictly smaller in both dimensions") and the two selection rules are
     // in toastcrop-pick.h, where they are unit-tested offline (toastcrop_pick_test.c).
+    // Rule and view, decided once so the stability re-walk below mirrors the first walk exactly
+    // (under ToastCropToastUnion the re-walk must reproduce the defect, not veto it).
+    BOOL useMenuRule = menu || g_TcToastUnionDefect;
+    TC_PICK_MODE mode = useMenuRule ? TcPickUnion : TcPickLargest;
+    BOOL usedControlView = FALSE;   // which view the accepted first walk came from
     {
         TC_CARD_ACC acc;
-        BOOL useMenuRule = menu || g_TcToastUnionDefect;
-        TC_PICK_MODE mode = useMenuRule ? TcPickUnion : TcPickLargest;
         const WCHAR* rule = menu ? L"menu:control-union"
                           : (g_TcToastUnionDefect ? L"toast:DEFECT-control-union" : L"toast:raw-largest");
         const WCHAR* view = L"raw";
@@ -599,12 +612,14 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
                 IUIAutomationTreeWalker_Release(walker);
                 walker = NULL;
                 view = L"control";
+                usedControlView = found;
             }
             if (!found)
             {
                 TcCardAccInit(&acc);
                 deadline = GetTickCount64() + 2000;
                 view = L"raw";
+                usedControlView = FALSE;
                 if (SUCCEEDED(IUIAutomation_get_RawViewWalker(uia, &walker)) && walker)
                 {
                     found = TcFindCardRect(walker, windowElement, raw, 0, deadline, &acc);
@@ -651,6 +666,44 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
     // (measured on win11-fresh 2026-08-11 - the guest crash-looped, one agent log every ~6 s,
     // and dom0 lost every window of the qube). It compiled cleanly, which is precisely why an
     // artefact must be run on a guest before it is called working.
+
+    // CARD STABILITY (toasts, worker path). The slide-in is a XAML translate of the card
+    // INSIDE a window that does not move, so the window recheck below cannot see it. Wait a
+    // moment and walk again: a card that is still travelling reports a different rect the
+    // second time, and the measurement is discarded (one bounded retry, the toast stays
+    // uncropped meanwhile). Root-caused 2026-09-06 from the agent's own TcApplyResult lines:
+    // the same toast measured l=209/53/105 with r=1 while sliding and l=16 r=16 at rest.
+    // Worker thread only (`settle`): the inline fallback runs on the tracking thread, where a
+    // sleep would stall input; that path keeps the asymmetry guard below, which needs no wait.
+    if (!menu && settle)
+    {
+        TC_CARD_ACC again;
+        RECT cardAgain = { 0, 0, 0, 0 };
+        IUIAutomationTreeWalker* walker = NULL;
+        BOOL foundAgain = FALSE;
+
+        Sleep(TOAST_CROP_SETTLE_MS);
+        TcCardAccInit(&again);
+        // Same view and rule as the accepted first walk, so only MOTION can make them differ.
+        HRESULT hrw = usedControlView ? IUIAutomation_get_ControlViewWalker(uia, &walker)
+                                      : IUIAutomation_get_RawViewWalker(uia, &walker);
+        if (SUCCEEDED(hrw) && walker)
+        {
+            foundAgain = TcFindCardRect(walker, windowElement, raw, 0, GetTickCount64() + 2000, &again);
+            IUIAutomationTreeWalker_Release(walker);
+            walker = NULL;
+        }
+        if (!foundAgain || !TcCardPick(&again, mode, &cardAgain) ||
+            cardAgain.left != cardRect.left || cardAgain.top != cardRect.top ||
+            cardAgain.right != cardRect.right || cardAgain.bottom != cardRect.bottom)
+        {
+            LogDebug("0x%x: card moved during measurement ((%d,%d)-(%d,%d) -> (%d,%d)-(%d,%d)) - sliding, retrying",
+                window, cardRect.left, cardRect.top, cardRect.right, cardRect.bottom,
+                cardAgain.left, cardAgain.top, cardAgain.right, cardAgain.bottom);
+            status = ERROR_NOT_FOUND;
+            goto end;
+        }
+    }
 
     // The card rect and `raw` were sampled at DIFFERENT times, and the toast slide-in is a
     // POSITION-ONLY animation - so the window may have moved between the two reads, and the
@@ -701,6 +754,23 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
     if (insets->bottom < 0)
         insets->bottom = 0;
 
+    // MID-SLIDE SIGNATURE (toasts, every path). Even a single read can be recognised: a card
+    // caught sliding in from the right has its right margin already at rest and its left
+    // margin far larger (l=209 r=1, l=53 r=1, l=105 r=1 measured; at rest 16/16). Rejected
+    // and retried, not latched - the rule and its threshold live in toastcrop-pick.h, where
+    // the offline suite proves it fires on the measured shapes and stays quiet on every
+    // resting card ever measured. Applies BEFORE the plausibility guard on purpose: a
+    // mid-slide 186x173 passes the 40% floor, which is how it shipped.
+    if (!menu && TcInsetsMidSlide(raw.right - raw.left, insets))
+    {
+        LogDebug("0x%x: insets l=%d r=%d asymmetric beyond %d px in a %dx%d window - card mid-slide, retrying",
+            window, insets->left, insets->right, TOAST_CROP_MAX_LR_ASYMMETRY,
+            raw.right - raw.left, raw.bottom - raw.top);
+        ZeroMemory(insets, sizeof(*insets));
+        status = ERROR_NOT_FOUND;
+        goto end;
+    }
+
     TcValidateInsets(window, raw.right - raw.left, raw.bottom - raw.top, insets);
 
     status = (insets->left || insets->top || insets->right || insets->bottom)
@@ -736,7 +806,8 @@ ULONG ToastCropQuery(IN HWND window, IN RECT raw, IN BOOL menu, OUT RECT* insets
         LeaveCriticalSection(&g_TcLock);
         return ERROR_NOT_SUPPORTED;
     }
-    status = TcQueryCore(uia, window, raw, menu, insets);
+    // Inline = on the caller's (tracking) thread: no settle wait here.
+    status = TcQueryCore(uia, window, raw, menu, FALSE, insets);
     LeaveCriticalSection(&g_TcLock);
     return status;
 }
@@ -850,7 +921,7 @@ static DWORD WINAPI TcWorkerThread(IN void* param)
                 break;
 
             RECT insets;
-            TcQueryCore(uia, req.Window, req.Raw, req.Menu, &insets); // status is in the insets
+            TcQueryCore(uia, req.Window, req.Raw, req.Menu, TRUE, &insets); // status is in the insets
             TcApplyResult(&req, &insets);
         }
     }

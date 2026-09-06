@@ -2816,7 +2816,11 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
 {
     if (SpawnHelperInSession(enable ? L"--set-shadows 1" : L"--set-shadows 0"))
     {
-        LogInfo("guest window shadows %s", enable ? L"restored (fullscreen)" : L"disabled (seamless)");
+        // The same helper also turns client-area animation OFF in both directions (the toast
+        // slide-in race, SetShadowsMain); it records the read-back in the user's hive as
+        // gui-agent\ClientAreaAnimation, which is where the rig checks it.
+        LogInfo("guest window shadows %s; client-area animation disabled (toast slide-in)",
+            enable ? L"restored (fullscreen)" : L"disabled (seamless)");
         return TRUE;
     }
     LogWarning("no interactive session token yet; cannot %s guest shadows (will retry)",
@@ -9117,6 +9121,58 @@ static int SetShadowsMain(LPSTR cmdLine)
     // fullscreen direction, mirroring the mask above.
     SystemParametersInfo(SPI_SETDROPSHADOW, 0, (void*)(INT_PTR)(enable ? TRUE : FALSE),
                          SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+
+    // CLIENT-AREA ANIMATION OFF - BOTH DIRECTIONS, NEVER RESTORED. This is not a shadow; it is
+    // the toast slide-in. A shell toast slides in from the right as a XAML translate of the
+    // card INSIDE a window that does not move, and the agent's UIA card measurement (toastcrop.c)
+    // taken mid-slide latched the travelling card's rect as the crop: measured 2026-09-06 on
+    // win11 24H2, the same toast gave insets l=209/53/105 r=1 (card cut to 186 px wide, action
+    // buttons clipped) with the animation on and l=16 r=16 three fires in a row with it off.
+    // SPI_SETCLIENTAREAANIMATION is the "Animate controls and elements inside windows" toggle
+    // (a UserPreferencesMask bit; SPIF_UPDATEINIFILE persists it in HKCU, so it survives
+    // re-login, and SPIF_SENDCHANGE makes ShellExperienceHost pick it up now). It is a per-USER
+    // setting, which is why it lives in this session-token helper and not in the SYSTEM agent
+    // (SPI in session 0 would change session 0). It is applied on the fullscreen direction too:
+    // there is nothing to restore - toasts render identically either way, and the owner already
+    // runs these guests with effects off for repaint cost (guest/disable-visual-effects.ps1,
+    // which is NOT invoked by the installer, so it is not a home for this).
+    // toastcrop.c keeps a mid-slide guard regardless (defense in depth for an image where this
+    // setting is policy-managed or a later shell animates differently).
+#ifndef SPI_GETCLIENTAREAANIMATION
+#define SPI_GETCLIENTAREAANIMATION 0x1042
+#define SPI_SETCLIENTAREAANIMATION 0x1043
+#endif
+    SystemParametersInfo(SPI_SETCLIENTAREAANIMATION, 0, (void*)(INT_PTR)FALSE,
+                         SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+    // The Performance Options UI mirror, like DropShadow above, so the dialog agrees.
+    if (!RegCreateKeyEx(HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects\\ControlAnimations",
+            0, NULL, 0, KEY_WRITE, NULL, &ve, NULL))
+    {
+        DWORD v = 0;
+        RegSetValueEx(ve, L"DefaultValue", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+        RegCloseKey(ve);
+    }
+    // VERIFIABLE: the spawner (SpawnHelperInSession) is fire-and-forget, so this helper's exit
+    // code is never seen. Read the setting back the way the shell will and record it in the
+    // user's own hive under the gui-agent key - ClientAreaAnimation = 0 means "off, confirmed",
+    // 1 means the SPI call did not take (policy?), and an ABSENT value means this helper never
+    // ran in that session. The rig asserts it from a user-session task; the SYSTEM agent can
+    // read it as HKEY_USERS\<sid>\... too.
+    {
+        BOOL anim = TRUE;
+        if (!SystemParametersInfo(SPI_GETCLIENTAREAANIMATION, 0, &anim, 0))
+            anim = TRUE;
+        HKEY ga = NULL;
+        if (!RegCreateKeyEx(HKEY_CURRENT_USER,
+                L"Software\\Invisible Things Lab\\Qubes Tools\\gui-agent",
+                0, NULL, 0, KEY_WRITE, NULL, &ga, NULL))
+        {
+            DWORD v = anim ? 1 : 0;
+            RegSetValueEx(ga, L"ClientAreaAnimation", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+            RegCloseKey(ga);
+        }
+    }
 
     // Make it live without a logoff.
     // SPI_SETUSERPREFERENCESMASK (0x1045) is not in this SDK's headers; the broadcast only needs

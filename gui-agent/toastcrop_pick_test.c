@@ -27,6 +27,11 @@
  * 364-wide card). CI inverts the exit code under the defect define to enforce it. Note this
  * is the SAME mechanism as the agent's registry knob ToastCropToastUnion=1, which forces the
  * rule at runtime on the rig; the define proves the suite, the knob proves the live crop.
+ *
+ * Second defect: -DTOASTCROP_PICK_DEFECT_NOGUARD disables the mid-slide guard
+ * (TcInsetsMidSlide) - the state before 2026-09-06, when a toast measured mid-slide-in
+ * (l=209 r=1 on a 396-wide window) was latched as its crop and shipped 186 px wide with its
+ * action buttons cut. The guard cases below MUST then fail.
  */
 
 #include "toastcrop-pick.h"
@@ -140,6 +145,9 @@ int main(void)
 #ifdef TOASTCROP_PICK_DEFECT_UNION
     printf("DEFECT BUILD: TOASTCROP_PICK_DEFECT_UNION - toasts use the union rule; this run MUST fail\n");
 #endif
+#ifdef TOASTCROP_PICK_DEFECT_NOGUARD
+    printf("DEFECT BUILD: TOASTCROP_PICK_DEFECT_NOGUARD - mid-slide guard off; this run MUST fail\n");
+#endif
     RECT got = { 0, 0, 0, 0 };
     BOOL found;
 
@@ -214,6 +222,37 @@ int main(void)
         };
         found = TcPickCard(g_ToastRaw, tie, 2, TcPickLargest, &got);
         Check("largest on tie -> first seen", found, got, TRUE, g_ToastCard, 0);
+    }
+
+    // ---- mid-slide guard (TcInsetsMidSlide) -----------------------------------------------
+    // The measured mid-slide inset shapes MUST be rejected (retried, never latched), and every
+    // resting card ever measured MUST pass. Under -DTOASTCROP_PICK_DEFECT_NOGUARD the guard
+    // never fires and the three measured shapes below go red: that is the 2026-09-06 defect,
+    // a 396x216 toast cropped to 186 wide with its action buttons cut.
+    {
+        struct { const char* name; LONG w; LONG l, t, r, b; BOOL expectReject; } cases[] = {
+            { "mid-slide l=209 r=1 (396x216, measured)",   396, 209, 30, 1, 13, TRUE  },
+            { "mid-slide l=53 r=1 (396x573, measured)",    396, 53,  30, 1, 13, TRUE  },
+            { "mid-slide l=105 r=1 (396x200, measured)",   396, 105, 30, 1, 13, TRUE  },
+            { "rest l=16 r=16 (animation off, measured)",  396, 16,  30, 16, 13, FALSE },
+            { "rest l=2 r=17 (2026-08-11 396x332 toast)",  396, 2,   31, 17, 14, FALSE },
+            { "rest l=16 r=16 t=30 b=13 (vertical asym ignored)", 396, 16, 30, 16, 13, FALSE },
+            { "boundary |l-r|=32 passes",                  396, 40,  30, 8, 13, FALSE },
+            { "boundary |l-r|=33 rejects",                 396, 41,  30, 8, 13, TRUE  },
+            { "mirror: l=1 r=209 rejects too",             396, 1,   30, 209, 13, TRUE },
+        };
+        for (int i = 0; i < COUNT(cases); i++)
+        {
+            RECT ins = R(cases[i].l, cases[i].t, cases[i].r, cases[i].b);
+            BOOL rej = TcInsetsMidSlide(cases[i].w, &ins);
+            g_run++;
+            BOOL ok = (rej == cases[i].expectReject);
+            if (!ok) g_fail++;
+            printf("%s guard %-46s l=%ld t=%ld r=%ld b=%ld -> %s (expected %s)\n",
+                ok ? "ok  " : "FAIL", cases[i].name,
+                (long)cases[i].l, (long)cases[i].t, (long)cases[i].r, (long)cases[i].b,
+                rej ? "REJECT" : "accept", cases[i].expectReject ? "REJECT" : "accept");
+        }
     }
 
     printf("%u checks, %u failed\n", g_run, g_fail);

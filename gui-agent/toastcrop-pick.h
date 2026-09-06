@@ -134,3 +134,41 @@ static __inline BOOL TcPickCard(RECT raw, const RECT* rects, int count, TC_PICK_
         TcCardAccumulate(raw, rects[i], &acc);
     return TcCardPick(&acc, mode, out);
 }
+
+// ---- mid-slide guard --------------------------------------------------------------------
+//
+// A shell toast SLIDES IN FROM THE RIGHT, and the slide is a XAML translate of the card
+// INSIDE a window that does not move (client-area animation). A UIA read taken mid-slide
+// therefore sees a card whose right edge is already at its resting margin while its left
+// edge is still far right of it - and the window-rect recheck in toastcrop.c cannot notice,
+// because the WINDOW is stable. The insets that come out have a signature no resting card
+// produces: a tiny inset on one side and a large one on the other. Measured 2026-09-06
+// (win11 24H2, complex 3-image toast, LogLevel=3 TcApplyResult lines):
+//   396x216 -> l=209 t=30 r=1 b=13      396x573 -> l=53 t=30 r=1 b=13
+//   396x200 -> l=105 t=30 r=1 b=13
+// and the same toast with client-area animation off, three fires in a row: l=16 r=16.
+// The resting cards ever measured are near-symmetric horizontally: 16/16 (twice), 2/17
+// (2026-08-11; 15 px apart). The rule: a horizontal left/right difference beyond
+// TOAST_CROP_MAX_LR_ASYMMETRY is a mid-slide read and must be RETRIED, never latched -
+// the slot's retry budget, then the last-good insets, then uncropped, are the fall-throughs.
+// Vertical asymmetry is NOT tested: the slide is horizontal, and a resting card's top/bottom
+// margins legitimately differ (30/13). Applied to TOASTS only - a WinUI menu does not slide
+// and its raw-view padding container makes its own asymmetry story (toastcrop.c).
+#define TOAST_CROP_MAX_LR_ASYMMETRY 32
+
+// TRUE iff `insets` carry the mid-slide signature for a window `rawWidth` wide.
+static __inline BOOL TcInsetsMidSlide(LONG rawWidth, const RECT* insets)
+{
+#ifdef TOASTCROP_PICK_DEFECT_NOGUARD
+    // Defect re-introduction: the guard never fires, so a mid-slide read is latched as
+    // the crop - which is exactly what shipped before 2026-09-06.
+    (void)rawWidth; (void)insets;
+    return FALSE;
+#else
+    (void)rawWidth;
+    LONG diff = insets->left - insets->right;
+    if (diff < 0)
+        diff = -diff;
+    return diff > TOAST_CROP_MAX_LR_ASYMMETRY;
+#endif
+}

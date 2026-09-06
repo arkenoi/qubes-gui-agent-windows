@@ -44,6 +44,16 @@
  * the window; a WinUI menu body has no such element (its presenter spans the full window
  * height), so its card is the UNION of the rows. The rule is chosen per surface at enqueue
  * time from the same classification the crop gate made (IsMenuPopupWindow).
+ *
+ * THE SLIDE-IN RACE (root-caused 2026-09-06 from the agent's own log). A toast slides in
+ * from the right as a XAML translate of the card INSIDE a window that does not move, so a
+ * UIA read mid-slide sees the card's right strip only: the same toast measured l=209/53/105
+ * r=1 while sliding (cropped to 186 px, action buttons cut) and l=16 r=16 at rest. Two
+ * layers fix it: (1) the agent's session helper (main.c SetShadowsMain) turns client-area
+ * animation OFF for the user, persistently, so there is no slide to race; (2) toast
+ * measurements are rejected and retried when the card moves between two walks 50 ms apart
+ * (worker path) or when the insets carry the mid-slide left/right asymmetry
+ * (TcInsetsMidSlide, every path) - through the retry budget, then last-good, then uncropped.
  */
 
 #pragma once
