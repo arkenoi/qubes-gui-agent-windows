@@ -48,6 +48,7 @@
 #include "debug.h"
 #include "perf.h"
 #include "toastcrop.h"
+#include "slicepaint.h"
 #include "etwproxy.h"
 #include "faultinject.h"
 #include "dragsim.h"
@@ -2540,6 +2541,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
 {
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1;
     entry->PwBrokerLastId = 0; entry->PwBrokerArenaOff = 0;
+    entry->PwDimsLogged = FALSE;   // re-arm the one-shot BROKERDIMS diagnostic per registration
     if (!WgcBrokerActive() || !entry->PwSliceFed) return FALSE;
     if (entry->Width == 0 || entry->Height == 0) return FALSE;
 
@@ -2629,8 +2631,23 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
         LONGLONG tick = s->CaptureTick, boff;
         if (b < 0 || b >= WGCBRK_RING) return FALSE;
         boff = s->BufOffset[b];
-        // dims must EXACTLY match the slab (so the dest-bounds check covers the source too)
-        if (fw != (LONG)e->PwWidth || fh != (LONG)e->PwHeight || stride != fw * 4) return FALSE;
+        // dims must EXACTLY match the slab (so the dest-bounds check covers the source too).
+        // A mismatch is not transient once the broker has settled: a WGC channel publishes
+        // WINDOW-sized frames, so after the agent re-registers a cropped window at its CARD
+        // size (toast crop resolved -> PwResizeWindow) every frame is rejected here and the
+        // window holds its zeroed slab for ever. Say so once, machine-readably, so a rig log
+        // names the feed loss instead of showing a silent BROKERHOLD.
+        if (fw != (LONG)e->PwWidth || fh != (LONG)e->PwHeight || stride != fw * 4)
+        {
+            if (!e->PwDimsLogged && fw > 0 && fh > 0)
+            {
+                e->PwDimsLogged = TRUE;
+                LogInfo("BROKERDIMS hwnd 0x%x slot %d frame %dx%d stride %d != slab %ux%u - broker frames rejected, window holds",
+                        (DWORD)(ULONG_PTR)e->Handle, e->PwBrokerSlot, fw, fh, stride,
+                        e->PwWidth, e->PwHeight);
+            }
+            return FALSE;
+        }
         // arena residency: [boff, boff + fh*stride) fully within [ArenaOffset, ArenaOffset+ArenaBytes)
         ULONGLONG need = (ULONGLONG)fh * (ULONGLONG)stride;
         if (boff < h->ArenaOffset ||
@@ -2683,22 +2700,25 @@ static BOOL BrokerOpaqueInsets(IN HWND window, OUT RECT* insets)
 // penalty; 400 ms is the worst case, not the norm.
 #define CROP_BEFORE_SHOW_TIMEOUT_MS 400
 
-// SLICE-CONTENT MAP-HOLD readiness (g_SliceMapHold, DEFAULT OFF). The non-de-sliced slice-fed
-// path has the same black-first-frame defect the de-slice arm below already fixes for 24H2+:
-// AddWindow maps the window and sends a full-rect initial damage while its per-window slab is
-// still the zeroed memory PwSlabAcquire handed out (perwindow.c documents "BLACK until the
-// window painted"), and the first composite copy (PwSliceCopyAndDamage) only lands later, on a
-// captured frame whose composite actually carries the window. Gate ON: not ready until PROVEN
-// content is in the buffer (PwNoteSliceContent - a consumed broker frame, or a composite copy
-// backed by screen damage intersecting the window). Bounded: the crop-before-show release site
-// maps after CROP_BEFORE_SHOW_TIMEOUT_MS regardless, so the worst case is exactly today's
-// behavior and a window (a toast in particular - required-kept) can never stay hidden.
-// Gate OFF: always TRUE - today's behavior, unchanged.
+// SLICE-CONTENT MAP-HOLD readiness (g_SliceMapHold). The non-de-sliced slice-fed path has the
+// same black-first-frame defect the de-slice arm below already fixes for 24H2+: AddWindow maps
+// the window and sends a full-rect initial damage while its per-window slab is still the zeroed
+// memory PwSlabAcquire handed out (perwindow.c documents "BLACK until the window painted"), and
+// the first composite copy (PwSliceCopyAndDamage) only lands later, on a captured frame whose
+// composite actually carries the window. Gate ON: not ready until the buffer is PAINTED
+// (PwSliceContentTick - set by PwNoteSliceContent only once a copy leaves the buffer passing
+// SlicePainted). A consumed broker frame is deliberately NOT a readiness term on its own any
+// more: the broker's WGC publish path has no non-black check, so its first frame for a
+// not-yet-rendered window is black, and "PwBrokerLastId != 0" released the hold onto exactly
+// that (rig 2026-09-06, black toast). Bounded: the crop-before-show release site maps after
+// CROP_BEFORE_SHOW_TIMEOUT_MS regardless, so the worst case is the old immediate-map behavior
+// delayed by the bound, and a window (a toast in particular - required-kept) can never stay
+// hidden. Gate OFF: always TRUE - the pre-gate behavior, unchanged.
 static BOOL SliceContentReady(IN const WINDOW_DATA* entry)
 {
     if (!g_SliceMapHold || !entry->PwSliceFed)
         return TRUE;
-    return entry->PwSliceContentTick != 0 || entry->PwBrokerLastId != 0;
+    return entry->PwSliceContentTick != 0;
 }
 
 // First-map bookkeeping for a slice-fed window - ALWAYS ON, flag-independent: the
@@ -2713,10 +2733,17 @@ static void PwNoteSliceFedMap(IN OUT WINDOW_DATA* entry)
     if (!entry->PwSliceFed || entry->PwSliceMapTick != 0)
         return;
     entry->PwSliceMapTick = GetTickCount64();
-    LogInfo("QGASLICEMAP hwnd=0x%x t=%llu content=%llu lead_ms=%lld hold=%d",
+    // painted=1 means the buffer passed SlicePainted before this map (no black frame possible);
+    // painted=0 with held_ms >= CROP_BEFORE_SHOW_TIMEOUT_MS is the bounded fail-open release
+    // (mapped unpainted because nothing painted in time - the QGASLICEBLACK line before it
+    // says a copy did land). held_ms=-1: the map was never deferred.
+    LogInfo("QGASLICEMAP hwnd=0x%x t=%llu content=%llu lead_ms=%lld painted=%d held_ms=%lld hold=%d",
         (DWORD)(ULONG_PTR)entry->Handle, entry->PwSliceMapTick, entry->PwSliceContentTick,
         entry->PwSliceContentTick != 0 ?
             (LONGLONG)(entry->PwSliceMapTick - entry->PwSliceContentTick) : (LONGLONG)-1,
+        entry->PwSliceContentTick != 0,
+        entry->MapDeferSince != 0 ?
+            (LONGLONG)(entry->PwSliceMapTick - entry->MapDeferSince) : (LONGLONG)-1,
         g_SliceMapHold);
 }
 
@@ -5544,16 +5571,43 @@ static BOOL PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRA
 // a bare poke does not put this window in TakePendingWindows' batch, so UpdateWindowData -
 // the only release site - might otherwise wait for the window's next natural event or the
 // periodic resync).
+//
+// PAINTED, NOT MERELY COPIED (rig 2026-09-06, win11 24H2, slice-fed toast on a de-slice guest):
+// a copy is only evidence that a copy happened. The first one for a shell surface is routinely
+// BLACK - the broker's WGC publish path has no non-black check, so a WGC frame of a window whose
+// visual tree has not rendered yet is transparent, and the slab is zeroed at attach - and a hold
+// released on it maps a black window, which is the exact defect the hold exists to prevent. So
+// the tick is set only once the window's OWN buffer passes SlicePainted (slicepaint.h: sampled
+// non-black test, the broker's own thresholds). Callers keep calling on every copy; each call
+// re-samples until the first pass (cheap: an 8x8 grid), after which the tick guard short-cuts.
+// A window whose copies never pass (content darker than the ceiling, a fully transparent
+// overlay) is mapped by the CROP_BEFORE_SHOW_TIMEOUT_MS release regardless - bounded, never
+// hidden. QGASLICEBLACK (one-shot per attach) records that a copy landed and the buffer is
+// still black, so the rig log shows the hold doing its job rather than a silent wait.
 static void PwNoteSliceContent(IN OUT WINDOW_DATA* entry)
 {
     if (entry->PwSliceContentTick != 0)
         return;
+    SLICE_PAINT_STATS st;
+    if (!SlicePainted((const BYTE*)entry->PwBuffer, (size_t)entry->PwWidth * 4,
+                      entry->PwWidth, entry->PwHeight, &st))
+    {
+        if (!entry->PwSliceBlackLogged)
+        {
+            entry->PwSliceBlackLogged = TRUE;
+            LogInfo("QGASLICEBLACK hwnd=0x%x t=%llu map=%llu nonblack=%lu/%lu %ux%u hold=%d - copied but not painted, holding",
+                (DWORD)(ULONG_PTR)entry->Handle, GetTickCount64(), entry->PwSliceMapTick,
+                (ULONG)st.NonBlack, (ULONG)st.Sampled, entry->PwWidth, entry->PwHeight,
+                g_SliceMapHold);
+        }
+        return;
+    }
     entry->PwSliceContentTick = GetTickCount64();
-    LogInfo("QGASLICECONTENT hwnd=0x%x t=%llu map=%llu flash_ms=%lld hold=%d",
+    LogInfo("QGASLICECONTENT hwnd=0x%x t=%llu map=%llu flash_ms=%lld nonblack=%lu/%lu hold=%d",
         (DWORD)(ULONG_PTR)entry->Handle, entry->PwSliceContentTick, entry->PwSliceMapTick,
         entry->PwSliceMapTick != 0 ?
             (LONGLONG)(entry->PwSliceContentTick - entry->PwSliceMapTick) : (LONGLONG)-1,
-        g_SliceMapHold);
+        (ULONG)st.NonBlack, (ULONG)st.Sampled, g_SliceMapHold);
     if (g_SliceMapHold && entry->MapDeferred)
         QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
 }
@@ -6546,8 +6600,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         entry->PwSliceNeedsFull = FALSE;
                         entry->PwBrokerLastId = bid;
                         PwSliceCopyAndDamageSrc(entry, bsrc, bpitch, entry->X, entry->Y, &pwRect);
-                        // A per-HWND broker frame IS content by definition - close the
-                        // map/first-content timing pair (and release a SliceMapHold defer).
+                        // A per-HWND broker frame is a COPY, not proof of content: the WGC
+                        // publish path has no non-black check, so the first frame of a
+                        // not-yet-rendered window is black. PwNoteSliceContent samples the
+                        // buffer and closes the map/first-content pair (releasing a
+                        // SliceMapHold defer) only once it is actually painted.
                         PwNoteSliceContent(entry);
                         if (firstBrokerFrame)
                             LogInfo("BROKERFRAME first WGC frame consumed hwnd 0x%x slot %d %ux%u",

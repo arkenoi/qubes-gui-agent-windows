@@ -495,8 +495,10 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwDumpSent = TRUE;
     entry->PwSliceFed = sliceFed;
     entry->PwSliceNeedsFull = sliceFed; // first frame does one full-window copy
-    // Fresh attach: re-arm the one-shot BROKERHOLD diagnostic (see the ProcessNewFrame hold arm).
+    // Fresh attach: re-arm the one-shot BROKERHOLD diagnostic (see the ProcessNewFrame hold arm)
+    // and the one-shot QGASLICEBLACK diagnostic (PwNoteSliceContent: copied-but-black hold).
     entry->PwHoldLogged = FALSE;
+    entry->PwSliceBlackLogged = FALSE;
     // WGC broker (24H2+): source this sliceFed window's pixels from the user-session broker's
     // per-HWND WGC capture. Every sliceFed window is attempted; no-op (returns FALSE) unless
     // the broker is active. Toasts are not sliceFed and never reach here.

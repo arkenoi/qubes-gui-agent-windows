@@ -267,14 +267,25 @@ typedef struct _WINDOW_DATA
     // One-shot BROKERHOLD diagnostic emitted: broker active but no per-window frame consumable
     // this pass - the window HOLDS its last content (never the DDA slice) until one arrives.
     BOOL     PwHoldLogged;
+    // One-shot BROKERDIMS diagnostic emitted: the broker published a frame for this window
+    // whose dimensions do not match the slab, so BrokerFreshFrame rejects every such frame
+    // (the window then sits in the hold arm with whatever its slab holds - a feed loss, not a
+    // transient). Re-armed on every BrokerRegister.
+    BOOL     PwDimsLogged;
+    // One-shot QGASLICEBLACK diagnostic emitted: a copy landed in this window's buffer but the
+    // buffer still fails SlicePainted (slicepaint.h) - the hold stays. Re-armed on attach.
+    BOOL     PwSliceBlackLogged;
 
-    // Slice-content map-hold (SliceMapHold gate, default OFF) + flash instrumentation
-    // (always on). PwSliceContentTick: GetTickCount64 when REAL content first landed in
-    // this slice-fed window's per-window buffer (a consumed broker frame, or a composite
-    // slice copy backed by screen damage intersecting the window); 0 = never. Set ONCE per
-    // window lifetime, deliberately never reset on buffer re-attach - it answers "has this
-    // window ever been fed", which is all the FIRST-map hold and the one-shot timing log
-    // need. PwSliceMapTick: GetTickCount64 when the window's FIRST map was issued; 0 = not
+    // Slice-content map-hold (SliceMapHold gate) + flash instrumentation (always on).
+    // PwSliceContentTick: GetTickCount64 when PAINTED content first landed in this slice-fed
+    // window's per-window buffer - a copy (consumed broker frame, or a composite slice copy
+    // backed by screen damage intersecting the window) after which the buffer passes
+    // SlicePainted (slicepaint.h: sampled non-black test). A copy that leaves the buffer
+    // black - the zeroed slab, a transparent WGC first frame - does NOT set it (rig
+    // 2026-09-06: that was the black toast). 0 = never. Set ONCE per window lifetime,
+    // deliberately never reset on buffer re-attach - it answers "has this window ever
+    // shown content", which is all the FIRST-map hold and the one-shot timing log need.
+    // PwSliceMapTick: GetTickCount64 when the window's FIRST map was issued; 0 = not
     // mapped yet. The QGASLICEMAP/QGASLICECONTENT log pair derives map->first-content (the
     // visible black flash) or content->map (hold lead) from these two.
     ULONGLONG PwSliceContentTick;
