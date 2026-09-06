@@ -287,6 +287,11 @@ typedef struct _WINDOW_DATA
     // (QGADIRECTSUPPRESS + the DirectSuppressed counter). Cleared when a frame finally arrives
     // (the window maps normally then) and on every fresh broker registration.
     BOOL      PwDirectSuppressed;
+    // Distinct per-window broker frames consumed since the last registration. Used by the
+    // suppression guard to tell "the feed is dead" from "the surface is genuinely dark": one
+    // frame proves nothing (a broker that just came back publishes a black first frame), which
+    // is exactly how a black toast reached the owner's screen on 2026-09-06.
+    DWORD     PwBrokerFrames;
     // One-shot QGASLICEBLACK diagnostic emitted: a copy landed in this window's buffer but the
     // buffer still fails SlicePainted (slicepaint.h) - the hold stays. Re-armed on attach.
     BOOL     PwSliceBlackLogged;

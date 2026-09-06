@@ -2308,6 +2308,10 @@ static void BrokerShutdown(void)
 //
 // THROTTLED: once, then at most every DIRECT_NOTIFY_REPEAT_MS, always carrying the running count,
 // so a broken broker produces a report - not a notification storm.
+// Distinct broker frames that must have been consumed before an unpainted window is allowed to
+// map anyway (see the QGADIRECTDARK arm). Two: one black frame is the measured signature of a
+// broker that just came back and published nothing useful, so it must not count as a live feed.
+#define DIRECT_DARK_FRAMES 2u
 #define DIRECT_NOTIFY_REPEAT_MS (5u * 60u * 1000u)
 static ULONGLONG g_DirectNotifyNext = 0;
 static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs);   // defined below
@@ -2644,6 +2648,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     entry->PwDimsSince = 0;
     entry->PwDimsStuck = FALSE;
     entry->PwDirectSuppressed = FALSE;
+    entry->PwBrokerFrames = 0;
     if (!WgcBrokerActive() || !entry->PwSliceFed) return FALSE;
     if (entry->Width == 0 || entry->Height == 0) return FALSE;
 
@@ -5295,8 +5300,21 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // the hold maps a BLACK card. A black card is not a notification; it is a rendering
         // failure wearing one. Stay deferred, say so out loud, and let the window map the moment
         // a real frame arrives (cropReady turns TRUE and this same arm runs).
-        if (!cropReady && timedOut && DirectRequired() &&
-            windowData->PwSliceFed && windowData->PwBrokerLastId == 0)
+        // MEASURED HOLE (rig 2026-09-06, owner saw the black window): the first version of this
+        // guard tested PwBrokerLastId == 0, i.e. "no frame ever arrived". A frame ARRIVING is not
+        // the same as HAVING PIXELS - the broker published one BLACK frame for the toast, the
+        // guard released, the timeout mapped it, and QGASLICEMAP recorded exactly what the owner
+        // saw: content=0 painted=0 held_ms=4953. The predicate is therefore PAINTED CONTENT
+        // (SliceContentReady == PwSliceContentTick, set only by SlicePainted), which covers both
+        // "no frame" and "frames that carry nothing".
+        //
+        // The escape that keeps a genuinely DARK surface from being hidden for ever: once the
+        // feed has delivered DIRECT_DARK_FRAMES distinct frames and the buffer is still
+        // unpainted, the feed is demonstrably working and the blackness belongs to the surface,
+        // not to us - map it and say so once (QGADIRECTDARK). One black frame is not evidence of
+        // a working feed; it is the exact signature of the failure above.
+        if (!cropReady && timedOut && DirectRequired() && windowData->PwSliceFed &&
+            !SliceContentReady(windowData) && windowData->PwBrokerFrames < DIRECT_DARK_FRAMES)
         {
             if (!windowData->PwDirectSuppressed)
             {
@@ -5320,6 +5338,13 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         }
         else if (cropReady || timedOut)
         {
+            if (timedOut && !cropReady && DirectRequired() && windowData->PwSliceFed &&
+                !SliceContentReady(windowData))
+                LogWarning("QGADIRECTDARK hwnd 0x%x (class %s) mapped UNPAINTED after %lu broker "
+                    L"frame(s): the per-window feed is delivering, so the surface itself is dark - "
+                    L"not a display fault. If it looks like a black window, this is the line to "
+                    L"quote", (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
+                    windowData->PwBrokerFrames);
             windowData->MapDeferred = FALSE;
             windowData->PwDirectSuppressed = FALSE;
             ULONG ms = SendWindowMap(windowData);
@@ -6829,6 +6854,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         BOOL firstBrokerFrame = (entry->PwBrokerLastId == 0);
                         entry->PwSliceNeedsFull = FALSE;
                         entry->PwBrokerLastId = bid;
+                        if (entry->PwBrokerFrames < 0xFFFFFFFFu) entry->PwBrokerFrames++;
                         PwSliceCopyAndDamageSrc(entry, bsrc, bpitch, entry->X, entry->Y, &pwRect);
                         // A per-HWND broker frame is a COPY, not proof of content: the WGC
                         // publish path has no non-black check, so the first frame of a
