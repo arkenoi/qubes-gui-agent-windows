@@ -663,22 +663,17 @@ static void EtwProxyTryLaunchLocked(void)
         return;
     }
 
-    // SESSION-0 PLACEMENT (rig-measured defect, 2026-09-06 p3a run): the design and the
-    // launch log claim "session 0", but a LogonUserW token inherits the CALLER's session
-    // id, and this agent runs in the INTERACTIVE session - so the proxy landed in the
-    // console session (tasklist: 'etwproxy.exe ... Console 1'), which also broke the
-    // harness's session-0 probes (T1j/T5). Stamp the token back to session 0 before
-    // CreateProcessAsUserW; SYSTEM holds the SE_TCB this needs. ETW and the \\.\pipe\
-    // namespace are machine-global and the proxy touches no window station (console
-    // split), so session 0 costs nothing and is the more isolated placement the design
-    // intended. Failure is logged and tolerated: placement is defense-in-depth, not
-    // correctness.
-    {
-        DWORD sess0 = 0;
-        if (!SetTokenInformation(token, TokenSessionId, &sess0, sizeof(sess0)))
-            LogWarning("ETWPROXYSUP could not stamp the proxy token to session 0 (%lu) - "
-                       "launching in this agent's session instead", GetLastError());
-    }
+    // SESSION PLACEMENT: the proxy runs in THIS agent's session (the interactive/console
+    // session a LogonUserW token inherits). An earlier fix stamped the token to session 0
+    // (SetTokenInformation TokenSessionId=0) for a "more isolated" placement, but the rig
+    // proved (2026-09-06 p3a run) that a session-0 process cannot be assigned to the
+    // agent's (interactive-session) job object - AssignProcessToJobObject returns
+    // ERROR_ACCESS_DENIED (5) and the proxy parks, tier down. The console-session proxy
+    // works end to end (WMIGUID run: LIVE + payload-free SIG frames, privileges shed), its
+    // security comes from the never-PLU/never-SYSTEM shed token NOT its session, and the
+    // harness finds it by image name (T1j/T5 no longer session-filter). So the stamp is
+    // REVERTED: it bought nothing and broke the job-sandbox assignment. Do not re-add it
+    // without moving the job object to session 0 too.
 
     // Census (never-held invariant, logged) + the consumer SID the grant needs.
     BYTE consumerSid[SECURITY_MAX_SID_SIZE];
@@ -872,7 +867,7 @@ static void EtwProxyTryLaunchLocked(void)
     LogInfo("ETWPROXYSUP launched etwproxy.exe pid=%lu client_sid=%s "
             "(session controller: %s live, providers=%d, consumer granted "
             "TRACELOG_ACCESS_REALTIME|WMIGUID_QUERY; job: 64MB/1-proc/UI-restricted/"
-            "kill-on-close; session 0, no winsta - GUI-DLL-free console proxy; "
+            "kill-on-close; agent session, no winsta - GUI-DLL-free console proxy; "
             "exit-wait armed)",
             pi.dwProcessId, g_ClientSid, ETWPROXY_SESSION_NAME, enabled);
 }
