@@ -146,11 +146,23 @@ static const GUID ETWPROXY_SESSION_GUID = /* generated once for this project, re
 #define ETWPROXY_EXIT_CONSUME   7   // proxy: consumer open/thread/event failure
 #define ETWPROXY_EXIT_PIPE      8   // proxy: pipe creation failed (squatter) or 5
                                     // consecutive connect failures (transients re-listen)
-// The proxy's COMPLETE exit-code set is {0, 5, 7, 8, 9} (tools/notifhost/etwproxy.cpp
-// header - shared contract, change both or neither). Any other rc CANNOT come from the
-// binary's own paths: it means external termination or a crash (which leaves a CRASH
-// breadcrumb in etw-proxy.log via BridgeCrashFilter). EtwProxyExitCb logs such codes as
-// a LOUD anomaly instead of a routine exit ([[fallbacks-are-anomalies]]).
+#define ETWPROXY_EXIT_KILLED    1   // NOT a proxy return path: the exit code TerminateProcess
+                                    // IMPOSES on a force-kill (taskkill /f, Stop-Process
+                                    // -Force, or our OWN stop-by-name reap of a stale
+                                    // instance). Expected on any SUPERVISED kill - park,
+                                    // shutdown, job-kill, the next-launch reap, and the p3a
+                                    // T5/T8c drills - so it is logged quietly (its own token,
+                                    // still greppable) and relaunched, NOT raised as
+                                    // EtwProxyUnknownExit. That anomaly stays reserved for a
+                                    // TRULY unaccounted code (a crash: 0xC0000005 / __fastfail
+                                    // / a CRT abort) - a benign external kill by 1 must not
+                                    // desensitize it ([[fallbacks-are-anomalies]]).
+// The proxy's COMPLETE self-return exit-code set is {0, 5, 7, 8, 9} (tools/notifhost/
+// etwproxy.cpp header - shared contract, change both or neither); 1 is the externally-imposed
+// force-kill code above. Any OTHER rc CANNOT come from the binary's own paths NOR from a
+// supervised kill: it means an uncommanded crash (which leaves a CRASH breadcrumb in
+// etw-proxy.log via BridgeCrashFilter). EtwProxyExitCb logs THOSE as a LOUD anomaly instead
+// of a routine exit ([[fallbacks-are-anomalies]]).
 
 typedef enum
 {
@@ -942,16 +954,29 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
                    "pipe failure: squatter or persistent connect faults",
                    g_Backoff);
     }
+    else if (rc == ETWPROXY_EXIT_KILLED)
+    {
+        // rc=1 is the code TerminateProcess IMPOSES - taskkill /f, Stop-Process -Force, or
+        // our own stop-by-name reap. It is NOT a proxy return path, but it is EXPECTED on any
+        // supervised kill (park/shutdown/job-kill, the next-launch reap, the p3a T5/T8c
+        // drills). Log it quietly + machine-readably (its own token, still greppable) and
+        // relaunch; do NOT raise EtwProxyUnknownExit, which stays reserved for a TRULY
+        // unaccounted code (a crash) so a benign external kill cannot desensitize it.
+        LogWarning("ETWPROXYSUP proxy exited rc=%lu after %llu ms (external force-termination: "
+                   "TerminateProcess/taskkill/Stop-Process/reap - expected on a supervised "
+                   "kill, not a proxy return path) - relaunch in %lu ms",
+                   rc, uptimeMs, g_Backoff);
+    }
     else
     {
-        // NOT a code the proxy can return (its complete set is 0/5/7/8/9): external
-        // termination or a crash. A fallback firing silently is how defects hide -
-        // log the anomaly loudly and machine-readably, then still relaunch (the tier
-        // is not worth wedging over, but the datum must not vanish into a routine line).
+        // NOT a code the proxy can return (0/5/7/8/9) NOR the force-kill code (1): an
+        // uncommanded crash. A fallback firing silently is how defects hide - log the anomaly
+        // loudly and machine-readably, then still relaunch (the tier is not worth wedging
+        // over, but the datum must not vanish into a routine line).
         LogWarning("ETWPROXYSUP proxy exited rc=%lu after %llu ms - ANOMALY "
-                   "EtwProxyUnknownExit (0x%lX): not an ETWPROXY_EXIT_* code (0/5/7/8/9), "
-                   "the proxy binary has no such return path - terminated externally or "
-                   "crashed (check etw-proxy.log for a CRASH line). Diagnose before "
+                   "EtwProxyUnknownExit (0x%lX): not an ETWPROXY_EXIT_* code (0/5/7/8/9) and "
+                   "not the force-kill code 1 - the proxy binary has no such return path, so "
+                   "it CRASHED (check etw-proxy.log for a CRASH line). Diagnose before "
                    "trusting the tier; relaunch in %lu ms",
                    rc, uptimeMs, rc, g_Backoff);
     }
