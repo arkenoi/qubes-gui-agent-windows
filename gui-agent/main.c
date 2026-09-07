@@ -4186,14 +4186,23 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
             // reading - "dom0 sent WINDOW_FLAG_MINIMIZE" - does not hold for this reproduction:
             // nothing was sent. The windows were lost to the re-map churn itself.
             // Caption-less windows are only the most reliable trigger, not the cause.
-            if (fgData && PwIsAttached(fgData))
+            // WHOSE PIXELS COME FROM THE COMPOSITE? That, not "is it attached", decides whether
+            // the corrective is needed - PwIsAttached is true on win10 as well, and a SLICE-FED
+            // window there is filled from the composited framebuffer, so for it the stacking
+            // really does decide which pixels it gets. Skip only where the window has its own:
+            //   own capture (!PwSliceFed)                    - any OS, WGC/PrintWindow per window
+            //   slice-fed but DirectRequired()               - de-slice: broker per-window frames
+            // Everything else (slice-fed on win10, or with the broker off) keeps the corrective,
+            // debounced. So the workaround stays where it is still earned.
+            if (fgData && PwIsAttached(fgData) && (!fgData->PwSliceFed || DirectRequired()))
             {
                 g_LastForeground = fg;   // remember it, but do NOT re-map: it feeds itself
                 if (!fgData->RaiseSkipLogged)
                 {
                     fgData->RaiseSkipLogged = TRUE;
                     LogInfo("foreground -> 0x%x: raise corrective SKIPPED, this window has its own "
-                            "per-window buffer (no composite slice to mis-stack)", fg);
+                            L"pixels (sliceFed=%d directRequired=%d) - no composite slice to mis-stack",
+                            fg, fgData->PwSliceFed, DirectRequired());
                 }
             }
             else if (fgData && fgData->CreateSent && fgData->IsVisible && !fgData->IsIconic &&
