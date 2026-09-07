@@ -125,14 +125,33 @@ BOOL     g_InputDragQuantise = TRUE;   // DEFAULT: measured better than stock by
 // `qvm-features <vm> service.guestTitleBar 0` reached the guest as "1" and the documented opt-in
 // could not be expressed at all. Every other feature here follows the Qubes convention - any
 // non-empty value enables, an empty value disables - and this one now does too.
-// DEFAULT OFF since 2026-08-17: the restyle changes the window's style, which makes the agent
-// RE-MAP it, and dom0's WM answers an unmap/map cycle with MSG_WINDOW_FLAGS set=MINIMIZE. Measured:
-// both restyled windows (0x1a0284 Notepad, 0x102ca Explorer, style 0x140f0000 ex 0x00040110) were
-// minimized by dom0 while the untouched 0x20244 was not, and the agent dutifully obeyed
-// (ShowWindowAsync -> "became minimized"). Windows spontaneously minimizing is far worse than the
-// duplicate title bar this removes. The mechanism (caption strip via an owner-context helper) works
-// and is verified; what is unsolved is doing it WITHOUT a re-map, so re-enable only after that.
-BOOL     g_HideGuestTitleBar = FALSE;
+// DEFAULT ON since 2026-09-07 (owner call), after the failure that disabled it was reproduced,
+// root-caused and fixed. The old note here said the restyle "makes the agent RE-MAP it, and dom0's
+// WM answers an unmap/map cycle with MSG_WINDOW_FLAGS set=MINIMIZE". Both halves were wrong:
+//
+//   * the re-map does not come from the style change. It comes from the RAISE-ON-FOREGROUND
+//     corrective in AddAllWindows, which fired on every focus change for every window;
+//   * dom0 did not send a minimize in the reproduction at all. Measured 2026-09-07 on win11-pres
+//     with debug logging confirmed active (3012 debug lines): the owner watched both restyled
+//     windows vanish while the guest reported IsIconic=False for both and there was ZERO
+//     HandleWindowFlags AND ZERO SendWindowFlags traffic. What the log did show was the corrective
+//     feeding itself - our map raises the window in dom0, dom0 activates it in the guest, the
+//     guest's foreground changes, the next pass re-maps - ping-ponging between exactly the two
+//     caption-less windows while the untouched one never joined.
+//
+// The corrective was slice-era: it existed because a composite-sliced window receives the pixels of
+// whatever covers it. A window with its own per-window buffer does not, so it now skips the raise
+// entirely (and composite-fed windows keep it, debounced) - agent 5471834/a852190.
+//
+// RE-VERIFIED on the same scenario with the fix in: two caption-stripped Notepads plus Explorer,
+// focus flipped 24 times -> QGARAISE sent=0 debounced=0 skipped=2, no repeated re-map, no window
+// flags in either direction, and all three windows still present (iconic=False).
+//
+// The mechanism itself was always sound and is unchanged: the inset-0 own-frame discriminator
+// leaves Edge/Explorer/UWP alone, the owner-token helper does the restyle (the SYSTEM agent cannot
+// - USER32 checks the process, so per-thread impersonation is not enough), and WS_EX_APPWINDOW is
+// added and verified before WS_CAPTION is stripped so the window stays dom0-managed.
+BOOL     g_HideGuestTitleBar = TRUE;
 BOOL     g_InputDragOriginInterp = TRUE;   // ON: user-approved baseline 2026-08-16
 DWORD    g_InputDragLagMs = 10;            // dom0 apply lag; measured L < 18 ms, median 0, p75 17
 DWORD    g_InputDragAdoptMs = 25;
@@ -382,7 +401,8 @@ void PerfInit(void)
             if (qdb)
             {
                 // Same dom0-owned pattern as enableWinKey: `service.`-prefixed features are the
-                // ones Qubes exports into the guest's qubesdb. Absent -> default above (OFF).
+                // ones Qubes exports into the guest's qubesdb. Absent -> the default above, which
+                // is now ON; `qvm-features <vm> service.hideGuestTitleBar ''` opts a guest OUT.
                 char *tb = qdb_read(qdb, "/qubes-service/hideGuestTitleBar", NULL);
                 if (tb)
                 {
