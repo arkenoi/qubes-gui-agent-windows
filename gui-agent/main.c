@@ -2720,6 +2720,12 @@ void BrokerUnregister(IN OUT WINDOW_DATA* entry)
 // with another raise - a loop that cost the owner two vanished windows on 2026-09-07.
 #define RAISE_DEBOUNCE_MS 750
 static ULONGLONG g_LastRaiseTick = 0;
+// QGARAISE counters - the evidence that the loop is gone. A field or rig log can assert on these
+// without reading window ids: `sent` should stay near zero on a de-sliced guest (every window has
+// its own pixels), `skipped` counts windows the corrective was correctly not needed for, and
+// `debounced` counts raises suppressed because they answered our own previous raise - which is the
+// loop itself, so a non-zero value there names it explicitly instead of leaving it to inference.
+static DWORD g_RaiseSent = 0, g_RaiseSkipped = 0, g_RaiseDebounced = 0;
 
 // How long a broker-frame/slab dimension mismatch may persist before it is treated as a desync
 // to repair rather than a resize in flight. A resize settles within a pass or two (~100 ms).
@@ -4197,12 +4203,14 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
             if (fgData && PwIsAttached(fgData) && (!fgData->PwSliceFed || DirectRequired()))
             {
                 g_LastForeground = fg;   // remember it, but do NOT re-map: it feeds itself
+                g_RaiseSkipped++;
                 if (!fgData->RaiseSkipLogged)
                 {
                     fgData->RaiseSkipLogged = TRUE;
-                    LogInfo("foreground -> 0x%x: raise corrective SKIPPED, this window has its own "
-                            L"pixels (sliceFed=%d directRequired=%d) - no composite slice to mis-stack",
-                            fg, fgData->PwSliceFed, DirectRequired());
+                    LogInfo("QGARAISE skipped hwnd 0x%x - own pixels (sliceFed=%d directRequired=%d), "
+                            L"no composite slice to mis-stack (sent=%lu skipped=%lu debounced=%lu)",
+                            fg, fgData->PwSliceFed, DirectRequired(),
+                            g_RaiseSent, g_RaiseSkipped, g_RaiseDebounced);
                 }
             }
             else if (fgData && fgData->CreateSent && fgData->IsVisible && !fgData->IsIconic &&
@@ -4213,13 +4221,19 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
                 ULONGLONG nowTick = GetTickCount64();
                 if (nowTick - g_LastRaiseTick < RAISE_DEBOUNCE_MS)
                 {
-                    LogDebug("foreground -> 0x%x: raise debounced (%I64u ms since the last one)",
-                             fg, nowTick - g_LastRaiseTick);
+                    g_RaiseDebounced++;
+                    LogInfo("QGARAISE debounced hwnd 0x%x after %I64u ms (sent=%lu skipped=%lu "
+                            L"debounced=%lu) - this raise answered our own previous one, which is "
+                            L"the loop", fg, nowTick - g_LastRaiseTick,
+                            g_RaiseSent, g_RaiseSkipped, g_RaiseDebounced);
                     goto raise_done;
                 }
                 g_LastRaiseTick = nowTick;
                 g_LastForeground = fg;
-                LogInfo("foreground -> 0x%x, re-mapping to raise it in dom0", fg);
+                g_RaiseSent++;
+                LogInfo("QGARAISE sent hwnd 0x%x re-mapping to raise it in dom0 (sent=%lu "
+                        L"skipped=%lu debounced=%lu) - composite-fed window, corrective earned",
+                        fg, g_RaiseSent, g_RaiseSkipped, g_RaiseDebounced);
                 if (SendWindowMap(fgData) == ERROR_SUCCESS)
                 {
                     // Timing instrumentation (always on, pre-flip must-fix): if THIS raise
