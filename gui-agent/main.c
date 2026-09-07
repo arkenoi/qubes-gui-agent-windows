@@ -2715,6 +2715,12 @@ void BrokerUnregister(IN OUT WINDOW_DATA* entry)
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1; entry->PwBrokerArenaOff = 0;
 }
 
+// Minimum gap between two raise correctives (see the foreground block in AddAllWindows). Without
+// it, dom0's response to our own raise arrives as a fresh foreground change and the agent answers
+// with another raise - a loop that cost the owner two vanished windows on 2026-09-07.
+#define RAISE_DEBOUNCE_MS 750
+static ULONGLONG g_LastRaiseTick = 0;
+
 // How long a broker-frame/slab dimension mismatch may persist before it is treated as a desync
 // to repair rather than a resize in flight. A resize settles within a pass or two (~100 ms).
 #define BROKER_DIMS_STUCK_MS 750
@@ -4166,9 +4172,43 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
         if (fg && fg != g_LastForeground)
         {
             WINDOW_DATA* fgData = FindWindowByHandle(fg);
-            if (fgData && fgData->CreateSent && fgData->IsVisible && !fgData->IsIconic &&
+            // THE CORRECTIVE IS SLICE-ERA. It exists because a window dom0 draws on top receives
+            // the pixels of whatever covers it in the guest's COMPOSITED framebuffer (see above).
+            // A window with its own per-window buffer gets its own pixels whatever the stacking,
+            // so for it this re-map buys nothing - and it costs a feedback loop:
+            //   our map -> dom0 raises -> dom0 activates it in the guest -> the guest's foreground
+            //   changes -> the next pass re-maps -> repeat.
+            // Measured 2026-09-07 on win11-pres with the caption strip on: two restyled Notepads
+            // ping-ponged the foreground and were re-mapped six times in two minutes, and the owner
+            // saw BOTH windows vanish from dom0 while the guest still reported IsIconic=False for
+            // both and NO window-flags message crossed the vchan in either direction (debug level
+            // on, 3012 debug lines, zero HandleWindowFlags/SendWindowFlags). So the 2026-08-17
+            // reading - "dom0 sent WINDOW_FLAG_MINIMIZE" - does not hold for this reproduction:
+            // nothing was sent. The windows were lost to the re-map churn itself.
+            // Caption-less windows are only the most reliable trigger, not the cause.
+            if (fgData && PwIsAttached(fgData))
+            {
+                g_LastForeground = fg;   // remember it, but do NOT re-map: it feeds itself
+                if (!fgData->RaiseSkipLogged)
+                {
+                    fgData->RaiseSkipLogged = TRUE;
+                    LogInfo("foreground -> 0x%x: raise corrective SKIPPED, this window has its own "
+                            "per-window buffer (no composite slice to mis-stack)", fg);
+                }
+            }
+            else if (fgData && fgData->CreateSent && fgData->IsVisible && !fgData->IsIconic &&
                 !fgData->Synthesized && !DirectWouldShowBlack(fgData))
             {
+                // Legacy (composite-fed) windows still need it, but never faster than
+                // RAISE_DEBOUNCE_MS: a raise that answers our own previous raise is the loop.
+                ULONGLONG nowTick = GetTickCount64();
+                if (nowTick - g_LastRaiseTick < RAISE_DEBOUNCE_MS)
+                {
+                    LogDebug("foreground -> 0x%x: raise debounced (%I64u ms since the last one)",
+                             fg, nowTick - g_LastRaiseTick);
+                    goto raise_done;
+                }
+                g_LastRaiseTick = nowTick;
                 g_LastForeground = fg;
                 LogInfo("foreground -> 0x%x, re-mapping to raise it in dom0", fg);
                 if (SendWindowMap(fgData) == ERROR_SUCCESS)
@@ -4182,6 +4222,7 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
                     PwNoteSliceFedMap(fgData);
                 }
             }
+        raise_done: ;
         }
     }
 

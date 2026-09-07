@@ -287,6 +287,9 @@ typedef struct _WINDOW_DATA
     // (QGADIRECTSUPPRESS + the DirectSuppressed counter). Cleared when a frame finally arrives
     // (the window maps normally then) and on every fresh broker registration.
     BOOL      PwDirectSuppressed;
+    // One-shot log: the raise-on-foreground corrective was skipped for this window because it has
+    // its own per-window buffer (the corrective is a slice-era stacking workaround).
+    BOOL      RaiseSkipLogged;
     // Distinct per-window broker frames consumed since the last registration. Used by the
     // suppression guard to tell "the feed is dead" from "the surface is genuinely dark": one
     // frame proves nothing (a broker that just came back publishes a black first frame), which
