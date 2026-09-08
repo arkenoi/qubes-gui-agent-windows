@@ -3862,6 +3862,31 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
         }
     }
 
+    // A WITHHELD WINDOW THAT DIES UNPAINTED IS A FAULT, whatever its grace said.
+    // The per-window grace exists so a young window is not mislabelled a defect, but it created a
+    // hole: a SHORT-LIVED window - a toast auto-dismisses in about six seconds - can be destroyed
+    // before a 10 s grace expires, so a genuinely dead broker would withhold every toast and never
+    // report anything. Silent failure is the one outcome that is worse than a false alarm, and it
+    // is exactly what this whole state machine exists to prevent.
+    // So the fault is declared HERE, at destruction, for a window we actually withheld
+    // (PwDirectWaitLogged) that never received painted content. The grace therefore delays the
+    // report only for windows that survive long enough to be reported some other way; nothing is
+    // ever dropped. Windows we never withheld, or that painted at least once, are silent.
+    if (entry->PwDirectWaitLogged && !entry->PwDirectSuppressed &&
+        entry->PwSliceFed && !SliceContentReady(entry))
+    {
+        (void)CfgWriteDword(NULL, REG_CONFIG_DIRECT_SUPPRESSED_VALUE, ++g_DirectSuppressed, NULL);
+        LogError("QGADIRECTSUPPRESS hwnd 0x%x (class %s, %ux%u) CLOSED WHILE WITHHELD: it was held "
+            L"for want of a painted frame and was destroyed before it ever got one, so it was "
+            L"never shown (brokerState=%d sliceFed=1 brokerSourced=%d frames=%lu). This IS a "
+            L"display fault - a short-lived surface such as a toast can die inside the per-window "
+            L"grace, and it must not vanish unreported. Check QGADESLICEDOWN/DesliceBrokerDown for "
+            L"the broker and BROKERDIMS/BROKERREREG for a capture desync. DirectSuppressed=%lu.",
+            (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height,
+            (int)BrokerState(), entry->PwBrokerSourced, entry->PwBrokerFrames, g_DirectSuppressed);
+        DirectSuppressNotifyUser(g_DirectSuppressed);
+    }
+
     free(entry);
     status = ERROR_SUCCESS;
 end:
