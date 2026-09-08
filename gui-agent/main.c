@@ -5093,10 +5093,17 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 windowData->PwSliceFed = TRUE;
                 windowData->PwWidth = windowData->Width;
                 windowData->PwHeight = windowData->Height;
-                // Start the per-window fault clock HERE, at registration - not at window
-                // creation. Re-registration (a resize, a crop change, a BROKERREREG repair)
-                // legitimately restarts the wait for a first frame, so it restarts the clock too.
-                windowData->PwDirectSince = GetTickCount64();
+                // Start the per-window fault clock at the FIRST registration of this eligibility
+                // episode, and never restart it while the episode lasts (it is cleared only when
+                // the window stops being slice-fed). Restarting it on every re-registration was
+                // the first version and it was WRONG: a window stuck in a re-registration loop -
+                // a BROKERREREG dims repair that keeps firing, say - would reset the clock for
+                // ever and never reach the fault, which is the undefined limbo this clock exists
+                // to remove. Only windows that have NEVER had painted content can reach the fault
+                // path at all (one painted frame makes DirectWouldShowBlack false permanently for
+                // that episode), so there is no legitimate case for extending the wait.
+                if (windowData->PwDirectSince == 0)
+                    windowData->PwDirectSince = GetTickCount64();
                 (void)BrokerRegister(windowData);
             }
         }
