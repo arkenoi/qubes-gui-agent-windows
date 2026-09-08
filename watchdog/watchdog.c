@@ -128,8 +128,14 @@ DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD
         // we'll launch gui agent when the console connects to a session again
     }
 
-    // Get access token from ourselves.
-    OpenProcessToken(currentProcess, TOKEN_ALL_ACCESS, &currentToken);
+    // Get access token from ourselves. Both tokens are closed before returning on every path:
+    // they used to leak on each launch (audit 2026-09-08) - bounded only by the 60 s backoff,
+    // but a service that respawns a crashing agent for days accumulated two handles per attempt.
+    // (GetCurrentProcess() is a pseudo-handle; it is not closed.)
+    if (!OpenProcessToken(currentProcess, TOKEN_ALL_ACCESS, &currentToken))
+    {
+        return win_perror("OpenProcessToken");
+    }
     // Session ID is stored in the access token. For services it's normally 0.
     GetTokenInformation(currentToken, TokenSessionId, &currenttSessionId, sizeof(currenttSessionId), &size);
     LogDebug("current session: %d, console session: %d", currenttSessionId, consoleSessionId);
@@ -137,15 +143,19 @@ DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD
     // We need to create a primary token for CreateProcessAsUser.
     if (!DuplicateTokenEx(currentToken, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &newToken))
     {
-        return win_perror("DuplicateTokenEx");
+        status = win_perror("DuplicateTokenEx");
+        CloseHandle(currentToken);
+        return status != ERROR_SUCCESS ? status : ERROR_GEN_FAILURE;
     }
-    CloseHandle(currentProcess);
+    CloseHandle(currentToken);
 
     // Change the session ID in the new access token to the target session ID.
     // This requires SeTcbPrivilege, but we're running as SYSTEM and have it.
     if (!SetTokenInformation(newToken, TokenSessionId, &consoleSessionId, sizeof(consoleSessionId)))
     {
-        return win_perror("SetTokenInformation(TokenSessionId)");
+        status = win_perror("SetTokenInformation(TokenSessionId)");
+        CloseHandle(newToken);
+        return status != ERROR_SUCCESS ? status : ERROR_GEN_FAILURE;
     }
 
     LogInfo("Running process '%s' in session %d", exePath, consoleSessionId);
@@ -158,8 +168,10 @@ DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD
     if (!CreateProcessAsUser(newToken, NULL, exePath, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
     {
         status = win_perror("CreateProcessAsUser");
+        CloseHandle(newToken);
         return status != ERROR_SUCCESS ? status : ERROR_GEN_FAILURE; // never report a failed launch as success
     }
+    CloseHandle(newToken);   // the new process holds its own reference
 
     // Keep the process handle: the watchdog waits on it, so the agent's exit is seen the instant
     // it happens instead of on the next 1 s name-match enumeration (or 60 s when backed off).
@@ -536,10 +548,25 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
     g_Status.dwCurrentState = SERVICE_RUNNING;
     SetServiceStatus(g_StatusHandle, &g_Status);
 
-    // The watchdog thread exits on g_StopEvent (set by ControlHandlerEx on STOP/SHUTDOWN, which
-    // reports STOP_PENDING). STOPPED is reported here, after it has actually exited, so a caller
-    // whose Stop-Service returned is guaranteed no further agent launch from this service.
-    WaitForSingleObject(watchdogHandle, INFINITE);
+    // The watchdog thread exits on g_StopEvent (set by ControlHandlerEx on STOP/SHUTDOWN/
+    // PRESHUTDOWN, which report STOP_PENDING). STOPPED is reported here, after it has actually
+    // exited, so a caller whose Stop-Service returned is guaranteed no further agent launch from
+    // this service. The join is BOUNDED once the stop is requested: a service that never reaches
+    // a terminal state is waited out for the full preshutdown timeout (180 s by default) and
+    // logged as Event 7043 - observed on this rig (2026-08-29) and the reason PRESHUTDOWN once
+    // reported STOPPED straight from the handler. The thread has no unbounded call, so hitting
+    // this bound is an anomaly worth the error line; the stop proceeds regardless.
+    {
+        HANDLE joinHandles[2] = { watchdogHandle, g_StopEvent };
+        DWORD join = WaitForMultipleObjects(2, joinHandles, FALSE, INFINITE);
+        if (join == WAIT_OBJECT_0 + 1)
+        {
+            join = WaitForSingleObject(watchdogHandle, 10000);
+            if (join != WAIT_OBJECT_0)
+                LogError("watchdog thread did not exit within 10 s of the stop request (wait 0x%x) - "
+                    L"reporting STOPPED anyway; the respawn loop is disarmed by g_ServiceStopping", join);
+        }
+    }
     cleanStop = TRUE;
 
 cleanup:
@@ -574,15 +601,21 @@ DWORD WINAPI ControlHandlerEx(IN DWORD controlCode, IN DWORD eventType, IN void 
         // That event was observed on this rig and traced here (2026-08-29). ServiceMain blocks
         // INFINITE on a worker thread that never exits, so no other path can report the state.
         //
-        // There is nothing to flush: this service's entire shutdown obligation is "stop respawning",
-        // which the flag above satisfies synchronously. So acknowledge and go STOPPED at once.
+        // Reporting STOPPED from this handler while WatchdogThread was still alive was the
+        // second half of that problem: the SCM considered us gone while the respawn loop was
+        // still live (only g_ServiceStopping kept it from relaunching). Now that the loop waits
+        // on g_StopEvent it ends within milliseconds of the event, so PRESHUTDOWN takes the same
+        // path as STOP: STOP_PENDING here, STOPPED from ServiceMain once the thread has exited -
+        // and ServiceMain bounds that join, so a stuck thread can never bring Event 7043 back.
         InterlockedExchange(&g_ServiceStopping, 1);
-        LogInfo("preshutdown - the agent will not be restarted from here on");
+        LogInfo("preshutdown - the agent will not be restarted from here on, stopping");
         g_Status.dwWin32ExitCode = 0;
-        g_Status.dwCurrentState = SERVICE_STOPPED;
+        g_Status.dwCurrentState = SERVICE_STOP_PENDING;
         g_Status.dwCheckPoint = 0;
-        g_Status.dwWaitHint = 0;
+        g_Status.dwWaitHint = 5000;
         SetServiceStatus(g_StatusHandle, &g_Status);
+        if (g_StopEvent)
+            SetEvent(g_StopEvent);
         break;
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
