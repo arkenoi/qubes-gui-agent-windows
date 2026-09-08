@@ -2408,13 +2408,46 @@ static void DirectSuppressNotifyUser(IN DWORD count)
     WriteFile(h, text, (DWORD)(cch * sizeof(WCHAR)), &wr, NULL);
     CloseHandle(h);
 
-    WCHAR args[MAX_PATH + 32];
-    StringCchPrintf(args, RTL_NUMBER_OF(args), L"--notify-file %s", path);
-    if (NotifRunInSession(NOTIF_DIRECT_TASK_NAME, args))
-        LogInfo("QGADIRECTSUPPRESS: user notification queued (%lu suppressed window(s))", count);
+    // DELIVER DIRECTLY, NOT THROUGH THE SESSION HELPER PATH.
+    // This is the agent's OWN error channel, so it must have as few links as possible - it is
+    // needed exactly when things are broken. NotifRunInSession adds two dependencies that have
+    // nothing to do with delivering a message: the Task Scheduler service, and (since the
+    // GetShellWindow guard added on 2026-09-08) a running shell. That guard is right for the
+    // notification BRIDGE, which forwards app toasts and genuinely needs a shell - but applying it
+    // here made the error path least available precisely when the guest is in trouble, which is a
+    // regression in the reporting channel introduced while removing undefined states.
+    // gui-agent already runs INSIDE the interactive session (the watchdog launches it there), so a
+    // plain CreateProcess reaches the same place with neither dependency.
+    // What remains, unavoidably: qrexec + qubesdb (notifhost speaks qubes.Notifications through
+    // qrexec-client-vm), notifhost.exe being packaged, and dom0 policy. This is therefore a good
+    // SECONDARY channel - independent of the GUI vchan, so it can report display faults - and NOT
+    // a last-resort one: it cannot survive a dead qrexec.
+    WCHAR exe[MAX_PATH] = { 0 };
+    if (GetModuleFileName(NULL, exe, RTL_NUMBER_OF(exe)))
+    {
+        WCHAR* sl = wcsrchr(exe, L'\\'); if (sl) *(sl + 1) = 0;
+        StringCchCat(exe, RTL_NUMBER_OF(exe), L"notifhost.exe");
+    }
+    WCHAR cmd[MAX_PATH * 2];
+    StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\" --notify-file \"%s\"", exe, path);
+    STARTUPINFO si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+    PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
+    if (GetFileAttributes(exe) == INVALID_FILE_ATTRIBUTES)
+    {
+        LogError("QGADIRECTSUPPRESS: notifhost.exe is NOT PRESENT at %s - the user cannot be told "
+            L"that %lu window(s) were withheld. PACKAGING GAP in the error-reporting path itself.",
+            exe, count);
+    }
+    else if (CreateProcess(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        LogInfo("QGADIRECTSUPPRESS: user notification sent (%lu suppressed window(s))", count);
+    }
     else
-        LogWarning("QGADIRECTSUPPRESS: could not launch notifhost --notify-file (no interactive "
-            L"session?) - the failure stays in this log only");
+    {
+        LogError("QGADIRECTSUPPRESS: CreateProcess(notifhost --notify-file) failed (0x%x) - the "
+            L"failure stays in this log only and the user is never told.", GetLastError());
+    }
 }
 static ULONGLONG g_NotifLastLaunch = 0;
 static ULONGLONG g_NotifNextPoll = 0;
