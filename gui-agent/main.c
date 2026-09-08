@@ -2332,6 +2332,17 @@ static void BrokerSupervise(void)
     if (sid != 0xFFFFFFFF && GetShellWindow())
     {
         g_WgcLastLaunch = now;
+        // ZERO THE SHARED FIELD, not just our local copy. ROOT CAUSE of "broker death is never
+        // detected", measured 2026-09-08: a dead broker's LAST heartbeat stays in shared memory,
+        // non-zero, for ever. Resetting only g_WgcBrokerHbLast to 0 meant the very next supervise
+        // pass compared that stale value against 0, found them different, and read it as "the
+        // heartbeat ADVANCED" - refreshing g_WgcBrokerHbSeenAt and re-certifying a corpse as alive.
+        // Since this ran on every relaunch attempt (~8 s), a dead broker was declared healthy
+        // indefinitely: no QGABROKERDIED, no QGADESLICEDOWN, brokerState stuck at READY, and the
+        // recovery machinery was thereby SUPPRESSING the failure detection it exists to support.
+        // Zeroing the shared field makes "no heartbeat yet" representable: the `hb != 0` guard then
+        // holds until a NEW broker writes a genuinely fresh value.
+        if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->BrokerHeartbeat = 0;
         g_WgcBrokerHbLast = 0; g_WgcBrokerHbSeenAt = 0;   // await a fresh heartbeat from the new broker
         if (WgcLaunch()) g_WgcSession = sid;
     }
