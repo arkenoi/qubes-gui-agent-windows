@@ -226,6 +226,7 @@ static ULONGLONG g_WgcNextPoll = 0;
 static LONGLONG  g_WgcBrokerHbLast = 0;    // last BrokerHeartbeat value observed
 static ULONGLONG g_WgcBrokerHbSeenAt = 0;  // wall time we last saw it ADVANCE
 static ULONGLONG g_WgcLastLaunch = 0;      // throttle: don't relaunch while one is starting
+static ULONGLONG g_AgentStartTick = 0;     // set at Init; bounds BRK_STARTING (see BrokerState)
 static ULONGLONG g_BrokerDownSince = 0;    // wall time the broker went (or started) DOWN while eligible; 0 = up/ok
 static ULONGLONG g_BrokerNextWarn = 0;     // next QGADESLICEDOWN warning is due (loud-persistent cadence)
 // Machine-readable de-slice health, published under the BASE Qubes Tools config key
@@ -2555,6 +2556,41 @@ BOOL WgcBrokerActive(void)
 // /qubes-service/wgc-broker=0 makes the guest not-eligible, and the retained DDA slice
 // serves it exactly as win10 (no direct path there) is served. An operator asking for the
 // fallback gets it; nothing else does.
+// BROKER LIFECYCLE - so that "eligible but not ready yet" is a DEFINED, BOUNDED state instead of
+// an undefined one (owner, 2026-09-08: "our task is to eliminate all race conditions to make sure
+// everything goes the defined path or gracefully fails and never ends in undefined state").
+//
+// DirectRequired() above is deliberately eligibility-without-readiness, and that is right for
+// deciding "no composite fallback". But it left a window - from the agent starting until the
+// broker heartbeats - in which a perfectly normal arriving window (a toast raised by the shell at
+// logon, say) was treated as a DISPLAY FAULT: it incremented DirectSuppressed, logged at ERROR
+// "THIS IS A BUG TO FIX", and spawned notifhost through Task Scheduler into a session that was
+// itself still coming up. Startup was indistinguishable from a genuinely dead broker.
+//
+// Now there are four states and every one of them is defined:
+//   BRK_NOT_ELIGIBLE - the sanctioned opt-out (WgcBroker=0, win10, PW off): composite, as before.
+//   BRK_STARTING     - launch fired (or not yet possible) and inside the grace: HOLD the window
+//                      quietly. Not mapped - a black window is still never acceptable - but not a
+//                      fault either, so no counter, no ERROR, no user notification, no helper spawn.
+//   BRK_READY        - normal operation.
+//   BRK_DOWN         - the grace expired, or a ready broker died: the loud, existing fault path.
+// BOTH entries into STARTING are bounded (from the launch, and from agent start when no launch has
+// fired), so the state always resolves to READY or DOWN. It can never sit undefined.
+#define BROKER_LAUNCH_GRACE_MS (45u * 1000u)   // schtasks launch + attach + first heartbeat, on a
+                                               // first boot that is still running an installer;
+                                               // the relaunch throttle alone is 8 s, so this
+                                               // allows several attempts before declaring a fault.
+typedef enum { BRK_NOT_ELIGIBLE = 0, BRK_STARTING, BRK_READY, BRK_DOWN } BROKER_STATE;
+static BROKER_STATE BrokerState(void)
+{
+    if (!DirectRequired())  return BRK_NOT_ELIGIBLE;
+    if (WgcBrokerActive())  return BRK_READY;
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG since = (g_WgcLastLaunch != 0) ? (now - g_WgcLastLaunch)
+                                             : (now - g_AgentStartTick);
+    return (since < BROKER_LAUNCH_GRACE_MS) ? BRK_STARTING : BRK_DOWN;
+}
+
 BOOL DirectRequired(void)
 {
     return g_WgcBroker && g_OsBuild >= 26100 && PwEnabled();
@@ -5411,7 +5447,30 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // a working feed; it is the exact signature of the failure above.
         if (!cropReady && timedOut && DirectWouldShowBlack(windowData))
         {
-            if (!windowData->PwDirectSuppressed)
+            // STARTING is not a fault. The window is still withheld (a black window is never
+            // acceptable), but nothing here declares a defect: no DirectSuppressed increment, no
+            // ERROR, and above all no notifhost spawn into a session that may itself be half up.
+            // Measured 2026-09-08: the agent came up at 08:22:41 and this site fired at 08:22:49 -
+            // eight seconds into a broker launch, on a guest that was mid-install and had just had
+            // two removable volumes announced by the shell. That was normal startup being reported
+            // as a display fault. BrokerState() bounds the wait, so a broker that never arrives
+            // still ends in BRK_DOWN and the loud path below.
+            if (BrokerState() == BRK_STARTING)
+            {
+                if (!windowData->PwDirectWaitLogged)
+                {
+                    windowData->PwDirectWaitLogged = TRUE;
+                    LogInfo("QGADIRECTWAIT hwnd 0x%x (class %s, %ux%u) held: the per-window broker "
+                        L"is still starting (launched=%d). This is the DEFINED startup state, not "
+                        L"a fault - the window is withheld rather than shown black, and will map as "
+                        L"soon as its first painted frame arrives. If the broker never arrives, "
+                        L"QGADIRECTSUPPRESS follows once the %lu ms grace expires.",
+                        (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
+                        windowData->Width, windowData->Height,
+                        (int)(g_WgcLastLaunch != 0), (DWORD)BROKER_LAUNCH_GRACE_MS);
+                }
+            }
+            else if (!windowData->PwDirectSuppressed)
             {
                 windowData->PwDirectSuppressed = TRUE;
                 (void)CfgWriteDword(NULL, REG_CONFIG_DIRECT_SUPPRESSED_VALUE,
@@ -9138,6 +9197,11 @@ static ULONG Init(void)
             (LONG(WINAPI*)(OSVERSIONINFOW*))GetProcAddress(nt, "RtlGetVersion") : NULL;
         if (pRtlGetVersion && pRtlGetVersion(&rovi) == 0) g_OsBuild = rovi.dwBuildNumber;
     }
+    // Start of the agent's life, so the broker's "starting" state can be BOUNDED from here even
+    // when no launch has been attempted yet (no session to launch into). Without a bound, a broker
+    // that can never start would hold every direct-path window for ever and never declare a fault -
+    // the same undefined limbo, just quieter. See BrokerState().
+    g_AgentStartTick = GetTickCount64();
     {
         // WGC broker ships DEFAULT-ON for 24H2+ (build >= 26100): it is the capture path for the
         // win11 shell surfaces, and the win11 de-slice benchmark shows no penalty vs the composite.
