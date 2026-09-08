@@ -2702,8 +2702,17 @@ static BROKER_STATE BrokerState(void)
     if (!DirectRequired())  return BRK_NOT_ELIGIBLE;
     if (WgcBrokerActive())  return BRK_READY;
     ULONGLONG now = GetTickCount64();
-    ULONGLONG since = (g_WgcLastLaunch != 0) ? (now - g_WgcLastLaunch)
-                                             : (now - g_AgentStartTick);
+    // ANCHOR ON THE START OF THE OUTAGE, NOT THE LATEST RELAUNCH ATTEMPT.
+    // The first version measured from g_WgcLastLaunch, which BrokerSupervise refreshes every ~8 s
+    // while it keeps retrying - so `since` was never more than ~9 s and BRK_STARTING could never
+    // expire. A broker that can NEVER come up (binary missing, WgcSupported() false, InitD3D
+    // failure, singleton contention) would have been reported as "the DEFINED young state" for
+    // ever: the exact unbounded limbo this state machine was added to remove, reintroduced by the
+    // state machine itself. Found by the 2026-09-08 audit, not by me.
+    // g_BrokerDownSince is the correct anchor: BrokerSupervise sets it on the FIRST not-alive pass
+    // and clears it only on recovery, so it measures the outage rather than the retry cadence.
+    ULONGLONG anchor = g_BrokerDownSince ? g_BrokerDownSince : g_AgentStartTick;
+    ULONGLONG since = (now > anchor) ? (now - anchor) : 0;
     return (since < BROKER_LAUNCH_GRACE_MS) ? BRK_STARTING : BRK_DOWN;
 }
 
