@@ -288,6 +288,11 @@ typedef struct _WINDOW_DATA
     // (the window maps normally then) and on every fresh broker registration.
     BOOL      PwDirectSuppressed;
     BOOL      PwDirectWaitLogged;   // QGADIRECTWAIT said once: held while the broker starts
+    // Tick at which this window first became eligible for the direct path (slice-fed and
+    // registered with the broker). A window is only ever DECLARED a display fault once it
+    // has been eligible this long without a painted frame - before that it is simply young,
+    // which is a defined state, not a defect. 0 = not eligible yet.
+    ULONGLONG PwDirectSince;
 
     // One-shot log: the raise-on-foreground corrective was skipped for this window because it has
     // its own per-window buffer (the corrective is a slice-era stacking workaround).

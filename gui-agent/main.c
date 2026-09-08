@@ -1959,6 +1959,7 @@ static void SynthDeactivate(IN OUT WINDOW_DATA* entry)
     if (entry->PwBrokerSourced)
         BrokerUnregister(entry);
     entry->PwSliceFed = FALSE;
+    entry->PwDirectSince = 0;
     WINDOW_DATA* owner = FindWindowByHandle(entry->SynthOwner);
     entry->SynthOwner = NULL;
     if (owner && owner->SynthChildCount > 0)
@@ -2586,6 +2587,12 @@ BOOL WgcBrokerActive(void)
 //   BRK_DOWN         - the grace expired, or a ready broker died: the loud, existing fault path.
 // BOTH entries into STARTING are bounded (from the launch, and from agent start when no launch has
 // fired), so the state always resolves to READY or DOWN. It can never sit undefined.
+// Per-WINDOW grace, measured from the moment it is registered with the broker. Generous on
+// purpose: it delays only the DECLARATION of a fault, never the mapping of a window (a window maps
+// the instant its first painted frame lands), so the cost of being wrong on the long side is a
+// late diagnostic, while the cost of being wrong on the short side is calling normal startup a
+// display fault and telling the user their display is broken - which is what shipped.
+#define DIRECT_WINDOW_GRACE_MS (10u * 1000u)
 #define BROKER_LAUNCH_GRACE_MS (45u * 1000u)   // schtasks launch + attach + first heartbeat, on a
                                                // first boot that is still running an installer;
                                                // the relaunch throttle alone is 8 s, so this
@@ -3829,6 +3836,7 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
                 if (c->PwBrokerSourced)
                     BrokerUnregister(c);
                 c->PwSliceFed = FALSE;
+                c->PwDirectSince = 0;
                 c->Synthesized = FALSE;
                 c->SynthOwner = NULL;
                 c->DeletePending = TRUE; // re-examined from scratch by TrackWindows
@@ -5085,6 +5093,10 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 windowData->PwSliceFed = TRUE;
                 windowData->PwWidth = windowData->Width;
                 windowData->PwHeight = windowData->Height;
+                // Start the per-window fault clock HERE, at registration - not at window
+                // creation. Re-registration (a resize, a crop change, a BROKERREREG repair)
+                // legitimately restarts the wait for a first frame, so it restarts the clock too.
+                windowData->PwDirectSince = GetTickCount64();
                 (void)BrokerRegister(windowData);
             }
         }
@@ -5465,19 +5477,35 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             // two removable volumes announced by the shell. That was normal startup being reported
             // as a display fault. BrokerState() bounds the wait, so a broker that never arrives
             // still ends in BRK_DOWN and the loud path below.
-            if (BrokerState() == BRK_STARTING)
+            // TWO young states, not one. Measured 2026-09-08 on win11-brk with this very build:
+            // gating only on the BROKER being young was not enough - both faults fired with
+            // brokerActive=1, for a toast (Windows.UI.Core.CoreWindow 364x109) and a terminal
+            // (CASCADIA_HOSTING_WINDOW_CLASS) that had simply not been sourced yet. A window
+            // freshly registered with a READY broker is indistinguishable, at this instant, from a
+            // window the broker can never capture - and only the second is a defect. So the window
+            // gets its own bounded clock from REGISTRATION, and both clocks must have expired
+            // before anything is called a fault.
+            // This costs nothing in responsiveness: the window still maps the moment its first
+            // painted frame arrives (DirectWouldShowBlack goes false and the arm below maps it).
+            // The grace delays only the DECLARATION of a fault, never the display of a window.
+            ULONGLONG dsince = windowData->PwDirectSince;
+            BOOL windowYoung = (dsince == 0) ||
+                               ((GetTickCount64() - dsince) < DIRECT_WINDOW_GRACE_MS);
+            if (BrokerState() == BRK_STARTING || windowYoung)
             {
                 if (!windowData->PwDirectWaitLogged)
                 {
                     windowData->PwDirectWaitLogged = TRUE;
-                    LogInfo("QGADIRECTWAIT hwnd 0x%x (class %s, %ux%u) held: the per-window broker "
-                        L"is still starting (launched=%d). This is the DEFINED startup state, not "
-                        L"a fault - the window is withheld rather than shown black, and will map as "
-                        L"soon as its first painted frame arrives. If the broker never arrives, "
-                        L"QGADIRECTSUPPRESS follows once the %lu ms grace expires.",
+                    LogInfo("QGADIRECTWAIT hwnd 0x%x (class %s, %ux%u) held: no painted frame yet "
+                        L"(brokerState=%d windowEligibleFor=%llu ms). This is the DEFINED young "
+                        L"state, not a fault - the window is withheld rather than shown black, and "
+                        L"maps as soon as its first painted frame arrives. If it never arrives, "
+                        L"QGADIRECTSUPPRESS follows once the broker (%lu ms) and window (%lu ms) "
+                        L"graces have both expired.",
                         (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
-                        windowData->Width, windowData->Height,
-                        (int)(g_WgcLastLaunch != 0), (DWORD)BROKER_LAUNCH_GRACE_MS);
+                        windowData->Width, windowData->Height, (int)BrokerState(),
+                        (ULONGLONG)(dsince ? (GetTickCount64() - dsince) : 0),
+                        (DWORD)BROKER_LAUNCH_GRACE_MS, (DWORD)DIRECT_WINDOW_GRACE_MS);
                 }
             }
             else if (!windowData->PwDirectSuppressed)
