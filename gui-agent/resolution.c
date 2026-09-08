@@ -23,7 +23,10 @@
 #include <winioctl.h>
 #include <assert.h>
 #include <setupapi.h>
+#include <cfgmgr32.h>
 #include <strsafe.h>
+
+#pragma comment(lib, "cfgmgr32.lib")   // CM_Register_Notification for the startup IDD-solo wait
 
 #include "common.h"
 #include "main.h"
@@ -495,26 +498,114 @@ void ResolutionRequestIddSoloReassert(void)
 // still arriving, which on a cold boot is normal for a few seconds. Retry only that case -
 // a guest with no IDD at all returns ERROR_SUCCESS immediately and must not be delayed, and
 // a real failure (ERROR_INVALID_STATE, already rolled back) is not made better by repeating.
+//
+// TRIGGERED, not polled (audit 2026-09-08): this runs BEFORE the WM_DISPLAYCHANGE listener
+// exists (main.c creates it after InitVideoModes), and a fixed 1 s Sleep between checks
+// meant the screen was mapped up to a full step after the monitor had actually arrived -
+// every cold boot on a Win10 IDD guest paid it. The arrival itself is a PnP event, so wait
+// on a GUID_DEVINTERFACE_MONITOR interface-arrival notification (cfgmgr32, no window needed
+// on this thread). The interface arriving is NOT the same instant as the mode list becoming
+// enumerable - there is a short lag - so an arrival wake that still reads ERROR_NOT_READY is
+// followed by tight re-checks, and a slow backstop poll remains for the case where no
+// notification is ever delivered. Same deadline, same terminal log line as before.
+
+// GUID_DEVINTERFACE_MONITOR (ntddvdeo.h), spelled out so no INITGUID/uuid.lib dependency
+// is introduced - same approach as QIDD_INTERFACE_GUID_INIT above.
+static const GUID g_MonitorInterfaceGuid =
+    { 0xe6f07b5f, 0xee97, 0x4a90, { 0xb0, 0x76, 0x33, 0xf5, 0x7b, 0xf4, 0xea, 0xa7 } };
+
+// Runs on a cfgmgr32 worker thread: only signal, do no display work here.
+static DWORD CALLBACK IddMonitorArrivalCallback(IN HCMNOTIFICATION notify, IN PVOID context,
+    IN CM_NOTIFY_ACTION action, IN PCM_NOTIFY_EVENT_DATA eventData, IN DWORD eventDataSize)
+{
+    UNREFERENCED_PARAMETER(notify);
+    UNREFERENCED_PARAMETER(eventData);
+    UNREFERENCED_PARAMETER(eventDataSize);
+    if (action == CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL)
+        SetEvent((HANDLE)context);
+    return ERROR_SUCCESS;
+}
+
 ULONG EnsureQubesIddSoloWaiting(IN DWORD timeoutMs)
 {
-    const DWORD stepMs = 1000;
-    DWORD waited = 0;
+    const DWORD backstopMs = 1000;    // re-check cadence while no arrival has been signalled
+    const DWORD settleStepMs = 250;   // re-check cadence right after an arrival, until...
+    const DWORD settleWindowMs = 2000; // ...this long after it (mode list lags the interface)
     ULONG status;
 
+    status = EnsureQubesIddSolo();
+    if (status != ERROR_NOT_READY)
+        return status;
+
+    ULONGLONG start = GetTickCount64();
+    HANDLE arrival = CreateEvent(NULL, FALSE, FALSE, NULL);
+    HCMNOTIFICATION notify = NULL;
+    if (!arrival)
+    {
+        // Not fatal: the backstop below is the pre-existing 1 s poll. Loud, because a
+        // failed CreateEvent this early is not a condition this code expects to see.
+        win_perror("creating the IDD monitor-arrival event - falling back to polling");
+    }
+    else
+    {
+        CM_NOTIFY_FILTER filter;
+        ZeroMemory(&filter, sizeof(filter));
+        filter.cbSize = sizeof(filter);
+        filter.FilterType = CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE;
+        filter.u.DeviceInterface.ClassGuid = g_MonitorInterfaceGuid;
+        CONFIGRET cr = CM_Register_Notification(&filter, arrival, IddMonitorArrivalCallback, &notify);
+        if (cr != CR_SUCCESS)
+        {
+            notify = NULL;
+            LogWarning("IDD solo: CM_Register_Notification(monitor arrival) failed, CONFIGRET 0x%x - falling back to polling",
+                cr);
+        }
+    }
+
+    ULONGLONG lastArrivalMs = 0;
     while (TRUE)
     {
-        status = EnsureQubesIddSolo();
-        if (status != ERROR_NOT_READY)
-            return status;
-        if (waited >= timeoutMs)
+        ULONGLONG elapsed = GetTickCount64() - start;
+        if (elapsed >= timeoutMs)
         {
             LogWarning("IDD solo: the IDD never published a mode within %lu ms - staying on the current display topology",
                 timeoutMs);
-            return status;
+            break;
         }
-        Sleep(stepMs);
-        waited += stepMs;
+
+        DWORD step = backstopMs;
+        if (lastArrivalMs != 0 && (GetTickCount64() - lastArrivalMs) < settleWindowMs)
+            step = settleStepMs;
+        DWORD remaining = (DWORD)(timeoutMs - elapsed);
+        if (step > remaining)
+            step = remaining;
+
+        if (notify)
+        {
+            if (WaitForSingleObject(arrival, step) == WAIT_OBJECT_0)
+            {
+                lastArrivalMs = GetTickCount64();
+                LogDebug("IDD solo: a monitor interface arrived %I64u ms into the wait - re-checking",
+                    lastArrivalMs - start);
+            }
+        }
+        else
+        {
+            Sleep(step);
+        }
+
+        status = EnsureQubesIddSolo();
+        if (status != ERROR_NOT_READY)
+            break;
     }
+
+    // Unregister BEFORE closing the event: CM_Unregister_Notification waits for an in-flight
+    // callback, which would otherwise SetEvent on a closed handle.
+    if (notify)
+        CM_Unregister_Notification(notify);
+    if (arrival)
+        CloseHandle(arrival);
+    return status;
 }
 
 static ULONG SetVideoModeInternal(IN ULONG width, IN ULONG height)

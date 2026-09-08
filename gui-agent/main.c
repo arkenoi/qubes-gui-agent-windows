@@ -222,7 +222,9 @@ static BYTE*  g_WgcBase = NULL;
 static DWORD  g_WgcSession = 0xFFFFFFFF;
 static ULONGLONG g_WgcNextPoll = 0;
 // The broker is launched via the Task Scheduler (see WgcLaunch), so there is no child process
-// HANDLE to wait on - liveness is inferred from the broker's shared-memory heartbeat advancing.
+// HANDLE at launch. g_WgcBrokerProc is opened from the pid the broker publishes, validated
+// (WgcOpenBrokerProcess), once its heartbeat is live; the heartbeat then backstops a HUNG broker.
+static LONG      g_WgcBrokerPidRejected = 0;   // last BrokerPid that failed validation (log once)
 static LONGLONG  g_WgcBrokerHbLast = 0;    // last BrokerHeartbeat value observed
 static ULONGLONG g_WgcBrokerHbSeenAt = 0;  // wall time we last saw it ADVANCE
 static ULONGLONG g_WgcLastLaunch = 0;      // throttle: don't relaunch while one is starting
@@ -2053,12 +2055,48 @@ static BOOL SpawnHelperAsUser(IN HWND tokenSource, IN const WCHAR* args)
 // needs only that the user be logged on - which happens BEFORE the shell window exists - so a
 // helper that touches only per-user settings (registry + SystemParametersInfo) runs correctly at
 // seamless entry on a cold boot, with no wait for the shell. Returns FALSE if no session yet.
+// Attempts allowed for the seamless shadow disable before it gives up LOUDLY. Driven from the
+// ~1 Hz settle sweep, so this is about half a minute of trying, not a fixed sleep.
+#define SHADOW_APPLY_MAX_ATTEMPTS 30u
+static unsigned g_ShadowAttempts = 0;
 static BOOL SpawnHelperInSession(IN const WCHAR* args)
 {
     DWORD sid = WTSGetActiveConsoleSessionId();
     if (sid == 0xFFFFFFFF) return FALSE;
     HANDLE utok = NULL, primary = NULL; BOOL ok = FALSE;
     if (!WTSQueryUserToken(sid, &utok)) return FALSE;   // no interactive user session yet
+    // A TOKEN IS NOT A PROFILE. WTSQueryUserToken succeeds as soon as the session's logon token is
+    // registered, which is before LoadUserProfile has finished (seconds, on a cold AppVM first logon
+    // that is still creating the profile). A helper spawned in that gap runs, but its
+    // HKEY_CURRENT_USER resolves to HKU\.DEFAULT: the SPI/registry writes and the ClientAreaAnimation
+    // read-back land in the wrong hive, the caller logs "shadows disabled", g_SeamlessShadowsDone
+    // latches TRUE and the sweep never retries - shadows stay ON for the session while the log says
+    // off (audit 2026-09-08). Require the user's hive (HKU\<sid>) to be mounted before spawning;
+    // FALSE is the callers' existing "retry later" path.
+    {
+        ULONGLONG tu[(sizeof(TOKEN_USER) + SECURITY_MAX_SID_SIZE + 7) / 8];   // 8-aligned for the SID
+        DWORD cb = 0;
+        LPWSTR sidStr = NULL; HKEY hive = NULL; BOOL profileLoaded = FALSE;
+        if (GetTokenInformation(utok, TokenUser, tu, sizeof(tu), &cb) &&
+            ConvertSidToStringSid(((TOKEN_USER*)tu)->User.Sid, &sidStr))
+        {
+            if (RegOpenKeyEx(HKEY_USERS, sidStr, 0, KEY_READ, &hive) == ERROR_SUCCESS)
+            { RegCloseKey(hive); profileLoaded = TRUE; }
+            LocalFree(sidStr);
+        }
+        if (!profileLoaded)
+        {
+            static BOOL s_profileWaitLogged = FALSE;   // once: the retry sweep runs at ~1 Hz during boot
+            if (!s_profileWaitLogged)
+            {
+                s_profileWaitLogged = TRUE;
+                LogInfo("session %lu has a logon token but its user profile (HKU\\<sid>) is not loaded "
+                    L"yet - helper spawn deferred so per-user writes do not land in HKU\\.DEFAULT", sid);
+            }
+            CloseHandle(utok);
+            return FALSE;
+        }
+    }
     if (DuplicateTokenEx(utok, TOKEN_ALL_ACCESS, NULL, SecurityImpersonation, TokenPrimary, &primary))
     {
         WCHAR self[MAX_PATH] = { 0 };
@@ -2070,7 +2108,28 @@ static BOOL SpawnHelperInSession(IN const WCHAR* args)
             si.cb = sizeof(si); si.lpDesktop = L"winsta0\\default";
             if (CreateProcessAsUser(primary, NULL, cmd, NULL, NULL, FALSE,
                     CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
-            { CloseHandle(pi.hThread); CloseHandle(pi.hProcess); ok = TRUE; }
+            {
+                CloseHandle(pi.hThread);
+                // Not fire-and-forget: the callers latch "applied" on TRUE, so TRUE must mean the
+                // helper ran to a zero exit, not merely that CreateProcessAsUser returned (the
+                // .DEFAULT trap above was invisible for exactly this reason). Bounded: the helper is
+                // a few SPI calls plus a 1 s-capped broadcast, and this is the main-loop thread.
+                DWORD w = WaitForSingleObject(pi.hProcess, 3000);
+                DWORD ec = (DWORD)-1;
+                if (w == WAIT_OBJECT_0 && GetExitCodeProcess(pi.hProcess, &ec) && ec == 0)
+                    ok = TRUE;
+                else if (w == WAIT_TIMEOUT)
+                {
+                    // Launched into a loaded profile and still running: its writes will land.
+                    // Not retried (a second instance would only repeat the same writes).
+                    ok = TRUE;
+                    LogWarning("session helper '%s' still running after 3 s - taken as applied", args);
+                }
+                else
+                    LogWarning("session helper '%s' exited with code %lu - not applied, will retry",
+                        args, ec);
+                CloseHandle(pi.hProcess);
+            }
         }
     }
     if (primary) CloseHandle(primary);
@@ -2137,7 +2196,21 @@ static BOOL WgcRunSchtasks(const WCHAR* argtail)
     if (!CreateProcess(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
     { win_perror("CreateProcess(schtasks)"); return FALSE; }
     CloseHandle(pi.hThread);
-    WaitForSingleObject(pi.hProcess, 15000);
+    // Wait in 1 s slices and keep the broker's AgentHeartbeat fresh meanwhile. This runs on the
+    // main-loop thread: a relaunch is THREE schtasks calls, each capped at 15 s, while the broker
+    // exits once AgentHeartbeat is >10 s stale (wgcbroker.cpp). One slow schtasks on a loaded first
+    // boot therefore made the agent starve a HEALTHY broker to death and then report QGABROKERDIED
+    // (+BrokerDeaths) for a death it caused (audit 2026-09-08). Bumping from THIS thread inside the
+    // bounded wait keeps the backstop's meaning - a hung agent still stops bumping; only "busy in
+    // schtasks" is excused.
+    ULONGLONG t0 = GetTickCount64(); DWORD w;
+    do
+    {
+        w = WaitForSingleObject(pi.hProcess, 1000);
+        if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->AgentHeartbeat = (LONGLONG)GetTickCount64();
+    } while (w == WAIT_TIMEOUT && GetTickCount64() - t0 < 15000);
+    if (w == WAIT_TIMEOUT)
+        LogWarning("schtasks did not finish within 15 s (%s) - treated as failed", argtail);
     DWORD ec = 1; GetExitCodeProcess(pi.hProcess, &ec);
     CloseHandle(pi.hProcess);
     return ec == 0;
@@ -2207,9 +2280,42 @@ static BOOL WgcLaunch(void)
     if (!WgcRunSchtasks(L"/run /tn " WGC_TASK_NAME)) { LogError("QGABROKERLAUNCHFAIL schtasks /run of " 
         "the de-slice broker FAILED - it cannot start, so per-window surfaces will be withheld. "
         "Check that the task exists and that Task Scheduler is running."); return FALSE; }
-    g_WgcBrokerProc = NULL;   // no child handle under Task Scheduler; heartbeat is the liveness signal
+    // No child handle under Task Scheduler; BrokerSupervise opens one (validated) from the pid the
+    // broker publishes, once its heartbeat is live. Until then the heartbeat is the only signal.
     LogInfo("WGCBROKER launched via Task Scheduler (user session %lu)", sid);
     return TRUE;
+}
+
+// Open the process named by hdr->BrokerPid for SYNCHRONIZE/TERMINATE - VALIDATED first. The pid
+// field is written by the user-session broker and the section DACL lets any interactive-user
+// process write it (wgcbroker_ipc.h security note), so before this SYSTEM process waits on or
+// kills anything it checks that the pid is wgcbroker.exe running from OUR install dir in the
+// console session. A forged pid gets NULL and no action.
+static HANDLE WgcOpenBrokerProcess(DWORD pid, DWORD consoleSid)
+{
+    if (pid == 0 || pid == GetCurrentProcessId()) return NULL;
+    DWORD psid = 0xFFFFFFFF;
+    if (!ProcessIdToSessionId(pid, &psid) || psid != consoleSid) return NULL;
+    HANDLE h = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, pid);
+    if (!h) return NULL;
+    WCHAR img[MAX_PATH] = { 0 }, want[MAX_PATH] = { 0 };
+    DWORD cch = RTL_NUMBER_OF(img);
+    BOOL match = FALSE;
+    if (QueryFullProcessImageName(h, 0, img, &cch) && GetModuleFileName(NULL, want, RTL_NUMBER_OF(want)))
+    {
+        WCHAR* sl = wcsrchr(want, L'\\'); if (sl) *(sl + 1) = 0;
+        StringCchCat(want, RTL_NUMBER_OF(want), L"wgcbroker.exe");
+        match = (_wcsicmp(img, want) == 0);
+        if (!match)
+        {
+            // The task's /tr uses the 8.3 short path; normalise before comparing.
+            WCHAR imgLong[MAX_PATH] = { 0 };
+            if (GetLongPathName(img, imgLong, RTL_NUMBER_OF(imgLong)))
+                match = (_wcsicmp(imgLong, want) == 0);
+        }
+    }
+    if (!match) { CloseHandle(h); return NULL; }
+    return h;
 }
 
 // ~1 Hz supervisor. Creates the section on first eligible pass, keeps the heartbeat fresh,
@@ -2225,19 +2331,50 @@ static void BrokerSupervise(void)
     // broker's staleness backstop never trips while the main loop is merely idle. The main
     // loop caps its wait to ~1 s while the broker is active, so this runs at least ~1/s.
     WGCBRK_HDR(g_WgcBase)->AgentHeartbeat = (LONGLONG)now;
-    if (now < g_WgcNextPoll) return;
+    // PROCESS EXIT IS THE PRIMARY DEATH SIGNAL; the heartbeat is the backstop for a HUNG broker.
+    // Heartbeat-only liveness noticed a death only after the 1 Hz poll + 6 s staleness window (~7 s
+    // of withheld toasts/menus per death, audit 2026-09-08). The validated handle (opened below on
+    // ready) sits in the main loop's wait array, so an exit wakes the loop and lands here at once -
+    // and bypasses the 1 Hz throttle.
+    BOOL brokerExited = FALSE; DWORD brokerExitCode = 0;
+    if (g_WgcBrokerProc && WaitForSingleObject(g_WgcBrokerProc, 0) == WAIT_OBJECT_0)
+    {
+        brokerExited = TRUE;
+        GetExitCodeProcess(g_WgcBrokerProc, &brokerExitCode);
+        CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
+    }
+    if (!brokerExited && now < g_WgcNextPoll) return;
     g_WgcNextPoll = now + 1000;
 
     WgcArenaReapPending();   // return deferred-free arena regions once the broker can no longer touch them
 
     DWORD sid = WTSGetActiveConsoleSessionId();
-    // Task-Scheduler-launched broker: no child HANDLE. Liveness = the shared-memory heartbeat
-    // has ADVANCED within the last ~6 s (and the console session is unchanged).
+    // Task-Scheduler-launched broker: no child HANDLE at launch. Liveness = the process (once its
+    // handle is held) has not exited AND the shared-memory heartbeat has ADVANCED within the last
+    // ~6 s (and the console session is unchanged).
     LONGLONG hb = WGCBRK_HDR(g_WgcBase)->BrokerHeartbeat;
     if (hb != 0 && hb != g_WgcBrokerHbLast) { g_WgcBrokerHbLast = hb; g_WgcBrokerHbSeenAt = now; }
-    BOOL alive = (g_WgcSession == sid) && g_WgcBrokerHbSeenAt && (now - g_WgcBrokerHbSeenAt < 6000);
+    BOOL alive = !brokerExited && (g_WgcSession == sid) && g_WgcBrokerHbSeenAt &&
+                 (now - g_WgcBrokerHbSeenAt < 6000);
     if (alive)
     {
+        // Take the process handle from the published pid, validated (WgcOpenBrokerProcess). Only
+        // while the heartbeat advances, so a dead broker's stale pid is never tried. A live
+        // heartbeat whose pid does not validate is an anomaly worth one loud line per pid: the
+        // pid field is user-writable, and without a handle a hung broker cannot be reaped.
+        LONG pid = WGCBRK_HDR(g_WgcBase)->BrokerPid;
+        if (!g_WgcBrokerProc && pid != 0 && pid != g_WgcBrokerPidRejected)
+        {
+            g_WgcBrokerProc = WgcOpenBrokerProcess((DWORD)pid, sid);
+            if (!g_WgcBrokerProc)
+            {
+                g_WgcBrokerPidRejected = pid;
+                LogWarning("QGABROKERPID BrokerPid %ld published in the shared section is not a "
+                    L"running wgcbroker.exe from the install dir in session %lu - ignored (the field "
+                    L"is user-writable). Only the heartbeat can detect this broker's death, and a "
+                    L"hung instance cannot be reaped before a relaunch.", pid, sid);
+            }
+        }
         if (!g_BrokerReady)
         {
             _InterlockedExchange(&g_BrokerReady, 1);
@@ -2274,6 +2411,16 @@ static void BrokerSupervise(void)
     {
         g_BrokerDiedAt = now;
         (void)CfgWriteDword(NULL, REG_CONFIG_BROKER_DEATHS_VALUE, ++g_BrokerDeaths, NULL);
+        // Say WHICH signal fired: an exit (with the broker's own exit code - the broker has no log
+        // of its own) is a crash/self-exit; a stale heartbeat with the process still running is a
+        // HANG, reaped below before the relaunch.
+        if (brokerExited)
+            LogError("QGABROKEREXIT de-slice broker process EXITED (exit code %lu) - detected by "
+                L"process wait, not by heartbeat staleness.", brokerExitCode);
+        else if (g_WgcBrokerProc && now - g_WgcBrokerHbSeenAt >= 6000)
+            LogError("QGABROKERHUNG de-slice broker process is still RUNNING but its heartbeat has "
+                L"not advanced for %I64u ms - a hang (most likely a synchronous PrintWindow into a "
+                L"hung target window), not a crash.", now - g_WgcBrokerHbSeenAt);
         LogError("QGABROKERDIED de-slice broker STOPPED HEARTBEATING after being ready (death #%lu, "
             L"pid was %ld). This is a MAJOR FAILURE, not a hiccup: while it is gone there is NO "
             L"composite fallback on an eligible guest, so toasts, menus and WinUI surfaces are "
@@ -2332,6 +2479,29 @@ static void BrokerSupervise(void)
     if (sid != 0xFFFFFFFF && GetShellWindow())
     {
         g_WgcLastLaunch = now;
+        // REAP A HUNG INSTANCE BEFORE RELAUNCHING. The broker holds Global\QubesWgcBrokerSingleton;
+        // a second instance exits 0, silently, on it (wgcbroker.cpp wmain). So when the old broker
+        // is HUNG (heartbeat stale, process alive - e.g. blocked in PrintWindow on a hung target)
+        // every relaunch here was refused without a trace and the outage lasted until the hung app
+        // died or the guest rebooted, while QGADESLICEDOWN pointed at a wgcbroker log that does not
+        // exist (audit 2026-09-08). The handle was validated when taken (WgcOpenBrokerProcess), so
+        // this terminates only our own wgcbroker.exe in the console session. Bounded wait: the
+        // mutex is released (abandoned, which the broker accepts) once the process is gone.
+        if (g_WgcBrokerProc)
+        {
+            if (WaitForSingleObject(g_WgcBrokerProc, 0) == WAIT_TIMEOUT)
+            {
+                LogWarning("QGABROKERREAP terminating hung de-slice broker pid %ld before relaunch - "
+                    L"without this the new instance exits on the singleton mutex and the outage "
+                    L"never ends.", (long)WGCBRK_HDR(g_WgcBase)->BrokerPid);
+                if (TerminateProcess(g_WgcBrokerProc, 1))
+                    WaitForSingleObject(g_WgcBrokerProc, 2000);
+                else
+                    LogError("QGABROKERREAP TerminateProcess failed (0x%x) - the relaunch will "
+                        L"most likely be refused by the singleton mutex", GetLastError());
+            }
+            CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
+        }
         // ZERO THE SHARED FIELD, not just our local copy. ROOT CAUSE of "broker death is never
         // detected", measured 2026-09-08: a dead broker's LAST heartbeat stays in shared memory,
         // non-zero, for ever. Resetting only g_WgcBrokerHbLast to 0 meant the very next supervise
@@ -2352,12 +2522,18 @@ static void BrokerShutdown(void)
 {
     if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->Shutdown = 1;   // broker self-exits on this flag
     WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
+    if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL; }
 }
 
 // ---- notification bridge launch/supervise (gate g_NotifBridge) ---------------------------
 #define NOTIF_TASK_NAME L"Qubes-NotifBridge"
 #define NOTIF_RESTORE_TASK_NAME L"Qubes-NotifRestore"
 #define NOTIF_DIRECT_TASK_NAME L"Qubes-NotifDirect"
+// Consecutive unreadable heartbeat samples before the bridge is judged stale. The file is
+// rewritten with CREATE_ALWAYS, so a read can catch it truncated; one such sample proves
+// nothing. At the supervisor's ~0.2 Hz this is roughly 15 s of genuine silence.
+#define NOTIF_UNPARSED_LIMIT 3u
+static unsigned g_NotifUnparsed = 0;
 
 // USER-VISIBLE half of the QGADIRECTSUPPRESS report (owner 2026-09-06: a suppressed window needs
 // "something user sees"). A log line is for us; the person at the screen must be TOLD that a
@@ -2529,7 +2705,10 @@ static BOOL NotifBridgeLaunch(void)
 
 // Second stop channel, reaching a RUNNING bridge: write the ProgramData stop file BridgeMain
 // polls every loop pass (what `notifhost --bridge-stop` does); the bridge exits on it and runs
-// BannerRestoreAll on the way out. schtasks /delete alone only removes the task DEFINITION,
+// BannerRestoreAll on the way out. schtasks /delete is NOT a clean stop: Task Scheduler ENDS the
+// task's running instance (measured, notifhost.cpp - the earlier claim here that /delete only
+// removes the definition was wrong), so a bridge killed that way never runs its exit path; a
+// bridge started under an older task definition is not reached by it at all;
 // and the bridge's --agent-pid self-exit handle is denied to its limited user token against
 // this SYSTEM process (it falls back to a PID snapshot poll, which PID reuse can defeat) - so
 // this file is the one channel that deterministically stops a live bridge.
@@ -2608,16 +2787,44 @@ static void NotifBridgeSupervise(void)
     WCHAR hb[MAX_PATH];
     if (!ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge\\heartbeat", hb, RTL_NUMBER_OF(hb)))
         return;
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (GetFileAttributesEx(hb, GetFileExInfoStandard, &fad))
+    // Liveness = the heartbeat file's CONTENT - the bridge's GetTickCount64 ("%llu\n", written every
+    // pass, notifhost.cpp BridgeMain) - against OUR GetTickCount64: same boot, same monotonic clock.
+    // The previous test compared the file's mtime with the WALL clock, so any forward clock step
+    // (the first NTP correction when an AppVM gets its netvm) read as ">15 s stale". A false
+    // "stale" here is DESTRUCTIVE: the relaunch below begins with schtasks /delete, which Task
+    // Scheduler applies by ENDING the running instance (measured - notifhost.cpp: "TERMINATED the
+    // still-alive bridge via schtasks /delete"), so a toast in flight was neither bannered nor
+    // forwarded and the kill left no trace on this side (audit 2026-09-08).
+    // A file whose tick is AHEAD of ours is from a previous boot - stale by definition.
+    BOOL fileSeen = FALSE, parsed = FALSE; ULONGLONG hbTick = 0;
+    HANDLE hf = CreateFile(hb, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hf != INVALID_HANDLE_VALUE)
     {
-        FILETIME nowFt; GetSystemTimeAsFileTime(&nowFt);
-        ULARGE_INTEGER wr, cur;
-        wr.LowPart = fad.ftLastWriteTime.dwLowDateTime; wr.HighPart = fad.ftLastWriteTime.dwHighDateTime;
-        cur.LowPart = nowFt.dwLowDateTime; cur.HighPart = nowFt.dwHighDateTime;
-        if (cur.QuadPart > wr.QuadPart && cur.QuadPart - wr.QuadPart < 15ULL * 10000000ULL)
-            return;   // heartbeat fresh within 15 s - bridge alive
+        char buf[64] = { 0 }; DWORD rd = 0;
+        fileSeen = TRUE;
+        if (ReadFile(hf, buf, sizeof(buf) - 1, &rd, NULL) && rd > 0)
+        {
+            char* end = buf;
+            hbTick = _strtoui64(buf, &end, 10);
+            parsed = (end != buf && hbTick != 0);
+        }
+        CloseHandle(hf);
+        if (parsed && hbTick <= now && now - hbTick < 15000)
+        {
+            g_NotifUnparsed = 0;
+            return;   // heartbeat fresh within 15 s of this boot's clock - bridge alive
+        }
     }
+    // A FILE THAT IS PRESENT BUT UNREADABLE IS INDETERMINATE, NOT STALE.
+    // notifhost writes the heartbeat with CREATE_ALWAYS (truncate) and then writes the tick, so a
+    // read landing in that gap legitimately returns 0 bytes. Treating that single sample as "no
+    // tick" made the supervisor relaunch - and the relaunch's `schtasks /delete` ENDS a perfectly
+    // healthy bridge, which is precisely the kill this heartbeat exists to avoid. Require several
+    // CONSECUTIVE unreadable samples (~15 s at this supervisor's cadence) before concluding
+    // anything; one parsed sample clears the count.
+    if (fileSeen && !parsed && ++g_NotifUnparsed < NOTIF_UNPARSED_LIMIT)
+        return;
     // 60 s relaunch throttle: a bridge that exits fatally on purpose (consent revoked,
     // listener broken) must not become a process treadmill - each retry re-runs its
     // selftest and exits again until the guest-side cause is fixed. The throttle must NOT
@@ -2626,6 +2833,17 @@ static void NotifBridgeSupervise(void)
     // (exactly the cold-boot bring-up window). Gate the throttle on having launched before.
     if (g_NotifLastLaunch != 0 && now - g_NotifLastLaunch < 60000) return;
     g_NotifLastLaunch = now;
+    // A stale heartbeat from a bridge that had been running is either a death or a HANG (one
+    // iteration past 15 s); the relaunch's /delete ends a hung instance abruptly (no banner
+    // restore). Say so - the kill was previously invisible. The bridge does not publish its pid,
+    // so alive-vs-dead cannot be told apart from here yet.
+    if (fileSeen && parsed)
+        LogWarning("NOTIFBRIDGE heartbeat STALE (bridge tick %I64u, agent tick %I64u, %I64d ms) - "
+            L"relaunching; if the bridge is still alive this is a hang and schtasks /delete ENDS it",
+            hbTick, now, (LONGLONG)(now - hbTick));
+    else if (fileSeen)
+        LogWarning("NOTIFBRIDGE heartbeat file exists but carries no tick - not written by this "
+            L"notifhost build? Treated as stale; relaunching");
     (void)NotifBridgeLaunch();
 }
 
@@ -2634,8 +2852,11 @@ static void NotifBridgeShutdown(void)
     // Remove the scheduled task so a stale definition cannot linger, AND write the stop
     // file: the --agent-pid self-exit is not a reliable channel (OpenProcess(SYNCHRONIZE)
     // on this SYSTEM process is denied to the bridge's limited token; its snapshot-poll
-    // fallback loses to PID reuse), and /delete cannot reach the already-running process.
-    // The stopped bridge restores every banner suppression on its way out.
+    // fallback loses to PID reuse), and /delete ENDS a running instance abruptly (measured,
+    // notifhost.cpp) without its banner-restore exit path - so on this ordering a live bridge
+    // is killed before the stop file can reach it; the stop file still covers a bridge whose
+    // task definition is already gone. A bridge stopped via the file restores every banner
+    // suppression on its way out.
     if (g_NotifBridge)
     {
         WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
@@ -3183,7 +3404,9 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
             enable ? L"restored (fullscreen)" : L"disabled (seamless)");
         return TRUE;
     }
-    LogWarning("no interactive session token yet; cannot %s guest shadows (will retry)",
+    // Token missing, profile not loaded yet, or the helper did not exit 0 (SpawnHelperInSession
+    // logs which) - in every case not applied, and the sweep retries.
+    LogWarning("no usable interactive session yet (token/profile/helper); cannot %s guest shadows (will retry)",
                enable ? L"restore" : L"disable");
     return FALSE;
 }
@@ -3829,8 +4052,22 @@ void DaemonSettleSweep(void)
     // first try (the user is logged on before capture starts). This only fires in the narrow boot
     // window where seamless was entered before WTSQueryUserToken had a session - it self-clears on
     // the first success, so it is not a perpetual poll.
-    if (g_SeamlessMode && !g_SeamlessShadowsDone)
+    // BOUNDED, and loud when it gives up. This retry is driven at ~1 Hz, so a helper that
+    // persistently exits non-zero (missing binary, broken profile, a bug in the helper itself)
+    // turned into a permanent process-spawn treadmill: one CreateProcessAsUser and one WARN every
+    // second, for the life of the session, while the log said only "will retry". Retrying for ever
+    // is not a defined outcome - it is the same limbo as a wait with no terminal state.
+    if (g_SeamlessMode && !g_SeamlessShadowsDone && g_ShadowAttempts < SHADOW_APPLY_MAX_ATTEMPTS)
+    {
         g_SeamlessShadowsDone = ApplyGuestShadows(FALSE);
+        if (g_SeamlessShadowsDone)
+            g_ShadowAttempts = 0;
+        else if (++g_ShadowAttempts >= SHADOW_APPLY_MAX_ATTEMPTS)
+            LogError("QGASHADOWGIVEUP could not disable guest window shadows after %u attempts - "
+                L"NOT retrying. Seamless windows keep their DWM drop shadows, which dom0 renders as "
+                L"a grey border artefact. The session helper never exited 0; see the 'session helper' "
+                L"lines above for its exit code.", (unsigned)SHADOW_APPLY_MAX_ATTEMPTS);
+    }
 
     if (g_InputDragWindow && g_InputDragLastEventTick != 0 &&
         GetTickCount() - g_InputDragLastEventTick > INPUT_DRAG_STUCK_MS)
@@ -8590,6 +8827,13 @@ static ULONG WINAPI WatchForEvents(void)
             vchanNoClientDeadline = 0; // said once; do not spin
         }
 
+        // The de-slice broker's validated process handle (BrokerSupervise) rides in the wait array
+        // so its exit wakes the loop at once instead of at the next 1 Hz heartbeat poll (~7 s of
+        // withheld toasts/menus per death before). Index 7 has no case in the switch below on
+        // purpose: BrokerSupervise runs before the switch on every wake and consumes the signal.
+        if (g_WgcBrokerProc) { watchedEvents[7] = g_WgcBrokerProc; eventCount = 8; }
+        else eventCount = 7;
+
         // Wait for events.
         signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, waitTimeout);
         if (signaledEvent != WAIT_TIMEOUT && signaledEvent >= MAXIMUM_WAIT_OBJECTS)
@@ -9291,6 +9535,31 @@ cleanup:
     return status;
 }
 
+// One dom0 service-gate read on Init's shared qubesdb handle, telling "key absent" (keep the
+// registry base) apart from a FAILED read. Both came back as NULL before, so a qubesdb transport
+// error under a watchdog respawn was applied as the gate's opposite with no log line at all:
+// wgc-broker=0 dropped -> broker launched and QGADESLICEDOWN; notify-bridge=1 dropped -> the
+// gate-off branch deleted the bridge task and wrote its stop file (audit 2026-09-08). The client
+// sets errno=ENOENT for absent, but errno need not cross the DLL's CRT boundary, so the
+// discriminator is a re-read of "/name" - present in every guest qubesdb - on the same handle:
+// if that fails too, the transport is down and no gate value can be trusted.
+// Returns the value (free() it) or NULL; *readFailed is TRUE only for the transport case.
+static char *ReadServiceGate(qdb_handle_t q, char *key, BOOL *readFailed)
+{
+    *readFailed = FALSE;
+    char *v = qdb_read(q, key, NULL);
+    if (v) return v;
+    int err = errno;
+    char *probe = qdb_read(q, "/name", NULL);
+    if (probe) { free(probe); return NULL; }   // transport answers: the key is genuinely absent
+    *readFailed = TRUE;
+    LogError("QGAQDBGATE qubesdb read of %S FAILED (errno %d, and /name is unreadable on the same "
+        L"connection) - a transport error, NOT an absent key. A dropped dom0 override cannot be "
+        L"told from its opposite here, so Init aborts for a watchdog respawn instead of acting on "
+        L"the registry base.", key, err);
+    return NULL;
+}
+
 static ULONG Init(void)
 {
     ULONG status;
@@ -9380,20 +9649,29 @@ static ULONG Init(void)
     // that can never start would hold every direct-path window for ever and never declare a fault -
     // the same undefined limbo, just quieter. See BrokerState().
     g_AgentStartTick = GetTickCount64();
+    // ONE qubesdb connection for every dom0 service gate below (wgc-broker, notify-bridge,
+    // legacy-toasts, gui-fullscreen, uac-disable). Five throwaway qdb_open() calls each failed
+    // SILENTLY into the registry base, so a qubesdb briefly unreachable during a watchdog respawn
+    // applied a dropped dom0 override as its opposite - and the gate-off branch ACTS at once
+    // (deletes the bridge task, writes its stop file). An open failure is treated as
+    // GetGuiDomainId treats it further down: loud, and Init fails so the watchdog respawns into a
+    // readable qubesdb - the agent could not have survived past GetGuiDomainId anyway.
+    qdb_handle_t gateQdb = qdb_open(NULL);
+    if (!gateQdb)
+        return win_perror("qdb_open (dom0 service gates)");
+    BOOL gateReadFailed = FALSE;
+    const WCHAR *wgcSrc = L"default";
     {
         // WGC broker ships DEFAULT-ON for 24H2+ (build >= 26100): it is the capture path for the
         // win11 shell surfaces, and the win11 de-slice benchmark shows no penalty vs the composite.
         // Registry "WgcBroker" / qubesdb /qubes-service/wgc-broker override it (0 forces it off).
         DWORD wgc = (g_OsBuild >= 26100) ? 1u : 0u;
-        (void)CfgReadDword(moduleName, REG_CONFIG_WGC_BROKER_VALUE, &wgc, NULL);
+        if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_WGC_BROKER_VALUE, &wgc, NULL))
+            wgcSrc = L"registry";
         g_WgcBroker = (wgc != 0);
-        qdb_handle_t q = qdb_open(NULL);
-        if (q)
-        {
-            char* v = qdb_read(q, "/qubes-service/wgc-broker", NULL);
-            if (v) { g_WgcBroker = (v[0] != '0'); free(v); }
-            qdb_close(q);
-        }
+        char* v = ReadServiceGate(gateQdb, "/qubes-service/wgc-broker", &gateReadFailed);
+        if (v) { g_WgcBroker = (v[0] != '0'); free(v); wgcSrc = L"qubesdb"; }
+        if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
     }
     {
         // Slice retirement (broker-only per-window slice) is the shipped behaviour on 24H2+ and
@@ -9409,8 +9687,9 @@ static ULONG Init(void)
         // (0 -> sliceFed windows take the retained agent DDA slice fallback).
         g_DeSlice = g_SliceRetire && (g_OsBuild >= 26100);
     }
-    LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d deSlice=%d (floor 26100)",
-            g_WgcBroker, g_OsBuild, g_SliceRetire, g_DeSlice);
+    // The source is logged so a dom0 override that did not reach the gate is visible in the log.
+    LogInfo("WGCBROKER gate: enabled=%d source=%s osBuild=%lu sliceRetire=%d deSlice=%d (floor 26100)",
+            g_WgcBroker, wgcSrc, g_OsBuild, g_SliceRetire, g_DeSlice);
     // Publish an authoritative de-slice health flag from the start. When the broker is NOT
     // expected (win10, or an explicit WgcBroker=0 opt-out) the answer is a definite "not down" =
     // 0, so acceptance never reads a stale value from a prior config; when it IS expected,
@@ -9441,15 +9720,15 @@ static ULONG Init(void)
         // /qubes-service/notify-bridge (dom0 wins), mirroring the broker gate. No build
         // floor - the listener path is proven on win10.
         DWORD nb = 0;
-        (void)CfgReadDword(moduleName, REG_CONFIG_NOTIF_BRIDGE_VALUE, &nb, NULL);
+        const WCHAR *nbSrc = L"default";
+        if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_NOTIF_BRIDGE_VALUE, &nb, NULL))
+            nbSrc = L"registry";
         g_NotifBridge = (nb != 0);
-        qdb_handle_t q = qdb_open(NULL);
-        if (q)
-        {
-            char* v = qdb_read(q, "/qubes-service/notify-bridge", NULL);
-            if (v) { g_NotifBridge = (v[0] != '0'); free(v); }
-            qdb_close(q);
-        }
+        // Shared handle + failed-vs-absent read (see ReadServiceGate): a dropped notify-bridge=1
+        // used to run the gate-off branch below, killing a bridge the operator turned on.
+        char* v = ReadServiceGate(gateQdb, "/qubes-service/notify-bridge", &gateReadFailed);
+        if (v) { g_NotifBridge = (v[0] != '0'); free(v); nbSrc = L"qubesdb"; }
+        if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
         // legacy_toasts: the explicit opt-OUT. When set (registry "LegacyToasts" or qubesdb
         // /qubes-service/legacy-toasts, dom0 wins) it FORCES the bridge off regardless of the
         // NotifyBridge gate, so toasts render as override-redirect windows exactly as before
@@ -9458,19 +9737,15 @@ static ULONG Init(void)
         DWORD legacy = 0;
         (void)CfgReadDword(moduleName, REG_CONFIG_LEGACY_TOASTS_VALUE, &legacy, NULL);
         BOOL legacyToasts = (legacy != 0);
-        q = qdb_open(NULL);
-        if (q)
-        {
-            char* v = qdb_read(q, "/qubes-service/legacy-toasts", NULL);
-            if (v) { legacyToasts = (v[0] != '0'); free(v); }
-            qdb_close(q);
-        }
+        v = ReadServiceGate(gateQdb, "/qubes-service/legacy-toasts", &gateReadFailed);
+        if (v) { legacyToasts = (v[0] != '0'); free(v); }
+        if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
         if (legacyToasts && g_NotifBridge)
         {
             g_NotifBridge = FALSE;
             LogInfo("NOTIFBRIDGE forced OFF by legacy_toasts - override-redirect toasts (window path)");
         }
-        LogInfo("NOTIFBRIDGE gate: enabled=%d legacy_toasts=%d", g_NotifBridge, legacyToasts);
+        LogInfo("NOTIFBRIDGE gate: enabled=%d source=%s legacy_toasts=%d", g_NotifBridge, nbSrc, legacyToasts);
         if (!g_NotifBridge)
         {
             // The opt-out must take effect NOW, not at the next reboot: a bridge launched
@@ -9523,18 +9798,17 @@ static ULONG Init(void)
         DWORD showFs = 0;
         (void)CfgReadDword(moduleName, REG_CONFIG_SHOW_FS_VALUE, &showFs, NULL); // absent -> 0 (hidden)
         g_ShowFullscreenScreen = (showFs != 0);
-        qdb_handle_t qdb = qdb_open(NULL);
-        if (qdb)
         {
             // `service.`-prefixed features are exported into the guest qubesdb as
-            // /qubes-service/<name>; dom0 wins over the registry base. Absent -> keep base.
-            char *v = qdb_read(qdb, "/qubes-service/gui-fullscreen", NULL);
+            // /qubes-service/<name>; dom0 wins over the registry base. Absent -> keep base;
+            // a FAILED read aborts Init (ReadServiceGate) rather than silently keeping it.
+            char *v = ReadServiceGate(gateQdb, "/qubes-service/gui-fullscreen", &gateReadFailed);
             if (v)
             {
                 g_ShowFullscreenScreen = (v[0] != '0'); // any non-'0' shows; "0" hides
                 free(v); // match perf.c's qubesdb-read convention (same binary, proven)
             }
-            qdb_close(qdb);
+            if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
         }
         LogInfo("QGAFSFLASH show full-desktop at boot/shutdown: %s",
             g_ShowFullscreenScreen ? L"on (opt-in)" : L"off (default, hidden)");
@@ -9563,8 +9837,10 @@ static ULONG Init(void)
     // seamless, inside the desktop window when not. The secure desktop is never granted to
     // dom0, so a prompt drawn there could never be seen or answered.
     {
-        qdb_handle_t qdb = qdb_open(NULL);
-        char *uacOff = qdb ? qdb_read(qdb, "/qubes-service/uac-disable", NULL) : NULL;
+        // Shared Init handle; a failed read aborts Init (ReadServiceGate) - before, a transport
+        // error read as "absent" here and, with UacDisabledByFeature set, silently UNDID the disable.
+        char *uacOff = ReadServiceGate(gateQdb, "/qubes-service/uac-disable", &gateReadFailed);
+        if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
         const BOOL wantDisable = (uacOff && uacOff[0] == '1');
         DWORD wasOurs = 0;
         (void)CfgReadDword(moduleName, L"UacDisabledByFeature", &wasOurs, NULL);
@@ -9578,14 +9854,12 @@ static ULONG Init(void)
         // pretending it worked; the feature belongs on the TEMPLATE.
         if (wantDisable)
         {
-            qdb_handle_t q2 = qdb_open(NULL);
-            char *cls = q2 ? qdb_read(q2, "/type", NULL) : NULL;
+            char *cls = qdb_read(gateQdb, "/type", NULL);
             if (cls && strcmp(cls, "TemplateVM") != 0 && strcmp(cls, "StandaloneVM") != 0)
                 LogWarning("QGAUAC service.uac-disable is set on a %S, whose C: is reset from its "
                     L"template at every boot - EnableLUA is read at boot, so this can NEVER take "
                     L"effect here. Set the feature on the TEMPLATE instead.", cls);
             if (cls) free(cls);
-            if (q2) qdb_close(q2);
         }
 
         if (wantDisable || wasOurs)
@@ -9627,8 +9901,8 @@ static ULONG Init(void)
             }
         }
         if (uacOff) free(uacOff);
-        if (qdb) qdb_close(qdb);
     }
+    qdb_close(gateQdb);   // last dom0 service gate read
 
     DWORD stagingGrant;
     status = CfgReadDword(moduleName, REG_CONFIG_STAGING_VALUE, &stagingGrant, NULL);

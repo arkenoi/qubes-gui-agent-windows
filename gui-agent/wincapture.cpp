@@ -83,7 +83,21 @@ struct Engine
     WC_DAMAGE_CALLBACK callback = nullptr;
     size_t sweepNext = 0;
     DWORD lastSweep = 0;
+    // Auto-reset wake for CaptureThread. Producers (WcMarkDirty, WcSetDdaOwned(FALSE),
+    // WcSetCrop/WcSetMask, WcAddWindow, WcShutdown) set it after storing their flag;
+    // the loop waits on it instead of Sleep(8). Before this the thread woke ~125x/s for
+    // the agent's whole life on an idle desktop, taking the lock and walking every
+    // channel to find nothing, and a dirty mark could sit up to 8 ms before service.
+    HANDLE wake = nullptr;
 };
+
+// Set-after-store: an auto-reset event stays signalled until a wait consumes it, so a
+// mark landing between the consumer's channel walk and its wait is never lost.
+void WakeCapture(Engine& e)
+{
+    if (e.wake)
+        SetEvent(e.wake);
+}
 
 Engine* g_eng = nullptr;
 
@@ -361,7 +375,26 @@ DWORD WINAPI CaptureThread(LPVOID param)
             for (auto& d : fired)
                 e.callback(d.hwnd, 0, d.y0, d.w, d.y1 - d.y0 + 1);
 
-        Sleep(didWork ? 2 : 8);
+        // Event-driven idle instead of Sleep(8) polling (audit 2026-09-08: 125 wakeups/s
+        // per agent on an idle desktop, each taking e.lock and walking every channel).
+        // After work: 2 ms pacing as before. Idle: sleep until the next round-robin sweep
+        // slot is due (the sweep is the only time-driven consumer), or until a producer
+        // signals e.wake - a dirty mark is then served immediately instead of <= 8 ms
+        // late. Bounded by SWEEP_INTERVAL_MS, never INFINITE: quit is a polled flag.
+        DWORD waitMs = 2;
+        if (!didWork)
+        {
+            waitMs = SWEEP_INTERVAL_MS;
+            if (n > 0)
+            {
+                const DWORD sinceSweep = GetTickCount() - e.lastSweep;
+                waitMs = sinceSweep >= SWEEP_INTERVAL_MS ? 1 : SWEEP_INTERVAL_MS - sinceSweep;
+            }
+        }
+        if (e.wake)
+            WaitForSingleObject(e.wake, waitMs);
+        else
+            Sleep(waitMs);
     }
     return 0;
 }
@@ -386,9 +419,16 @@ ULONG WcInit(WC_DAMAGE_CALLBACK callback)
         return ERROR_ALREADY_INITIALIZED;
     auto e = std::make_unique<Engine>();
     e->callback = callback;
+    e->wake = CreateEventW(nullptr, FALSE /*auto-reset*/, FALSE, nullptr);
+    if (!e->wake)
+        return GetLastError();
     e->thread = CreateThread(nullptr, 0, CaptureThread, e.get(), 0, nullptr);
     if (!e->thread)
-        return GetLastError();
+    {
+        ULONG err = GetLastError();
+        CloseHandle(e->wake);
+        return err;
+    }
     g_eng = e.release();
     return ERROR_SUCCESS;
 }
@@ -398,11 +438,14 @@ void WcShutdown(void)
     if (!g_eng)
         return;
     g_eng->quit.store(true);
+    WakeCapture(*g_eng); // the idle wait is now up to SWEEP_INTERVAL_MS; cut it short
     WaitForSingleObject(g_eng->thread, 5000);
     CloseHandle(g_eng->thread);
     AcquireSRWLockExclusive(&g_eng->lock);
     g_eng->channels.clear();
     ReleaseSRWLockExclusive(&g_eng->lock);
+    if (g_eng->wake)
+        CloseHandle(g_eng->wake);
     delete g_eng;
     g_eng = nullptr;
 }
@@ -423,6 +466,7 @@ ULONG WcAddWindow(HWND hwnd, int width, int height, int cropX, int cropY, void* 
     AcquireSRWLockExclusive(&g_eng->lock);
     g_eng->channels.push_back(std::move(c));
     ReleaseSRWLockExclusive(&g_eng->lock);
+    WakeCapture(*g_eng); // new channel starts dirty (initial fill)
     return ERROR_SUCCESS;
 }
 
@@ -463,6 +507,7 @@ void WcSetCrop(HWND hwnd, int cropX, int cropY)
                 ch->cropX = cropX;
                 ch->cropY = cropY;
                 ch->dirty.store(true); // the whole buffer is now wrong; re-capture it
+                WakeCapture(*g_eng);
             }
             break;
         }
@@ -483,6 +528,7 @@ void WcSetMask(HWND hwnd, const RECT* rects, int count)
                 ch->mask[i] = rects[i];
             ch->maskCount = count;
             ch->dirty.store(true); // re-capture so unmasked areas refresh promptly
+            WakeCapture(*g_eng);
             break;
         }
     ReleaseSRWLockExclusive(&g_eng->lock);
@@ -513,6 +559,7 @@ void WcMarkDirty(HWND hwnd)
         if (ch->hwnd == hwnd)
         {
             ch->dirty.store(true);
+            WakeCapture(*g_eng);
             break;
         }
     ReleaseSRWLockShared(&g_eng->lock);
@@ -527,6 +574,11 @@ void WcSetDdaOwned(HWND hwnd, BOOL owned)
         if (ch->hwnd == hwnd)
         {
             ch->ddaOwned.store(owned ? true : false);
+            // Ownership dropping is what releases a dirty mark that arrived while the
+            // frame loop owned the buffer (kept pending, see CaptureThread); wake so it
+            // is served now rather than at the next sweep slot.
+            if (!owned)
+                WakeCapture(*g_eng);
             break;
         }
     ReleaseSRWLockShared(&g_eng->lock);

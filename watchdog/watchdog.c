@@ -39,6 +39,18 @@ SERVICE_STATUS_HANDLE g_StatusHandle;
 // AgentRespawnPointless below.
 volatile LONG g_ServiceStopping = 0;
 
+// Manual-reset: set by ControlHandlerEx on STOP/SHUTDOWN, ends WatchdogThread. Before this
+// existed the handler reported STOPPED while the respawn loop was still live, so Stop-Service
+// returned and the loop could relaunch the agent under an installer that had just killed it.
+static HANDLE g_StopEvent = NULL;
+// Auto-reset: set on SERVICE_CONTROL_SESSIONCHANGE (console connect / logon) so the watchdog
+// starts the agent when the console session arrives instead of rediscovering it by polling.
+static HANDLE g_SessionEvent = NULL;
+
+// StartTargetProcess: nothing was launched because there is no console session yet. Distinct
+// from a launch failure so the caller does not stamp a start it never made.
+#define START_SKIPPED_NO_SESSION ERROR_NO_SUCH_LOGON_SESSION
+
 void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[]);
 DWORD WINAPI ControlHandlerEx(IN DWORD controlCode, IN DWORD eventType, IN void *eventData, IN void *context);
 
@@ -88,7 +100,10 @@ cleanup:
 }
 
 // Starts the process as SYSTEM in currently active console session.
-DWORD StartTargetProcess(IN WCHAR *exePath) // non-const because it can be modified by CreateProcess*
+// Returns ERROR_SUCCESS with *processHandle/*processId set when a process was created,
+// START_SKIPPED_NO_SESSION when there is no console session to start it in (nothing was
+// launched), or the Win32 error of the failing call.
+DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD *processId) // non-const because it can be modified by CreateProcess*
 {
     PROCESS_INFORMATION pi;
     STARTUPINFO si;
@@ -97,12 +112,19 @@ DWORD StartTargetProcess(IN WCHAR *exePath) // non-const because it can be modif
     DWORD size;
     HANDLE currentToken;
     HANDLE currentProcess = GetCurrentProcess();
+    DWORD status;
+
+    *processHandle = NULL;
+    *processId = 0;
 
     consoleSessionId = WTSGetActiveConsoleSessionId();
     if (consoleSessionId == 0xFFFFFFFF) // disconnected or changing
     {
+        // Distinct code, not ERROR_SUCCESS: the caller used to treat this skip as a launch, find
+        // no agent a second later, and count it as a crash - backoff 1->2->...->60 s during early
+        // boot plus a "grant-table exhaustion, needs a reboot" warning for a transient.
         LogDebug("console session is 0x%x, skipping", consoleSessionId);
-        return ERROR_SUCCESS;
+        return START_SKIPPED_NO_SESSION;
         // we'll launch gui agent when the console connects to a session again
     }
 
@@ -135,10 +157,14 @@ DWORD StartTargetProcess(IN WCHAR *exePath) // non-const because it can be modif
     // and hardcoding this to winlogon is wrong.
     if (!CreateProcessAsUser(newToken, NULL, exePath, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
     {
-        return win_perror("CreateProcessAsUser");
+        status = win_perror("CreateProcessAsUser");
+        return status != ERROR_SUCCESS ? status : ERROR_GEN_FAILURE; // never report a failed launch as success
     }
 
-    CloseHandle(pi.hProcess);
+    // Keep the process handle: the watchdog waits on it, so the agent's exit is seen the instant
+    // it happens instead of on the next 1 s name-match enumeration (or 60 s when backed off).
+    *processHandle = pi.hProcess;
+    *processId = pi.dwProcessId;
     CloseHandle(pi.hThread);
 
     return ERROR_SUCCESS;
@@ -209,15 +235,118 @@ DWORD WINAPI WatchdogThread(void *param)
     DWORD backoffMs = 1000;
     DWORD quickDeaths = 0;
     ULONGLONG startedAt = 0;
+    // A launch attempt that failed in CreateProcessAsUser is backed off like a quick death but
+    // reported as what it is; the old code folded it into the "died within 10 s" grant-table text.
+    BOOL lastLaunchFailed = FALSE;
+    DWORD lastLaunchError = ERROR_SUCCESS;
+    // Handle of the agent we started (or adopted after a service restart under a live agent).
+    // While we hold one it is the liveness oracle: the loop sleeps on it and wakes the moment the
+    // process exits. Without it the loop enumerated processes every second by name prefix, which
+    // both detected a death late and could adopt a same-named stranger as "running" without a
+    // word in the log.
+    HANDLE agentProcess = NULL;
+    DWORD agentPid = 0;
+    BOOL waitingForSession = FALSE;
+    BOOL adoptFailureLogged = FALSE;
 
     while (TRUE)
     {
-        Sleep(backoffMs);
+        HANDLE waitHandles[3];
+        DWORD waitCount = 0;
+        DWORD timeoutMs;
+        DWORD wait;
+        BOOL running;
+        BOOL exitedQuickly = FALSE;
 
-        // Check if the gui agent is running.
-        if (!IsProcessRunning(exeName, NULL, NULL))
+        waitHandles[waitCount++] = g_StopEvent;
+        waitHandles[waitCount++] = g_SessionEvent;
+        if (agentProcess)
+            waitHandles[waitCount++] = agentProcess;
+
+        // Holding a healthy agent's handle there is nothing to poll for: its exit wakes us. The
+        // timeout is only the respawn backoff, plus the QUICK_DEATH_MS survival check while a
+        // backoff is in force.
+        timeoutMs = (agentProcess && quickDeaths == 0) ? INFINITE : backoffMs;
+
+        wait = WaitForMultipleObjects(waitCount, waitHandles, FALSE, timeoutMs);
+        if (wait == WAIT_OBJECT_0) // stop event
+        {
+            LogInfo("service stop requested, watchdog thread exiting");
+            break;
+        }
+        if (wait == WAIT_FAILED)
+        {
+            win_perror("WaitForMultipleObjects");
+            Sleep(backoffMs); // do not spin
+            continue;
+        }
+        if (wait == WAIT_OBJECT_0 + 1)
+            LogInfo("console session changed, checking the agent");
+        if (agentProcess && wait == WAIT_OBJECT_0 + 2)
+        {
+            DWORD exitCode = 0;
+            if (!GetExitCodeProcess(agentProcess, &exitCode))
+                exitCode = 0xFFFFFFFF;
+            LogWarning("Process '%s' (PID %u) exited with code 0x%x", exeName, agentPid, exitCode);
+            CloseHandle(agentProcess);
+            agentProcess = NULL;
+            agentPid = 0;
+            // Judge "quick" at the moment of death, not after the delay below (a 16 s+ delay made
+            // every death look old and reset the backoff). And KEEP the delay: the handle wakes
+            // us the instant the agent exits, so without it a quick death would be respawned
+            // immediately and the backoff would never hold - exactly the once-a-second grant-table
+            // hammering it was added to stop.
+            exitedQuickly = (startedAt != 0 && GetTickCount64() - startedAt < QUICK_DEATH_MS);
+            if (exitedQuickly &&
+                WaitForSingleObject(g_StopEvent, backoffMs) == WAIT_OBJECT_0)
+            {
+                LogInfo("service stop requested, watchdog thread exiting");
+                break;
+            }
+        }
+
+        // Is the gui agent running? Our handle is authoritative. Without one (service start or
+        // restart while an agent we did not launch is alive) look it up once and adopt it so it
+        // too is waited on rather than re-enumerated each second.
+        running = (agentProcess != NULL);
+        if (!running)
+        {
+            DWORD pid = 0, sid = 0;
+            if (IsProcessRunning(exeName, &pid, &sid))
+            {
+                running = TRUE;
+                agentProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                if (agentProcess)
+                {
+                    agentPid = pid;
+                    lastLaunchFailed = FALSE; // an agent is running, whoever started it
+                    LogInfo("Process '%s' already running (PID %u, session %u) - adopted, waiting on it",
+                        exeName, pid, sid);
+                }
+                else if (!adoptFailureLogged)
+                {
+                    // Anomaly: a same-named process we cannot open. Say so (once per episode);
+                    // keep the 1 s name poll for it rather than silently treating it as our
+                    // agent for ever.
+                    win_perror("OpenProcess(adopt)");
+                    LogWarning("Process '%s' (PID %u, session %u) is running but cannot be opened - "
+                        L"falling back to polling it by name", exeName, pid, sid);
+                    adoptFailureLogged = TRUE;
+                }
+            }
+            else
+            {
+                adoptFailureLogged = FALSE;
+            }
+        }
+
+        if (!running)
         {
             WCHAR why[128] = L"";
+            HANDLE newProcess = NULL;
+            DWORD newPid = 0;
+            DWORD status;
+
             if (AgentRespawnPointless(why, RTL_NUMBER_OF(why)))
             {
                 LogInfo("Process '%s' not running and the system is going down (%s) - "
@@ -225,7 +354,24 @@ DWORD WINAPI WatchdogThread(void *param)
                 continue;
             }
 
-            if (startedAt != 0 && GetTickCount64() - startedAt < QUICK_DEATH_MS)
+            // No console session yet (early boot, or 0xFFFFFFFF while it is changing): nothing
+            // can be started, so nothing is recorded - this is not an agent death and must not
+            // grow the backoff. g_SessionEvent wakes us when the console connects.
+            if (WTSGetActiveConsoleSessionId() == 0xFFFFFFFF)
+            {
+                if (!waitingForSession)
+                    LogInfo("Process '%s' not running and there is no console session yet - "
+                        L"will start it when one connects (%s)", exeName, why);
+                waitingForSession = TRUE;
+                continue;
+            }
+            waitingForSession = FALSE;
+
+            // Fast failure = the agent we waited on died quickly, or the previous launch itself
+            // failed (nothing ran, so "ran long enough to be healthy" cannot apply), or - on the
+            // poll-by-name path only - the last start is recent.
+            if (exitedQuickly || lastLaunchFailed ||
+                (startedAt != 0 && GetTickCount64() - startedAt < QUICK_DEATH_MS))
             {
                 quickDeaths++;
                 if (backoffMs < BACKOFF_MAX_MS)
@@ -234,10 +380,15 @@ DWORD WINAPI WatchdogThread(void *param)
                     if (backoffMs > BACKOFF_MAX_MS)
                         backoffMs = BACKOFF_MAX_MS;
                 }
-                LogWarning("Process '%s' died within %u ms of starting, %u time(s) in a row - "
-                    L"backing off to %u ms (%s). The guest has NO GUI while this lasts; the agent "
-                    L"log names the failure (grant-table exhaustion, 0x5aa, needs a reboot).",
-                    exeName, QUICK_DEATH_MS, quickDeaths, backoffMs, why);
+                if (lastLaunchFailed)
+                    LogWarning("Starting process '%s' failed (error 0x%x), %u time(s) in a row - "
+                        L"backing off to %u ms (%s). The guest has NO GUI while this lasts.",
+                        exeName, lastLaunchError, quickDeaths, backoffMs, why);
+                else
+                    LogWarning("Process '%s' died within %u ms of starting, %u time(s) in a row - "
+                        L"backing off to %u ms (%s). The guest has NO GUI while this lasts; the agent "
+                        L"log names the failure (grant-table exhaustion, 0x5aa, needs a reboot).",
+                        exeName, QUICK_DEATH_MS, quickDeaths, backoffMs, why);
             }
             else
             {
@@ -249,8 +400,27 @@ DWORD WINAPI WatchdogThread(void *param)
                 LogWarning("Process '%s' not running, restarting it (%s)", exeName, why);
             }
 
-            StartTargetProcess(cmdline);
+            status = StartTargetProcess(cmdline, &newProcess, &newPid);
+            if (status == START_SKIPPED_NO_SESSION)
+            {
+                // Session vanished between our check and the launch: not an attempt, record nothing.
+                continue;
+            }
             startedAt = GetTickCount64();
+            if (status == ERROR_SUCCESS && newProcess)
+            {
+                agentProcess = newProcess;
+                agentPid = newPid;
+                lastLaunchFailed = FALSE;
+                lastLaunchError = ERROR_SUCCESS;
+            }
+            else
+            {
+                // Real launch failure (already logged by win_perror): backed off via startedAt on
+                // the next tick, with the actual error in the text.
+                lastLaunchFailed = TRUE;
+                lastLaunchError = status;
+            }
         }
         else if (quickDeaths != 0 && startedAt != 0 &&
                  GetTickCount64() - startedAt >= QUICK_DEATH_MS)
@@ -262,6 +432,8 @@ DWORD WINAPI WatchdogThread(void *param)
         }
     }
 
+    if (agentProcess)
+        CloseHandle(agentProcess);
     return ERROR_SUCCESS;
 }
 
@@ -300,6 +472,7 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
     HANDLE workerHandle = NULL;
     HANDLE watchdogHandle = NULL;
     DWORD status;
+    BOOL cleanStop = FALSE;
 
     WCHAR* cmdline = malloc(MAX_PATH_LONG_WSIZE);
     if (!cmdline)
@@ -314,12 +487,22 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
         goto cleanup;
     }
 
+    // Created before the control handler is registered so a STOP arriving early cannot be missed.
+    g_StopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
+    g_SessionEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (!g_StopEvent || !g_SessionEvent)
+    {
+        win_perror("CreateEvent");
+        goto cleanup;
+    }
+
     g_Status.dwServiceType = SERVICE_WIN32;
     g_Status.dwCurrentState = SERVICE_START_PENDING;
     // PRESHUTDOWN arrives BEFORE the ordinary shutdown notifications, which is the only chance to
     // know the machine is going down early enough to stop respawning the agent into it.
+    // SESSIONCHANGE tells the watchdog when the console session arrives (see g_SessionEvent).
     g_Status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN |
-        SERVICE_ACCEPT_PRESHUTDOWN;
+        SERVICE_ACCEPT_PRESHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE;
     g_Status.dwWin32ExitCode = 0;
     g_Status.dwServiceSpecificExitCode = 0;
     g_Status.dwCheckPoint = 0;
@@ -330,9 +513,6 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
         win_perror("RegisterServiceCtrlHandlerEx");
         goto cleanup;
     }
-
-    g_Status.dwCurrentState = SERVICE_RUNNING;
-    SetServiceStatus(g_StatusHandle, &g_Status);
 
     LogDebug("Starting event thread");
     workerHandle = CreateThread(NULL, 0, EventsThread, NULL, 0, NULL);
@@ -350,13 +530,24 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
         goto cleanup;
     }
 
-    // FIXME that thread never exits
-    WaitForSingleObject(workerHandle, INFINITE);
+    // RUNNING only once both threads exist; a thread-creation failure is then a visible start
+    // failure (START_PENDING -> STOPPED with the error) instead of a service that says RUNNING
+    // while doing nothing.
+    g_Status.dwCurrentState = SERVICE_RUNNING;
+    SetServiceStatus(g_StatusHandle, &g_Status);
+
+    // The watchdog thread exits on g_StopEvent (set by ControlHandlerEx on STOP/SHUTDOWN, which
+    // reports STOP_PENDING). STOPPED is reported here, after it has actually exited, so a caller
+    // whose Stop-Service returned is guaranteed no further agent launch from this service.
+    WaitForSingleObject(watchdogHandle, INFINITE);
+    cleanStop = TRUE;
 
 cleanup:
     // don't free cmdline here, a thread using it may be still running, memory is freed on exit anyway
     g_Status.dwCurrentState = SERVICE_STOPPED;
-    g_Status.dwWin32ExitCode = GetLastError();
+    g_Status.dwWin32ExitCode = cleanStop ? 0 : GetLastError();
+    g_Status.dwCheckPoint = 0;
+    g_Status.dwWaitHint = 0;
     if (g_StatusHandle)
         SetServiceStatus(g_StatusHandle, &g_Status);
 
@@ -396,10 +587,34 @@ DWORD WINAPI ControlHandlerEx(IN DWORD controlCode, IN DWORD eventType, IN void 
     case SERVICE_CONTROL_STOP:
     case SERVICE_CONTROL_SHUTDOWN:
         InterlockedExchange(&g_ServiceStopping, 1);
-        g_Status.dwWin32ExitCode = 0;
-        g_Status.dwCurrentState = SERVICE_STOPPED;
         LogInfo("stopping...");
+        // STOP_PENDING here, STOPPED from ServiceMain once WatchdogThread has exited. Reporting
+        // STOPPED from this handler let Stop-Service return while the respawn loop was still live;
+        // if its tick fell in that window it relaunched the agent the installer had just killed,
+        // under the very device surgery the quiesce exists to protect.
+        g_Status.dwWin32ExitCode = 0;
+        g_Status.dwCurrentState = SERVICE_STOP_PENDING;
+        g_Status.dwCheckPoint = 0;
+        g_Status.dwWaitHint = 5000;
         SetServiceStatus(g_StatusHandle, &g_Status);
+        if (g_StopEvent)
+            SetEvent(g_StopEvent);
+        break;
+    case SERVICE_CONTROL_SESSIONCHANGE:
+        // Console session arrival is what the watchdog waits for when it could not start the
+        // agent (no session yet); wake it instead of leaving it to rediscover the session by polling.
+        if (eventType == WTS_CONSOLE_CONNECT || eventType == WTS_SESSION_LOGON)
+        {
+            WTSSESSION_NOTIFICATION *notification = (WTSSESSION_NOTIFICATION *)eventData;
+            LogInfo("session change 0x%x, session %u", eventType,
+                notification ? notification->dwSessionId : 0xFFFFFFFF);
+            if (g_SessionEvent)
+                SetEvent(g_SessionEvent);
+        }
+        else
+        {
+            LogDebug("session change 0x%x (ignored)", eventType);
+        }
         break;
     default:
         LogDebug("code 0x%x, event 0x%x", controlCode, eventType);

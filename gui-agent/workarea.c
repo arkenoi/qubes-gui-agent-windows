@@ -23,6 +23,11 @@
 // it falls back to; see WorkAreaEnsureApplied.
 #define WA_LOST_FIGHT_TRIES 5
 #define WA_DRIFT_BACKOFF_MS 30000
+// qubesdb (re)connect backoff of the watch thread: doubles from MIN to MAX; a warning
+// on the first failure and every NAG_EVERY-th one after that. See WaWatchThread.
+#define WA_QDB_RETRY_MIN_MS 1000
+#define WA_QDB_RETRY_MAX_MS 30000
+#define WA_QDB_NAG_EVERY 10
 
 static CRITICAL_SECTION g_WaLock;
 static BOOL g_WaLockInit = FALSE; // g_WaLock initialized (see WorkAreaLockInit)
@@ -373,14 +378,32 @@ BOOL WorkAreaSyncReadDom0(void)
 static DWORD WINAPI WaWatchThread(PVOID param)
 {
     UNREFERENCED_PARAMETER(param);
+    // qubesdb already answered in Init() (GetGuiDomainId is fatal without it), so a
+    // failed open here is the daemon having GONE, not "not up yet". It used to be a
+    // silent flat Sleep(30000): a daemon that never came back was indistinguishable
+    // from one restarting, and a restart cost up to 30 s of stale dom0 work area.
+    // Doubling backoff (1 s .. 30 s) makes a short restart cheap; the warning on the
+    // first failure and every WA_QDB_NAG_EVERY-th one keeps a permanently absent
+    // daemon visible without flooding the log.
+    DWORD retryMs = WA_QDB_RETRY_MIN_MS;
+    unsigned failures = 0;
     for (;;)
     {
         qdb_handle_t h = qdb_open(NULL);
         if (!h)
         {
-            Sleep(30000);
+            failures++;
+            if (failures == 1 || (failures % WA_QDB_NAG_EVERY) == 0)
+                LogWarning("qdb_open failed (%u consecutive), dom0 work area feed unavailable; retrying in %u ms",
+                    failures, (unsigned)retryMs);
+            Sleep(retryMs);
+            retryMs = retryMs * 2 > WA_QDB_RETRY_MAX_MS ? WA_QDB_RETRY_MAX_MS : retryMs * 2;
             continue;
         }
+        if (failures)
+            LogInfo("qubesdb connection re-established after %u failed attempts", failures);
+        failures = 0;
+        DWORD connectedAt = GetTickCount();
 
         if (WaReadDom0(h))
             WorkAreaApply();
@@ -395,10 +418,23 @@ static DWORD WINAPI WaWatchThread(PVOID param)
                     WorkAreaApply();
             }
         }
+        else
+        {
+            LogWarning("qdb_watch(%S) failed - work-area changes will not be delivered until reconnect", QDB_WORKAREA_PATH);
+        }
 
         qdb_close(h);
-        LogDebug("qubesdb connection lost, retrying");
-        Sleep(30000);
+        // The backoff resets to MIN only after a connection that HELD for a while; a
+        // daemon that accepts and immediately drops (or refuses the watch) would
+        // otherwise spin this loop and its warnings at 1 s instead of the old 30 s.
+        if (GetTickCount() - connectedAt >= WA_QDB_RETRY_MAX_MS)
+            retryMs = WA_QDB_RETRY_MIN_MS;
+        else
+            retryMs = retryMs * 2 > WA_QDB_RETRY_MAX_MS ? WA_QDB_RETRY_MAX_MS : retryMs * 2;
+        // Warning, not debug: the daemon was serving and stopped - that is a failure of
+        // a working component, not a routine event.
+        LogWarning("qubesdb connection lost, reconnecting in %u ms", (unsigned)retryMs);
+        Sleep(retryMs);
     }
 }
 

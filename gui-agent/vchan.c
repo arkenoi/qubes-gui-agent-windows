@@ -44,6 +44,12 @@ struct libvchan *g_Vchan = NULL;
 // that the daemon gets to drain between pieces.
 #define VCHAN_SEND_CHUNK_SIZE 16384
 
+// Longest single wait for ring space in VchanReserveLocked. The wait is on the vchan's
+// event (fired when the daemon consumes, see below), the slice is only a backstop: a peer
+// that dies without firing the channel is still noticed by the per-slice libvchan_is_open
+// re-check, and a wake that fails to arrive costs one slice, not a whole 10 s deadline.
+#define VCHAN_RESERVE_WAIT_SLICE_MS 100
+
 // All four are written only under g_VchanCriticalSection, which every sender holds.
 static BOOL              g_VchanSendWedged = FALSE;
 static VCHAN_SEND_RESULT g_VchanWedgeResult = VCHAN_SEND_OK;
@@ -136,6 +142,20 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
     ULONGLONG firstBlock = 0;
     BOOL blocked = FALSE;
 
+    // The wait below used to be Sleep(1): under back-pressure (daemon slow to drain a heavy
+    // damage burst, or a human on its modal dialog) the sending thread ran a 1 kHz
+    // timer-resolution spin for up to 10-30 s. libvchan already has the trigger: every
+    // VchanGetWriteBufferSize call arms VCHAN_NOTIFY_READ, so the daemon's next consume
+    // fires this event (armed BEFORE the space is read, so no lost wake). It is the same
+    // auto-reset event the main loop watches for INCOMING data (main.c watchedEvents[4]),
+    // so a wake taken here may have been "data arrived" - `consumedWake` hands it back
+    // (SetEvent) on every exit, or a message would sit unread in the ring until the next
+    // unrelated wake. A data-less wake is already routine for the main loop (the daemon's
+    // read-notify produces them), so the re-signal is harmless there.
+    // Fetched on the first miss, like the clock: the hot path stays one ring query.
+    HANDLE vchanEvent = NULL;
+    BOOL consumedWake = FALSE;
+
     for (;;)
     {
         // Hot path first and alone: one ring query, no clock read, no liveness call. This
@@ -152,6 +172,8 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
                 LogInfo("VCHANWAIT %s: ring drained after %I64u ms, %I64u bytes sent",
                     what, GetTickCount64() - start, (ULONG64)size);
             }
+            if (consumedWake)
+                SetEvent(vchanEvent);
             return TRUE;
         }
 
@@ -161,6 +183,8 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             // Safe to return even mid-message: the stream is gone, there is nothing left
             // to keep in sync.
             *result = VCHAN_SEND_DEAD;
+            if (consumedWake)
+                SetEvent(vchanEvent);
             return FALSE;
         }
 
@@ -169,6 +193,7 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             blocked = TRUE;
             start = GetTickCount64();
             firstBlock = start;
+            vchanEvent = libvchan_fd_for_select(vchan);
             LogWarning("VCHANWAIT %s: ring full (need %I64u, free %d) - waiting up to %u ms "
                 "for gui-daemon to drain", what, (ULONG64)size, space, VCHAN_SEND_DEADLINE_MS);
         }
@@ -177,6 +202,8 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             if (mayAbort)
             {
                 *result = VCHAN_SEND_UNRESPONSIVE;
+                if (consumedWake)
+                    SetEvent(vchanEvent);
                 return FALSE;
             }
 
@@ -196,6 +223,8 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
                     "exits for a clean respawn rather than hanging the display forever)",
                     what, VCHAN_SEND_COMMITTED_DEADLINE_MS);
                 *result = VCHAN_SEND_DEAD;
+                if (consumedWake)
+                    SetEvent(vchanEvent);
                 return FALSE;
             }
 
@@ -207,7 +236,21 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             start = GetTickCount64();
         }
 
-        Sleep(1);
+        // Sleep until the daemon consumes (event) or the slice expires, whichever is first,
+        // never past the deadline check above. WAIT_FAILED (a bad handle) degrades to the
+        // slice as a plain sleep - the deadlines still end the wait.
+        {
+            ULONGLONG elapsed = GetTickCount64() - start;
+            DWORD wait = VCHAN_RESERVE_WAIT_SLICE_MS;
+            if (elapsed < (ULONGLONG)VCHAN_SEND_DEADLINE_MS &&
+                (ULONGLONG)VCHAN_SEND_DEADLINE_MS - elapsed < (ULONGLONG)wait)
+                wait = (DWORD)((ULONGLONG)VCHAN_SEND_DEADLINE_MS - elapsed);
+            DWORD w = (vchanEvent == NULL) ? WAIT_FAILED : WaitForSingleObject(vchanEvent, wait);
+            if (w == WAIT_OBJECT_0)
+                consumedWake = TRUE;
+            else if (w != WAIT_TIMEOUT)
+                Sleep(wait);    // a failed wait returns at once; without this the loop would spin
+        }
     }
 }
 
