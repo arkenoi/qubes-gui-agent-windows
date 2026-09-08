@@ -2377,6 +2377,16 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs)
     DWORD sid = WTSGetActiveConsoleSessionId();
     if (sid == 0xFFFFFFFF) return FALSE;
 
+    // A SESSION EXISTING IS NOT A SESSION THAT CAN HOST A UI HELPER. Between logon and the shell
+    // coming up, WTSGetActiveConsoleSessionId and WTSUserName are both already satisfied while
+    // there is no shell for notifhost to present into - so the launch would half-succeed into a
+    // session that is itself still starting. WgcLaunch's caller has always required GetShellWindow()
+    // for exactly this reason; this path did not, and it is the one that fired at 08:22:49 on
+    // 2026-09-08, during the first logon of a guest that was still installing.
+    // Returning FALSE here is a DEFINED outcome the callers already handle (they log "no
+    // interactive session?" and keep the failure in the log), not a silent drop.
+    if (!GetShellWindow()) return FALSE;
+
     WCHAR* user = NULL; DWORD userLen = 0;
     if (!WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, sid, WTSUserName, &user, &userLen) ||
         !user || !*user)
