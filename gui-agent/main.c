@@ -240,6 +240,15 @@ static ULONGLONG g_BrokerNextWarn = 0;     // next QGADESLICEDOWN warning is due
 // assert it is 0 without parsing the log. Any non-zero value is a defect to chase.
 #define REG_CONFIG_DIRECT_SUPPRESSED_VALUE L"DirectSuppressed"
 static DWORD g_DirectSuppressed = 0;
+// Count of BROKER DEATHS - times a broker that WAS ready stopped heartbeating. A broker crash is
+// a major failure, not a hiccup: the agent relaunches within ~8 s, and before this counter existed
+// that recovery was completely SILENT unless the outage happened to outlast DESLICE_FIRST_WARN_MS
+// (30 s), so the common case - crash, relaunch, carry on - produced no error anywhere. Owner
+// 2026-09-08: "all 3 scenarios are major failures that should emit loud error messages, not silent
+// recovery." Any non-zero value is a defect to chase; acceptance asserts 0.
+#define REG_CONFIG_BROKER_DEATHS_VALUE L"BrokerDeaths"
+static DWORD g_BrokerDeaths = 0;
+static ULONGLONG g_BrokerDiedAt = 0;   // tick of the death being reported; 0 = not currently dead
 static UINT64 g_WgcNonce = 0;
 static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
 static ULONGLONG g_WgcArenaNext = 0;   // bump frontier within the arena (offset past ArenaOffset)
@@ -2158,6 +2167,20 @@ static BOOL WgcLaunch(void)
     WCHAR* sl = wcsrchr(self, L'\\'); if (sl) *(sl + 1) = 0;   // keep the trailing backslash
     WCHAR longExe[MAX_PATH];
     StringCchPrintf(longExe, RTL_NUMBER_OF(longExe), L"%swgcbroker.exe", self);
+    // PACKAGING GAP IS KNOWABLE NOW, not in 30 s. If the binary is not next to gui-agent.exe the
+    // broker can never start, and waiting DESLICE_FIRST_WARN_MS to say so just delays the only
+    // message that names the cause. This has really shipped: 4.3.18 went out with the de-slice
+    // broker inert on every clean install because wgcbroker.exe was never staged into the MSI.
+    if (GetFileAttributes(longExe) == INVALID_FILE_ATTRIBUTES)
+    {
+        WTSFreeMemory(user);
+        LogError("QGABROKERMISSING wgcbroker.exe is NOT PRESENT at %s - the de-slice broker cannot "
+            L"start, so on this eligible guest toasts, menus and WinUI surfaces will be WITHHELD "
+            L"(there is no composite fallback). This is a PACKAGING GAP: the helper was built but "
+            L"never staged next to gui-agent.exe. It is a major failure of the install, not a "
+            L"runtime condition to tolerate.", longExe);
+        return FALSE;
+    }
     WCHAR shortExe[MAX_PATH] = { 0 };
     if (!GetShortPathName(longExe, shortExe, RTL_NUMBER_OF(shortExe)))
         StringCchCopy(shortExe, RTL_NUMBER_OF(shortExe), longExe);
@@ -2181,7 +2204,9 @@ static BOOL WgcLaunch(void)
         L"/create /tn " WGC_TASK_NAME L" /tr \"%s\" /sc once /st 00:00 /ru %s /it /f", tr, user);
     WTSFreeMemory(user);
     if (!WgcRunSchtasks(args)) { LogWarning("WGCBROKER schtasks /create failed"); return FALSE; }
-    if (!WgcRunSchtasks(L"/run /tn " WGC_TASK_NAME)) { LogWarning("WGCBROKER schtasks /run failed"); return FALSE; }
+    if (!WgcRunSchtasks(L"/run /tn " WGC_TASK_NAME)) { LogError("QGABROKERLAUNCHFAIL schtasks /run of " 
+        "the de-slice broker FAILED - it cannot start, so per-window surfaces will be withheld. "
+        "Check that the task exists and that Task Scheduler is running."); return FALSE; }
     g_WgcBrokerProc = NULL;   // no child handle under Task Scheduler; heartbeat is the liveness signal
     LogInfo("WGCBROKER launched via Task Scheduler (user session %lu)", sid);
     return TRUE;
@@ -2216,7 +2241,21 @@ static void BrokerSupervise(void)
         if (!g_BrokerReady)
         {
             _InterlockedExchange(&g_BrokerReady, 1);
-            LogInfo("WGCBROKER ready (heartbeat live)");
+            // RECOVERY FROM A DEATH IS ITSELF REPORTABLE. A broker that crashed and came back is
+            // not a non-event just because the pixels resumed: something killed it, and the only
+            // record that it happened is this line plus BrokerDeaths.
+            if (g_BrokerDiedAt)
+            {
+                LogWarning("QGABROKERBACK de-slice broker RECOVERED after %I64u ms down (deaths=%lu). "
+                    L"The relaunch worked, but a broker death is a real failure - windows withheld "
+                    L"during the outage were never shown. Collect the wgcbroker log for the crash.",
+                    GetTickCount64() - g_BrokerDiedAt, g_BrokerDeaths);
+                g_BrokerDiedAt = 0;
+            }
+            else
+            {
+                LogInfo("WGCBROKER ready (heartbeat live)");
+            }
         }
         // Recovered (or first-ever ready): clear the hard-fail state + its machine-readable flag.
         if (g_BrokerDownSince)
@@ -2226,7 +2265,23 @@ static void BrokerSupervise(void)
         }
         return;
     }
-    _InterlockedExchange(&g_BrokerReady, 0);
+    // THE DEATH TRANSITION IS THE LOUD MOMENT, not the 30 s mark. Before this, a broker that
+    // crashed and was relaunched inside DESLICE_FIRST_WARN_MS produced NO log line and NO flag at
+    // all - the failure recovered silently and nobody could know it had happened. Excluding logoff
+    // and fast-user-switch (these guests enforce autologon with one user, so neither occurs), a
+    // CRASH is essentially the only way a ready broker dies, which makes this the realistic case.
+    if (_InterlockedExchange(&g_BrokerReady, 0) != 0)
+    {
+        g_BrokerDiedAt = now;
+        (void)CfgWriteDword(NULL, REG_CONFIG_BROKER_DEATHS_VALUE, ++g_BrokerDeaths, NULL);
+        LogError("QGABROKERDIED de-slice broker STOPPED HEARTBEATING after being ready (death #%lu, "
+            L"pid was %ld). This is a MAJOR FAILURE, not a hiccup: while it is gone there is NO "
+            L"composite fallback on an eligible guest, so toasts, menus and WinUI surfaces are "
+            L"WITHHELD rather than drawn. A relaunch follows within ~8 s and may well succeed - "
+            L"that recovery does NOT make this benign, and it is reported here precisely so it "
+            L"cannot pass silently. BrokerDeaths=%lu is published under the Qubes Tools config key.",
+            g_BrokerDeaths, (long)WGCBRK_HDR(g_WgcBase)->BrokerPid, g_BrokerDeaths);
+    }
 
     // HARD-FAIL, LOUDLY, ON AN ELIGIBLE SYSTEM (owner 2026-09-04: "I want deslicer to hard fail
     // on eligible system", "silent fallbacks with no diag" is the exact worry). We are here only
