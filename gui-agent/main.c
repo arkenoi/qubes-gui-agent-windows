@@ -2286,12 +2286,13 @@ static BOOL WgcLaunch(void)
     return TRUE;
 }
 
-// Open the process named by hdr->BrokerPid for SYNCHRONIZE/TERMINATE - VALIDATED first. The pid
-// field is written by the user-session broker and the section DACL lets any interactive-user
-// process write it (wgcbroker_ipc.h security note), so before this SYSTEM process waits on or
-// kills anything it checks that the pid is wgcbroker.exe running from OUR install dir in the
-// console session. A forged pid gets NULL and no action.
-static HANDLE WgcOpenBrokerProcess(DWORD pid, DWORD consoleSid)
+// Open a helper process published by pid for SYNCHRONIZE/TERMINATE - VALIDATED first. The pid
+// is written by a user-session helper into something the interactive user can write (the
+// broker's shared section per the wgcbroker_ipc.h security note; the bridge's ProgramData
+// heartbeat file), so before this SYSTEM process waits on or kills anything it checks that the
+// pid is <imageName> running from OUR install dir in the console session. A forged pid gets
+// NULL and no action.
+static HANDLE OpenHelperProcess(DWORD pid, DWORD consoleSid, const WCHAR* imageName)
 {
     if (pid == 0 || pid == GetCurrentProcessId()) return NULL;
     DWORD psid = 0xFFFFFFFF;
@@ -2304,7 +2305,7 @@ static HANDLE WgcOpenBrokerProcess(DWORD pid, DWORD consoleSid)
     if (QueryFullProcessImageName(h, 0, img, &cch) && GetModuleFileName(NULL, want, RTL_NUMBER_OF(want)))
     {
         WCHAR* sl = wcsrchr(want, L'\\'); if (sl) *(sl + 1) = 0;
-        StringCchCat(want, RTL_NUMBER_OF(want), L"wgcbroker.exe");
+        StringCchCat(want, RTL_NUMBER_OF(want), imageName);
         match = (_wcsicmp(img, want) == 0);
         if (!match)
         {
@@ -2316,6 +2317,11 @@ static HANDLE WgcOpenBrokerProcess(DWORD pid, DWORD consoleSid)
     }
     if (!match) { CloseHandle(h); return NULL; }
     return h;
+}
+
+static HANDLE WgcOpenBrokerProcess(DWORD pid, DWORD consoleSid)
+{
+    return OpenHelperProcess(pid, consoleSid, L"wgcbroker.exe");
 }
 
 // ~1 Hz supervisor. Creates the section on first eligible pass, keeps the heartbeat fresh,
@@ -2638,6 +2644,16 @@ static void DirectSuppressNotifyUser(IN DWORD count)
 }
 static ULONGLONG g_NotifLastLaunch = 0;
 static ULONGLONG g_NotifNextPoll = 0;
+// The bridge is Task-Scheduler-launched (no child handle at launch). It publishes its pid in
+// the heartbeat file ("<tick> <pid>"); once the tick is fresh the pid is opened VALIDATED
+// (OpenHelperProcess: notifhost.exe from our install dir in the console session - the file is
+// user-writable) and the handle rides in the main loop's wait array. PROCESS EXIT IS THE
+// PRIMARY DEATH SIGNAL; the heartbeat tick stays as the bounded backstop for a HUNG bridge.
+// Before this, a death was noticed only at 15 s stale + the 5 s poll grain, and a stale tick
+// could not be told from a hang (audit 2026-09-08).
+static HANDLE g_NotifBridgeProc = NULL;
+static DWORD  g_NotifBridgePid = 0;
+static DWORD  g_NotifBridgePidRejected = 0;   // last heartbeat pid that failed validation (log once)
 // Gate-off crash sweep pending: crash-leftover ShowBanner markers exist and the one-shot
 // restore has not been launched yet (see NotifBridgeRestoreSweep). Also keeps the idle wait
 // bounded so the sweep gets loop time on a quiet guest.
@@ -2646,8 +2662,9 @@ static BOOL g_NotifRestorePending = FALSE;
 // Run notifhost.exe with the given arguments inside the interactive user session via a
 // one-shot Task Scheduler task - the same /ru <user> /it launch as WgcLaunch, proven to put a
 // helper into the interactive session with a full user context (the run-as-user pattern the
-// bridge's listener was demonstrated under). There is no child handle; callers watch their own
-// signals (the bridge's heartbeat file, the restore one-shot's marker deletion).
+// bridge's listener was demonstrated under). There is no child handle AT LAUNCH; callers watch
+// their own signals (the bridge: its heartbeat file, then the validated process handle taken
+// from the pid it publishes there; the restore one-shot: its marker deletion).
 static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs)
 {
     DWORD sid = WTSGetActiveConsoleSessionId();
@@ -2771,60 +2788,141 @@ static void NotifBridgeRestoreSweep(void)
     }
 }
 
-// ~0.2 Hz supervisor: (re)launch notifhost --bridge when its heartbeat file is stale. The
-// bridge fails OPEN by construction (it restores ShowBanner on every exit path and only
-// suppresses while its dom0 connection is up), so a supervision gap costs dom0-native
-// prettiness, never a lost notification. Gate OFF: the only supervision left is the
-// crash-leftover banner restore sweep.
+// ~0.2 Hz supervisor, plus an immediate pass whenever the bridge's process handle signals:
+// (re)launch notifhost --bridge when it has EXITED or its heartbeat is stale. The bridge fails
+// OPEN by construction (it restores ShowBanner on every exit path and only suppresses while its
+// dom0 connection is up), so a supervision gap costs dom0-native prettiness, never a lost
+// notification. Gate OFF: the only supervision left is the crash-leftover banner restore sweep.
+static ULONGLONG g_NotifBridgeExitedAt = 0;   // tick of an exit already reported; 0 = none pending
+static BOOL g_NotifNoPidLogged = FALSE;
 static void NotifBridgeSupervise(void)
 {
     if (!g_NotifBridge) { NotifBridgeRestoreSweep(); return; }
     ULONGLONG now = GetTickCount64();
-    if (now < g_NotifNextPoll) return;
+    // PROCESS EXIT FIRST, ahead of the 5 s throttle: the validated handle sits in the main loop's
+    // wait array, so an exit wakes the loop and lands here at once. Consume the signal here or
+    // the signalled handle would re-wake the loop on every pass until the throttle expired.
+    BOOL bridgeExited = FALSE;
+    if (g_NotifBridgeProc && WaitForSingleObject(g_NotifBridgeProc, 0) == WAIT_OBJECT_0)
+    {
+        DWORD exitCode = 0;
+        if (!GetExitCodeProcess(g_NotifBridgeProc, &exitCode)) exitCode = 0xFFFFFFFF;
+        CloseHandle(g_NotifBridgeProc); g_NotifBridgeProc = NULL;
+        bridgeExited = TRUE;
+        g_NotifBridgeExitedAt = now;
+        // A bridge exit is a FAILURE to report, not a supervision detail: the gate is ON (checked
+        // above), so nothing here asked it to stop. Its exit codes (notifhost.cpp BridgeMain):
+        // 0 = singleton held / agent gone / stop file / session changed, 2 = listener access
+        // denied (consent), 3 = listener init threw. ShowBanner is restored on every exit path,
+        // so the cost is dom0-native toasts, not lost ones - which does not make it benign.
+        LogError("QGANOTIFBRIDGEEXIT notification bridge pid %lu EXITED (exit code %lu) - detected "
+            L"by process wait, not by heartbeat staleness. Guest toasts take the window path until "
+            L"the relaunch (throttled to one per 60 s). bridge.log names the reason.",
+            g_NotifBridgePid, exitCode);
+        g_NotifBridgePid = 0;
+    }
+    if (!bridgeExited && now < g_NotifNextPoll) return;
     g_NotifNextPoll = now + 5000;
-    if (WTSGetActiveConsoleSessionId() == 0xFFFFFFFF || !GetShellWindow()) return;
+    DWORD sid = WTSGetActiveConsoleSessionId();
+    if (sid == 0xFFFFFFFF || !GetShellWindow()) return;
 
     WCHAR hb[MAX_PATH];
     if (!ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge\\heartbeat", hb, RTL_NUMBER_OF(hb)))
         return;
-    // Liveness = the heartbeat file's CONTENT - the bridge's GetTickCount64 ("%llu\n", written every
-    // pass, notifhost.cpp BridgeMain) - against OUR GetTickCount64: same boot, same monotonic clock.
-    // The previous test compared the file's mtime with the WALL clock, so any forward clock step
-    // (the first NTP correction when an AppVM gets its netvm) read as ">15 s stale". A false
-    // "stale" here is DESTRUCTIVE: the relaunch below begins with schtasks /delete, which Task
-    // Scheduler applies by ENDING the running instance (measured - notifhost.cpp: "TERMINATED the
-    // still-alive bridge via schtasks /delete"), so a toast in flight was neither bannered nor
-    // forwarded and the kill left no trace on this side (audit 2026-09-08).
+    // Liveness = the heartbeat file's CONTENT - "<tick> <pid>": the bridge's GetTickCount64
+    // (written every pass, notifhost.cpp BridgeMain) against OUR GetTickCount64 - same boot, same
+    // monotonic clock - and the pid the handle above is opened from. The previous test compared
+    // the file's mtime with the WALL clock, so any forward clock step (the first NTP correction
+    // when an AppVM gets its netvm) read as ">15 s stale". A false "stale" here is DESTRUCTIVE:
+    // the relaunch below begins with schtasks /delete, which Task Scheduler applies by ENDING
+    // the running instance (measured - notifhost.cpp: "TERMINATED the still-alive bridge via
+    // schtasks /delete"), so a toast in flight was neither bannered nor forwarded and the kill
+    // left no trace on this side (audit 2026-09-08).
     // A file whose tick is AHEAD of ours is from a previous boot - stale by definition.
-    BOOL fileSeen = FALSE, parsed = FALSE; ULONGLONG hbTick = 0;
-    HANDLE hf = CreateFile(hb, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (hf != INVALID_HANDLE_VALUE)
+    // A just-exited bridge's tick can still be fresh: skip the file when the exit is already known.
+    BOOL fileSeen = FALSE, parsed = FALSE; ULONGLONG hbTick = 0; DWORD hbPid = 0;
+    if (!bridgeExited)
     {
-        char buf[64] = { 0 }; DWORD rd = 0;
-        fileSeen = TRUE;
-        if (ReadFile(hf, buf, sizeof(buf) - 1, &rd, NULL) && rd > 0)
+        HANDLE hf = CreateFile(hb, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                               NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (hf != INVALID_HANDLE_VALUE)
         {
-            char* end = buf;
-            hbTick = _strtoui64(buf, &end, 10);
-            parsed = (end != buf && hbTick != 0);
+            char buf[64] = { 0 }; DWORD rd = 0;
+            fileSeen = TRUE;
+            if (ReadFile(hf, buf, sizeof(buf) - 1, &rd, NULL) && rd > 0)
+            {
+                char* end = buf;
+                hbTick = _strtoui64(buf, &end, 10);
+                parsed = (end != buf && hbTick != 0);
+                // Optional second field (older notifhost builds wrote the tick alone).
+                if (parsed && *end == ' ')
+                    hbPid = (DWORD)strtoul(end + 1, NULL, 10);
+            }
+            CloseHandle(hf);
+            if (parsed && hbTick <= now && now - hbTick < 15000)
+            {
+                g_NotifUnparsed = 0;
+                // Fresh: take the process handle from the published pid, validated
+                // (OpenHelperProcess) - only while the tick advances, so a dead instance's pid
+                // is never tried, and once per pid so a forged/foreign pid costs one loud line.
+                if (!g_NotifBridgeProc && hbPid != 0 && hbPid != g_NotifBridgePidRejected)
+                {
+                    g_NotifBridgeProc = OpenHelperProcess(hbPid, sid, L"notifhost.exe");
+                    if (g_NotifBridgeProc)
+                    {
+                        g_NotifBridgePid = hbPid;
+                        g_NotifBridgeExitedAt = 0;
+                        LogInfo("NOTIFBRIDGE ready (heartbeat live, pid %lu) - its exit is now waited on", hbPid);
+                    }
+                    else
+                    {
+                        g_NotifBridgePidRejected = hbPid;
+                        // A DEAD PID IS A CRASH, NOT A FORGERY. On the crash path the heartbeat
+                        // file is still fresh (the bridge wrote it moments before dying) while the
+                        // process is already gone, so the validated open fails for an entirely
+                        // ordinary reason. Reporting that as "not a running notifhost.exe ... the
+                        // file is user-writable" accuses the guest of tampering on every single
+                        // bridge crash, which dilutes a warning that is supposed to mean forgery.
+                        // Tell them apart by asking whether the pid exists AT ALL first.
+                        HANDLE probe = OpenProcess(SYNCHRONIZE, FALSE, hbPid);
+                        if (!probe)
+                            LogWarning("NOTIFBRIDGE heartbeat pid %lu is gone - the bridge exited "
+                                L"between writing its tick and this check (a crash, not a forged "
+                                L"pid); the heartbeat backstop will relaunch it.", hbPid);
+                        else
+                        {
+                            CloseHandle(probe);
+                            LogWarning("QGANOTIFPID heartbeat pid %lu IS running but is not "
+                                L"notifhost.exe from the install dir in session %lu - ignored (the "
+                                L"file is user-writable, so this looks like a forged pid). Only the "
+                                L"heartbeat can detect this bridge's death, and a hung instance "
+                                L"cannot be reaped before a relaunch.", hbPid, sid);
+                        }
+                    }
+                }
+                else if (!g_NotifBridgeProc && hbPid == 0 && !g_NotifNoPidLogged)
+                {
+                    // Agent and bridge ship together; a tick without a pid means an older
+                    // notifhost.exe is running under this agent. Mixed versions are an install
+                    // anomaly, said once; supervision falls back to heartbeat-only.
+                    g_NotifNoPidLogged = TRUE;
+                    LogWarning("QGANOTIFNOPID heartbeat carries a tick but no pid - the running "
+                        L"notifhost.exe predates this agent (mixed install). Death detection is "
+                        L"heartbeat-only (15 s + poll grain) until it is replaced.");
+                }
+                return;   // heartbeat fresh within 15 s of this boot's clock - bridge alive
+            }
         }
-        CloseHandle(hf);
-        if (parsed && hbTick <= now && now - hbTick < 15000)
-        {
-            g_NotifUnparsed = 0;
-            return;   // heartbeat fresh within 15 s of this boot's clock - bridge alive
-        }
+        // A FILE THAT IS PRESENT BUT UNREADABLE IS INDETERMINATE, NOT STALE.
+        // notifhost writes the heartbeat with CREATE_ALWAYS (truncate) and then writes the tick,
+        // so a read landing in that gap legitimately returns 0 bytes. Treating that single
+        // sample as "no tick" made the supervisor relaunch - and the relaunch's `schtasks
+        // /delete` ENDS a perfectly healthy bridge, which is precisely the kill this heartbeat
+        // exists to avoid. Require several CONSECUTIVE unreadable samples (~15 s at this
+        // supervisor's cadence) before concluding anything; one parsed sample clears the count.
+        if (fileSeen && !parsed && ++g_NotifUnparsed < NOTIF_UNPARSED_LIMIT)
+            return;
     }
-    // A FILE THAT IS PRESENT BUT UNREADABLE IS INDETERMINATE, NOT STALE.
-    // notifhost writes the heartbeat with CREATE_ALWAYS (truncate) and then writes the tick, so a
-    // read landing in that gap legitimately returns 0 bytes. Treating that single sample as "no
-    // tick" made the supervisor relaunch - and the relaunch's `schtasks /delete` ENDS a perfectly
-    // healthy bridge, which is precisely the kill this heartbeat exists to avoid. Require several
-    // CONSECUTIVE unreadable samples (~15 s at this supervisor's cadence) before concluding
-    // anything; one parsed sample clears the count.
-    if (fileSeen && !parsed && ++g_NotifUnparsed < NOTIF_UNPARSED_LIMIT)
-        return;
     // 60 s relaunch throttle: a bridge that exits fatally on purpose (consent revoked,
     // listener broken) must not become a process treadmill - each retry re-runs its
     // selftest and exits again until the guest-side cause is fixed. The throttle must NOT
@@ -2833,17 +2931,48 @@ static void NotifBridgeSupervise(void)
     // (exactly the cold-boot bring-up window). Gate the throttle on having launched before.
     if (g_NotifLastLaunch != 0 && now - g_NotifLastLaunch < 60000) return;
     g_NotifLastLaunch = now;
-    // A stale heartbeat from a bridge that had been running is either a death or a HANG (one
-    // iteration past 15 s); the relaunch's /delete ends a hung instance abruptly (no banner
-    // restore). Say so - the kill was previously invisible. The bridge does not publish its pid,
-    // so alive-vs-dead cannot be told apart from here yet.
-    if (fileSeen && parsed)
+    // A stale heartbeat from a bridge whose handle we hold is a HANG (process alive, tick not
+    // advancing - one iteration past 15 s). REAP IT BEFORE RELAUNCHING: the bridge holds
+    // Local\QubesToastBridgeSingleton and a second instance exits 0 on it without a trace
+    // (notifhost.cpp BridgeMain), and schtasks /delete does not reach an instance started under
+    // an older task definition - so without this the outage lasted until the hung process died.
+    // The handle was validated when taken, so this terminates only our own notifhost.exe in the
+    // console session. Its banner-restore exit path does not run; the new instance's startup
+    // BannerRestoreAll covers the leftovers (that is what it exists for).
+    if (g_NotifBridgeProc)
+    {
+        if (WaitForSingleObject(g_NotifBridgeProc, 0) == WAIT_TIMEOUT)
+        {
+            LogError("QGANOTIFBRIDGEHUNG notification bridge pid %lu is still RUNNING but its "
+                L"heartbeat has not advanced (bridge tick %I64u, agent tick %I64u, %I64d ms) - a "
+                L"hang, not a crash. Terminating it before the relaunch; without this the new "
+                L"instance exits on the singleton mutex and the outage never ends.",
+                g_NotifBridgePid, hbTick, now, (LONGLONG)(now - hbTick));
+            if (TerminateProcess(g_NotifBridgeProc, 1))
+                WaitForSingleObject(g_NotifBridgeProc, 2000);
+            else
+                LogError("QGANOTIFBRIDGEHUNG TerminateProcess failed (0x%x) - the relaunch will most "
+                    L"likely be refused by the singleton mutex", GetLastError());
+        }
+        CloseHandle(g_NotifBridgeProc); g_NotifBridgeProc = NULL; g_NotifBridgePid = 0;
+    }
+    else if (bridgeExited || g_NotifBridgeExitedAt != 0)
+    {
+        // Already reported as QGANOTIFBRIDGEEXIT when the handle signalled; this pass is the
+        // (throttled) relaunch for it.
+        LogInfo("NOTIFBRIDGE relaunching after the exit reported %I64u ms ago",
+            now - g_NotifBridgeExitedAt);
+    }
+    else if (fileSeen && parsed)
+        // No handle was ever taken for this instance (pid absent or rejected), so alive-vs-dead
+        // cannot be told here; if it is alive this is a hang and schtasks /delete ENDS it.
         LogWarning("NOTIFBRIDGE heartbeat STALE (bridge tick %I64u, agent tick %I64u, %I64d ms) - "
-            L"relaunching; if the bridge is still alive this is a hang and schtasks /delete ENDS it",
-            hbTick, now, (LONGLONG)(now - hbTick));
+            L"relaunching with no process handle held; if the bridge is still alive this is a hang "
+            L"and schtasks /delete ENDS it", hbTick, now, (LONGLONG)(now - hbTick));
     else if (fileSeen)
         LogWarning("NOTIFBRIDGE heartbeat file exists but carries no tick - not written by this "
             L"notifhost build? Treated as stale; relaunching");
+    g_NotifBridgeExitedAt = 0;
     (void)NotifBridgeLaunch();
 }
 
@@ -2862,6 +2991,7 @@ static void NotifBridgeShutdown(void)
         WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
         NotifBridgeRequestStop();
     }
+    if (g_NotifBridgeProc) { CloseHandle(g_NotifBridgeProc); g_NotifBridgeProc = NULL; }
 }
 
 // ---- WGC broker stage 2b: register occluded NRB app windows, consume their frames --------
@@ -8827,12 +8957,14 @@ static ULONG WINAPI WatchForEvents(void)
             vchanNoClientDeadline = 0; // said once; do not spin
         }
 
-        // The de-slice broker's validated process handle (BrokerSupervise) rides in the wait array
-        // so its exit wakes the loop at once instead of at the next 1 Hz heartbeat poll (~7 s of
-        // withheld toasts/menus per death before). Index 7 has no case in the switch below on
-        // purpose: BrokerSupervise runs before the switch on every wake and consumes the signal.
-        if (g_WgcBrokerProc) { watchedEvents[7] = g_WgcBrokerProc; eventCount = 8; }
-        else eventCount = 7;
+        // The validated helper process handles (BrokerSupervise, NotifBridgeSupervise) ride in the
+        // wait array so an exit wakes the loop at once instead of at the next heartbeat poll (~7 s
+        // of withheld toasts/menus per broker death, 15-20 s per bridge death before). Indices 7+
+        // have no case in the switch below on purpose: both supervisors run before the switch on
+        // every wake and consume the signal.
+        eventCount = 7;
+        if (g_WgcBrokerProc) watchedEvents[eventCount++] = g_WgcBrokerProc;
+        if (g_NotifBridgeProc) watchedEvents[eventCount++] = g_NotifBridgeProc;
 
         // Wait for events.
         signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, waitTimeout);
