@@ -233,9 +233,8 @@ static const CLSID g_TcClsidUIAutomation8 =
 static const IID g_TcIidUIAutomation2 =
     { 0x34723aff, 0x0c9d, 0x49d0, { 0x98, 0x96, 0x7a, 0xb5, 0x2d, 0xf8, 0xcd, 0x8a } };
 
-// Milliseconds. Generous enough that a merely busy shell still answers, short enough that a
-// dead one cannot stall a frame for a human-visible time.
-#define TOAST_CROP_UIA_TIMEOUT_MS 500
+// TOAST_CROP_UIA_TIMEOUT_MS now lives in toastcrop.h: main.c derives the crop-before-show budget
+// from it, and the two MUST NOT drift apart (they did, and the budget lost - see the header).
 
 // NOTE: the card is no longer identified by class name. FlexibleToastView/ToastView were the
 // names on one build for one surface; TcFindCardRect finds the card geometrically instead, which

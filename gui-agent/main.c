@@ -3385,10 +3385,19 @@ static BOOL BrokerOpaqueInsets(IN HWND window, OUT RECT* insets)
 }
 
 // Crop-before-show fallback ceiling: map a held toast/menu after this long even if the crop never
-// resolves, so it can never stay hidden. Typical maps happen far sooner (when the broker reports,
-// ~100-150 ms); this only bounds a broker-slow / broker-down case. Owner OK'd a ~100 ms new-window
-// penalty; 400 ms is the worst case, not the norm.
-#define CROP_BEFORE_SHOW_TIMEOUT_MS 400
+// resolves, so it can never stay hidden. A fast measurement still maps far sooner - the ceiling is
+// only ever reached when the crop is genuinely slow, so the common case keeps the owner's ~100 ms
+// new-window penalty.
+//
+// DERIVED, not chosen. It was a flat 400 ms while one UIA operation was allowed 500 ms
+// (TOAST_CROP_UIA_TIMEOUT_MS), so the window a measurement was held for was shorter than the
+// measurement's own worst case and a slow crop could never make it: the toast was mapped UNCROPPED
+// with its shadow strip, then snapped when the insets arrived ~150 ms later. Measured on win11-ne
+// 2026-09-09 (agent 4.3.22), holds were 188 / 407 / 484 / 1843 ms - the fallback was the NORM, not
+// the exception the old comment claimed. Deriving it keeps the invariant "the budget outlasts one
+// UIA operation" true no matter which file someone edits; the slack covers scheduling the result
+// back onto the main loop.
+#define CROP_BEFORE_SHOW_TIMEOUT_MS (TOAST_CROP_UIA_TIMEOUT_MS + 200)
 
 // SLICE-CONTENT MAP-HOLD readiness (g_SliceMapHold). The non-de-sliced slice-fed path has the
 // same black-first-frame defect the de-slice arm below already fixes for 24H2+: AddWindow maps
@@ -6075,6 +6084,19 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         }
         else if (cropReady || timedOut)
         {
+            // CROP-BEFORE-SHOW FALLBACK FIRED. Say so LOUDLY and machine-readably: this maps the
+            // window UNCROPPED, so its shadow strip is visible until the measurement lands and the
+            // window then snaps to the tight rect. That is the visible defect an owner reports as
+            // "it violated crop-before-map", and until 2026-09-09 there was NO line naming it -
+            // only held_ms in QGASLICEMAP encoded it, implicitly. A fallback that fires silently is
+            // the anomaly this project's own rule forbids, so grep QGACROPLATE for it.
+            if (timedOut && !cropReady)
+                LogWarning("QGACROPLATE hwnd 0x%x (class %s) mapped UNCROPPED: the shadow-crop did "
+                    L"not resolve within %lu ms, so the window is shown at its full rect and will "
+                    L"snap when the measurement lands. This is the line to quote for a toast/menu "
+                    L"that appears with its shadow strip",
+                    (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
+                    (ULONG)CROP_BEFORE_SHOW_TIMEOUT_MS);
             if (timedOut && !cropReady && DirectRequired() && windowData->PwSliceFed &&
                 !SliceContentReady(windowData))
                 LogWarning("QGADIRECTDARK hwnd 0x%x (class %s) mapped UNPAINTED after %lu broker "

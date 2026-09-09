@@ -140,6 +140,21 @@ ULONG ToastCropQuery(
     OUT RECT* insets
     );
 
+// How long a single UIA operation may take. Generous enough that a merely busy shell still
+// answers, short enough that a dead one cannot stall a frame for a human-visible time.
+//
+// IT IS ALSO THE FLOOR FOR THE CROP-BEFORE-SHOW BUDGET, which is why it is declared here rather
+// than in toastcrop.c. Until 2026-09-09 the budget (CROP_BEFORE_SHOW_TIMEOUT_MS, main.c) was 400 ms
+// while this was 500 ms: the window a measurement is held for was SHORTER than the measurement's
+// own worst case, so any slow measurement was structurally guaranteed to miss it and the window was
+// then mapped UNCROPPED - the shadow strip showing, then snapping when the insets landed.
+// Measured on win11-ne, agent 4.3.22, 2026-09-09: of four held windows in one boot the holds were
+// 188, 407, 484 and 1843 ms - three of four over the 400 ms budget. The design comment claimed
+// "typical ~100-150 ms, 400 ms is the worst case, not the norm"; the timeout arm was the norm.
+// main.c derives its budget from this constant, so the invariant "the budget outlasts one UIA
+// operation" cannot be broken by editing one file.
+#define TOAST_CROP_UIA_TIMEOUT_MS 500
+
 // Drop this window's cache slot. Windows recycles HWND values, so a stale hit would apply
 // one window's insets to an unrelated popup; called from RemoveWindow.
 void ToastCropEvict(

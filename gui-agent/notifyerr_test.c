@@ -15,6 +15,9 @@
  *   dedupe     NOTIFYERR_DEFECT_RATELIMIT - the same (component,id) twice in one boot sends once;
  *                                           a marker from an EARLIER boot does not suppress
  *   cap        NOTIFYERR_DEFECT_CAP       - the 9th distinct error in one boot is suppressed
+ *   close reboot NOTIFYERR_DEFECT_CLOSEREBOOT - two boots whose tokens are near each other are
+ *                                           still two boots; the 4.3.22 +/-120 s tolerance made a
+ *                                           73 s reboot look like one and swallowed the error
  *   redaction  NOTIFYERR_DEFECT_REDACT    - secret-shaped text is refused, at the pure level and
  *                                           end-to-end (no marker, no spawn)
  *   fail-open  NOTIFYERR_DEFECT_FAILOPEN  - transport missing/failed/unwritable store: the caller
@@ -113,9 +116,10 @@ static void WriteFileRel(const char* rel, const char* text)
 
 int main(void)
 {
-    const long long BOOT = 1757400000LL;   /* any fixed epoch; the tolerance is what matters */
+    const long long BOOT = 1757400000LL;   /* any fixed per-boot token; only equality matters */
 #if defined(NOTIFYERR_DEFECT_SEVERITY) || defined(NOTIFYERR_DEFECT_RATELIMIT) || \
-    defined(NOTIFYERR_DEFECT_CAP) || defined(NOTIFYERR_DEFECT_REDACT) || defined(NOTIFYERR_DEFECT_FAILOPEN)
+    defined(NOTIFYERR_DEFECT_CAP) || defined(NOTIFYERR_DEFECT_REDACT) || \
+    defined(NOTIFYERR_DEFECT_FAILOPEN) || defined(NOTIFYERR_DEFECT_CLOSEREBOOT)
     const int defectBuild = 1;
     printf("NOTE: a NOTIFYERR_DEFECT_* switch is compiled in - this suite MUST fail now.\n");
 #else
@@ -186,8 +190,18 @@ int main(void)
         Check("count: missing count does not parse", !QerrParseCount("boot=5\n", &b, &c));
         Check("count: format round-trips", QerrFormatCount(buf, sizeof(buf), 9, 2) &&
               QerrParseCount(buf, &b, &c) && b == 9 && c == 2);
-        Check("boot: within tolerance is one boot", QerrBootMatch(1000, 1000 + QERR_BOOT_TOLERANCE_S));
-        Check("boot: beyond tolerance is another boot", !QerrBootMatch(1000, 1000 + QERR_BOOT_TOLERANCE_S + 1));
+        Check("boot: the same token is one boot", QerrBootMatch(1000, 1000));
+        /* NOTIFYERR_DEFECT_CLOSEREBOOT. The shipped 4.3.22 matched boot stamps with a +/-120 s
+         * tolerance, so two boots whose stamps were close counted as one and the second boot's
+         * ACTION error was swallowed as a duplicate. Measured on win11-ne 2026-09-09: a real
+         * reboot 73 s apart did exactly that. Consecutive stamps are (previous uptime + downtime)
+         * apart, so this is the ordinary chained-update reboot, not a corner case. These two are
+         * the regression: they FAIL the moment any margin is reintroduced. */
+        Check("boot: a token 73 s away is ANOTHER boot (close reboot, the 4.3.22 defect)",
+              !QerrBootMatch(1000, 1000 + 73));
+        Check("boot: a token 1 s away is ANOTHER boot", !QerrBootMatch(1000, 1000 + 1));
+        Check("boot: tokens differing either way are different boots",
+              !QerrBootMatch(1000, 927) && !QerrBootMatch(1000, 5000));
     }
 
     /* ---- 3. pure decision: severity threshold ------------------------------------------- */
@@ -202,9 +216,16 @@ int main(void)
             QerrDecide(QERR_SEV_ACTION, "gui-agent", "y", t, 0, 0, 0, 0, 0, BOOT, &nc), QERR_SEND);
         Check("decide: first send counts 1", nc == 1);
         CheckDecision("decide: same boot marker -> duplicate",
-            QerrDecide(QERR_SEV_ACTION, "gui-agent", "y", t, 1, BOOT + 30, 0, 0, 0, BOOT, &nc), QERR_SUPPRESS_DUP);
+            QerrDecide(QERR_SEV_ACTION, "gui-agent", "y", t, 1, BOOT, 0, 0, 0, BOOT, &nc), QERR_SUPPRESS_DUP);
         CheckDecision("decide: earlier-boot marker -> sends",
             QerrDecide(QERR_SEV_ACTION, "gui-agent", "y", t, 1, BOOT - 5000, 0, 0, 0, BOOT, &nc), QERR_SEND);
+        /* The same defect at the decision layer, not just the comparator: a marker left by a boot
+         * that ended 73 s ago must not suppress this boot's error. */
+        CheckDecision("decide: marker from a boot 73 s earlier -> sends (close reboot)",
+            QerrDecide(QERR_SEV_ACTION, "gui-agent", "y", t, 1, BOOT - 73, 0, 0, 0, BOOT, &nc), QERR_SEND);
+        CheckDecision("decide: cap from a boot 73 s earlier does not count (close reboot)",
+            QerrDecide(QERR_SEV_ACTION, "gui-agent", "y", t, 0, 0, 1, BOOT - 73, QERR_CAP_PER_BOOT, BOOT, &nc),
+            QERR_SEND);
         CheckDecision("decide: cap reached -> suppressed",
             QerrDecide(QERR_SEV_ACTION, "gui-agent", "y", t, 0, 0, 1, BOOT, QERR_CAP_PER_BOOT, BOOT, &nc), QERR_SUPPRESS_CAP);
         CheckDecision("decide: cap from an earlier boot does not count",

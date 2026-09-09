@@ -32,10 +32,11 @@
  *              escalates into the ACTION event that follows it (broker died -> relaunch, or
  *              QGADESLICEDOWN 30 s later), so notifying it only duplicates that ACTION.
  *   dedupe     one notification per distinct (component, id) per BOOT. Marker file
- *              <state>\<component>.<id> holding "boot=<boot epoch seconds>"; the boot stamp is
- *              derived from uptime, so a respawned agent or a second script in the same boot
- *              sees the earlier attempt. A marker from an earlier boot (stamp differs by more than
- *              QERR_BOOT_TOLERANCE_S) is stale and is overwritten.
+ *              <state>\<component>.<id> holding "boot=<per-boot token>"; the token is minted once
+ *              per boot and shared by every process in it (PlatBootStamp), so a respawned agent or
+ *              a second script in the same boot sees the earlier attempt. A marker whose token is
+ *              not this boot's is stale and is overwritten. Tokens compare EXACTLY - see
+ *              QerrBootMatch for why the tolerance that used to live here was a defect.
  *   cap        at most QERR_CAP_PER_BOOT notifications per boot across ALL ids (file
  *              <state>\.count, "boot=<n>\ncount=<n>"): the storm guard for a bug that mints
  *              distinct ids. Rejections are logged; they never block the caller.
@@ -87,9 +88,13 @@ extern "C" {
 #define QERR_MAX_TEXT          600    /* UTF-8 bytes of summary + log hint, the whole payload */
 #define QERR_MAX_LINES         6
 #define QERR_CAP_PER_BOOT      8
-#define QERR_BOOT_TOLERANCE_S  120    /* two uptime-derived boot stamps this close are one boot */
 #define QERR_OPAQUE_RUN        40     /* base64-class run length that reads as a key/blob */
 #define QERR_HEX_RUN           32     /* hex run length that reads as a digest/GUID/key */
+
+/* Where the per-boot token lives. Created REG_OPTION_VOLATILE, so the kernel drops it at shutdown
+ * and its presence is exactly "this boot". The PowerShell twin (guest/qwt-notify-error.ps1) mints
+ * and reads the same key, so a script and the agent share one boot identity. */
+#define QERR_BOOT_KEY "SOFTWARE\\Invisible Things Lab\\Qubes Tools\\NotifyErrBoot"
 
 typedef enum QerrDecision {
     QERR_SEND = 0,
@@ -192,12 +197,35 @@ static inline const char* QerrRedactReason(const char* utf8)
 #endif
 }
 
-/* --- boot stamps and the marker files ---------------------------------------------------- */
+/* --- boot tokens and the marker files ------------------------------------------------------ */
+/* EXACT equality, and the exactness is the point.
+ *
+ * This was |a - b| <= QERR_BOOT_TOLERANCE_S (120 s) over a stamp derived as (wall clock - uptime).
+ * Two consecutive boot stamps differ by the PREVIOUS boot's uptime plus its downtime, so a guest
+ * that reboots soon after booting mints stamps only tens of seconds apart - and the tolerance then
+ * declared two real boots to be one, suppressing the second boot's notification as a duplicate.
+ *
+ * Measured on win11-ne, 2026-09-09, agent 4.3.22: a reboot whose stamps were 73 s apart COLLIDED
+ * (an ACTION error was swallowed as suppressed:duplicate); one 373 s apart did not. The 73 s case
+ * is not exotic - it is the chained Windows-update reboot, i.e. precisely the situation this route
+ * exists to report on. The same run showed the stamp does not drift at all within a boot (two
+ * reads 100 s apart were byte-identical), so the 120 s margin was absorbing no real jitter while
+ * costing real reports.
+ *
+ * The stamp is now an opaque per-boot token whose lifetime the OS itself maintains, so identity is
+ * exact and no margin is needed or wanted. Do not reintroduce one: a margin here can only ever
+ * turn a distinct boot into a duplicate, and the failure is silent. */
 static inline int QerrBootMatch(long long a, long long b)
 {
+#ifdef NOTIFYERR_DEFECT_CLOSEREBOOT
+    /* The shipped 4.3.22 comparator, restored ONLY by tools/tests/notifyerr-selftest.sh so the
+     * close-reboot guards are seen to fail with the defect present. Never build this otherwise. */
     long long d = a - b;
     if (d < 0) d = -d;
-    return d <= QERR_BOOT_TOLERANCE_S;
+    return d <= 120;
+#else
+    return a == b;
+#endif
 }
 
 /* Marker file: "boot=<n>\n". Count file: "boot=<n>\ncount=<n>\n". Parsers are tolerant of CR and

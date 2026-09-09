@@ -127,6 +127,16 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
      * reads the store. Read both files up front anyway - they are tiny and this keeps the
      * decision a single pure call the test can pin. */
     now = PlatBootStamp();
+    if (!now) {
+        /* No boot identity means neither once-per-boot nor the cap can be honoured. Guessing would
+         * either storm dom0 or swallow errors, so this fails - LOUDLY, because on a guest where the
+         * agent runs as SYSTEM this cannot happen by design and is therefore a bug of ours, not a
+         * condition to degrade around. */
+        PlatLog("QGANOTIFYERR no per-boot token (HKLM\\%s): dedupe and the per-boot cap cannot be "
+                "honoured, so %s.%s is NOT notified - it is in the log only",
+                QERR_BOOT_KEY, component ? component : "-", id ? id : "-");
+        return QERR_FAIL_TRANSPORT;
+    }
     snprintf(markerPath, sizeof(markerPath), "%s/%s.%s", g_QerrStateDir,
              component ? component : "-", id ? id : "-");
     snprintf(countPath, sizeof(countPath), "%s/.count", g_QerrStateDir);
@@ -191,13 +201,58 @@ static void PlatLog(const char* fmt, ...)
     LogWarning("%S", line);   /* WARNING: visible in the default log like QGADESLICEDOWN */
 }
 
+/* An opaque token minted once per boot and identical for every process in that boot.
+ *
+ * A VOLATILE registry key is the OS's own per-boot object: the kernel discards it at shutdown, so
+ * the key's EXISTENCE is the boot. No clock arithmetic is involved, which matters twice over -
+ * the old (wall clock - uptime) derivation needed a tolerance and so could not tell two close
+ * reboots apart (see QerrBootMatch), and it also moved whenever the wall clock was set, which on
+ * a Qubes guest is routine (the host clock is pushed in after every start).
+ *
+ * Returns 0 when the token cannot be established. That is NOT a fallback to some other identity:
+ * without a boot identity neither once-per-boot nor the per-boot cap can be honoured, and silently
+ * guessing would either storm dom0 or swallow errors. QerrReport turns 0 into a loud failure.
+ *
+ * The mint race is resolved FAIL-OPEN on purpose: if two processes mint at once one may briefly
+ * read its own value, costing at most one duplicate notification. A duplicate is a nuisance; a
+ * suppressed ACTION error is the defect this whole route exists to prevent. */
 static long long PlatBootStamp(void)
 {
-    FILETIME ft; ULARGE_INTEGER u;
-    GetSystemTimeAsFileTime(&ft);
-    u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
-    /* 100 ns since 1601 -> seconds since 1970, minus uptime. Tolerance in QerrBootMatch. */
-    return (long long)(u.QuadPart / 10000000ULL) - 11644473600LL - (long long)(GetTickCount64() / 1000ULL);
+    static volatile LONG64 s_cached = 0;
+    HKEY key = NULL;
+    DWORD disp = 0, type = 0, cb = (DWORD)sizeof(LONG64);
+    LONG64 token = 0;
+
+    if (s_cached) return (long long)s_cached;
+
+    if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, QERR_BOOT_KEY, 0, NULL, REG_OPTION_VOLATILE,
+                        KEY_READ | KEY_WRITE, NULL, &key, &disp) != ERROR_SUCCESS)
+        return 0;
+
+    if (disp == REG_OPENED_EXISTING_KEY &&
+        RegQueryValueExA(key, "Token", NULL, &type, (LPBYTE)&token, &cb) == ERROR_SUCCESS &&
+        type == REG_QWORD && cb == (DWORD)sizeof(LONG64) && token != 0)
+    {
+        RegCloseKey(key);
+        InterlockedCompareExchange64(&s_cached, token, 0);
+        return (long long)s_cached;
+    }
+
+    /* Mint. The token only ever needs to differ from the PREVIOUS boot's, so the 100 ns system
+     * time mixed with the pid is ample; 0 is reserved as the "no token" sentinel. */
+    {
+        FILETIME ft; ULARGE_INTEGER u;
+        GetSystemTimeAsFileTime(&ft);
+        u.LowPart = ft.dwLowDateTime; u.HighPart = ft.dwHighDateTime;
+        token = (LONG64)(u.QuadPart ^ ((ULONGLONG)GetCurrentProcessId() << 48));
+        if (!token) token = 1;
+    }
+    if (RegSetValueExA(key, "Token", 0, REG_QWORD, (const BYTE*)&token, sizeof(token)) != ERROR_SUCCESS)
+        token = 0;
+    RegCloseKey(key);
+    if (!token) return 0;
+    InterlockedCompareExchange64(&s_cached, token, 0);
+    return (long long)s_cached;
 }
 
 static void PlatDefaultStateDir(char* out, size_t cap)
@@ -294,10 +349,13 @@ static void PlatLog(const char* fmt, ...)
 
 static long long PlatBootStamp(void)
 {
-    /* The suite pins the stamp; without a pin there is no uptime source in plain C, and the
-     * wall clock is a stand-in that only ever matches itself within one run. */
+    /* The suite pins the token. Unpinned there is no per-boot object in plain C, so latch one
+     * value for the life of the process: tokens now compare EXACTLY, and a bare time(NULL) read
+     * twice would look like two different boots a second apart. */
+    static long long s_token = 0;
     if (QerrTestBootStamp) return QerrTestBootStamp;
-    return (long long)time(NULL);
+    if (!s_token) s_token = (long long)time(NULL);
+    return s_token;
 }
 
 static void PlatDefaultStateDir(char* out, size_t cap)
