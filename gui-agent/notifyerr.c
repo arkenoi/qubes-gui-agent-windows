@@ -225,8 +225,13 @@ static long long PlatBootStamp(void)
 
     if (s_cached) return (long long)s_cached;
 
+    /* KEY_WOW64_64KEY pins the NATIVE view. HKLM\SOFTWARE is WOW64-redirected, so a 32-bit caller
+     * would otherwise mint its own token under Wow6432Node - and the agent (x64) and a 32-bit
+     * PowerShell host would then hold two different ideas of "this boot", quietly undoing the
+     * cross-language dedupe this key exists to provide. The PowerShell twin pins Registry64 for
+     * the same reason. */
     if (RegCreateKeyExA(HKEY_LOCAL_MACHINE, QERR_BOOT_KEY, 0, NULL, REG_OPTION_VOLATILE,
-                        KEY_READ | KEY_WRITE, NULL, &key, &disp) != ERROR_SUCCESS)
+                        KEY_READ | KEY_WRITE | KEY_WOW64_64KEY, NULL, &key, &disp) != ERROR_SUCCESS)
         return 0;
 
     if (disp == REG_OPENED_EXISTING_KEY &&
