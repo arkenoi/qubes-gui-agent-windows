@@ -21,6 +21,9 @@
     <ClCompile Include="..\..\gui-agent\main.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="..\..\gui-agent\notifyerr.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="..\..\gui-agent\perf.c">
       <Filter>Source Files</Filter>
     </ClCompile>

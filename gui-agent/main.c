@@ -52,6 +52,7 @@
 #include "etwproxy.h"
 #include "faultinject.h"
 #include "dragsim.h"
+#include "notifyerr.h"
 #include "qubes-io.h"
 
 // windows-utils
@@ -171,6 +172,17 @@ BOOL g_NoScreenGrant = FALSE;
 // before), winning over NotifyBridge. Registry "LegacyToasts" / qubesdb /qubes-service/legacy-toasts.
 #define REG_CONFIG_LEGACY_TOASTS_VALUE L"LegacyToasts"
 BOOL          g_NotifBridge = FALSE;
+// Secondary error-delivery route (docs/DESIGN-error-notify.md, notifyerr.h): an ACTION-severity
+// agent fault is ALSO sent to dom0 as a notification, through notifhost --notify-file over the
+// stock qubes.Notifications service, in addition to its log line - never instead of it. It rides
+// qrexec, so it delivers only while qrexec-agent is up; a guest whose qrexec is down (the case that
+// prompted it) gets nothing from it and the log stays the only record. Gate: registry
+// "NotifyErrors" (default 0) / qubesdb /qubes-service/notify-errors (dom0 wins), read once at init.
+// A SIBLING of the NotifyBridge gate, deliberately not the same one: that gate forwards the guest's
+// app toasts and suppresses their banners, and legacy_toasts forces it off - neither may decide
+// whether the agent's own faults reach dom0.
+#define REG_CONFIG_NOTIF_ERRORS_VALUE L"NotifyErrors"
+BOOL          g_NotifyErrors = FALSE;
 // Slice retirement (broker-only sliceFed handling) is the SHIPPED behaviour on 24H2+ and tracks
 // the broker build floor unconditionally; the SliceRetire diagnostic knob is retired. Field
 // kill-switch: WgcBroker=0 / /qubes-service/wgc-broker=0 - broker inactive routes every sliceFed
@@ -2252,6 +2264,12 @@ static BOOL WgcLaunch(void)
             L"(there is no composite fallback). This is a PACKAGING GAP: the helper was built but "
             L"never staged next to gui-agent.exe. It is a major failure of the install, not a "
             L"runtime condition to tolerate.", longExe);
+        // Secondary route (ACTION: will not recover by itself; a reinstall is the fix). The log
+        // line above stays the record; this is the courtesy copy, once per boot.
+        QerrReport("gui-agent", "broker-missing", QERR_SEV_ACTION,
+            "wgcbroker.exe is missing from the install, so toasts, menus and WinUI surfaces are "
+            "withheld on this guest; reinstall the package",
+            "gui-agent log in Qubes Logs, line QGABROKERMISSING");
         return FALSE;
     }
     WCHAR shortExe[MAX_PATH] = { 0 };
@@ -2434,6 +2452,13 @@ static void BrokerSupervise(void)
             L"that recovery does NOT make this benign, and it is reported here precisely so it "
             L"cannot pass silently. BrokerDeaths=%lu is published under the Qubes Tools config key.",
             g_BrokerDeaths, (long)WGCBRK_HDR(g_WgcBase)->BrokerPid, g_BrokerDeaths);
+        // Secondary route, DEGRADED - deliberately BELOW the route's ACTION threshold, so this is
+        // rejected and stays in the log: a relaunch follows within ~8 s, and if it does not take,
+        // QGADESLICEDOWN below escalates to ACTION 30 s later. Wired so the threshold is exercised
+        // by a real site and a future promotion is a one-word change, not new plumbing.
+        QerrReport("gui-agent", "broker-died", QERR_SEV_DEGRADED,
+            "the de-slice broker stopped heartbeating; a relaunch follows",
+            "gui-agent log in Qubes Logs, line QGABROKERDIED");
     }
 
     // HARD-FAIL, LOUDLY, ON AN ELIGIBLE SYSTEM (owner 2026-09-04: "I want deslicer to hard fail
@@ -2477,6 +2502,16 @@ static void BrokerSupervise(void)
                          L"gui-agent.exe)",
             binPresent ? L"" : L"This is the 2026-09-04 packaging finding.",
             binPresent ? 1u : 2u);
+        // Secondary route (ACTION: windows are being withheld and nothing here recovers it). Once
+        // per boot regardless of the 120 s re-warn cadence above; the text names the cause the same
+        // way the log line does, and points at the log for everything else.
+        QerrReport("gui-agent", "deslice-down", QERR_SEV_ACTION,
+            binPresent
+              ? "the de-slice broker is expected but has not been running for over 30 s, so toasts, "
+                "menus and WinUI surfaces are withheld; collect the gui-agent and wgcbroker logs"
+              : "the de-slice broker binary is missing from the install (packaging gap), so toasts, "
+                "menus and WinUI surfaces are withheld; reinstall the package",
+            "gui-agent log in Qubes Logs, line QGADESLICEDOWN");
     }
 
     // Throttle relaunch: a freshly launched broker needs a few seconds to attach and heartbeat;
@@ -2715,8 +2750,11 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs)
 
 static BOOL NotifBridgeLaunch(void)
 {
-    WCHAR args[64];
-    StringCchPrintf(args, RTL_NUMBER_OF(args), L"--bridge --agent-pid %lu", GetCurrentProcessId());
+    WCHAR args[96];
+    // --notify-errors: the resolved secondary-error-route gate, so the bridge can report its own
+    // ACTION faults (listener access denied) without reading the gate itself (notifyerr.h).
+    StringCchPrintf(args, RTL_NUMBER_OF(args), L"--bridge --agent-pid %lu --notify-errors %d",
+                    GetCurrentProcessId(), g_NotifyErrors ? 1 : 0);
     return NotifRunInSession(NOTIF_TASK_NAME, args);
 }
 
@@ -7314,6 +7352,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     L"(qvm-features <vm> service.gui-fullscreen 1, then qubes.SetGuiMode FULLSCREEN) "
                     L"where the sign-in screen IS shown inside the bounded window.",
                     desktopName, (now - s_SecureSince) / 1000);
+                // Secondary route (ACTION: dom0 sees nothing and only a human can change that).
+                // This is the case the route is best at - a guest with zero windows and a live
+                // qrexec - so the notification is exactly what the log line cannot be: seen.
+                // The desktop name is not included: the fixed text is all a reader needs.
+                QerrReport("gui-agent", "desktop-stuck", QERR_SEV_ACTION,
+                    "the guest has been on the Windows sign-in or lock screen for over 30 s and "
+                    "shows nothing in seamless mode; arm autologon or open the windowed desktop",
+                    "gui-agent log in Qubes Logs, line QGADESKSTUCK");
             }
 
             // Seamless: nothing may flow while this desktop is up. Non-seamless falls through
@@ -9898,6 +9944,27 @@ static ULONG Init(void)
         // no new knobs - service.notify-bridge is the single control). All launch and
         // supervision logic lives in etwproxy.c, deliberately outside this file.
         EtwProxyInit(g_NotifBridge);
+    }
+    {
+        // Secondary error route gate (REG_CONFIG_NOTIF_ERRORS_VALUE): registry base, qubesdb
+        // /qubes-service/notify-errors override (dom0 wins), same failed-vs-absent discipline as
+        // the gates above. Default OFF: a guest must not start notifying dom0 because it was
+        // upgraded. Resolved ONCE here (capabilities are decided at start) and handed to
+        // notifyerr.c and to the bridge helper (--notify-errors on its command line) - the agent is
+        // the single reader of this gate.
+        DWORD ne = 0;
+        const WCHAR *neSrc = L"default";
+        char* v;
+        if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_NOTIF_ERRORS_VALUE, &ne, NULL))
+            neSrc = L"registry";
+        g_NotifyErrors = (ne != 0);
+        v = ReadServiceGate(gateQdb, "/qubes-service/notify-errors", &gateReadFailed);
+        if (v) { g_NotifyErrors = (v[0] != '0'); free(v); neSrc = L"qubesdb"; }
+        if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
+        LogInfo("NOTIFYERR gate: enabled=%d source=%s (ACTION faults also go to dom0 as a "
+                "notification via notifhost/qubes.Notifications; needs qrexec-agent; log stays primary)",
+                g_NotifyErrors, neSrc);
+        QerrInit(g_NotifyErrors, NULL);
     }
 
     // Diagnostic-only window-filter override; absent (the normal case) means 0 = all
