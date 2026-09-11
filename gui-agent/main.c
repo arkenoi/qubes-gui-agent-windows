@@ -1644,17 +1644,16 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         // least half the window in each dim (a real menu's shadow margin is tiny, ~90%+ card; the
         // 50% floor blocks a malicious broker from cropping the window down to a sliver). All-zero
         // is a valid "no margin, no crop". Anything implausible falls back to the UIA path.
-        // ONE AUTHORITY FOR A MENU, when the broker can answer at all. The broker's opaque
-        // bounds are measured from the actual rendered pixels; the UIA card rect is an estimate,
-        // and the two DISAGREE (measured 2026-09-11: 20/69 vs 24/77 insets on the same 287x328
-        // menu). With both live, whichever answered first won that pass and the geometry FLIPPED
-        // when the other landed - which re-registers the broker slot, costs a fresh first-frame
-        // round trip, and briefly exposes an unpainted strip at the new size. That is exactly
-        // what the owner reported as "settles very slowly" and "black blink is short but
-        // noticeable". So when the broker is active a menu waits for the pixel-exact answer and
-        // never takes the estimate; UIA remains the authority only where no broker exists
-        // (win10, below the broker floor), where there is nothing to disagree with.
-        const BOOL menuBrokerAuthority = IsMenuPopupWindow(entry) && WgcBrokerActive();
+        // THE TWO AUTHORITIES DISAGREE (measured 2026-09-11: broker pixel-exact 20/69 vs UIA
+        // estimate 24/77 on the same 287x328 menu), and whichever answers first wins the pass -
+        // when the other lands the geometry flips, which is the owner-reported "settles slowly"
+        // and the short black blink at the newly exposed strip. MAKING THE BROKER THE SOLE
+        // AUTHORITY WAS TRIED AND REVERTED (2026-09-11): its bounds are frequently not available
+        // inside the budget, so menus fell through to the ceiling and mapped UNCROPPED - median
+        // 375 -> 600 ms and timeout releases 0-1 -> 1-3 per run. Keeping the estimate usable is
+        // strictly better than waiting for exactness. The flip still needs fixing, but by
+        // LATCHING whichever value resolves first for a (class,size) so it cannot change under
+        // an already-mapped window - not by waiting for one side.
         if (IsMenuPopupWindow(entry) && BrokerOpaqueInsets(entry->Handle, &insets))
         {
             LONG cw = (LONG)entry->Width  - insets.left - insets.right;
@@ -1662,10 +1661,10 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
             if (insets.left >= 0 && insets.top >= 0 && insets.right >= 0 && insets.bottom >= 0 &&
                 cw * 2 >= (LONG)entry->Width && ch * 2 >= (LONG)entry->Height)
                 have = (insets.left || insets.top || insets.right || insets.bottom);
-            else if (!menuBrokerAuthority && ToastCropLookup(entry, &insets))
+            else if (ToastCropLookup(entry, &insets))
                 have = TRUE;
         }
-        else if (!menuBrokerAuthority && ToastCropLookup(entry, &insets))
+        else if (ToastCropLookup(entry, &insets))
             have = TRUE;
 
         if (have)
@@ -3596,12 +3595,7 @@ static BOOL CropReadyForMap(IN const WINDOW_DATA* entry)
 {
     RECT tmp;
     if (IsMenuPopupWindow(entry))
-        // With the broker live the pixel-exact insets are the ONLY answer that will be applied
-        // (see GetWindowData), so releasing on "UIA has stopped pending" would map at a geometry
-        // that is about to change - the flip the owner sees. Wait for the authority itself.
-        return (WgcBrokerActive()
-                    ? BrokerOpaqueInsets(entry->Handle, &tmp)
-                    : (BrokerOpaqueInsets(entry->Handle, &tmp) || !CropPending(entry))) &&
+        return (BrokerOpaqueInsets(entry->Handle, &tmp) || !CropPending(entry)) &&
                SliceChromeContentReady(entry);
     if (IsShellToastWindow(entry))
         return !CropPending(entry) && SliceChromeContentReady(entry);
