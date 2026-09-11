@@ -1437,11 +1437,22 @@ BOOL CropPending(IN const WINDOW_DATA* data)
     if (!isToast && !IsMenuPopupWindow(data))
         return FALSE;
 
+    // KEY ON THE RAW SIZE, ALWAYS. The cache is keyed on the size, and applying a crop REPLACES
+    // data->Width/Height with the CROPPED size (GetWindowData subtracts the insets). So once a
+    // window had been cropped, every later lookup here keyed on the cropped size, missed the
+    // entry stored under the raw size, and reported the crop as still pending - which kept the
+    // map deferred to the ceiling even though the measurement had long since resolved.
+    // Measured 2026-09-11: menus deferred at raw 287x328 were released at cropped 267x259 after
+    // 343-719 ms, while the ONE window released at its raw size came out in 47 ms. The stored
+    // crop is exactly what makes the two differ, so add it back to recover the key.
+    const DWORD rawW = data->Width + (DWORD)(data->CropLeft + data->CropRight);
+    const DWORD rawH = data->Height + (DWORD)(data->CropTop + data->CropBottom);
+
     BOOL pending = TRUE;
     EnterCriticalSection(&g_TcLock);
     {
         RECT lastGood;
-        TOAST_CROP_ENTRY* slot = TcFindSlotLocked(TcCacheKey(data), data->Width, data->Height);
+        TOAST_CROP_ENTRY* slot = TcFindSlotLocked(TcCacheKey(data), rawW, rawH);
         if (slot && (slot->Resolved || slot->Attempts >= TOAST_CROP_DEFER_ATTEMPTS))
             pending = FALSE;                // resolved, or defer budget spent: map it now
         else if (TcRecallLastGood(data->Handle, &lastGood))
