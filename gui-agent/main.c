@@ -158,6 +158,17 @@ BOOL g_NoScreenGrant = FALSE;
 // never affect rendering. Toasts/o-r menus are NOT routed here (topmost, slice-correct; the
 // toast interceptor handles toasts). See wgcbroker_ipc.h for the contract.
 #define REG_CONFIG_WGC_BROKER_VALUE L"WgcBroker"
+// FlattenCorners: Win11 rounds window corners at DWM composition and the broker's capture grabs
+// that composited result, so the rounded-out corner triangles arrive TRANSPARENT and dom0 renders
+// them as BLACK. Owner, watching menus 2026-09-11: "corners are black". Rather than plumb a
+// second crop path, fill them - replace ONLY near-black/transparent pixels in each corner block
+// with the window's own sampled background, never touching real content. Written and gated OFF as
+// an experiment on 2026-09-02 (279446a), reverted unused the same day (3ea905b); restored here and
+// DEFAULT ON because it is the fix the owner asked for. Cost is ~1150 pixel tests per frame per
+// window and it is IDEMPOTENT - once a corner is filled it is no longer near-black, so steady
+// state does the scan and nothing else.
+#define REG_CONFIG_FLATTEN_CORNERS_VALUE L"FlattenCorners"
+BOOL          g_FlattenCorners = TRUE;
 
 // Notification bridge (docs/DESIGN-toast-bridge.md, phase A0): notifhost --bridge runs in the
 // interactive user session, forwards ALLOWLISTED apps' toasts (HKLM gui-agent config,
@@ -1774,6 +1785,53 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 #define SYNTH_FULL_PATCH_MS 200
 
 static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child);
+
+// Square off the black rounded-corner triangles DWM leaves in a captured window. For each of the
+// four corners, sample the window's own background just inside the arc and replace only near-black
+// or transparent pixels in the corner triangle with it. Never touches real content (a corner that
+// HAS content stays), no-op on windows whose corners are not black, and idempotent - so it cannot
+// re-damage a window frame after frame. Damage is sent per corner only on the frame it changes
+// something.
+#define FLATTEN_CORNER_R 12
+static void FlattenBufferCorners(IN OUT WINDOW_DATA* entry)
+{
+    if (!g_FlattenCorners || !entry->PwBuffer) return;
+    int W = (int)entry->PwWidth, H = (int)entry->PwHeight;
+    const int R = FLATTEN_CORNER_R;
+    if (W < 2 * R || H < 2 * R) return;
+    BYTE* buf = (BYTE*)entry->PwBuffer;
+    const struct { int ox, oy, dirx, diry, sx, sy; } C[4] = {
+        { 0,     0,      1,  1,  R,         R         },
+        { W - 1, 0,     -1,  1,  W - 1 - R, R         },
+        { 0,     H - 1,  1, -1,  R,         H - 1 - R },
+        { W - 1, H - 1, -1, -1,  W - 1 - R, H - 1 - R },
+    };
+    for (int c = 0; c < 4; c++)
+    {
+        const BYTE* sp = buf + ((size_t)C[c].sy * W + C[c].sx) * 4;
+        // Nothing clean to fill with if the sample itself is dark or transparent (a genuinely
+        // dark or empty window) - leave it alone rather than invent a colour.
+        if ((sp[0] < 24 && sp[1] < 24 && sp[2] < 24) || sp[3] < 128) continue;
+        BOOL changed = FALSE;
+        for (int j = 0; j < R; j++)
+            for (int i = 0; i < R - j; i++)
+            {
+                int x = C[c].ox + C[c].dirx * i, y = C[c].oy + C[c].diry * j;
+                if (x < 0 || x >= W || y < 0 || y >= H) continue;
+                BYTE* q = buf + ((size_t)y * W + x) * 4;
+                if ((q[0] < 24 && q[1] < 24 && q[2] < 24) || q[3] < 128)
+                {
+                    q[0] = sp[0]; q[1] = sp[1]; q[2] = sp[2]; q[3] = 255;
+                    changed = TRUE;
+                }
+            }
+        if (changed)
+        {
+            int dx = (C[c].ox == 0) ? 0 : (W - R), dy = (C[c].oy == 0) ? 0 : (H - R);
+            (void)SendWindowDamageEvent(entry->Handle, dx, dy, R, R);
+        }
+    }
+}
 
 // Owner-candidacy checks shared by the GW_OWNER path and the same-process fallback:
 // the owner must be an announceable window with its own PrintWindow-fed buffer (a
@@ -7703,6 +7761,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         entry->PwBrokerLastId = bid;
                         if (entry->PwBrokerFrames < 0xFFFFFFFFu) entry->PwBrokerFrames++;
                         PwSliceCopyAndDamageSrc(entry, bsrc, bpitch, entry->X, entry->Y, &pwRect);
+                        // Buffer is complete for this window: square off DWM's black rounded
+                        // corners before the content check judges it.
+                        FlattenBufferCorners(entry);
                         // A per-HWND broker frame is a COPY, not proof of content: the WGC
                         // publish path has no non-black check, so the first frame of a
                         // not-yet-rendered window is black. PwNoteSliceContent samples the
