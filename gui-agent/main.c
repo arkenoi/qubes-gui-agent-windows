@@ -2080,7 +2080,6 @@ static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
     entry->Synthesized = TRUE;
     entry->SynthOwner = owner->Handle;
     owner->SynthChildCount++;
-    SynthUpdateMask(owner);
     // Paint it NOW: a menu paints once, before it is tracked, and a static screen
     // produces no further frames - waiting for damage would leave it invisible.
     //
@@ -2090,7 +2089,14 @@ static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
     // FAIL while RND-3 stayed PASS). Skipping the paint leaves the SYNTH bookkeeping intact and
     // the owner's pixels UNCHANGED - which is the defect those checks exist to catch, and it
     // shows up as output, not as a log line.
+    // PAINT BEFORE MASKING. The mask stops the OWNER's own pixels being captured over this
+    // region, so updating it first leaves a window in which the region is neither refreshed by
+    // the owner nor yet painted by the child - which is the residual flash on a menu that has a
+    // synthesized part (owner, 2026-09-12: gone on fully o-r menus, "significantly reduced" on
+    // partial ones). Same ordering rule that fixed the o-r half: put the content in place before
+    // changing what is shown.
     PwPatchSynthRect(owner, entry);   // FI_NOSYNTHPAINT is enforced inside the paint chokepoint
+    SynthUpdateMask(owner);
     owner->SynthLastFullPatch = GetTickCount();
     LogInfo("QGAPROTO,msg=SYNTH,hwnd=0x%x,owner=0x%x,x=%d,y=%d,w=%u,h=%u",
         (uint32_t)(ULONG_PTR)entry->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
