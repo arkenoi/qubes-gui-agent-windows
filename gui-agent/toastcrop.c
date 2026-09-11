@@ -199,6 +199,9 @@ static TOAST_PID_ENTRY g_TcPidCache[TOAST_PID_CACHE_SIZE];
 typedef struct _TC_QUERY_REQ
 {
     HWND  Window;
+    // Slot identity, which is NOT the window for a menu - see TcCacheKey. Window stays the real
+    // HWND because the UIA measurement must run against the actual live window.
+    HWND  CacheKey;
     RECT  Raw;
     DWORD RawWidth;
     DWORD RawHeight;
@@ -838,6 +841,39 @@ ULONG ToastCropQuery(IN HWND window, IN RECT raw, IN BOOL menu, OUT RECT* insets
 
 // g_TcLock must be held. Find-only counterpart of TcGetSlot: the worker must never
 // resurrect a slot that ToastCropEvict cleared while its query was in flight.
+// CROP-CACHE IDENTITY. A toast keeps its own window as the key: it is long-lived and its card
+// grows as it lays out, so its measurement belongs to that instance.
+//
+// A MENU MUST NOT be keyed that way. A WinUI context menu is created FRESH on every open, so its
+// HWND is new every time, every cache lookup missed, and every menu paid a full UIA measurement
+// that cannot finish inside CROP_BEFORE_SHOW_TIMEOUT_MS. Measured on the rig 2026-09-11 (8 opens,
+// instrumented build): every menu was released by the TIMEOUT arm at 656-734 ms (median 719) and
+// therefore mapped UNCROPPED, with the shadow strip crop-before-show exists to remove. The hold
+// cost ~700 ms and bought nothing.
+//
+// The insets are a property of the menu's CLASS and SIZE, not of the instance. The same run
+// measured, identically on every repeat:
+//     287x279 -> l=16 t=6 r=16 b=22          287x68 -> l=10 t=2 r=10 b=4
+// So menus are keyed by class+size: the first menu of a given shape still measures, and every
+// later one is an instant cache HIT - it maps immediately AND cropped, which is strictly better
+// than the old behaviour on both axes. The synthetic key sets the top bit so it can never alias
+// a real HWND, and size stays part of the key, so a different-shaped menu measures on its own.
+static HWND TcCacheKey(IN const WINDOW_DATA* data)
+{
+    if (!data)
+        return NULL;
+    if (!IsMenuPopupWindow(data))
+        return data->Handle;
+
+    ULONGLONG h = 1469598103934665603ULL;             // FNV-1a over the class name
+    for (const WCHAR* p = data->Class; *p; p++)
+    {
+        h ^= (ULONGLONG)*p;
+        h *= 1099511628211ULL;
+    }
+    return (HWND)(ULONG_PTR)((h & 0x0000FFFFFFFFFFFFULL) | 0x8000000000000000ULL);
+}
+
 static TOAST_CROP_ENTRY* TcFindSlotLocked(IN HWND window, IN DWORD rawWidth, IN DWORD rawHeight)
 {
     for (int i = 0; i < TOAST_CROP_CACHE_SIZE; i++)
@@ -859,7 +895,7 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
 
     EnterCriticalSection(&g_TcLock);
 
-    TOAST_CROP_ENTRY* slot = TcFindSlotLocked(req->Window, req->RawWidth, req->RawHeight);
+    TOAST_CROP_ENTRY* slot = TcFindSlotLocked(req->CacheKey, req->RawWidth, req->RawHeight);
     if (slot && !slot->Resolved)
     {
         slot->Insets = *insets;
@@ -980,7 +1016,7 @@ static DWORD WINAPI TcWorkerThread(IN void* param)
 
 // g_TcLock must be held. Queues one measurement for the worker; a full queue or an
 // already-queued duplicate is dropped silently - the slot's RetryAt pacing re-requests it.
-static BOOL TcEnqueueQueryLocked(IN HWND window, IN const RECT* raw, IN DWORD rawWidth, IN DWORD rawHeight,
+static BOOL TcEnqueueQueryLocked(IN HWND window, IN HWND cacheKey, IN const RECT* raw, IN DWORD rawWidth, IN DWORD rawHeight,
     IN BOOL menu)
 {
     int freeIdx = -1;
@@ -1006,6 +1042,7 @@ static BOOL TcEnqueueQueryLocked(IN HWND window, IN const RECT* raw, IN DWORD ra
         return FALSE;
 
     g_TcQueue[freeIdx].Window = window;
+    g_TcQueue[freeIdx].CacheKey = cacheKey;
     g_TcQueue[freeIdx].Raw = *raw;
     g_TcQueue[freeIdx].RawWidth = rawWidth;
     g_TcQueue[freeIdx].RawHeight = rawHeight;
@@ -1190,7 +1227,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
 
     EnterCriticalSection(&g_TcLock);
 
-    TOAST_CROP_ENTRY* slot = TcGetSlot(data->Handle, data->Width, data->Height);
+    TOAST_CROP_ENTRY* slot = TcGetSlot(TcCacheKey(data), data->Width, data->Height);
     slot->LastUse = ++g_TcClock;
 
     // One-shot confirmation re-measure of a RESOLVED toast (see ConfirmAt). Toasts only; menus
@@ -1207,7 +1244,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
         rawc.right = data->X + (LONG)data->Width;
         rawc.bottom = data->Y + (LONG)data->Height;
         slot->ConfirmQueued = TRUE;   // one-shot whether or not the enqueue takes
-        (void)TcEnqueueQueryLocked(data->Handle, &rawc, slot->RawWidth, slot->RawHeight, FALSE);
+        (void)TcEnqueueQueryLocked(data->Handle, TcCacheKey(data), &rawc, slot->RawWidth, slot->RawHeight, FALSE);
     }
 
     if (!slot->Resolved && GetTickCount64() >= slot->RetryAt)
@@ -1249,7 +1286,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
             // tracking pass so the crop lands within one pass of the answer. Attempt
             // pacing (Attempts/RetryAt above) is unchanged: a lost or unanswered request
             // is simply re-queued at the next retry tick.
-            if (!TcEnqueueQueryLocked(data->Handle, &raw, data->Width, data->Height, menu))
+            if (!TcEnqueueQueryLocked(data->Handle, TcCacheKey(data), &raw, data->Width, data->Height, menu))
             {
                 // Worker unavailable (thread failed to start, or the queue is full with
                 // other windows). Fall back to the old inline query rather than never
@@ -1262,7 +1299,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
                 ToastCropQuery(data->Handle, raw, menu, &measured);
 
                 EnterCriticalSection(&g_TcLock);
-                slot = TcFindSlotLocked(data->Handle, data->Width, data->Height);
+                slot = TcFindSlotLocked(TcCacheKey(data), data->Width, data->Height);
                 if (slot && !slot->Resolved)
                 {
                     slot->Insets = measured;
@@ -1369,7 +1406,7 @@ BOOL ShellSurfaceCardless(IN const WINDOW_DATA* data)
     EnterCriticalSection(&g_TcLock);
     {
         RECT lastGood;
-        TOAST_CROP_ENTRY* slot = TcFindSlotLocked(data->Handle, data->Width, data->Height);
+        TOAST_CROP_ENTRY* slot = TcFindSlotLocked(TcCacheKey(data), data->Width, data->Height);
         if (slot && (slot->Insets.left || slot->Insets.top ||
                      slot->Insets.right || slot->Insets.bottom))
             noCard = FALSE;                 // measured, card known
@@ -1404,7 +1441,7 @@ BOOL CropPending(IN const WINDOW_DATA* data)
     EnterCriticalSection(&g_TcLock);
     {
         RECT lastGood;
-        TOAST_CROP_ENTRY* slot = TcFindSlotLocked(data->Handle, data->Width, data->Height);
+        TOAST_CROP_ENTRY* slot = TcFindSlotLocked(TcCacheKey(data), data->Width, data->Height);
         if (slot && (slot->Resolved || slot->Attempts >= TOAST_CROP_DEFER_ATTEMPTS))
             pending = FALSE;                // resolved, or defer budget spent: map it now
         else if (TcRecallLastGood(data->Handle, &lastGood))
