@@ -168,7 +168,9 @@ BOOL g_NoScreenGrant = FALSE;
 // window and it is IDEMPOTENT - once a corner is filled it is no longer near-black, so steady
 // state does the scan and nothing else.
 #define REG_CONFIG_FLATTEN_CORNERS_VALUE L"FlattenCorners"
-BOOL          g_FlattenCorners = FALSE;   // OFF: made the in-window black frames WORSE (owner, 2026-09-11)
+BOOL          g_FlattenCorners = FALSE;   // OFF: measurably slow for ZERO effect - it scanned the
+                                          // CHILD buffer with an alpha test, while the black lands in the
+                                          // OWNER buffer as opaque near-black (owner, 2026-09-11)
 
 // Notification bridge (docs/DESIGN-toast-bridge.md, phase A0): notifhost --bridge runs in the
 // interactive user session, forwards ALLOWLISTED apps' toasts (HKLM gui-agent config,
@@ -6951,8 +6953,22 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
         BYTE* dp = dst;
         for (int col = 0; col < w; col++, sp += 4, dp += 4)
         {
-            if (sp[3] < 128)
-                continue;               // transparent: keep the owner's pixel
+            // NEAR-BLACK, not alpha. The capture is a PrintWindow render composited onto
+            // black with no usable alpha channel - which is why testing sp[3] was inert
+            // (owner, 2026-09-11: the black frame was unchanged). The menu's drop-shadow
+            // margin AND its rounded-corner cut-outs both arrive as opaque near-black, so
+            // one test removes both: the black frame around the card and the black corners
+            // it reduces to.
+            //
+            // Keeping the OWNER's pixel is better than filling with a guessed colour - the
+            // parent's real content shows through exactly where the shadow should be
+            // translucent.
+            //
+            // THRESHOLD SAFETY: a real menu is never this dark. Win11's dark-mode menu
+            // background is ~#2B2B2B (43 per channel) and light mode far brighter, both
+            // well above 24, so genuine menu pixels are copied. Only true black is dropped.
+            if (sp[0] < 24 && sp[1] < 24 && sp[2] < 24)
+                continue;               // shadow margin / rounded corner: keep the owner's pixel
             *(DWORD*)dp = *(const DWORD*)sp;
         }
         src += srcPitch;
