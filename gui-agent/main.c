@@ -6114,6 +6114,21 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // worked) or the bounded timeout expired with the buffer still unfed
                 // (lead_ms=-1; the flash then shows up in QGASLICECONTENT).
                 PwNoteSliceFedMap(windowData);
+                // QGAHELDMAP: the hold every DEFERRED window actually paid, and WHY it ended.
+                // PwNoteSliceFedMap above only fires for PwSliceFed windows, so a MENU - the most
+                // common deferred window there is - produced NO timing line at all and its latency
+                // could not be measured without guessing (found 2026-09-11 while measuring the
+                // menu map-hold: ten context menus, zero QGASLICEMAP lines). reason=crop means the
+                // crop resolved and the window maps already-cropped, which is the hold working;
+                // reason=timeout means CROP_BEFORE_SHOW_TIMEOUT_MS expired and it mapped UNCROPPED.
+                // A rising share of timeout= is the regression to watch, and held_ms is the number
+                // any menu-latency work has to move.
+                LogInfo("QGAHELDMAP hwnd=0x%x class=%s held_ms=%llu reason=%s menu=%d toast=%d",
+                    (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
+                    (ULONGLONG)(GetTickCount64() - windowData->MapDeferSince),
+                    cropReady ? "crop" : "timeout",
+                    IsMenuPopupWindow(windowData) ? 1 : 0,
+                    IsShellToastWindow(windowData) ? 1 : 0);
                 (void)SendWindowDamageEvent(windowData->Handle, 0, 0,
                     windowData->Width, windowData->Height);
             }
