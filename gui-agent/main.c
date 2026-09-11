@@ -2089,14 +2089,15 @@ static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
     // FAIL while RND-3 stayed PASS). Skipping the paint leaves the SYNTH bookkeeping intact and
     // the owner's pixels UNCHANGED - which is the defect those checks exist to catch, and it
     // shows up as output, not as a log line.
-    // PAINT BEFORE MASKING. The mask stops the OWNER's own pixels being captured over this
-    // region, so updating it first leaves a window in which the region is neither refreshed by
-    // the owner nor yet painted by the child - which is the residual flash on a menu that has a
-    // synthesized part (owner, 2026-09-12: gone on fully o-r menus, "significantly reduced" on
-    // partial ones). Same ordering rule that fixed the o-r half: put the content in place before
-    // changing what is shown.
-    PwPatchSynthRect(owner, entry);   // FI_NOSYNTHPAINT is enforced inside the paint chokepoint
+    // MASK FIRST, THEN PAINT - and do not "fix" this ordering again. Swapping it (2026-09-12,
+    // reasoning by analogy with the damage-before-map fix that cleared the o-r flash) MASSIVELY
+    // REGRESSED the FIRST menu on a window: black border flash and visibly slow, with later
+    // menus fine. The asymmetry is the clue - on the first menu the child has no per-window
+    // frame yet, so the paint is a no-op and only the mask does anything; deferring the mask
+    // until after that no-op leaves the region unclaimed for a frame. The o-r case is NOT
+    // analogous: there the content genuinely exists before the map.
     SynthUpdateMask(owner);
+    PwPatchSynthRect(owner, entry);   // FI_NOSYNTHPAINT is enforced inside the paint chokepoint
     owner->SynthLastFullPatch = GetTickCount();
     LogInfo("QGAPROTO,msg=SYNTH,hwnd=0x%x,owner=0x%x,x=%d,y=%d,w=%u,h=%u",
         (uint32_t)(ULONG_PTR)entry->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
