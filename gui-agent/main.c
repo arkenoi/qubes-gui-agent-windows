@@ -264,6 +264,7 @@ static DWORD g_DirectSuppressed = 0;
 static DWORD g_BrokerDeaths = 0;
 static ULONGLONG g_BrokerDiedAt = 0;   // tick of the death being reported; 0 = not currently dead
 static UINT64 g_WgcNonce = 0;
+static HANDLE g_WgcFrame = NULL;   // broker -> agent: a frame was published (auto-reset)
 static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
 static ULONGLONG g_WgcArenaNext = 0;   // bump frontier within the arena (offset past ArenaOffset)
 // Arena free-list: reclaim regions freed on BrokerUnregister so high-churn windows (menus open/
@@ -2167,9 +2168,15 @@ static BOOL WgcCreateSection(void)
     LARGE_INTEGER pc; QueryPerformanceCounter(&pc);
     g_WgcNonce = ((UINT64)GetTickCount64() << 20) ^ (UINT64)pc.QuadPart
                ^ ((UINT64)GetCurrentProcessId() << 3);
-    WCHAR nmShm[128], nmCtl[128];
+    WCHAR nmShm[128], nmCtl[128], nmFrm[128];
     StringCchPrintf(nmShm, RTL_NUMBER_OF(nmShm), L"Global\\QubesWgcBrk_%llx_shm", g_WgcNonce);
     StringCchPrintf(nmCtl, RTL_NUMBER_OF(nmCtl), L"Global\\QubesWgcBrk_%llx_ctl", g_WgcNonce);
+    // BROKER -> AGENT wake. The ctl event above is agent->broker only; there was NO channel the
+    // other way, so a published frame was noticed only when the agent's next DESKTOP-capture pass
+    // happened to run - and if that frame hashed as redundant the per-window walk was skipped
+    // entirely, so a painted window could sit unnoticed on a static desktop. Measured 2026-09-11:
+    // ~125 ms of the menu hold, plus that correctness hole.
+    StringCchPrintf(nmFrm, RTL_NUMBER_OF(nmFrm), L"Global\\QubesWgcBrk_%llx_frm", g_WgcNonce);
 
     PSECURITY_DESCRIPTOR sdS = NULL, sdE = NULL;
     // section: SY GENERIC_ALL, IU GENERIC_READ|WRITE; event: SY all, IU SYNCHRONIZE|MODIFY_STATE
@@ -2186,8 +2193,9 @@ static BOOL WgcCreateSection(void)
     if (g_WgcMap && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(g_WgcMap); g_WgcMap = NULL; }
     if (g_WgcMap) g_WgcBase = (BYTE*)MapViewOfFile(g_WgcMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
     g_WgcCtl = CreateEvent(&saE, FALSE, FALSE, nmCtl);
+    g_WgcFrame = CreateEvent(&saE, FALSE, FALSE, nmFrm);
     LocalFree(sdS); LocalFree(sdE);
-    if (!g_WgcBase || !g_WgcCtl) return FALSE;
+    if (!g_WgcBase || !g_WgcCtl || !g_WgcFrame) return FALSE;
 
     WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
     ZeroMemory(g_WgcBase, WGCBRK_HEADER_BYTES);
@@ -2289,12 +2297,12 @@ static BOOL WgcLaunch(void)
     WCHAR tr[1024];
     if (wcschr(shortExe, L' '))
         StringCchPrintf(tr, RTL_NUMBER_OF(tr),
-            L"\\\"%s\\\" --serve --agent-pid %lu --shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl",
-            shortExe, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce);
+            L"\\\"%s\\\" --serve --agent-pid %lu --shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl --frame Global\\QubesWgcBrk_%llx_frm",
+            shortExe, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce, g_WgcNonce);
     else
         StringCchPrintf(tr, RTL_NUMBER_OF(tr),
-            L"%s --serve --agent-pid %lu --shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl",
-            shortExe, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce);
+            L"%s --serve --agent-pid %lu --shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl --frame Global\\QubesWgcBrk_%llx_frm",
+            shortExe, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce, g_WgcNonce);
 
     // Recreate the task fresh each launch (idempotent), then run it now.
     WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
@@ -8890,6 +8898,18 @@ static ULONG WINAPI WatchForEvents(void)
     // Last, so that WaitForMultipleObjects prefers frames and vchan traffic to it.
     watchedEvents[6] = g_WindowEventSignal;
     eventCount = 7;
+    // BROKER FRAME PUBLISHED. Optional (absent when the broker gate is off), appended last so it
+    // can never take priority over a real desktop frame or vchan traffic. Before this the agent
+    // had NO way to be told a per-window frame existed: it noticed one only on its next
+    // desktop-capture pass, and a redundant desktop frame skipped that walk entirely, so a
+    // painted window could sit unnoticed on a static desktop. Waking here lets a held map be
+    // released the moment its pixels land instead of at desktop-capture cadence.
+    int frameEventIdx = -1;
+    if (g_WgcFrame)
+    {
+        frameEventIdx = eventCount;
+        watchedEvents[eventCount++] = g_WgcFrame;
+    }
 
     CAPTURE_CONTEXT* capture = NULL;
 
@@ -9139,6 +9159,22 @@ static ULONG WINAPI WatchForEvents(void)
         NotifBridgeSupervise();   // ~0.2 Hz; no-op unless the NotifyBridge gate is on
         EtwProxyPoke();   // launch-precondition only (console session / user change); proxy
                           // DEATH is detected by its exit-wait, not here (etwproxy.c)
+
+        if (frameEventIdx >= 0 && (int)signaledEvent == frameEventIdx)
+        {
+            // A per-window frame landed. The map-hold release site is the tracking pass, so ask
+            // for one: MapDeferWakeSweep at the top of the next iteration queues every still-held
+            // window, and the pass then re-evaluates CropReadyForMap with the new content. No
+            // frame walk here - this is deliberately just a wake, so a burst of broker frames
+            // cannot turn into a burst of capture work.
+            // 1, not 0: MapDeferWakeSweep treats 0 as "nothing armed" and early-outs, so zeroing
+            // it would DISABLE the very sweep this wake exists to trigger. Any non-zero tick in
+            // the past makes it due immediately, and the sweep itself queues each still-held
+            // window by handle (queueing a NULL handle here would corrupt the pending list).
+            if (g_MapDeferWake != 0)
+                g_MapDeferWake = 1;
+            continue;
+        }
 
         switch (signaledEvent)
         {
