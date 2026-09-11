@@ -6126,7 +6126,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 LogInfo("QGAHELDMAP hwnd=0x%x class=%s held_ms=%llu reason=%s menu=%d toast=%d",
                     (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
                     (ULONGLONG)(GetTickCount64() - windowData->MapDeferSince),
-                    cropReady ? "crop" : "timeout",
+                    cropReady ? L"crop" : L"timeout",
                     IsMenuPopupWindow(windowData) ? 1 : 0,
                     IsShellToastWindow(windowData) ? 1 : 0);
                 (void)SendWindowDamageEvent(windowData->Handle, 0, 0,
