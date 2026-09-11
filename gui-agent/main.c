@@ -10090,9 +10090,14 @@ static ULONG Init(void)
     // Compiles to nothing unless the build was made with -p:QgaFaultInjection=1.
     FiInit();
     PwInit();
-    // Take the one-time crop/UIA setup off the first menu the user opens - it was measured
-    // initialising lazily at that exact moment (see CropWarmUp).
-    CropWarmUp();
+    // NO CropWarmUp() HERE - and do not add it back without solving what follows. Warming the
+    // crop subsystem at agent Init took the one-time UIA/COM setup off the first menu, which is
+    // a real win, but TcInit creates a UIA automation object and doing that on the agent's MAIN
+    // thread at startup left something that stopped the process exiting: the 4.3.29 acceptance
+    // run failed three cells in a row with "subject would not halt" at ~0% CPU, i.e. Windows
+    // shutdown waiting on the agent. Lazy init is slower for exactly one menu; a guest that
+    // cannot shut down is a release blocker. If this is retried, initialise on the crop WORKER
+    // thread (which already owns its own IUIAutomation) and prove a clean shutdown first.
     // Synthetic guest-native drag, opt-in via the DragSim registry value. Not a verdict
     // instrument - see dragsim.h for the owner's standing rule about scripted drags.
     DragSimStart();
