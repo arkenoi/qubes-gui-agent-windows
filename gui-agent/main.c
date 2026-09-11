@@ -3241,8 +3241,10 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     _InterlockedIncrement(&h->ControlGen);
     entry->PwBrokerSlot = slot; entry->PwBrokerSourced = TRUE; entry->PwBrokerArenaOff = off0;
     if (g_WgcCtl) SetEvent(g_WgcCtl);
-    LogVerbose("BROKER register slot %d hwnd 0x%x %ux%u", slot, (DWORD)(ULONG_PTR)entry->Handle,
-               entry->Width, entry->Height);
+    // At Info, with a tick: the gap from here to QGASLICECONTENT is the broker's first-frame
+    // latency, which is what menu latency reduces to once nothing maps unpainted (2026-09-11).
+    LogInfo("QGABROKERREG hwnd=0x%x slot=%d %ux%u t=%llu", (DWORD)(ULONG_PTR)entry->Handle, slot,
+            entry->Width, entry->Height, (ULONGLONG)GetTickCount64());
     return TRUE;
 }
 
@@ -3572,7 +3574,14 @@ static BOOL CropReadyForMap(IN const WINDOW_DATA* entry)
     // consumed (else it would map black until the broker's first frame). Owner OK'd the ~100 ms
     // new-window penalty. This arm is UNCHANGED by SliceMapHold.
     if (g_DeSlice && entry->PwSliceFed)
-        return entry->PwBrokerLastId != 0;
+        // RENDER, THEN MAP - universally, not per surface class. This arm used to release on
+        // PwBrokerLastId != 0, i.e. "a frame ARRIVED", which is not the same as HAVING PIXELS:
+        // the broker can publish a black frame for a window that has not painted, and this
+        // project has twice shipped a black surface that way. Require the PAINTED signal as
+        // well, exactly like every other arm. Windows with no per-window pixel source are
+        // unaffected - SliceContentReady returns TRUE when !PwSliceFed, so nothing that has
+        // nothing to wait for is ever held - and CROP_BEFORE_SHOW_TIMEOUT_MS still bounds it.
+        return entry->PwBrokerLastId != 0 && SliceContentReady(entry);
     // Non-de-sliced slice-fed (win10 / broker floor): today "map immediately as before" -
     // which is the black-rectangle flash. SliceContentReady holds it when the gate is on;
     // gate off (default) and every non-slice-fed window: TRUE, exactly as before.
@@ -3807,8 +3816,9 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             // grows to its final one, the defer-time lookup necessarily misses and the window
             // waits for its own layout to settle - which would be the guest's time, not ours.
             // This line is what tells those two apart instead of guessing (2026-09-11).
-            LogInfo("QGAHELDDEFER hwnd=0x%x class=%s w=%u h=%u",
-                (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height);
+            LogInfo("QGAHELDDEFER hwnd=0x%x class=%s w=%u h=%u t=%llu slicefed=%d brokerslot=%d",
+                (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height,
+                (ULONGLONG)entry->MapDeferSince, entry->PwSliceFed ? 1 : 0, entry->PwBrokerSlot);
             // Wake guarantee: arm the main loop so the CROP_BEFORE_SHOW_TIMEOUT_MS bound
             // fires even if no frame/event ever wakes it again (see MapDeferWakeSweep).
             {
