@@ -1632,7 +1632,11 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     // black when the menu materializes as its own dom0 window (not synthesized into an owner).
     if (IsShellToastWindow(entry) || IsMenuPopupWindow(entry))
     {
-        RECT insets;
+        // Zero-init: the compiler cannot prove that every path setting have=TRUE also wrote
+        // insets once the broker-authority short-circuit is in the condition (C4701, warnings
+        // are errors here - same class as the cardRect fix). All-zero is also the correct
+        // "no crop" value, so this is not merely silencing the warning.
+        RECT insets = { 0, 0, 0, 0 };
         BOOL have = FALSE;
         // Menus: prefer the broker's PIXEL-EXACT opaque-bounds report (measured from the full
         // PrintWindow render) over UIA's +/-1-2px estimate. It is shared memory written by the
