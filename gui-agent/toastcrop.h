@@ -116,6 +116,11 @@ BOOL ShellSurfaceCardless(
 // returns FALSE and the surface maps - cropped, or uncropped as the required-kept fallback so a
 // toast/menu is never lost. START/Search are NOT gated here (see ShellSurfaceCardless, which
 // SUPPRESSES their card-less phantom instead). No-op when crop is disabled or forced.
+// Tell the crop module that a tracked window actually CHANGED, so a paced retry may fire now
+// instead of waiting out TOAST_CROP_RETRY_MS. Cheap (one interlocked increment); call it from the
+// window-event path, not from a timer.
+void CropNoteWindowChanged(void);
+
 BOOL CropPending(
     IN const WINDOW_DATA* data
     );

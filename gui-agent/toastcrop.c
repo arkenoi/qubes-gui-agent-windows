@@ -101,6 +101,7 @@ typedef struct _TOAST_CROP_ENTRY
     BOOL      Resolved;   // measured, or retries exhausted - no more UIA for this key
     UINT      Attempts;
     ULONGLONG RetryAt;    // GetTickCount64() before which no further UIA call is made
+    LONG      RetryGen;   // g_TcChangeGen when RetryAt was armed; a newer gen releases the pacing
     // CONFIRMATION PASS (owner-observed 2026-09-06: a "back up your pc" toast CUT AT THE BOTTOM).
     // Resolving latches the FIRST non-zero measurement for this (hwnd, size) key and never looks
     // again - so a card still laying out inside an ALREADY-FINAL window rect is latched
@@ -181,6 +182,22 @@ static BOOL TcRecallLastGood(IN HWND window, OUT RECT* insets)
 }
 
 static IUIAutomation* g_TcUia = NULL;   // created on first use, kept for the process life
+// SIGNAL-DRIVEN RETRY. TOAST_CROP_RETRY_MS paces re-measurement, and that pacing WAS the menu
+// latency: a deferred menu absorbed up to two 250 ms ticks doing nothing, and the measured
+// held_ms histogram was visibly quantised to that grid (203/250/296/422/500/656...). The pacing
+// cannot simply be shortened - the attempt BUDGET exists because the XAML tree is often not
+// populated on the first look, and burning all attempts in ~450 ms is the old bug where every
+// surface stayed uncropped. So keep the budget, and drive the RETRY off a real signal instead of
+// a clock: the agent already receives WinEvents for these windows and bumps this generation, and
+// a slot whose last attempt predates the current generation may retry AT ONCE. The timer remains
+// only as the no-signal floor.
+static volatile LONG g_TcChangeGen = 0;
+
+void CropNoteWindowChanged(void)
+{
+    InterlockedIncrement(&g_TcChangeGen);
+}
+
 static TOAST_CROP_ENTRY g_TcCache[TOAST_CROP_CACHE_SIZE];
 static TOAST_PID_ENTRY g_TcPidCache[TOAST_PID_CACHE_SIZE];
 // ---- async measurement worker ----
@@ -1247,8 +1264,10 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
         (void)TcEnqueueQueryLocked(data->Handle, TcCacheKey(data), &rawc, slot->RawWidth, slot->RawHeight, FALSE);
     }
 
-    if (!slot->Resolved && GetTickCount64() >= slot->RetryAt)
+    if (!slot->Resolved &&
+        (GetTickCount64() >= slot->RetryAt || slot->RetryGen != g_TcChangeGen))
     {
+        slot->RetryGen = g_TcChangeGen;   // this attempt covers everything seen so far
         // RetryAt paces REQUESTS; Attempts counts completed MEASUREMENTS (worker side,
         // TcApplyResult) so the budget spans real answers, not event bursts.
         slot->RetryAt = GetTickCount64() + TOAST_CROP_RETRY_MS;

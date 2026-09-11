@@ -858,6 +858,14 @@ static void CALLBACK WindowEventProc(
     if (event != EVENT_OBJECT_DESTROY && GetAncestor(window, GA_PARENT) != GetDesktopWindow())
         return;
 
+    // A REAL change to a tracked window releases the crop module's retry pacing, so a
+    // re-measurement happens because the guest actually did something rather than because
+    // 250 ms elapsed. That pacing was the bulk of menu latency (the measured held_ms
+    // histogram was quantised to its 250 ms grid); the attempt BUDGET is untouched, which is
+    // what the pacing actually existed to protect. One interlocked increment, on the same
+    // events already being queued, so this adds nothing to the hook's cost.
+    CropNoteWindowChanged();
+
     QueueWindowEvent(window, event, FALSE);
 }
 
