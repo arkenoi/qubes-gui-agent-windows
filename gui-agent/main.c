@@ -6275,6 +6275,18 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                     windowData->PwBrokerFrames);
             windowData->MapDeferred = FALSE;
             windowData->PwDirectSuppressed = FALSE;
+            // FILL AND DAMAGE **BEFORE** THE MAP. The buffer is attached before mapping, but
+            // dom0 was told to SHOW the window before it was told there was anything to draw -
+            // so it paints an empty window for a frame no matter what the buffer holds. That is
+            // the black flash the owner still sees on the o-r half after render-before-map and
+            // after filling the buffer (both correct, both insufficient: three fixes with no
+            // effect, because the flash is an ORDERING problem, not a content one).
+            // The damage is re-sent after the map as well, a few lines below: if the daemon
+            // ignores damage for a not-yet-mapped window this costs one redundant message, and
+            // if it honours it the window is already painted the instant it appears.
+            MenuFillNearBlack(windowData);
+            (void)SendWindowDamageEvent(windowData->Handle, 0, 0,
+                windowData->Width, windowData->Height);
             ULONG ms = SendWindowMap(windowData);
             if (ms == ERROR_SUCCESS)
             {
@@ -6282,9 +6294,6 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // window QGASLICEMAP's lead_ms tells whether content beat the map (hold
                 // worked) or the bounded timeout expired with the buffer still unfed
                 // (lead_ms=-1; the flash then shows up in QGASLICECONTENT).
-                // Fill the menu's black shadow margin / corners before dom0 ever sees it -
-                // this is the frame the window becomes visible on.
-                MenuFillNearBlack(windowData);
                 PwNoteSliceFedMap(windowData);
                 // QGAHELDMAP: the hold every DEFERRED window actually paid, and WHY it ended.
                 // PwNoteSliceFedMap above only fires for PwSliceFed windows, so a MENU - the most
