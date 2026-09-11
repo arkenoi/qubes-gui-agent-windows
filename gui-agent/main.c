@@ -168,7 +168,7 @@ BOOL g_NoScreenGrant = FALSE;
 // window and it is IDEMPOTENT - once a corner is filled it is no longer near-black, so steady
 // state does the scan and nothing else.
 #define REG_CONFIG_FLATTEN_CORNERS_VALUE L"FlattenCorners"
-BOOL          g_FlattenCorners = TRUE;
+BOOL          g_FlattenCorners = FALSE;   // OFF: made the in-window black frames WORSE (owner, 2026-09-11)
 
 // Notification bridge (docs/DESIGN-toast-bridge.md, phase A0): notifhost --bridge runs in the
 // interactive user session, forwards ALLOWLISTED apps' toasts (HKLM gui-agent config,
@@ -6929,9 +6929,32 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
     const BYTE* src = srcBase + (size_t)(r.top - srcOriginY) * srcPitch + (size_t)(r.left - srcOriginX) * 4;
     BYTE* dst = (BYTE*)owner->PwBuffer +
         ((size_t)relY * owner->PwWidth + (size_t)relX) * 4;
+    // SKIP TRANSPARENT SOURCE PIXELS instead of memcpy'ing them in. A Win11 menu window is
+    // WIDER than its visible card - the difference is a transparent drop-shadow margin (measured
+    // 2026-09-11: a 313-wide window carrying a 268-wide card). A straight copy wrote that margin
+    // into the OWNER's buffer, where transparent composites as BLACK, which is the black frame
+    // the owner reported around a menu whenever part of it overlaps its parent window. Leaving
+    // those pixels alone lets the parent's own content show through, which is what a shadow
+    // margin should do and needs no crop plumbed through this path.
+    //
+    // ALPHA ONLY, deliberately not "near-black RGB": a genuinely dark menu item is opaque and
+    // must be copied. If a source carries no meaningful alpha this degrades to the old copy
+    // rather than punching holes in real content.
+    //
+    // COST: a per-pixel test replaces memcpy on the SYNTH path only (menus/tooltips patched into
+    // an owner), not on any whole-window path. The row is still walked linearly, so it stays
+    // cache-friendly; the owner explicitly asked that this not get slower, and this does not
+    // touch the per-frame cost of ordinary windows at all.
     for (int row = 0; row < h; row++)
     {
-        memcpy(dst, src, (size_t)w * 4);
+        const BYTE* sp = src;
+        BYTE* dp = dst;
+        for (int col = 0; col < w; col++, sp += 4, dp += 4)
+        {
+            if (sp[3] < 128)
+                continue;               // transparent: keep the owner's pixel
+            *(DWORD*)dp = *(const DWORD*)sp;
+        }
         src += srcPitch;
         dst += (size_t)owner->PwWidth * 4;
     }
