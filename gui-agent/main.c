@@ -3460,6 +3460,16 @@ static void PwNoteSliceFedMap(IN OUT WINDOW_DATA* entry)
 //     the window in the next tracking batch where the timeout arm releases it.
 // Main-loop-thread only (AddWindow/UpdateWindowData and the pump all run there); the
 // hook thread never touches it.
+// How often a DEFERRED map is re-examined. The hold ends the moment CropReadyForMap turns
+// true, but that is only ever evaluated on the tracking pass - so until 2026-09-11 the wake was
+// armed for the CEILING (MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS) and a crop that was ready
+// far earlier still waited the full ~700 ms. Measured: 8/8 menus held 656-734 ms (median 719)
+// even with their insets already cached and the release reason recorded as "crop", i.e. ready
+// and simply not looked at. Re-checking on a short tick turns the ceiling back into what it was
+// meant to be - a bound, not the normal case. Cost is a handful of wakes ONLY while a map is
+// deferred, and the sweep fully disarms itself when no hold remains.
+#define MAP_DEFER_RECHECK_MS 32
+
 static ULONGLONG g_MapDeferWake = 0;   // earliest MapDeferred deadline (tick), 0 = none armed
 
 static void MapDeferWakeSweep(void)
@@ -3476,15 +3486,14 @@ static void MapDeferWakeSweep(void)
         WINDOW_DATA* entry = CONTAINING_RECORD(le, WINDOW_DATA, ListEntry);
         if (!entry->MapDeferred || entry->DeletePending)
             continue;
-        ULONGLONG due = entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10;
-        if (due <= now)
-        {
-            // Expired: hand it to the tracking pass (the only legal release site) and
-            // keep a short retry armed until the hold actually clears - the queued event
-            // is delivered, but the bound must not be lost even if this one is coalesced.
-            QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
-            due = now + 100;
-        }
+        const ULONGLONG ceiling = entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10;
+        // Poke the tracking pass on EVERY tick, not only at the ceiling. The pass is the only
+        // legal release site, so a hold whose crop is already resolved stays held until one
+        // runs; waking only at the ceiling made every menu pay the full bound even when its
+        // insets were cached and ready. Expired or not, the action is the same - ask the pass
+        // to look - and the ceiling remains the hard bound it always was.
+        QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
+        ULONGLONG due = (ceiling > now) ? (now + MAP_DEFER_RECHECK_MS) : (now + 100);
         if (next == 0 || due < next)
             next = due;
     }
@@ -3788,7 +3797,7 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             // Wake guarantee: arm the main loop so the CROP_BEFORE_SHOW_TIMEOUT_MS bound
             // fires even if no frame/event ever wakes it again (see MapDeferWakeSweep).
             {
-                ULONGLONG due = entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10;
+                ULONGLONG due = entry->MapDeferSince + MAP_DEFER_RECHECK_MS;
                 if (g_MapDeferWake == 0 || due < g_MapDeferWake)
                     g_MapDeferWake = due;
             }
@@ -3803,7 +3812,7 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             entry->MapDeferred = TRUE;
             entry->MapDeferSince = GetTickCount64();
             {
-                ULONGLONG due = entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10;
+                ULONGLONG due = entry->MapDeferSince + MAP_DEFER_RECHECK_MS;
                 if (g_MapDeferWake == 0 || due < g_MapDeferWake)
                     g_MapDeferWake = due;
             }
