@@ -3794,6 +3794,13 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
         {
             entry->MapDeferred = TRUE;
             entry->MapDeferSince = GetTickCount64();
+            // Size AT DEFER TIME, to be compared with the size in QGAHELDMAP at release. The
+            // crop cache key includes the window size, so if a menu is CREATED at one size and
+            // grows to its final one, the defer-time lookup necessarily misses and the window
+            // waits for its own layout to settle - which would be the guest's time, not ours.
+            // This line is what tells those two apart instead of guessing (2026-09-11).
+            LogInfo("QGAHELDDEFER hwnd=0x%x class=%s w=%u h=%u",
+                (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height);
             // Wake guarantee: arm the main loop so the CROP_BEFORE_SHOW_TIMEOUT_MS bound
             // fires even if no frame/event ever wakes it again (see MapDeferWakeSweep).
             {
@@ -6132,8 +6139,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // reason=timeout means CROP_BEFORE_SHOW_TIMEOUT_MS expired and it mapped UNCROPPED.
                 // A rising share of timeout= is the regression to watch, and held_ms is the number
                 // any menu-latency work has to move.
-                LogInfo("QGAHELDMAP hwnd=0x%x class=%s held_ms=%llu reason=%s menu=%d toast=%d",
+                LogInfo("QGAHELDMAP hwnd=0x%x class=%s w=%u h=%u held_ms=%llu reason=%s menu=%d toast=%d",
                     (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
+                    windowData->Width, windowData->Height,
                     (ULONGLONG)(GetTickCount64() - windowData->MapDeferSince),
                     cropReady ? L"crop" : L"timeout",
                     IsMenuPopupWindow(windowData) ? 1 : 0,
