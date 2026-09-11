@@ -3518,8 +3518,16 @@ static BOOL SliceChromeContentReady(IN const WINDOW_DATA* entry)
 {
     if (g_SliceMapHoldChrome == 0)
         return TRUE;                     // chrome never content-holds
-    if (g_SliceMapHoldChrome == 1 && g_DeSlice && !IsShellToastWindow(entry))
-        return TRUE;                     // de-slice MENUS keep their proven chrome behavior
+    // MENUS ARE NO LONGER EXEMPT (2026-09-11, owner saw it on screen: "black blink ... the
+    // window itself settles very slowly"). The exemption was only ever SAFE BY ACCIDENT: a menu
+    // was held ~700 ms waiting for its shadow-crop, and that wait incidentally gave the first
+    // frame time to arrive, so menus mapped painted. Once the crop hold was fixed (cache keyed
+    // correctly + a 32 ms re-check) menus mapped in 15-47 ms with painted=0 and lead_ms=-1 on
+    // 8 of 8 - i.e. with NO content - which is the black flash, and the geometry then settled
+    // visibly afterwards. Latency that is bought with a black frame is not a win; this project
+    // has paid for that lesson twice already. Hold a menu until its own first frame is PAINTED,
+    // exactly like every other surface, so the map lands cropped AND with pixels. The bound is
+    // unchanged: CROP_BEFORE_SHOW_TIMEOUT_MS still releases it no matter what.
     return SliceContentReady(entry);     // no-op unless g_SliceMapHold is on
 }
 
