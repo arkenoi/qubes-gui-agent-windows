@@ -1794,6 +1794,51 @@ static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child)
 // HAS content stays), no-op on windows whose corners are not black, and idempotent - so it cannot
 // re-damage a window frame after frame. Damage is sent per corner only on the frame it changes
 // something.
+// Replace near-black pixels in a MENU's own buffer with the menu's background colour, once,
+// just before it is mapped. The o-r half of a Win11 menu is its own window with nothing behind
+// it, so unlike the synthesized half there is no owner pixel to keep - the black has to be
+// filled. The capture is a PrintWindow render composited onto BLACK with no usable alpha, so
+// both the drop-shadow margin and the rounded-corner cut-outs arrive as opaque near-black and
+// this one pass removes the black flash the owner reported at menu open.
+//
+// SCOPED AND ONE-SHOT, which is what FlattenCorners got wrong: that ran on EVERY window's buffer
+// on EVERY frame (measurably slow for zero effect). This runs only for a menu popup, only on the
+// frame it is first mapped - one pass over ~70k pixels, once per menu.
+//
+// The background is sampled from the buffer's own top edge, which is menu chrome above the first
+// item, never text. If nothing bright enough is found the menu really is that dark and the fill
+// is skipped rather than inventing a colour.
+static void MenuFillNearBlack(IN OUT WINDOW_DATA* entry)
+{
+    if (!entry->PwBuffer || !IsMenuPopupWindow(entry))
+        return;
+    const int W = (int)entry->PwWidth, H = (int)entry->PwHeight;
+    if (W < 8 || H < 8)
+        return;
+    BYTE* buf = (BYTE*)entry->PwBuffer;
+
+    DWORD bg = 0; BOOL haveBg = FALSE;
+    for (int probe = 0; probe < 3 && !haveBg; probe++)
+    {
+        const int px = (probe == 0) ? (W / 2) : (probe == 1) ? 3 : (W - 4);
+        for (int py = 2; py < 8 && !haveBg; py++)
+        {
+            const BYTE* q = buf + ((size_t)py * W + px) * 4;
+            if (q[0] >= 24 || q[1] >= 24 || q[2] >= 24) { bg = *(const DWORD*)q; haveBg = TRUE; }
+        }
+    }
+    if (!haveBg)
+        return;
+
+    for (int y = 0; y < H; y++)
+    {
+        BYTE* q = buf + (size_t)y * W * 4;
+        for (int x = 0; x < W; x++, q += 4)
+            if (q[0] < 24 && q[1] < 24 && q[2] < 24)
+                *(DWORD*)q = bg;
+    }
+}
+
 #define FLATTEN_CORNER_R 12
 static void FlattenBufferCorners(IN OUT WINDOW_DATA* entry)
 {
@@ -6237,6 +6282,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // window QGASLICEMAP's lead_ms tells whether content beat the map (hold
                 // worked) or the bounded timeout expired with the buffer still unfed
                 // (lead_ms=-1; the flash then shows up in QGASLICECONTENT).
+                // Fill the menu's black shadow margin / corners before dom0 ever sees it -
+                // this is the frame the window becomes visible on.
+                MenuFillNearBlack(windowData);
                 PwNoteSliceFedMap(windowData);
                 // QGAHELDMAP: the hold every DEFERRED window actually paid, and WHY it ended.
                 // PwNoteSliceFedMap above only fires for PwSliceFed windows, so a MENU - the most
