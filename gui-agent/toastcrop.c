@@ -346,6 +346,18 @@ static BOOL WINAPI TcInitOnceCallback(PINIT_ONCE initOnce, PVOID parameter, PVOI
     return TRUE;
 }
 
+// Warm the crop subsystem up front. It used to initialise lazily ON THE FIRST MENU - the log
+// shows TcInitOnceCallback and TcCreateAutomation (~130 ms of COM/UIA setup) running right when
+// the user opens their first menu, which is precisely the one the owner reported as mapped
+// before render and before crop while later menus were fine. Paying it at startup costs nothing
+// visible and takes the cold path off the first menu.
+static void TcInit(void);
+
+void CropWarmUp(void)
+{
+    TcInit();
+}
+
 static void TcInit(void)
 {
     InitOnceExecuteOnce(&g_TcInitOnce, TcInitOnceCallback, NULL, NULL);

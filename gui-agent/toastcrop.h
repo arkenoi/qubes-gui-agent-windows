@@ -121,6 +121,10 @@ BOOL ShellSurfaceCardless(
 // window-event path, not from a timer.
 void CropNoteWindowChanged(void);
 
+// Initialise the crop subsystem NOW rather than on the first menu, so the one-time UIA/COM
+// setup is not paid on the first surface the user opens. Safe to call more than once.
+void CropWarmUp(void);
+
 BOOL CropPending(
     IN const WINDOW_DATA* data
     );

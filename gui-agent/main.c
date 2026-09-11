@@ -1640,6 +1640,17 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         // least half the window in each dim (a real menu's shadow margin is tiny, ~90%+ card; the
         // 50% floor blocks a malicious broker from cropping the window down to a sliver). All-zero
         // is a valid "no margin, no crop". Anything implausible falls back to the UIA path.
+        // ONE AUTHORITY FOR A MENU, when the broker can answer at all. The broker's opaque
+        // bounds are measured from the actual rendered pixels; the UIA card rect is an estimate,
+        // and the two DISAGREE (measured 2026-09-11: 20/69 vs 24/77 insets on the same 287x328
+        // menu). With both live, whichever answered first won that pass and the geometry FLIPPED
+        // when the other landed - which re-registers the broker slot, costs a fresh first-frame
+        // round trip, and briefly exposes an unpainted strip at the new size. That is exactly
+        // what the owner reported as "settles very slowly" and "black blink is short but
+        // noticeable". So when the broker is active a menu waits for the pixel-exact answer and
+        // never takes the estimate; UIA remains the authority only where no broker exists
+        // (win10, below the broker floor), where there is nothing to disagree with.
+        const BOOL menuBrokerAuthority = IsMenuPopupWindow(entry) && WgcBrokerActive();
         if (IsMenuPopupWindow(entry) && BrokerOpaqueInsets(entry->Handle, &insets))
         {
             LONG cw = (LONG)entry->Width  - insets.left - insets.right;
@@ -1647,10 +1658,10 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
             if (insets.left >= 0 && insets.top >= 0 && insets.right >= 0 && insets.bottom >= 0 &&
                 cw * 2 >= (LONG)entry->Width && ch * 2 >= (LONG)entry->Height)
                 have = (insets.left || insets.top || insets.right || insets.bottom);
-            else if (ToastCropLookup(entry, &insets))
+            else if (!menuBrokerAuthority && ToastCropLookup(entry, &insets))
                 have = TRUE;
         }
-        else if (ToastCropLookup(entry, &insets))
+        else if (!menuBrokerAuthority && ToastCropLookup(entry, &insets))
             have = TRUE;
 
         if (have)
@@ -3581,7 +3592,12 @@ static BOOL CropReadyForMap(IN const WINDOW_DATA* entry)
 {
     RECT tmp;
     if (IsMenuPopupWindow(entry))
-        return (BrokerOpaqueInsets(entry->Handle, &tmp) || !CropPending(entry)) &&
+        // With the broker live the pixel-exact insets are the ONLY answer that will be applied
+        // (see GetWindowData), so releasing on "UIA has stopped pending" would map at a geometry
+        // that is about to change - the flip the owner sees. Wait for the authority itself.
+        return (WgcBrokerActive()
+                    ? BrokerOpaqueInsets(entry->Handle, &tmp)
+                    : (BrokerOpaqueInsets(entry->Handle, &tmp) || !CropPending(entry))) &&
                SliceChromeContentReady(entry);
     if (IsShellToastWindow(entry))
         return !CropPending(entry) && SliceChromeContentReady(entry);
@@ -9912,6 +9928,9 @@ static ULONG Init(void)
     // Compiles to nothing unless the build was made with -p:QgaFaultInjection=1.
     FiInit();
     PwInit();
+    // Take the one-time crop/UIA setup off the first menu the user opens - it was measured
+    // initialising lazily at that exact moment (see CropWarmUp).
+    CropWarmUp();
     // Synthetic guest-native drag, opt-in via the DragSim registry value. Not a verdict
     // instrument - see dragsim.h for the owner's standing rule about scripted drags.
     DragSimStart();
