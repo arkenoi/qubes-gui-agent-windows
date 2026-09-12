@@ -10090,14 +10090,20 @@ static ULONG Init(void)
     // Compiles to nothing unless the build was made with -p:QgaFaultInjection=1.
     FiInit();
     PwInit();
-    // NO CropWarmUp() HERE - and do not add it back without solving what follows. Warming the
-    // crop subsystem at agent Init took the one-time UIA/COM setup off the first menu, which is
-    // a real win, but TcInit creates a UIA automation object and doing that on the agent's MAIN
-    // thread at startup left something that stopped the process exiting: the 4.3.29 acceptance
-    // run failed three cells in a row with "subject would not halt" at ~0% CPU, i.e. Windows
-    // shutdown waiting on the agent. Lazy init is slower for exactly one menu; a guest that
-    // cannot shut down is a release blocker. If this is retried, initialise on the crop WORKER
-    // thread (which already owns its own IUIAutomation) and prove a clean shutdown first.
+    // Warm the crop subsystem here rather than on the first menu the user opens. It used to
+    // initialise lazily AT THAT MOMENT - the log shows TcInitOnceCallback and TcCreateAutomation
+    // (~130 ms of COM/UIA setup) running exactly when the first menu appears, which is why the
+    // owner reported the first menu mapping before render and before crop while later ones were
+    // fine.
+    //
+    // THIS WAS REVERTED ONCE ON A FALSE DIAGNOSIS (2026-09-12) and the reasoning is recorded so
+    // it is not repeated: an acceptance run failed cells with "subject would not halt" and this
+    // was blamed for holding a COM apartment open. It was not. The same binary carrying this call
+    // passed 6/6 proven reboots, a clean install followed by an immediate shutdown took 22 s
+    // against a 420 s budget, and the real cause was in the HARNESS - queued qrexec calls
+    // restarting a guest after it halted, with no drain in the park path (findings/rig.md).
+    // Removing a user-facing fix on an unproven theory is the mistake here, not the warm-up.
+    CropWarmUp();
     // Synthetic guest-native drag, opt-in via the DragSim registry value. Not a verdict
     // instrument - see dragsim.h for the owner's standing rule about scripted drags.
     DragSimStart();
