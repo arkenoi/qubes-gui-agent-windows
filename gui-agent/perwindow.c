@@ -11,6 +11,7 @@
 #include "send.h"
 #include "wincapture.h"
 #include "perwindow.h"
+#include "pwcarry.h"
 
 #include <log.h>
 #include <config.h>
@@ -404,7 +405,46 @@ BOOL PwWindowEligible(IN const WINDOW_DATA* entry)
     return TRUE;
 }
 
-ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
+// CARRY THE PIXELS ACROSS A REBUILD (owner 2026-09-13: "fix the black blink, it is ugly af").
+//
+// PwResizeWindow detaches and re-attaches, and PwSlabAcquire ZEROES every slab it hands out (it
+// must: a reused slab otherwise shows the previous window's content). For a PrintWindow-captured
+// window PwAttachWindow then calls WcPrefill and real pixels are in place before the dump. A
+// SLICE-FED window has no such prefill: the rebuild announces a BLACK buffer to dom0 and damages
+// it, and the window stays black until its next full copy arrives - one composite frame on the
+// win10 path, but on de-slice a broker re-registration plus a published frame, which is hundreds
+// of ms to seconds. That is the black toast the owner saw "self-fix after a while": the first map
+// is held until painted (QGASLICEMAP showed painted=1 on every sample), and then the crop-snap
+// resize blanked the window AFTER it was already on screen, where no map-hold can reach it.
+//
+// The old slab is still valid and still holds those pixels at this point - slabs are never freed,
+// and PW_SLAB_QUARANTINE_MS keeps a just-released one out of PwSlabAcquire - so copy the surviving
+// region over before the new buffer is announced. The two buffers are indexed window-relative to
+// their own origins, so the overlap is computed IN SCREEN SPACE from PwOriginX/Y: exact for a
+// crop-snap (the new rect is a sub-rect of the old, so the whole window is covered), exact for a
+// move+resize, and for a growth it leaves only the genuinely new edge strip zeroed. Nothing here
+// changes what is ultimately displayed: PwSliceNeedsFull is set by the attach, so the next real
+// frame overwrites all of it.
+typedef struct _PW_CARRY
+{
+    const void* Buffer;   // the OUTGOING buffer, still valid (slabs are never freed)
+    ULONG Width, Height;  // dimensions it was granted for
+    int   X, Y;           // screen position it was indexed from
+} PW_CARRY;
+
+static void PwCarryContent(IN const PW_CARRY* c, IN void* newBuffer,
+                           IN ULONG newW, IN ULONG newH, IN int newX, IN int newY)
+{
+    if (!c)
+        return;
+    unsigned rows = PwCarryBlit((const unsigned char*)c->Buffer, c->X, c->Y, c->Width, c->Height,
+                                (unsigned char*)newBuffer, newX, newY, newW, newH);
+    if (rows)
+        LogDebug("PWCARRY %u rows carried across the rebuild (%lux%lu@%d,%d -> %lux%lu@%d,%d)",
+                 rows, c->Width, c->Height, c->X, c->Y, newW, newH, newX, newY);
+}
+
+static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* carry)
 {
     if (!g_PwOn)
         return ERROR_NOT_SUPPORTED;
@@ -473,6 +513,14 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
             LogWarning("WcPrefill(0x%x) failed - window starts black in dom0 until the "
                 "first successful capture", entry->Handle);
     }
+    else
+    {
+        // Slice-fed: no prefill exists, so a REBUILD hands its surviving pixels over here.
+        // BEFORE SendWindowDump, deliberately - dom0 repaints the window the moment it
+        // processes the dump, so filling afterwards would still leave one black frame. This
+        // is the same fill-before-announce ordering the crop-before-show release arm uses.
+        PwCarryContent(carry, buffer, entry->Width, entry->Height, entry->X, entry->Y);
+    }
 
     status = SendWindowDump(entry->Handle, entry->Width, entry->Height,
                             pageCount, refs);
@@ -492,6 +540,8 @@ ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwGrantHandle = shared;
     entry->PwWidth = entry->Width;
     entry->PwHeight = entry->Height;
+    entry->PwOriginX = entry->X;
+    entry->PwOriginY = entry->Y;
     entry->PwDumpSent = TRUE;
     entry->PwSliceFed = sliceFed;
     entry->PwSliceNeedsFull = sliceFed; // first frame does one full-window copy
@@ -599,14 +649,25 @@ void PwForceLegacy(IN OUT WINDOW_DATA* entry)
     }
 }
 
+// FIRST attach of a window: nothing to carry over (the slab is zeroed and the map-hold -
+// SliceContentReady in main.c - is what keeps that from being shown).
+ULONG PwAttachWindow(IN OUT WINDOW_DATA* entry)
+{
+    return PwAttachWindowCarry(entry, NULL);
+}
+
 ULONG PwResizeWindow(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->PwDumpSent)
         return ERROR_NOT_SUPPORTED;
+    // Snapshot the outgoing buffer BEFORE the detach clears the fields; the re-attach copies
+    // the surviving pixels into the new (zeroed) slab so the rebuild never shows black.
+    const PW_CARRY carry = { entry->PwBuffer, entry->PwWidth, entry->PwHeight,
+                             entry->PwOriginX, entry->PwOriginY };
     // Old grant to the pending list; the daemon releases its mapping when it processes
     // the new MSG_WINDOW_DUMP below, after which revocation succeeds on a tick/ACK.
     PwDetachWindow(entry);
-    ULONG status = PwAttachWindow(entry);
+    ULONG status = PwAttachWindowCarry(entry, &carry);
     if (status != ERROR_SUCCESS)
     {
         // The daemon still composites this window from the DETACHED (stale, pinned)

@@ -154,6 +154,12 @@ typedef struct _WINDOW_DATA
     // dump claiming more pixels than the granted pages makes gui-daemon exit(1).
     ULONG PwWidth;
     ULONG PwHeight;
+    // Screen position the CURRENT buffer was attached at (entry->X/Y at attach time). The
+    // buffer is indexed window-relative to it, so this is what makes the old and new buffers
+    // of a rebuild comparable IN SCREEN SPACE - which is what PwResizeWindow's content
+    // carry-over needs to place the surviving pixels exactly instead of guessing an offset.
+    int PwOriginX;
+    int PwOriginY;
 
     // Last MSG_CONFIGURE sent for this window: byte-identical repeats are suppressed
     // (bursts of 4+ duplicates were measured during drags), and geometry the daemon
