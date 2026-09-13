@@ -70,15 +70,25 @@ static __inline unsigned PwCarrySampleBg(
 /* Copy the overlapping region of the OLD window rect into the NEW one.
  * Returns the number of rows copied; 0 means nothing was carried (disjoint, degenerate, or the
  * same buffer). Never reads or writes outside either buffer. */
-static __inline unsigned PwCarryBlit(
+/* bgFallback: a background remembered from an EARLIER frame of this window, used when the
+ * outgoing buffer itself has nothing bright enough to sample. Without it a rebuild whose source
+ * is momentarily dark (a broker re-registration publishes a black first frame) falls back to a
+ * zeroed slab - which is the "small black flash still happens" the owner reported after the first
+ * two fills landed. 0 = none known. bgUsed, when non-NULL, receives whatever background this call
+ * settled on, so the caller can remember it for next time. */
+static __inline unsigned PwCarryBlit2(
     const unsigned char* src, int srcX, int srcY, unsigned srcW, unsigned srcH,
-    unsigned char* dst, int dstX, int dstY, unsigned dstW, unsigned dstH)
+    unsigned char* dst, int dstX, int dstY, unsigned dstW, unsigned dstH,
+    unsigned bgFallback, unsigned* bgUsed)
 {
     int l, t, r, b, y;
     size_t bytes;
     const unsigned char* s;
     unsigned char* d;
 
+#ifdef PWCARRY_DEFECT_NOFILL
+    (void)bgFallback; (void)bgUsed;   /* the defect build does no filling at all */
+#endif
     if (!src || !dst)
         return 0;
 #ifndef PWCARRY_DEFECT_SAMEBUFFER
@@ -116,6 +126,8 @@ static __inline unsigned PwCarryBlit(
 #ifndef PWCARRY_DEFECT_NOFILL
         {
             unsigned bg = PwCarrySampleBg(src, srcW, 0, 0, (int)srcW, (int)srcH);
+            if (!bg) bg = bgFallback;
+            if (bgUsed) *bgUsed = bg;
             if (bg)
             {
                 unsigned x, y2;
@@ -138,6 +150,8 @@ static __inline unsigned PwCarryBlit(
     if ((unsigned)(r - l) < dstW || (unsigned)(b - t) < dstH)
     {
         unsigned bg = PwCarrySampleBg(src, srcW, l - srcX, t - srcY, r - l, b - t);
+        if (!bg) bg = bgFallback;
+        if (bgUsed) *bgUsed = bg;
         if (bg)
         {
             unsigned x, y2;
@@ -149,6 +163,15 @@ static __inline unsigned PwCarryBlit(
             }
         }
     }
+
+    /* CARRYING BLACK IS WORSE THAN NOT CARRYING. If the overlap we are about to copy has nothing
+     * bright in it, the source is momentarily dark (a broker re-registration's black first frame)
+     * and blitting it would paint that black straight back over the fill we just did - found by
+     * the offline suite, which is the only reason this is not another intermittent flash on the
+     * rig. With a remembered background to stand in, keep the fill and carry nothing; with no
+     * memory either, carry as before, because a stale surface still beats an empty one. */
+    if (bgFallback && !PwCarrySampleBg(src, srcW, l - srcX, t - srcY, r - l, b - t))
+        return 0;
 #endif
 
     bytes = (size_t)(r - l) * 4;
@@ -165,4 +188,12 @@ static __inline unsigned PwCarryBlit(
         d += (size_t)dstW * 4;
     }
     return (unsigned)(b - t);
+}
+
+/* Back-compat wrapper: no remembered background, no report. Used by the offline suite. */
+static __inline unsigned PwCarryBlit(
+    const unsigned char* src, int srcX, int srcY, unsigned srcW, unsigned srcH,
+    unsigned char* dst, int dstX, int dstY, unsigned dstW, unsigned dstH)
+{
+    return PwCarryBlit2(src, srcX, srcY, srcW, srcH, dst, dstX, dstY, dstW, dstH, 0, 0);
 }

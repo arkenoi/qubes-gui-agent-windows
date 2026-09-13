@@ -307,6 +307,48 @@ int main(void)
         free(src.mem); free(dst.mem);
     }
 
+    /* --- 9. REMEMBERED BACKGROUND. A rebuild whose OUTGOING buffer is itself dark - a broker
+       re-registration publishes a black first frame - has nothing to sample, so without a
+       remembered background it hands dom0 a zeroed slab. That is the residual "small black flash
+       still happens". With one, the surface is painted. */
+    {
+        BUF src = Alloc(364, 157), dst = Alloc(364, 326);
+        unsigned x, y, zero = 0, hit = 0, used = 0;
+        const unsigned REMEMBERED = 0xFF2B2B2Bu;
+        for (y = 0; y < src.h; y++)                     /* source is BLACK: nothing to sample */
+            for (x = 0; x < src.w; x++)
+                memset(src.px + ((size_t)y * src.w + x) * 4, 0, 4);
+        (void)PwCarryBlit2(src.px, 4740, 1222, 364, 157, dst.px, 4740, 1053, 364, 326,
+                           REMEMBERED, &used);
+        for (y = 0; y < dst.h; y++)
+            for (x = 0; x < dst.w; x++)
+            {
+                unsigned v;
+                memcpy(&v, dst.px + ((size_t)y * dst.w + x) * 4, 4);
+                if (v == 0) zero++; else if (v == REMEMBERED) hit++;
+            }
+        Check("remembered bg: reported back to the caller", used == REMEMBERED, 1);
+        Check("remembered bg: NOTHING left black", (int)zero, 0);
+        Check("remembered bg: whole buffer painted with it", (int)hit, 364 * 326);
+        free(src.mem); free(dst.mem);
+    }
+
+    /* --- 9b. AND STILL INVENTS NOTHING when there is neither a sample nor a memory. */
+    {
+        BUF src = Alloc(364, 157), dst = Alloc(364, 326);
+        unsigned x, y, zero = 0, used = 0xDEADBEEF;
+        for (y = 0; y < src.h; y++)
+            for (x = 0; x < src.w; x++)
+                memset(src.px + ((size_t)y * src.w + x) * 4, 0, 4);
+        (void)PwCarryBlit2(src.px, 4740, 1222, 364, 157, dst.px, 4740, 1053, 364, 326, 0, &used);
+        for (y = 0; y < dst.h; y++)
+            for (x = 0; x < dst.w; x++)
+                if (dst.px[((size_t)y * dst.w + x) * 4] == 0) zero++;
+        Check("no sample, no memory: nothing invented", (int)zero, 364 * 326);
+        Check("no sample, no memory: reports no background", (int)used, 0);
+        free(src.mem); free(dst.mem);
+    }
+
     printf(g_fail ? "\nFAILED (%d)\n" : "\nall checks passed (%d failures)\n", g_fail);
     return g_fail ? 1 : 0;
 }

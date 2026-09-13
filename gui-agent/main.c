@@ -1879,6 +1879,21 @@ static void MenuFillNearBlack(IN OUT WINDOW_DATA* entry)
 // bottom edge is a margin, not a gap between cards, and is left alone. Each gap pixel takes the
 // pixel directly above the run, so the fill reproduces the card's own background rather than
 // inventing a colour - the same discipline as every other fill here.
+// Brightest channel anywhere in a row's interior. Shared by the gap detector and the seam
+// absorber below.
+static int RowInteriorMax(IN const BYTE* buf, IN int W, IN int m, IN int y)
+{
+    const BYTE* q = buf + ((size_t)y * W + m) * 4;
+    int rowMax = 0;
+    for (int x = m; x < W - m; x++, q += 4)
+    {
+        if (q[0] > rowMax) rowMax = q[0];
+        if (q[1] > rowMax) rowMax = q[1];
+        if (q[2] > rowMax) rowMax = q[2];
+    }
+    return rowMax;
+}
+
 #define TOAST_GAP_MAX_ROWS 64
 static void ToastFillGapRows(IN OUT WINDOW_DATA* entry)
 {
@@ -1911,6 +1926,17 @@ static void ToastFillGapRows(IN OUT WINDOW_DATA* entry)
         int end = y;
         while (end + 1 < H && dark[end + 1])
             end++;
+        // ABSORB THE ANTIALIASED SEAM ROWS on either side (owner, 2026-09-13: "fill is not as
+        // wide as toast itself"). Measured: the 12 pure-black rows 157..168 are bracketed by rows
+        // 156 and 169 at a uniform 47 against a card of 238 - the cards' antialiased edges - and
+        // those rows carry 8 FULLY BLACK columns at each end (x=2..4, x=359..361, just inside the
+        // dom0 border). Filling only the pure-black run therefore left a grey line top and bottom
+        // and a black sliver at each side, which reads as a fill narrower than the card. A row
+        // whose whole interior is below 64 is not content on a 238 card; absorb it.
+        while (y > 1 && RowInteriorMax(buf, W, m, y - 1) < 64)
+            y--;
+        while (end + 1 < H - 1 && RowInteriorMax(buf, W, m, end + 1) < 64)
+            end++;
         const int rows = end - y + 1;
         if (end >= H - 1 || rows > TOAST_GAP_MAX_ROWS)   // touches the bottom edge, or implausible
         {
@@ -1924,15 +1950,7 @@ static void ToastFillGapRows(IN OUT WINDOW_DATA* entry)
         int srcY = y - 1;
         for (int probe = 1; probe <= 8 && y - probe >= 0; probe++)
         {
-            const BYTE* q = buf + ((size_t)(y - probe) * W + m) * 4;
-            int rowMax = 0;
-            for (int x = m; x < W - m; x++, q += 4)
-            {
-                if (q[0] > rowMax) rowMax = q[0];
-                if (q[1] > rowMax) rowMax = q[1];
-                if (q[2] > rowMax) rowMax = q[2];
-            }
-            if (rowMax >= 64) { srcY = y - probe; break; }
+            if (RowInteriorMax(buf, W, m, y - probe) >= 64) { srcY = y - probe; break; }
         }
         const BYTE* above = buf + ((size_t)srcY * W) * 4;
         for (int yy = y; yy <= end; yy++)

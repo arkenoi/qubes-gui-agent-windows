@@ -432,13 +432,17 @@ typedef struct _PW_CARRY
     int   X, Y;           // screen position it was indexed from
 } PW_CARRY;
 
-static void PwCarryContent(IN const PW_CARRY* c, IN void* newBuffer,
+static void PwCarryContent(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c, IN void* newBuffer,
                            IN ULONG newW, IN ULONG newH, IN int newX, IN int newY)
 {
     if (!c)
         return;
-    unsigned rows = PwCarryBlit((const unsigned char*)c->Buffer, c->X, c->Y, c->Width, c->Height,
-                                (unsigned char*)newBuffer, newX, newY, newW, newH);
+    unsigned bgUsed = 0;
+    unsigned rows = PwCarryBlit2((const unsigned char*)c->Buffer, c->X, c->Y, c->Width, c->Height,
+                                 (unsigned char*)newBuffer, newX, newY, newW, newH,
+                                 entry->PwLastBg, &bgUsed);
+    if (bgUsed)
+        entry->PwLastBg = bgUsed;   // remember it for a rebuild whose source is dark
     // INFO, not DEBUG: LogDebug does not appear at the guest's default LogLevel=3, and this is
     // the line that PROVES the black-blink fix ran on a guest - a proof line nobody can read at
     // the shipped log level is not a proof. A rebuild is a rare event (a crop-snap, a resize),
@@ -527,7 +531,7 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
         // BEFORE SendWindowDump, deliberately - dom0 repaints the window the moment it
         // processes the dump, so filling afterwards would still leave one black frame. This
         // is the same fill-before-announce ordering the crop-before-show release arm uses.
-        PwCarryContent(carry, buffer, entry->Width, entry->Height, entry->X, entry->Y);
+        PwCarryContent(entry, carry, buffer, entry->Width, entry->Height, entry->X, entry->Y);
     }
 
     status = SendWindowDump(entry->Handle, entry->Width, entry->Height,

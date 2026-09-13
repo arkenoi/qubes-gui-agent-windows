@@ -315,6 +315,11 @@ typedef struct _WINDOW_DATA
     // filled from the card above at least once (ToastFillGapRows runs per frame; the line
     // must not).
     BOOL     ToastGapLogged;
+    // Last background this window's buffer was seen to have (BGRA, 0 = never). Fed to the
+    // rebuild carry-over so a rebuild whose OUTGOING buffer is momentarily dark - a broker
+    // re-registration publishes a black first frame - still paints the surface instead of
+    // handing dom0 a zeroed slab.
+    unsigned PwLastBg;
 
     // Slice-content map-hold (SliceMapHold gate) + flash instrumentation (always on).
     // PwSliceContentTick: GetTickCount64 when PAINTED content first landed in this slice-fed
