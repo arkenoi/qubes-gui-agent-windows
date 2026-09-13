@@ -1943,14 +1943,33 @@ static void ToastFillGapRows(IN OUT WINDOW_DATA* entry)
             y = end;
             continue;
         }
-        // Source row: NOT simply y-1. The row immediately above a gap is the card's own bottom
-        // edge, which is antialiased and half dark (measured: row 156 max=47 against a card of
-        // 238) - copying it would trade a black band for a grey one. Walk up to 8 rows for the
-        // first that is unambiguously card content.
-        int srcY = y - 1;
-        for (int probe = 1; probe <= 8 && y - probe >= 0; probe++)
+        // Source row: NOT simply y-1, and not merely the first bright one either.
+        //
+        // y-1 is the card's own antialiased bottom edge (measured: row 156 max=47 against a card
+        // of 238), so copying it trades a black band for a grey one. But "the first row with
+        // interior content" is also wrong, and the owner saw why: "background fill BETWEEN two
+        // toasts still does not span edge to edge". Measured live on win11-up, stack 364x326 -
+        // the filled rows carried FOUR fully-black columns {2,3,360,361} while the card rows
+        // above and below carried only TWO {2,361}. A card has ROUNDED CORNERS, so rows near a
+        // card's edge have a thicker dark margin; copying one of those reproduces it down the
+        // whole seam and leaves a black notch at each end.
+        //
+        // So choose the most BODY-LIKE row: among the candidates, the one with the FEWEST fully
+        // dark columns across the FULL width (ties broken by proximity). That is the row whose
+        // left and right edges are the card's straight sides, which is exactly what the seam has
+        // to reproduce to span edge to edge.
+        int srcY = y - 1, bestDark = -1;
+        for (int probe = 1; probe <= 10 && y - probe >= 0; probe++)
         {
-            if (RowInteriorMax(buf, W, m, y - probe) >= 64) { srcY = y - probe; break; }
+            const int cy = y - probe;
+            if (RowInteriorMax(buf, W, m, cy) < 64)
+                continue;                       // not content at all
+            const BYTE* q = buf + (size_t)cy * W * 4;
+            int darkCols = 0;
+            for (int x = 0; x < W; x++, q += 4)
+                if (q[0] < 24 && q[1] < 24 && q[2] < 24) darkCols++;
+            if (bestDark < 0 || darkCols < bestDark) { bestDark = darkCols; srcY = cy; }
+            if (darkCols == 0) break;           // cannot do better than an edge-to-edge row
         }
         const BYTE* above = buf + ((size_t)srcY * W) * 4;
         for (int yy = y; yy <= end; yy++)
