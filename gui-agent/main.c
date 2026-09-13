@@ -143,12 +143,31 @@ DWORD g_HostScreenHeight = 0;
 // gives the A/B against the direct-map path.
 BOOL g_StagingGrant = TRUE;
 
-// Registry gate REG_CONFIG_NO_SCREEN_GRANT_VALUE ("SeamlessNoScreenGrant", default OFF):
-// P2 probe (DESIGN-pure-per-window.md) - the staging buffer is allocated and filled but
-// never granted, and the window-0 dump is suppressed, so dom0 renders exclusively from
-// per-window grants. Requires g_StagingGrant (the direct-map path grants the mapped DXGI
-// surface itself and has no ungranted form). One registry flip + agent restart per arm.
-BOOL g_NoScreenGrant = FALSE;
+// Registry gate REG_CONFIG_NO_SCREEN_GRANT_VALUE ("SeamlessNoScreenGrant", DEFAULT ON in
+// seamless): the staging buffer is allocated and filled but never granted, and the window-0
+// dump is suppressed, so dom0 renders exclusively from per-window grants. Requires
+// g_StagingGrant (the direct-map path grants the mapped DXGI surface itself and has no
+// ungranted form). Set SeamlessNoScreenGrant=0 to restore the whole-desktop grant.
+//
+// SHIPPED 2026-09-13 (owner: retiring this grant was always part of de-slice). It was built
+// and PROVEN as a probe on 2026-09-02 - gui-daemon needs no screen image at all, every
+// g->screen_window use is NULL-guarded and damage for an imageless window is a safe no-op
+// (xside.c:733, 2352-2367) - and then left at FALSE while de-slice shipped default-on around
+// it, so the per-window path became the default while the grant it replaces stayed live.
+//
+// What retiring it removes: the 7200-page staging-grant leak, the redundant copy of the whole
+// desktop into dom0 (secure-desktop pixels included), and the long-lived grant that survives
+// capture teardown - the one that stage 2 orphaned when the installer killed the agent, since
+// grants are NOT released when the xeniface handle closes (capture.c revoke site).
+//
+// NOT a security win (owner ruling 2026-09-02): the qube boundary and the gui-daemon trust
+// model are unchanged. Tidiness and correctness.
+//
+// SEAMLESS ONLY, and that is settled at Init, not at runtime: a guest with
+// service.gui-fullscreen on can be asked for the whole-desktop window, whose image IS this
+// grant, so on that guest the flag is turned back off at Init and the grant stays live. See
+// the gate in Init for why the feature is the right discriminator.
+BOOL g_NoScreenGrant = TRUE;
 
 // WGC capture broker (DESIGN-wgc-broker.md): user-session helper that captures OCCLUDED
 // app/NRB windows via Windows.Graphics.Capture (which the SYSTEM agent itself cannot
@@ -184,7 +203,7 @@ BOOL          g_FlattenCorners = FALSE;   // OFF: measurably slow for ZERO effec
 // legacy_toasts: explicit opt-out that FORCES the bridge off (override-redirect toasts as
 // before), winning over NotifyBridge. Registry "LegacyToasts" / qubesdb /qubes-service/legacy-toasts.
 #define REG_CONFIG_LEGACY_TOASTS_VALUE L"LegacyToasts"
-BOOL          g_NotifBridge = FALSE;
+BOOL          g_NotifBridge = TRUE;
 // Secondary error-delivery route (docs/DESIGN-error-notify.md, notifyerr.h): an ACTION-severity
 // agent fault is ALSO sent to dom0 as a notification, through notifhost --notify-file over the
 // stock qubes.Notifications service, in addition to its log line - never instead of it. It rides
@@ -195,7 +214,7 @@ BOOL          g_NotifBridge = FALSE;
 // app toasts and suppresses their banners, and legacy_toasts forces it off - neither may decide
 // whether the agent's own faults reach dom0.
 #define REG_CONFIG_NOTIF_ERRORS_VALUE L"NotifyErrors"
-BOOL          g_NotifyErrors = FALSE;
+BOOL          g_NotifyErrors = TRUE;
 // Slice retirement (broker-only sliceFed handling) is the SHIPPED behaviour on 24H2+ and tracks
 // the broker build floor unconditionally; the SliceRetire diagnostic knob is retired. Field
 // kill-switch: WgcBroker=0 / /qubes-service/wgc-broker=0 - broker inactive routes every sliceFed
@@ -10202,10 +10221,17 @@ static ULONG Init(void)
                 g_SliceMapHold, g_SliceMapHoldChrome, CROP_BEFORE_SHOW_TIMEOUT_MS);
     }
     {
-        // Notification bridge gate: default OFF; registry "NotifyBridge" then qubesdb
-        // /qubes-service/notify-bridge (dom0 wins), mirroring the broker gate. No build
-        // floor - the listener path is proven on win10.
-        DWORD nb = 0;
+        // Notification bridge gate: DEFAULT ON (owner, 2026-09-13); registry "NotifyBridge"
+        // then qubesdb /qubes-service/notify-bridge (dom0 wins), mirroring the broker gate. No
+        // build floor - the listener path is proven on win10.
+        //
+        // It shipped default-OFF from 05b5bdd (2026-09-04) with no recorded decision behind
+        // that default, which meant the bridge never ran for any user: built, given a full
+        // acceptance harness (a0-toast-bridge.sh P1-P7), and functionally unshipped. The
+        // opt-outs below exist precisely BECAUSE the default is on - legacy_toasts forces the
+        // old override-redirect toasts back for anyone who wants them, and dom0 can clear
+        // notify-bridge outright.
+        DWORD nb = 1;
         const WCHAR *nbSrc = L"default";
         if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_NOTIF_BRIDGE_VALUE, &nb, NULL))
             nbSrc = L"registry";
@@ -10256,11 +10282,14 @@ static ULONG Init(void)
     {
         // Secondary error route gate (REG_CONFIG_NOTIF_ERRORS_VALUE): registry base, qubesdb
         // /qubes-service/notify-errors override (dom0 wins), same failed-vs-absent discipline as
-        // the gates above. Default OFF: a guest must not start notifying dom0 because it was
-        // upgraded. Resolved ONCE here (capabilities are decided at start) and handed to
+        // the gates above. DEFAULT ON (owner, 2026-09-13): an agent fault that needs action is
+        // worth telling dom0 about, and /qubes-service/notify-errors=0 turns it off. The old
+        // "a guest must not start notifying dom0 because it was upgraded" reasoning is what kept
+        // a delivered feature switched off by default. Resolved ONCE here (capabilities are
+        // decided at start) and handed to
         // notifyerr.c and to the bridge helper (--notify-errors on its command line) - the agent is
         // the single reader of this gate.
-        DWORD ne = 0;
+        DWORD ne = 1;
         const WCHAR *neSrc = L"default";
         char* v;
         if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_NOTIF_ERRORS_VALUE, &ne, NULL))
@@ -10423,18 +10452,38 @@ static ULONG Init(void)
         g_StagingGrant = (stagingGrant != 0);
     }
 
+    // DEFAULT ON: absent registry value means enabled. Only an explicit 0 turns it off.
     DWORD noScreenGrant;
     status = CfgReadDword(moduleName, REG_CONFIG_NO_SCREEN_GRANT_VALUE, &noScreenGrant, NULL);
-    g_NoScreenGrant = (ERROR_SUCCESS == status) && (noScreenGrant != 0);
+    g_NoScreenGrant = (ERROR_SUCCESS == status) ? (noScreenGrant != 0) : TRUE;
     if (g_NoScreenGrant && !g_StagingGrant)
     {
-        // The probe needs the staging buffer as the LOCAL pixel source; the direct-map
-        // path grants the mapped DXGI surface itself and has no ungranted form.
+        // The ungranted path needs the staging buffer as the LOCAL pixel source; the
+        // direct-map path grants the mapped DXGI surface itself and has no ungranted form.
         LogWarning("P2NOGRANT requires StagingGrant=1 - ignoring SeamlessNoScreenGrant");
         g_NoScreenGrant = FALSE;
     }
+    // SEAMLESS ONLY, DECIDED HERE AND NEVER AGAIN (the rule in CLAUDE.md: capabilities are
+    // settled at start, and a component that was working and then stops is a FAILURE, not a
+    // capability change). Non-seamless is ONE dom0 window showing the whole guest desktop, and
+    // that window's image IS the screen grant - retiring it there would black the desktop out.
+    // The gate is therefore the feature that decides whether this guest can enter non-seamless
+    // AT ALL: with service.gui-fullscreen off, SetSeamlessMode coerces every non-seamless
+    // request back to seamless ("QGAFSFLASH fullscreen mode refused"), so the desktop image can
+    // never be needed and the grant can never be missed. With it on, the guest keeps the grant
+    // it may be asked for - no runtime flip, no window where dom0 asks for a desktop we have
+    // no longer granted. g_ShowFullscreenScreen is resolved above, before this point.
+    if (g_NoScreenGrant && g_ShowFullscreenScreen)
+    {
+        LogInfo("P2NOGRANT not applied: service.gui-fullscreen is on, so this guest can be asked "
+            L"for the whole-desktop window, whose image is that grant - it stays live");
+        g_NoScreenGrant = FALSE;
+    }
     if (g_NoScreenGrant)
-        LogInfo("P2NOGRANT active: desktop framebuffer stays ungranted, window-0 dump suppressed (probe, seamless-only)");
+        LogInfo("P2NOGRANT active: desktop framebuffer stays ungranted, window-0 dump suppressed "
+            L"(seamless-only guest; dom0 renders exclusively from per-window grants)");
+    else
+        LogInfo("P2NOGRANT off: the whole desktop is granted to dom0");
 
     SystemParametersInfo(SPI_SETFOREGROUNDLOCKTIMEOUT, 0, 0, SPIF_UPDATEINIFILE);
 
