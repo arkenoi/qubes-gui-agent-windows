@@ -311,6 +311,10 @@ typedef struct _WINDOW_DATA
     // One-shot QGASLICEBLACK diagnostic emitted: a copy landed in this window's buffer but the
     // buffer still fails SlicePainted (slicepaint.h) - the hold stays. Re-armed on attach.
     BOOL     PwSliceBlackLogged;
+    // One-shot QGATOASTGAP diagnostic: this toast's transparent inter-card gap has been
+    // filled from the card above at least once (ToastFillGapRows runs per frame; the line
+    // must not).
+    BOOL     ToastGapLogged;
 
     // Slice-content map-hold (SliceMapHold gate) + flash instrumentation (always on).
     // PwSliceContentTick: GetTickCount64 when PAINTED content first landed in this slice-fed

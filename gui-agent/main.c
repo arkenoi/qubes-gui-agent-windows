@@ -1858,6 +1858,101 @@ static void MenuFillNearBlack(IN OUT WINDOW_DATA* entry)
     }
 }
 
+
+// THE BLACK BAND BETWEEN STACKED TOASTS (owner, 2026-09-13: "space between merged toasts is still
+// black"). MEASURED on win11-up, not inferred: two stacked toasts arrive as ONE 364x326 window
+// (the only override-redirect window dom0 lists for them) whose interior is two cards of
+// (238,238,238) separated by exactly 12 rows of pure (0,0,0) - rows 157..168. The gap is
+// TRANSPARENT in the source, and WGC hands us premultiplied pixels with no usable alpha, so
+// transparent captures as opaque black. Same root cause as the menu shadow margin that
+// MenuFillNearBlack already removes; the Qubes protocol has no per-pixel alpha for us to pass the
+// transparency through, so the choice is a black bar or a continuous card. The owner calls them
+// "merged toasts", and merged is what a filled gap looks like.
+//
+// WHY PER FRAME AND NOT ONCE. MenuFillNearBlack is one-shot at map because a menu's buffer is
+// painted once. A toast stack is re-captured while it animates, and the band came back in every
+// capture seconds apart, so a one-shot fill would be overwritten by the next frame.
+//
+// SCOPED HARD, because an every-frame pass over every buffer is exactly what made FlattenCorners
+// "measurably slow for ZERO effect": toast windows only, and only rows whose whole interior is
+// near-black AND which are bounded above and below by real content. A run touching the top or
+// bottom edge is a margin, not a gap between cards, and is left alone. Each gap pixel takes the
+// pixel directly above the run, so the fill reproduces the card's own background rather than
+// inventing a colour - the same discipline as every other fill here.
+#define TOAST_GAP_MAX_ROWS 64
+static void ToastFillGapRows(IN OUT WINDOW_DATA* entry)
+{
+    if (!entry->PwBuffer || !entry->PwSliceFed || !IsShellToastWindow(entry))
+        return;
+    const int W = (int)entry->PwWidth, H = (int)entry->PwHeight;
+    const int m = 4;                      // ignore a few edge columns (border/antialiasing)
+    if (W < 2 * m + 8 || H < 8)
+        return;
+    BYTE* buf = (BYTE*)entry->PwBuffer;
+
+    // Pass 1: which rows are near-black across their whole interior?
+    BOOL* dark = (BOOL*)calloc((size_t)H, sizeof(BOOL));
+    if (!dark)
+        return;
+    for (int y = 0; y < H; y++)
+    {
+        const BYTE* q = buf + ((size_t)y * W + m) * 4;
+        BOOL allDark = TRUE;
+        for (int x = m; x < W - m; x++, q += 4)
+            if (q[0] >= 24 || q[1] >= 24 || q[2] >= 24) { allDark = FALSE; break; }
+        dark[y] = allDark;
+    }
+
+    // Pass 2: fill each BOUNDED run from the row above it.
+    for (int y = 1; y < H - 1; y++)
+    {
+        if (!dark[y])
+            continue;
+        int end = y;
+        while (end + 1 < H && dark[end + 1])
+            end++;
+        const int rows = end - y + 1;
+        if (end >= H - 1 || rows > TOAST_GAP_MAX_ROWS)   // touches the bottom edge, or implausible
+        {
+            y = end;
+            continue;
+        }
+        // Source row: NOT simply y-1. The row immediately above a gap is the card's own bottom
+        // edge, which is antialiased and half dark (measured: row 156 max=47 against a card of
+        // 238) - copying it would trade a black band for a grey one. Walk up to 8 rows for the
+        // first that is unambiguously card content.
+        int srcY = y - 1;
+        for (int probe = 1; probe <= 8 && y - probe >= 0; probe++)
+        {
+            const BYTE* q = buf + ((size_t)(y - probe) * W + m) * 4;
+            int rowMax = 0;
+            for (int x = m; x < W - m; x++, q += 4)
+            {
+                if (q[0] > rowMax) rowMax = q[0];
+                if (q[1] > rowMax) rowMax = q[1];
+                if (q[2] > rowMax) rowMax = q[2];
+            }
+            if (rowMax >= 64) { srcY = y - probe; break; }
+        }
+        const BYTE* above = buf + ((size_t)srcY * W) * 4;
+        for (int yy = y; yy <= end; yy++)
+        {
+            BYTE* q = buf + ((size_t)yy * W) * 4;
+            memcpy(q, above, (size_t)W * 4);
+        }
+        (void)SendWindowDamageEvent(entry->Handle, 0, y, W, rows);
+        if (!entry->ToastGapLogged)
+        {
+            entry->ToastGapLogged = TRUE;
+            LogInfo("QGATOASTGAP hwnd 0x%x filled %d black row(s) at y=%d from the card above "
+                L"(transparent inter-card gap; logged once per window)",
+                (DWORD)(ULONG_PTR)entry->Handle, rows, y);
+        }
+        y = end;
+    }
+    free(dark);
+}
+
 #define FLATTEN_CORNER_R 12
 static void FlattenBufferCorners(IN OUT WINDOW_DATA* entry)
 {
@@ -7886,6 +7981,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // Buffer is complete for this window: square off DWM's black rounded
                         // corners before the content check judges it.
                         FlattenBufferCorners(entry);
+                        // Transparent gap between stacked toast cards arrives as opaque black
+                        // (premultiplied WGC capture, no usable alpha) - fill it from the card
+                        // above. Toast windows only; see ToastFillGapRows.
+                        ToastFillGapRows(entry);
                         // A per-HWND broker frame is a COPY, not proof of content: the WGC
                         // publish path has no non-black check, so the first frame of a
                         // not-yet-rendered window is black. PwNoteSliceContent samples the
