@@ -236,9 +236,34 @@ int main(void)
         rows = (int)PwCarryBlit(src.px, 0, 0, 100, 50, dst.px, 500, 500, 100, 50);
         Tally(&dst, 500, 500, &c, &z, &w);
         Check("disjoint: nothing carried", rows, 0);
-        Check("disjoint: destination untouched", z, 100 * 50);
+        Check("disjoint: destination NOT left black", z, 0);
         Check("disjoint: dest guards intact", GuardsIntact(&dst), 1);
         (void)c; (void)w;
+        free(src.mem); free(dst.mem);
+    }
+
+    /* --- 5b. DISJOINT, the real one: the toast host jumps clear of its old rect
+       (364x326@4740,1053 -> 364x338@4740,687 - measured on win11-up). Nothing overlaps, so
+       nothing is carried, but the destination must still be the surface's background rather
+       than a black hole - that is the owner's "short black flash sometimes". */
+    {
+        BUF src = Alloc(364, 326), dst = Alloc(364, 338);
+        unsigned x, y, zero = 0, bg = 0, rows;
+        const unsigned char CARD = 0x2B;
+        for (y = 0; y < src.h; y++)
+            for (x = 0; x < src.w; x++)
+                memset(src.px + ((size_t)y * src.w + x) * 4, CARD, 4);
+        rows = PwCarryBlit(src.px, 4740, 1053, 364, 326, dst.px, 4740, 687, 364, 338);
+        for (y = 0; y < dst.h; y++)
+            for (x = 0; x < dst.w; x++)
+            {
+                unsigned char v = dst.px[((size_t)y * dst.w + x) * 4];
+                if (v == 0) zero++; else if (v == CARD) bg++;
+            }
+        Check("toast jump: nothing carried (rects are disjoint)", (int)rows, 0);
+        Check("toast jump: NOTHING left black", (int)zero, 0);
+        Check("toast jump: whole buffer is the sampled background", (int)bg, 364 * 338);
+        Check("toast jump: dest guards intact", GuardsIntact(&dst), 1);
         free(src.mem); free(dst.mem);
     }
 

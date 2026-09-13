@@ -101,7 +101,35 @@ static __inline unsigned PwCarryBlit(
     b = (srcY + (int)srcH) < (dstY + (int)dstH) ? (srcY + (int)srcH) : (dstY + (int)dstH);
 #endif
     if (r <= l || b <= t)
-        return 0;               /* disjoint: the window moved clear of its old rect */
+    {
+        /* DISJOINT, AND STILL NOT ALLOWED TO BE BLACK (owner, 2026-09-13: "there is still a short
+         * black flash sometimes"). Measured on win11-up minutes later, the exact event:
+         *
+         *   PWCARRY nothing carried (364x326@4740,1053 -> 364x338@4740,687)
+         *
+         * The toast host jumped far enough up that the new rect (687..1025) clears the old one
+         * (1053..1379) completely. No overlap means nothing to copy - but the old buffer still
+         * holds the surface's pixels, so its BACKGROUND is still knowable. Paint the new buffer
+         * with it. A card-coloured window for one frame is the same surface; a black one is a
+         * hole. Sampling is from the whole source here, since no sub-rect survives.
+         * The "invent nothing" rule is unchanged: no bright sample, no fill. */
+#ifndef PWCARRY_DEFECT_NOFILL
+        {
+            unsigned bg = PwCarrySampleBg(src, srcW, 0, 0, (int)srcW, (int)srcH);
+            if (bg)
+            {
+                unsigned x, y2;
+                for (y2 = 0; y2 < dstH; y2++)
+                {
+                    unsigned char* row = dst + (size_t)y2 * dstW * 4;
+                    for (x = 0; x < dstW; x++, row += 4)
+                        memcpy(row, &bg, 4);
+                }
+            }
+        }
+#endif
+        return 0;               /* nothing CARRIED - the caller logs that, and it is still true */
+    }
 
     /* Paint the surface's own background first, so any part of the new buffer the carry does not
      * cover shows the card instead of a black hole. Only when the destination is actually bigger
