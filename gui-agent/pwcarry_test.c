@@ -6,7 +6,8 @@
  * so an out-of-bounds row or column FAILS rather than merely looking right.
  *
  * The cases are the real ones: a toast crop-snap (new rect strictly inside the old, offset by the
- * shadow inset), a move+resize, a growth (the genuinely new edge must stay zero), a disjoint move,
+ * shadow inset), a move+resize, a growth (the newly exposed edge must be the surface's own
+ * background, never black), a genuinely dark source that must invent nothing, a disjoint move,
  * an identical rect, the same-slab refusal, and degenerate dimensions.
  */
 #include <stdio.h>
@@ -77,6 +78,22 @@ static void Tally(const BUF* d, int ox, int oy, int* correct, int* zero, int* wr
         }
 }
 
+/* Mismatches strictly INSIDE the carried region, in destination-local coordinates. Counting
+ * "correct" over the WHOLE destination stopped working once the uncovered area is background-
+ * filled: Val() is one byte, so a filled pixel coincides with its screen-derived value now and
+ * then (measured: 124 of 20000). That is a property of the test's own pattern, not of the blit -
+ * so assert the overlap exactly, and let the separate background checks own the rest. */
+static int MismatchesIn(const BUF* d, int ox, int oy, unsigned rx, unsigned ry,
+                        unsigned rw, unsigned rh)
+{
+    unsigned x, y; int bad = 0;
+    for (y = ry; y < ry + rh; y++)
+        for (x = rx; x < rx + rw; x++)
+            if (d->px[((size_t)y * d->w + x) * 4] != Val(ox + (int)x, oy + (int)y))
+                bad++;
+    return bad;
+}
+
 int main(void)
 {
     /* --- 1. TOAST CROP-SNAP: the new rect is strictly inside the old, offset by the shadow
@@ -97,34 +114,103 @@ int main(void)
         free(src.mem); free(dst.mem);
     }
 
-    /* --- 2. MOVE + RESIZE: partial overlap. The overlap must be exact and everything outside it
-       must still be zero (the next full frame fills that). */
+    /* --- 2. MOVE + RESIZE: partial overlap. The overlap must be exact, and everything OUTSIDE it
+       must be the sampled background - never black. (Before the background fill this asserted
+       "remainder still black", which was the defect, not the contract.) */
     {
         BUF src = Alloc(200, 100), dst = Alloc(200, 100);
-        int c, z, w, rows;
+        int c, z, w, rows, filled = 0;
+        unsigned bg, x, y;
         Paint(&src, 0, 0);
+        bg = PwCarrySampleBg(src.px, 200, 40, 25, 160, 75);
         rows = (int)PwCarryBlit(src.px, 0, 0, 200, 100, dst.px, 40, 25, 200, 100);
         Tally(&dst, 40, 25, &c, &z, &w);
+        for (y = 0; y < dst.h; y++)
+            for (x = 0; x < dst.w; x++)
+            {
+                unsigned v;
+                memcpy(&v, dst.px + ((size_t)y * dst.w + x) * 4, 4);
+                if (v == bg) filled++;
+            }
         Check("move: 75 rows carried", rows, 75);
-        Check("move: overlap exact", c, 160 * 75);
-        Check("move: remainder still black", z, 200 * 100 - 160 * 75);
-        Check("move: nothing misplaced", w, 0);
+        Check("move: overlap exact", MismatchesIn(&dst, 40, 25, 0, 0, 160, 75), 0);
+        Check("move: carried at least the overlap", c >= 160 * 75, 1);
+        Check("move: NOTHING left black", z, 0);
+        Check("move: a background was sampled", bg != 0, 1);
+        Check("move: remainder is the sampled background",
+              filled >= 200 * 100 - 160 * 75, 1);
         Check("move: dest guards intact", GuardsIntact(&dst), 1);
         free(src.mem); free(dst.mem);
     }
 
-    /* --- 3. GROWTH at the same origin: the old area is carried, the new edge stays black. */
+    /* --- 3. GROWTH at the same origin: the old area is carried, and the newly exposed edge is
+       the sampled background rather than a black hole. */
     {
         BUF src = Alloc(100, 50), dst = Alloc(160, 80);
-        int c, z, w, rows;
+        int c, z, w, rows, filled = 0;
+        unsigned bg, x, y;
         Paint(&src, 10, 10);
+        bg = PwCarrySampleBg(src.px, 100, 0, 0, 100, 50);
         rows = (int)PwCarryBlit(src.px, 10, 10, 100, 50, dst.px, 10, 10, 160, 80);
         Tally(&dst, 10, 10, &c, &z, &w);
+        for (y = 0; y < dst.h; y++)
+            for (x = 0; x < dst.w; x++)
+            {
+                unsigned v;
+                memcpy(&v, dst.px + ((size_t)y * dst.w + x) * 4, 4);
+                if (v == bg) filled++;
+            }
         Check("growth: 50 rows carried", rows, 50);
-        Check("growth: old area carried", c, 100 * 50);
-        Check("growth: new edge still black", z, 160 * 80 - 100 * 50);
-        Check("growth: nothing misplaced", w, 0);
+        Check("growth: old area carried", MismatchesIn(&dst, 10, 10, 0, 0, 100, 50), 0);
+        Check("growth: carried at least the old area", c >= 100 * 50, 1);
+        Check("growth: NOTHING left black", z, 0);
+        Check("growth: new edge is the sampled background",
+              filled >= 160 * 80 - 100 * 50, 1);
         Check("growth: dest guards intact", GuardsIntact(&dst), 1);
+        free(src.mem); free(dst.mem);
+    }
+
+    /* --- 3b. GROWTH, BACKGROUND-FILLED: the newly-exposed area must show the surface's own
+       background, not black. This is the owner's "second one in the same window gets black for a
+       moment" - the real geometry measured on win11-up, where a second toast grows the shell's
+       toast host 364x157 -> 364x326 and moves it UP, exposing 169 rows at the top. */
+    {
+        BUF src = Alloc(364, 157), dst = Alloc(364, 326);
+        unsigned x, y, zero = 0, bg = 0, rows;
+        const unsigned char CARD = 0x2B;              /* dark-theme toast card */
+        for (y = 0; y < src.h; y++)
+            for (x = 0; x < src.w; x++)
+                memset(src.px + ((size_t)y * src.w + x) * 4, CARD, 4);
+        rows = PwCarryBlit(src.px, 4740, 1222, 364, 157, dst.px, 4740, 1053, 364, 326);
+        for (y = 0; y < dst.h; y++)
+            for (x = 0; x < dst.w; x++)
+            {
+                unsigned char v = dst.px[((size_t)y * dst.w + x) * 4];
+                if (v == 0) zero++;
+                else if (v == CARD) bg++;
+            }
+        Check("toast growth: 157 rows carried", (int)rows, 157);
+        Check("toast growth: NOTHING left black", (int)zero, 0);
+        Check("toast growth: whole card is the sampled background", (int)bg, 364 * 326);
+        Check("toast growth: dest guards intact", GuardsIntact(&dst), 1);
+        free(src.mem); free(dst.mem);
+    }
+
+    /* --- 3c. A GENUINELY DARK SOURCE INVENTS NOTHING. Same discipline as MenuFillNearBlack: if
+       no sample is bright enough the surface really is that dark, so skip the fill rather than
+       paint a colour that was never on screen. */
+    {
+        BUF src = Alloc(364, 157), dst = Alloc(364, 326);
+        unsigned x, y, zero = 0, rows;
+        for (y = 0; y < src.h; y++)
+            for (x = 0; x < src.w; x++)
+                memset(src.px + ((size_t)y * src.w + x) * 4, 8, 4);   /* below the 24 ceiling */
+        rows = PwCarryBlit(src.px, 4740, 1222, 364, 157, dst.px, 4740, 1053, 364, 326);
+        for (y = 0; y < dst.h; y++)
+            for (x = 0; x < dst.w; x++)
+                if (dst.px[((size_t)y * dst.w + x) * 4] == 0) zero++;
+        Check("dark source: rows still carried", (int)rows, 157);
+        Check("dark source: no colour invented (uncovered stays zero)", (int)zero, 364 * (326 - 157));
         free(src.mem); free(dst.mem);
     }
 
