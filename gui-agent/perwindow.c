@@ -439,9 +439,17 @@ static void PwCarryContent(IN const PW_CARRY* c, IN void* newBuffer,
         return;
     unsigned rows = PwCarryBlit((const unsigned char*)c->Buffer, c->X, c->Y, c->Width, c->Height,
                                 (unsigned char*)newBuffer, newX, newY, newW, newH);
+    // INFO, not DEBUG: LogDebug does not appear at the guest's default LogLevel=3, and this is
+    // the line that PROVES the black-blink fix ran on a guest - a proof line nobody can read at
+    // the shipped log level is not a proof. A rebuild is a rare event (a crop-snap, a resize),
+    // never per-frame, so this costs a handful of lines in a session.
     if (rows)
-        LogDebug("PWCARRY %u rows carried across the rebuild (%lux%lu@%d,%d -> %lux%lu@%d,%d)",
-                 rows, c->Width, c->Height, c->X, c->Y, newW, newH, newX, newY);
+        LogInfo("PWCARRY %u rows carried across the rebuild (%lux%lu@%d,%d -> %lux%lu@%d,%d)",
+                rows, c->Width, c->Height, c->X, c->Y, newW, newH, newX, newY);
+    else
+        LogInfo("PWCARRY nothing carried (%lux%lu@%d,%d -> %lux%lu@%d,%d): no overlap, or no "
+                L"outgoing buffer - the new slab stays zeroed until its next full frame",
+                c->Width, c->Height, c->X, c->Y, newW, newH, newX, newY);
 }
 
 static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* carry)
