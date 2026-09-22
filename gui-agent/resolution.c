@@ -151,7 +151,25 @@ void InitVideoModes()
 //      with its previous mode and primary flag, and commit.
 // A degraded topology (IDD plus a leftover display) is NOT rolled back: it is suboptimal but
 // visible, and tearing it down again would risk the state this code exists to avoid.
-#define QUBES_IDD_DEVICE_STRING L"IddSampleDriver Device"
+// The adapter is identified by DISPLAY_DEVICE.DeviceString, which is the INF's %DeviceName%.
+// That string was rebranded to "Qubes Idd" in 4.3.31; the sample's original
+// name is still matched because agent and driver do NOT have to be the same generation on a
+// guest - an upgrade that re-installs the agent while the driver package stays put (or an
+// -noidd image that keeps an older driver store entry) would otherwise stop finding the IDD
+// and leave topology management silently disabled.
+#define QUBES_IDD_DEVICE_STRING        L"Qubes Idd"
+#define QUBES_IDD_DEVICE_STRING_LEGACY L"IddSampleDriver Device"
+
+// EXACT compare on the new name, prefix compare on the legacy one (which is what shipped).
+// "Qubes Idd" is only nine characters, and a prefix test that short would also accept an
+// adapter merely BEGINNING with it - the one hazard worth removing while this is being
+// touched anyway.
+static BOOL IsQubesIddAdapter(IN const WCHAR *deviceString)
+{
+    return (0 == _wcsicmp(deviceString, QUBES_IDD_DEVICE_STRING)) ||
+           (0 == _wcsnicmp(deviceString, QUBES_IDD_DEVICE_STRING_LEGACY,
+                           ARRAYSIZE(QUBES_IDD_DEVICE_STRING_LEGACY) - 1));
+}
 
 // Does this adapter offer any usable mode? An IddCx adapter with no monitor attached
 // enumerates as a display device but has an EMPTY mode list, and CDS_SET_PRIMARY on it fails.
@@ -251,8 +269,7 @@ ULONG EnsureQubesIddSolo(void)
         if (dev.StateFlags & DISPLAY_DEVICE_MIRRORING_DRIVER)
             continue;
 
-        if (0 == _wcsnicmp(dev.DeviceString, QUBES_IDD_DEVICE_STRING,
-                           ARRAYSIZE(QUBES_IDD_DEVICE_STRING) - 1))
+        if (IsQubesIddAdapter(dev.DeviceString))
         {
             StringCchCopyW(iddName, ARRAYSIZE(iddName), dev.DeviceName);
             iddIsPrimary = ((dev.StateFlags & DISPLAY_DEVICE_ATTACHED_TO_DESKTOP) &&
