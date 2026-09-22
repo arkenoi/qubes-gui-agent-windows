@@ -196,7 +196,9 @@ BOOL          g_FlattenCorners = FALSE;   // OFF: measurably slow for ZERO effec
 // "NotifyBridgeAllow" REG_MULTI_SZ of AUMIDs) to dom0's stock qubes.Notifications service and
 // suppresses their banners; every other app keeps today's window path untouched (fail-open).
 // The agent only launches and supervises the helper - all bridge state lives in notifhost.
-// Gate: registry "NotifyBridge" (default 0) / qubesdb /qubes-service/notify-bridge (dom0
+// Gate: registry "NotifyBridge" (DEFAULT ON since 2026-09-13, owner decision - see the gate itself
+// below; this line said "default 0" until 2026-09-22, contradicting the code) / qubesdb
+// /qubes-service/notify-bridge (dom0
 // wins), read once at init like the broker gate. Liveness = mtime of the bridge's
 // %ProgramData%\qubes-toast-bridge\heartbeat file (no shared section needed).
 #define REG_CONFIG_NOTIF_BRIDGE_VALUE L"NotifyBridge"
