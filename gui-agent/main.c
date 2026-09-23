@@ -1829,69 +1829,6 @@ static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child)
 // The background is sampled from the buffer's own top edge, which is menu chrome above the first
 // item, never text. If nothing bright enough is found the menu really is that dark and the fill
 // is skipped rather than inventing a colour.
-// Paint a never-captured window's buffer a plausible background colour, so that if its first
-// capture has not landed by PW_FIRSTCAP_HOLD_MS the window appears as a neutral surface rather
-// than a black rectangle. Owner, 2026-09-24: "even if it was background not black would had been
-// better."
-//
-// This is the ONE place this project invents a colour instead of sampling one. Everywhere else a
-// fill reproduces the window's own pixels (MenuFillNearBlack samples the buffer). Here there is
-// nothing to sample: the slab is freshly zeroed and the window has not painted. Jev rated the
-// relaxation justified-and-narrowly-scoped at 0.60 and "a wrong colour is worse than black" at
-// 0.55 - i.e. close, so this stays as accurate as it cheaply can: the window's own class
-// background brush when it has a real one, else a neutral chosen from the window's OWN dark-mode
-// attribute rather than a global guess. No cross-process call, so the announce still never blocks
-// on the application.
-static void PwFillNewWindowBackground(IN OUT WINDOW_DATA* entry)
-{
-    if (!entry->PwBuffer || entry->PwWidth == 0 || entry->PwHeight == 0)
-        return;
-
-    COLORREF col;
-    BOOL have = FALSE;
-
-    HBRUSH hb = (HBRUSH)GetClassLongPtr(entry->Handle, GCLP_HBRBACKGROUND);
-    if (hb)
-    {
-        // A class may register COLOR_xxx+1 in place of a real brush handle.
-        if ((ULONG_PTR)hb <= (ULONG_PTR)(COLOR_ENDCOLORS + 1))
-        {
-            col = GetSysColor((int)((ULONG_PTR)hb - 1));
-            have = TRUE;
-        }
-        else
-        {
-            LOGBRUSH lb;
-            if (GetObject(hb, sizeof(lb), &lb) == sizeof(lb) && lb.lbStyle == BS_SOLID)
-            {
-                col = lb.lbColor;
-                have = TRUE;
-            }
-        }
-    }
-    if (!have)
-    {
-        BOOL dark = FALSE;
-        // DWMWA_USE_IMMERSIVE_DARK_MODE. Per window, so a dark app inside a light desktop (or the
-        // reverse) still gets the right side of the choice.
-        if (FAILED(DwmGetWindowAttribute(entry->Handle, 20, &dark, sizeof(dark))))
-            dark = FALSE;
-        col = dark ? RGB(0x20, 0x20, 0x20) : RGB(0xF3, 0xF3, 0xF3);
-    }
-
-    // Buffer is BGRA.
-    const DWORD px = ((DWORD)GetBValue(col)) | ((DWORD)GetGValue(col) << 8) |
-                     ((DWORD)GetRValue(col) << 16) | 0xFF000000u;
-    DWORD* q = (DWORD*)entry->PwBuffer;
-    const size_t n = (size_t)entry->PwWidth * entry->PwHeight;
-    for (size_t i = 0; i < n; i++)
-        q[i] = px;
-
-    LogInfo("QGAPROTO,msg=FIRSTCAPFILL,hwnd=0x%x,rgb=%02x%02x%02x,w=%u,h=%u",
-        (DWORD)(ULONG_PTR)entry->Handle, GetRValue(col), GetGValue(col), GetBValue(col),
-        entry->PwWidth, entry->PwHeight);
-}
-
 static void MenuFillNearBlack(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->PwBuffer || !IsMenuPopupWindow(entry))
@@ -3830,18 +3767,6 @@ static void PwNoteSliceFedMap(IN OUT WINDOW_DATA* entry)
 // deferred, and the sweep fully disarms itself when no hold remains.
 #define MAP_DEFER_RECHECK_MS 32
 
-// How long a newly created, non-slice-fed window's MAP waits for its OWN first capture before
-// being mapped with a synthetic background instead. Chosen from the measured distribution of
-// first-capture cost on this class of window (32, 62, 62, 66, 70, 78, 94, 250, 329, 438 ms;
-// median ~70): about half land inside this and are shown COMPLETE, having never been displayed
-// unfilled, while the slow tail still appears promptly rather than waiting up to 438 ms.
-// The owner asked for exactly this shape - "can we keep map hold but not the entirety of the
-// delay" - after the full hold measured snappy-but-slower and the no-hold version flashed black.
-// Jev, given the distribution: bounded-hold-then-fill 0.82 over instant-map-with-fill 0.17,
-// bound 70-80 ms at 0.68. Enforced on the MAP_DEFER_RECHECK_MS tick, so the effective bound is
-// this rounded up to the next 32 ms.
-#define PW_FIRSTCAP_HOLD_MS 75
-
 static ULONGLONG g_MapDeferWake = 0;   // earliest MapDeferred deadline (tick), 0 = none armed
 
 static void MapDeferWakeSweep(void)
@@ -3939,20 +3864,9 @@ static BOOL CropReadyForMap(IN OUT WINDOW_DATA* entry)
     // hold by CROP_BEFORE_SHOW_TIMEOUT_MS, so it can never strand a window.
     if (entry->PwAwaitFirstCap)
     {
-        if (WcHasCaptured(entry->Handle))
-        {
-            entry->PwAwaitFirstCap = FALSE;   // complete: never shown unfilled
-        }
-        else if (GetTickCount64() - entry->MapDeferSince >= PW_FIRSTCAP_HOLD_MS)
-        {
-            // Bound reached. Show it now, as a background rather than a black rectangle.
-            PwFillNewWindowBackground(entry);
-            entry->PwAwaitFirstCap = FALSE;
-        }
-        else
-        {
+        if (!WcHasCaptured(entry->Handle))
             return FALSE;
-        }
+        entry->PwAwaitFirstCap = FALSE;
     }
     if (IsMenuPopupWindow(entry))
     {
