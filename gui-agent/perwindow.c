@@ -618,7 +618,18 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     // WGC broker (24H2+): source this sliceFed window's pixels from the user-session broker's
     // per-HWND WGC capture. Every sliceFed window is attempted; no-op (returns FALSE) unless
     // the broker is active. Toasts are not sliceFed and never reach here.
-    BrokerRegister(entry);
+    if (entry->PwBrokerKeep)
+    {
+        // Resize rebuild with a surviving slot: point it at the new geometry instead of
+        // acquiring a new one. Falls back to a full registration if anything changed underneath.
+        entry->PwBrokerKeep = FALSE;
+        if (!BrokerRetarget(entry))
+            BrokerRegister(entry);
+    }
+    else
+    {
+        BrokerRegister(entry);
+    }
     // Fresh channel: no mask has been pushed to it yet, and no move state carries
     // over from a previous buffer (a resize rebuild lands here mid-drag).
     entry->SynthMaskLastCount = 0;
@@ -666,7 +677,10 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->PwDumpSent)
         return;
-    if (entry->PwBrokerSourced)
+    // PwBrokerKeep is set only by PwResizeWindow, and only when the slot can survive the rebuild
+    // (see BrokerCanKeepSlot). Releasing it here is what used to make the broker close and
+    // recreate the window's WGC capture session on every menu resize.
+    if (entry->PwBrokerSourced && !entry->PwBrokerKeep)
         BrokerUnregister(entry);   // release the broker slot before tearing the buffer down
     LogInfo("0x%x: per-window buffer %ux%u detached%s", entry->Handle,
             entry->PwWidth, entry->PwHeight, entry->PwSliceFed ? L" (slice-fed)" : L"");
@@ -734,12 +748,26 @@ ULONG PwResizeWindow(IN OUT WINDOW_DATA* entry)
     // the surviving pixels into the new (zeroed) slab so the rebuild never shows black.
     const PW_CARRY carry = { entry->PwBuffer, entry->PwWidth, entry->PwHeight,
                              entry->PwOriginX, entry->PwOriginY };
+    // Decide NOW, before PwDetachWindow tears the slot state down: can the broker slot survive
+    // this rebuild? A Win11 menu resizes repeatedly while opening and each release/re-acquire
+    // cost it a whole WGC session recreate (measured 2026-09-24: 5 registrations -> 484 ms to
+    // first content, 4 -> 328 ms, 1 -> 109 ms).
+    entry->PwBrokerKeep = BrokerCanKeepSlot(entry, entry->Width, entry->Height);
     // Old grant to the pending list; the daemon releases its mapping when it processes
     // the new MSG_WINDOW_DUMP below, after which revocation succeeds on a tick/ACK.
     PwDetachWindow(entry);
     ULONG status = PwAttachWindowCarry(entry, &carry);
     if (status != ERROR_SUCCESS)
     {
+        // The attach may have returned before consuming PwBrokerKeep, which would leave the slot
+        // claimed with nothing attached to it. Release it here rather than leak it - a kept slot
+        // is only ever an optimisation, never a correctness requirement.
+        if (entry->PwBrokerKeep)
+        {
+            entry->PwBrokerKeep = FALSE;
+            if (entry->PwBrokerSourced)
+                BrokerUnregister(entry);
+        }
         // The daemon still composites this window from the DETACHED (stale, pinned)
         // buffer until something makes it release the image. Force that now with an
         // unmap/map cycle (no re-dump: we are no longer attached), dropping the window

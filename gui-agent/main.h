@@ -265,6 +265,14 @@ typedef struct _WINDOW_DATA
     // WGC broker (24H2+): this sliceFed window's pixels come from the user-session broker's
     // per-HWND WGC capture instead of the composited-desktop slice. See BrokerRegister/
     // BrokerFreshFrame in main.c. Falls back to the slice whenever no fresh broker frame.
+    // Set for the duration of a RESIZE rebuild when the broker slot can be kept and merely
+    // retargeted instead of released and re-acquired. A Win11 menu resizes repeatedly while it
+    // opens, and every resize used to release the slot: the broker's Reconcile then CLOSED the
+    // WGC capture session (it closes whenever the slot's Hwnd goes to 0) and reopened it on the
+    // next registration, so the menu paid a fresh CreateForWindow + frame-pool + first-frame for
+    // each one. Measured 2026-09-24: first-content latency tracked the registration count -
+    // 5 registrations 484 ms, 4 -> 328 ms, 1 -> 109 ms. See BrokerCanKeepSlot/BrokerRetarget.
+    BOOL   PwBrokerKeep;
     BOOL   PwBrokerSourced;   // registered with the broker (any sliceFed window)
     LONG   PwBrokerSlot;      // index into WGCBRK_SLOTS(g_WgcBase); -1 if none
     UINT64 PwBrokerLastId;    // last WGCBRK_SLOT.FrameId consumed (change detection)
@@ -488,6 +496,12 @@ BOOL WgcBrokerActive(void);
 // the whole-desktop composite is NOT an allowed source for a per-window window. See main.c.
 BOOL DirectRequired(void);
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry);
+// TRUE when a resize can keep this window's existing broker slot: it is registered, the slot is
+// still ours, and the new size still fits the arena buffers the slot already owns.
+BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG newHeight);
+// Point the kept slot at the new geometry WITHOUT releasing it - no arena churn, no Hwnd change
+// (so the broker never closes the capture session), and the frame counters are preserved.
+BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry);
 void BrokerUnregister(IN OUT WINDOW_DATA* entry);
 
 // ApplyPendingDaemonMove for every watched window; takes g_csWatchedWindows itself.

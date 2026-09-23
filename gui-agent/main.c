@@ -3543,6 +3543,63 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     return TRUE;
 }
 
+BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG newHeight)
+{
+    if (!g_WgcBase || !WgcBrokerActive()) return FALSE;
+    if (!entry->PwBrokerSourced || entry->PwBrokerSlot < 0 ||
+        entry->PwBrokerSlot >= WGCBRK_MAX_SLOTS) return FALSE;
+    if (newWidth == 0 || newHeight == 0) return FALSE;
+
+    const WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
+    // Still OUR slot, and still serving. A slot the broker has already torn down, or one that
+    // was reassigned, must go through the full registration path.
+    if (s->Hwnd != (UINT64)(ULONG_PTR)entry->Handle) return FALSE;
+    if (s->ReqState != WGCBRK_REQUESTED) return FALSE;
+
+    // The arena buffers are allocated per registration and cannot grow. Keep the slot only when
+    // the new frame still fits both of them; otherwise a full re-registration is the only way to
+    // get bigger buffers.
+    const ULONGLONG need = ((ULONGLONG)newWidth * newHeight * 4 + 63) & ~(ULONGLONG)63;
+    if ((ULONGLONG)s->BufBytes < need) return FALSE;
+    if (s->BufOffset[0] <= 0 || s->BufOffset[1] <= 0) return FALSE;
+    return TRUE;
+}
+
+BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
+{
+    if (!BrokerCanKeepSlot(entry, entry->Width, entry->Height))
+        return FALSE;
+
+    WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
+    // Hwnd is deliberately NOT touched: wgcbroker's Reconcile only closes and reopens a channel
+    // when the slot's Hwnd CHANGES (`if (wantOpen && c.hwnd != want)`), so leaving it alone is
+    // exactly what keeps the WGC capture session alive across the resize.
+    s->ReqWidth  = (LONG)entry->Width;
+    s->ReqHeight = (LONG)entry->Height;
+    s->ReqCropX  = (LONG)entry->CropLeft;
+    s->ReqCropY  = (LONG)entry->CropTop;
+    s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;   // re-measured for the new geometry
+    MemoryBarrier();
+    _InterlockedIncrement(&s->ControlSeq);
+    _InterlockedIncrement(&WGCBRK_HDR(g_WgcBase)->ControlGen);
+    if (g_WgcCtl) SetEvent(g_WgcCtl);
+
+    // PwBrokerLastId and PwBrokerFrames are PRESERVED. The window's own buffer is a fresh zeroed
+    // slab, so a full copy is still required - PwSliceNeedsFull, set by the attach, does that -
+    // but the frame the copy takes must be one published at the NEW size. BrokerFreshFrame
+    // rejects any frame whose dimensions do not match (its comment: "a mismatch is transient
+    // while a resize is in flight"), so keeping LastId costs at most the frames published
+    // between the request and the broker acting on it, and never admits a stale-sized frame.
+    entry->PwBrokerSourced = TRUE;
+    entry->PwDimsLogged = FALSE;   // re-arm the one-shot dims diagnostic for the new geometry
+    entry->PwDimsSince = 0;
+    entry->PwDimsStuck = FALSE;
+    LogInfo("QGABROKERKEEP hwnd=0x%x slot=%d %ux%u t=%llu (slot kept, session not recreated)",
+            (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+            entry->Width, entry->Height, (ULONGLONG)GetTickCount64());
+    return TRUE;
+}
+
 void BrokerUnregister(IN OUT WINDOW_DATA* entry)
 {
     if (!g_WgcBase || entry->PwBrokerSlot < 0) { entry->PwBrokerSourced = FALSE; return; }
