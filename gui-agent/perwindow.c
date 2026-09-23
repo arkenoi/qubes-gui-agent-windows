@@ -12,6 +12,7 @@
 #include "wincapture.h"
 #include "perwindow.h"
 #include "pwcarry.h"
+#include "perf.h"
 
 #include <log.h>
 #include <config.h>
@@ -485,9 +486,14 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     // spent for ever - see the PW_SLAB comment. The slab may be larger than this window needs;
     // that is deliberate and safe, and it is what lets the next window (or the next size within
     // the class) attach without granting anything at all.
+    // Diagnostic (ProtoTrace): CREATE->MAP was measured at 319 ms for a fresh Explorer window
+    // (2026-09-23) and the cost was unattributed between the calls below. Time each one.
+    const ULONGLONG pwT0 = GetTickCount64();
     PW_SLAB* slab = PwSlabAcquire(pageCount);
     if (!slab)
         return ERROR_NOT_ENOUGH_MEMORY;
+    const ULONGLONG pwTSlab = GetTickCount64();
+    ULONGLONG pwTAdd = pwTSlab, pwTPrefill = pwTSlab;
 
     PVOID buffer = slab->Buffer;
     ULONG* refs = slab->Refs;
@@ -521,9 +527,12 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
         // Real pixels before the first engine frame; failure means a black window until
         // the first capture lands - worth a visible warning (field diagnosis 2026-08-27:
         // this was LogDebug, invisible in every field log).
+        pwTAdd = GetTickCount64();
+
         if (WcPrefill(entry->Handle) != ERROR_SUCCESS)
             LogWarning("WcPrefill(0x%x) failed - window starts black in dom0 until the "
                 "first successful capture", entry->Handle);
+        pwTPrefill = GetTickCount64();
     }
     else
     {
@@ -536,6 +545,14 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
 
     status = SendWindowDump(entry->Handle, entry->Width, entry->Height,
                             pageCount, refs);
+    if (g_ProtoTrace)
+    {
+        const ULONGLONG pwTDump = GetTickCount64();
+        LogInfo("QGAPROTO,msg=PWATTACH,hwnd=0x%x,slicefed=%d,slab=%llu,add=%llu,prefill=%llu,dump=%llu,total=%llu",
+            (uint32_t)(ULONG_PTR)entry->Handle, sliceFed ? 1 : 0,
+            pwTSlab - pwT0, pwTAdd - pwTSlab, pwTPrefill - pwTAdd,
+            pwTDump - pwTPrefill, pwTDump - pwT0);
+    }
     if (status != ERROR_SUCCESS)
     {
         win_perror2(status, "SendWindowDump");

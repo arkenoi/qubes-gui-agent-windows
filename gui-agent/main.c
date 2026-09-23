@@ -8566,6 +8566,26 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             // Record BOTH outcomes: the claim is a rate - captures avoided over
                             // captures considered - and skips alone cannot express one.
                             PerfNotePwDecision(pwSkip);
+                            // Diagnostic (ProtoTrace): log only DECISION FLIPS, each carrying
+                            // how long the previous decision held. A long skip=1 run before a
+                            // flip means the frame loop WAS running and judged the window
+                            // unchanged; no line at all (with seen unchanged) means it never
+                            // ran. See the PwDecide* comment in main.h.
+                            entry->PwDecideSeen++;
+                            if (g_ProtoTrace)
+                            {
+                                if (!entry->PwDecideValid || entry->PwDecideLast != pwSkip)
+                                {
+                                    LogInfo("QGAPROTO,msg=PWDECIDE,hwnd=0x%x,skip=%d,prevrun=%lu,seen=%lu",
+                                        (uint32_t)(ULONG_PTR)entry->Handle, pwSkip ? 1 : 0,
+                                        entry->PwDecideValid ? entry->PwDecideRun : 0,
+                                        entry->PwDecideSeen);
+                                    entry->PwDecideValid = TRUE;
+                                    entry->PwDecideLast = pwSkip;
+                                    entry->PwDecideRun = 0;
+                                }
+                                entry->PwDecideRun++;
+                            }
                             if (!pwSkip)
                                 WcMarkDirty(entry->Handle);
                         }

@@ -354,6 +354,19 @@ typedef struct _WINDOW_DATA
     DWORD PwLastMoveTick;
     DWORD PwLastMoveCapTick;
 
+    // DIAGNOSTIC (ProtoTrace only, 2026-09-23). The intended event-driven producer for a
+    // direct-captured window is ProcessNewFrame -> PwScreenUnchanged -> WcMarkDirty. When a
+    // window goes visibly stale the question is which of two things happened: the frame loop
+    // never ran, or it ran and judged the window unchanged every pass. They have different
+    // fixes, and a plain per-frame log cannot be left on to tell them apart. So only DECISION
+    // FLIPS are logged, each carrying how many consecutive frames the previous decision held
+    // (PwDecideRun) and how many frames this window has ever been considered in
+    // (PwDecideSeen) - which distinguishes the two at a cost of a few lines per window.
+    BOOL PwDecideValid;
+    BOOL PwDecideLast;
+    ULONG PwDecideRun;
+    ULONG PwDecideSeen;
+
     // INPUT-DRAG SLICE MODE (InputDragSlice knob; ProcessNewFrame moving branch). While
     // the user drags this window, its content is refreshed by a row-diffed copy out of
     // the composited desktop framebuffer instead of PrintWindow. WHY: PrintWindow is a
