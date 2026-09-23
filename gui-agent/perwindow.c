@@ -487,8 +487,8 @@ static void PwFillNewWindowBackground(IN OUT WINDOW_DATA* entry, IN void* buffer
     if (!buffer || width == 0 || height == 0)
         return;
 
-    COLORREF col;
-    BOOL have = FALSE;
+    COLORREF col = RGB(0xF3, 0xF3, 0xF3);   // initialised: every path below assigns, but the
+    BOOL have = FALSE;                       // compiler cannot see that and warnings are errors
 
     HBRUSH hb = (HBRUSH)GetClassLongPtr(entry->Handle, GCLP_HBRBACKGROUND);
     if (hb)
