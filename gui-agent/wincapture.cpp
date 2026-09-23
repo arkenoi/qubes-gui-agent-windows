@@ -57,19 +57,6 @@ struct Channel
     // ~2.5-point idle CPU floor over stock). Direct WcPrefill calls are unaffected -
     // the frame loop uses them to establish the buffer it is taking ownership of.
     std::atomic<bool> ddaOwned{ false };
-    // THE FIRST CAPTURE AFTER ATTACH IS REPORTED IN FULL, never as a diff band.
-    // Damage here is a single contiguous row band computed by diffing against the buffer's
-    // CURRENT contents, so what dom0 is told to repaint depends on what the buffer happened to
-    // hold. That is fine in steady state and wrong for the first frame: dom0's view of a freshly
-    // granted buffer is established by that frame, so it must cover the whole window.
-    // Measured 2026-09-24: with a ZEROED buffer every row differs, the first capture reported the
-    // whole window in one message, and a new window appeared at once. With the buffer pre-filled
-    // with a background colour the band shrank to the rows that differ from the fill, and the same
-    // window visibly arrived in STAGES - owner: "window builds in stages: first the 'main' part of
-    // it, then 'middle menu' settles down ... with our original fix it happened on instant".
-    // Jev put that mechanism at 0.95. Forcing the first band full decouples "no black flash" from
-    // "appears at once", which were only ever coupled by this accident.
-    std::atomic<bool> fullNext{ true };
     int failures = 0;
     bool dead = false;
     // Telemetry (added for the 2026-08-27 field black-window diagnosis: this engine
@@ -306,14 +293,6 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
     SelectObject(memdc, old);
     DeleteObject(bmp);
     DeleteDC(memdc);
-
-    // First capture on this channel: report the whole window, whatever the diff found. Rows that
-    // matched the buffer already hold correct pixels, so a full report is always safe here.
-    if (ok && out && c.fullNext.exchange(false))
-    {
-        y0 = 0;
-        y1 = c.height - 1;
-    }
 
     if (ok && y0 >= 0 && out)
     {
