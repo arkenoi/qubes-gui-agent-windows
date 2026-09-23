@@ -648,9 +648,16 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
         {
             // Newly created window: no synchronous prefill, so give dom0 something other than the
             // zeroed slab to show until the engine's capture lands (WcMarkDirty below).
-            const LONGLONG f0 = PerfNow();
+            // NOT PerfNow(): it returns 0 unless g_PerfEnabled, which is off on ordinary
+            // guests, so fill_us read 0 on every run and measured nothing. "Is the fill
+            // instant?" is a fair question and deserves a real number, so time it directly.
+            LARGE_INTEGER f0, f1, ffreq;
+            QueryPerformanceCounter(&f0);
             PwFillNewWindowBackground(entry, buffer, entry->Width, entry->Height);
-            pwFillUs = g_PerfFreq ? ((PerfNow() - f0) * 1000000) / g_PerfFreq : 0;
+            QueryPerformanceCounter(&f1);
+            QueryPerformanceFrequency(&ffreq);
+            pwFillUs = ffreq.QuadPart
+                ? ((f1.QuadPart - f0.QuadPart) * 1000000) / ffreq.QuadPart : -1;
         }
         pwTPrefill = GetTickCount64();
     }
