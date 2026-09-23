@@ -78,11 +78,6 @@ void WcSetMask(HWND hwnd, const RECT* rects, int count);
 // frame arrives. Window-relative crop applied as in WcAddWindow.
 ULONG WcPrefill(HWND hwnd);
 
-// TRUE once hwnd's channel has completed at least one successful capture, i.e. its buffer holds
-// real pixels. FALSE for an unknown or never-yet-captured window. Used to hold a newly created
-// window's MAP until there is something to show instead of an all-zero buffer.
-BOOL WcHasCaptured(HWND hwnd);
-
 #ifdef __cplusplus
 }
 #endif

@@ -377,14 +377,6 @@ typedef struct _WINDOW_DATA
     ULONGLONG HoldNoPendAt;    // crop no longer pending
     ULONGLONG HoldChromeAt;    // SliceChromeContentReady
     ULONG HoldChecks;          // how many times the hold was re-examined
-    // Set when this window's FIRST capture was handed to the engine instead of being taken
-    // synchronously before MAP (see PwAttachWindowCarry). Its granted buffer is all zeroes until
-    // that capture lands, so the map must be held until then - otherwise dom0 is told to show a
-    // window that has nothing in it, which is a BLACK FLASH lasting as long as the prefill used
-    // to (32-438 ms measured). The existing DirectWouldShowBlack guard does NOT cover this: it
-    // requires PwSliceFed, and these windows are not slice-fed. Owner reported the flash
-    // 2026-09-24; Jev put the mechanism at 0.90 and this fix at 1.00.
-    BOOL PwAwaitFirstCap;
     BOOL PwPreExisting;
     BOOL PwDecideValid;
     BOOL PwDecideLast;

@@ -636,13 +636,7 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     // First capture, off the announce path (see the WcPrefill note above). Issued only
     // now: the daemon has the dump, so damage from this capture names a buffer it knows.
     if (!sliceFed && !carry && !entry->PwPreExisting)
-    {
-        // The buffer is all zeroes until this capture lands, so the map is held until it does
-        // (PwAwaitFirstCap). Without that, dom0 shows an empty window for as long as the
-        // synchronous prefill used to take - the black flash the owner reported 2026-09-24.
-        entry->PwAwaitFirstCap = TRUE;
         WcMarkDirty(entry->Handle);
-    }
     LogInfo("0x%x: per-window buffer %ux%u (%lu pages of a %lu-page slab) attached%s",
              entry->Handle, entry->Width, entry->Height, pageCount, grantedPages,
              sliceFed ? L" (slice-fed)" : L"");

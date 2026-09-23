@@ -57,10 +57,6 @@ struct Channel
     // ~2.5-point idle CPU floor over stock). Direct WcPrefill calls are unaffected -
     // the frame loop uses them to establish the buffer it is taking ownership of.
     std::atomic<bool> ddaOwned{ false };
-    // Set once the channel's FIRST capture has succeeded, i.e. the caller's buffer now holds
-    // real pixels rather than the zeroes PwSlabAcquire hands out. The agent uses this to hold
-    // a new window's MAP until there is something to show - see PwAwaitFirstCap in main.h.
-    std::atomic<bool> captured{ false };
     int failures = 0;
     bool dead = false;
     // Telemetry (added for the 2026-08-27 field black-window diagnosis: this engine
@@ -351,7 +347,6 @@ DWORD WINAPI CaptureThread(LPVOID param)
             if (CaptureAndDiff(e, c, &dmg))
             {
                 c.failures = 0;
-                c.captured.store(true);
                 if (dmg.hwnd)
                     fired.push_back(dmg);
             }
@@ -587,17 +582,6 @@ void WcSetDdaOwned(HWND hwnd, BOOL owned)
             break;
         }
     ReleaseSRWLockShared(&g_eng->lock);
-}
-
-BOOL WcHasCaptured(HWND hwnd)
-{
-    if (!g_eng) return FALSE;
-    BOOL r = FALSE;
-    AcquireSRWLockShared(&g_eng->lock);
-    for (auto& cp : g_eng->channels)
-        if (cp->hwnd == hwnd) { r = cp->captured.load() ? TRUE : FALSE; break; }
-    ReleaseSRWLockShared(&g_eng->lock);
-    return r;
 }
 
 ULONG WcPrefill(HWND hwnd)
