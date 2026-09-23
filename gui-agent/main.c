@@ -4894,6 +4894,10 @@ static BOOL IsWindowRejected(IN HWND window)
 // Interrogate a window that isn't tracked yet: add it to the watched list if it
 // qualifies, otherwise remember it as ineligible.
 // Watched windows critical section must be entered.
+// Set only while AddAllWindows' EnumWindows pass runs. A window interrogated during that pass
+// pre-dates our knowledge of it; one interrogated outside it arrived on its own create event.
+static BOOL g_PwInEnumPass = FALSE;
+
 static ULONG ExamineWindow(IN HWND window, IN OUT UINT* interrogated)
 {
     WINDOW_DATA* data = NULL;
@@ -4932,6 +4936,8 @@ static ULONG ExamineWindow(IN HWND window, IN OUT UINT* interrogated)
         free(data);
         return ERROR_SUCCESS;
     }
+
+    data->PwPreExisting = g_PwInEnumPass;
 
     status = AddWindow(data); // the list takes ownership of data
     if (ERROR_SUCCESS != status)
@@ -5058,7 +5064,10 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
 
     ULONG status = ERROR_SUCCESS;
     // Enum top-level windows and add all that are not filtered.
-    if (!EnumWindows(AddWindowsProc, (LPARAM)&context))
+    g_PwInEnumPass = TRUE;
+    const BOOL enumOk = EnumWindows(AddWindowsProc, (LPARAM)&context);
+    g_PwInEnumPass = FALSE;   // cleared before any early return below
+    if (!enumOk)
     {
         status = context.Status != ERROR_SUCCESS ? context.Status : win_perror("EnumWindows");
         // Correlate the failure with this thread's desktop (see QGADESK in util.c): the

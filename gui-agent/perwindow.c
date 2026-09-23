@@ -410,7 +410,8 @@ BOOL PwWindowEligible(IN const WINDOW_DATA* entry)
 //
 // PwResizeWindow detaches and re-attaches, and PwSlabAcquire ZEROES every slab it hands out (it
 // must: a reused slab otherwise shows the previous window's content). For a PrintWindow-captured
-// window PwAttachWindow then calls WcPrefill and real pixels are in place before the dump. A
+// window the REBUILD path still calls WcPrefill, so real pixels are in place before the dump (a
+// first attach does not - see the WcPrefill note in PwAttachWindowCarry). A
 // SLICE-FED window has no such prefill: the rebuild announces a BLACK buffer to dom0 and damages
 // it, and the window stays black until its next full copy arrives - one composite frame on the
 // win10 path, but on de-slice a broker re-registration plus a published frame, which is hundreds
@@ -529,9 +530,45 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
         // this was LogDebug, invisible in every field log).
         pwTAdd = GetTickCount64();
 
-        if (WcPrefill(entry->Handle) != ERROR_SUCCESS)
-            LogWarning("WcPrefill(0x%x) failed - window starts black in dom0 until the "
-                "first successful capture", entry->Handle);
+        // The first capture is NOT taken here. It used to be: a synchronous
+        // WcPrefill(PrintWindow) ran at this point, before SendWindowMap, so dom0 could
+        // not display a new window until the target application answered a cross-process
+        // render on its own UI thread. Measured on win11 2026-09-23 over three runs, that
+        // call was the ENTIRE CREATE->MAP delay - 438 / 32 / 329 ms, with the slab, the
+        // channel open and the vchan dump all at 0-15 ms.
+        //
+        // It also did not buy what it cost. A window is prefilled at CREATION time, when
+        // the application has not painted its content yet, so in all three runs the
+        // prefilled frame was superseded immediately: damage kept arriving for a further
+        // 1.5-4.3 s, starting with a full-window rect sent in the same millisecond as MAP.
+        // Jev rated "the prefill earns its cost" at 0.22.
+        //
+        // So the first capture moves to the engine thread, which does the same PrintWindow
+        // and already owns the diff-and-report path. The mark is issued after the dump
+        // below - never before, or damage could name a buffer the daemon has not been told
+        // about. WcMarkDirty wakes the capture thread immediately rather than waiting for
+        // its next sweep slot, so the content still lands promptly; it simply no longer
+        // blocks the announce.
+        //
+        // A REBUILD IS DIFFERENT AND KEEPS THE SYNCHRONOUS PREFILL. PwResizeWindow detaches
+        // and re-attaches, and PwSlabAcquire zeroes every slab; for a PrintWindow-captured
+        // window this prefill IS the carry mechanism (the PwCarryContent path is slice-fed
+        // only), so dropping it there would reinstate the black blink the owner reported on
+        // 2026-09-13 ("fix the black blink, it is ugly af"). The distinction is exactly
+        // `carry`: NULL on a first attach, non-NULL on a rebuild of an already-painted
+        // window. A first attach has nothing to preserve; a rebuild does.
+        // Same reasoning for a window that ALREADY EXISTED when this agent attached to it
+        // (agent restart, mode transition, or a resync catching a window the hooks missed):
+        // its pixels are real and the slab is zeroed, so it must be filled synchronously or
+        // dom0 would briefly show it empty. Only a window created just now - which has
+        // nothing painted yet, which is why the prefill was not earning its cost - takes the
+        // fast path.
+        if (carry || entry->PwPreExisting)
+        {
+            if (WcPrefill(entry->Handle) != ERROR_SUCCESS)
+                LogWarning("WcPrefill(0x%x) failed - window starts black in dom0 until the "
+                    "first successful capture", entry->Handle);
+        }
         pwTPrefill = GetTickCount64();
     }
     else
@@ -548,8 +585,8 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     if (g_ProtoTrace)
     {
         const ULONGLONG pwTDump = GetTickCount64();
-        LogInfo("QGAPROTO,msg=PWATTACH,hwnd=0x%x,slicefed=%d,slab=%llu,add=%llu,prefill=%llu,dump=%llu,total=%llu",
-            (uint32_t)(ULONG_PTR)entry->Handle, sliceFed ? 1 : 0,
+        LogInfo("QGAPROTO,msg=PWATTACH,hwnd=0x%x,slicefed=%d,pre=%d,slab=%llu,add=%llu,prefill=%llu,dump=%llu,total=%llu",
+            (uint32_t)(ULONG_PTR)entry->Handle, sliceFed ? 1 : 0, entry->PwPreExisting ? 1 : 0,
             pwTSlab - pwT0, pwTAdd - pwTSlab, pwTPrefill - pwTAdd,
             pwTDump - pwTPrefill, pwTDump - pwT0);
     }
@@ -596,6 +633,10 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     // Fresh channel starts un-owned in the engine, so the drag-slice must re-engage
     // (re-claim ownership) before its next copy - a mid-drag resize lands here.
     entry->PwDragSlice = FALSE;
+    // First capture, off the announce path (see the WcPrefill note above). Issued only
+    // now: the daemon has the dump, so damage from this capture names a buffer it knows.
+    if (!sliceFed && !carry && !entry->PwPreExisting)
+        WcMarkDirty(entry->Handle);
     LogInfo("0x%x: per-window buffer %ux%u (%lu pages of a %lu-page slab) attached%s",
              entry->Handle, entry->Width, entry->Height, pageCount, grantedPages,
              sliceFed ? L" (slice-fed)" : L"");

@@ -362,6 +362,13 @@ typedef struct _WINDOW_DATA
     // FLIPS are logged, each carrying how many consecutive frames the previous decision held
     // (PwDecideRun) and how many frames this window has ever been considered in
     // (PwDecideSeen) - which distinguishes the two at a cost of a few lines per window.
+    // TRUE when this window was discovered by an ENUMERATION pass rather than by its own
+    // creation event - i.e. it already existed, and already has content, when the agent first
+    // attached to it (agent restart, mode transition, or a resync catching a missed window).
+    // Such a window needs the synchronous prefill: its pixels exist and the slab is zeroed, so
+    // going async would briefly announce it empty. A genuinely new window has nothing to
+    // preserve and takes the fast path. See PwAttachWindowCarry.
+    BOOL PwPreExisting;
     BOOL PwDecideValid;
     BOOL PwDecideLast;
     ULONG PwDecideRun;
