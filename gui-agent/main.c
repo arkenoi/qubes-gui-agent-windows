@@ -3504,7 +3504,17 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
         if (slots[i].Hwnd == 0 && slots[i].ReqState == WGCBRK_FREE) { slot = i; break; }
     if (slot < 0) return FALSE;
 
+    // SIZE CLASS, not the exact frame. Arena buffers are fixed at registration and cannot grow,
+    // so an exact allocation makes the NEXT size up unservable and forces a full re-registration -
+    // which closes and recreates the WGC capture session (see BrokerCanKeepSlot). A Win11 menu
+    // oscillates BOTH ways while opening (measured: 313x387 -> 313x324 -> 293x304, and
+    // 289x297 -> 293x304), so an exact fit defeats slot-keeping on every grow. Rounding to a
+    // class lets the whole oscillation live in one allocation. The arena is 128 MB and a menu
+    // costs 2 x 512 KB, so the headroom is cheap; it also keeps the free list to a few sizes,
+    // which is friendlier to the best-fit reuse above.
+    const ULONGLONG WGC_BUF_CLASS = 256u * 1024u;
     ULONGLONG one = ((ULONGLONG)entry->Width * entry->Height * 4 + 63) & ~(ULONGLONG)63;
+    one = (one + (WGC_BUF_CLASS - 1)) & ~(WGC_BUF_CLASS - 1);
     ULONGLONG off0 = WgcArenaAlloc(one);
     ULONGLONG off1 = WgcArenaAlloc(one);
     if (!off0 || !off1)
@@ -3538,8 +3548,9 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     if (g_WgcCtl) SetEvent(g_WgcCtl);
     // At Info, with a tick: the gap from here to QGASLICECONTENT is the broker's first-frame
     // latency, which is what menu latency reduces to once nothing maps unpainted (2026-09-11).
-    LogInfo("QGABROKERREG hwnd=0x%x slot=%d %ux%u t=%llu", (DWORD)(ULONG_PTR)entry->Handle, slot,
-            entry->Width, entry->Height, (ULONGLONG)GetTickCount64());
+    LogInfo("QGABROKERREG hwnd=0x%x slot=%d %ux%u buf=%llu t=%llu",
+            (DWORD)(ULONG_PTR)entry->Handle, slot,
+            entry->Width, entry->Height, one, (ULONGLONG)GetTickCount64());
     return TRUE;
 }
 
