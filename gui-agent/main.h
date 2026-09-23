@@ -368,6 +368,15 @@ typedef struct _WINDOW_DATA
     // Such a window needs the synchronous prefill: its pixels exist and the slab is zeroed, so
     // going async would briefly announce it empty. A genuinely new window has nothing to
     // preserve and takes the fast path. See PwAttachWindowCarry.
+    // DIAGNOSTIC (ProtoTrace only, 2026-09-23). A deferred MAP ends when CropReadyForMap turns
+    // true, but that is a conjunction of three sub-conditions and the log only ever said the
+    // hold ended, never WHICH one was last to arrive. Measured menu holds vary 234-516 ms, so
+    // the question is which term the wait is actually spent on. Each field is the tick at which
+    // that term FIRST became true (0 = never); reported as offsets from MapDeferSince.
+    ULONGLONG HoldInsetsAt;    // BrokerOpaqueInsets available
+    ULONGLONG HoldNoPendAt;    // crop no longer pending
+    ULONGLONG HoldChromeAt;    // SliceChromeContentReady
+    ULONG HoldChecks;          // how many times the hold was re-examined
     BOOL PwPreExisting;
     BOOL PwDecideValid;
     BOOL PwDecideLast;

@@ -3856,12 +3856,27 @@ static BOOL DirectWouldShowBlack(IN const WINDOW_DATA* entry)
 // timeout, so required-kept toasts always appear. On the de-slice path the broker's
 // crop+first-frame machinery already governs these surfaces (menu rendering validated
 // there), so the interplay is off by default and explicitly A/B-able.
-static BOOL CropReadyForMap(IN const WINDOW_DATA* entry)
+static BOOL CropReadyForMap(IN OUT WINDOW_DATA* entry)
 {
     RECT tmp;
     if (IsMenuPopupWindow(entry))
-        return (BrokerOpaqueInsets(entry->Handle, &tmp) || !CropPending(entry)) &&
-               SliceChromeContentReady(entry);
+    {
+        // Evaluated into locals so the diagnostic can say WHICH term the hold was waiting on.
+        // Note this drops the || short-circuit on the insets/pending pair: both are cheap
+        // predicates with no side effects, and the answer is unchanged.
+        const BOOL insets = BrokerOpaqueInsets(entry->Handle, &tmp);
+        const BOOL noPend = !CropPending(entry);
+        const BOOL chrome = SliceChromeContentReady(entry);
+        if (g_ProtoTrace)
+        {
+            const ULONGLONG now = GetTickCount64();
+            if (insets && !entry->HoldInsetsAt) entry->HoldInsetsAt = now;
+            if (noPend && !entry->HoldNoPendAt) entry->HoldNoPendAt = now;
+            if (chrome && !entry->HoldChromeAt) entry->HoldChromeAt = now;
+            entry->HoldChecks++;
+        }
+        return (insets || noPend) && chrome;
+    }
     if (IsShellToastWindow(entry))
         return !CropPending(entry) && SliceChromeContentReady(entry);
     // DE-SLICE: with the whole-desktop composite retired there is nothing to fill a slice-fed
@@ -6480,6 +6495,19 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                     cropReady ? L"crop" : L"timeout",
                     IsMenuPopupWindow(windowData) ? 1 : 0,
                     IsShellToastWindow(windowData) ? 1 : 0);
+                // Which term of the conjunction was the hold actually waiting on? Offsets from
+                // MapDeferSince; -1 means that term never became true before the map was released.
+                if (g_ProtoTrace && IsMenuPopupWindow(windowData))
+                {
+                    const ULONGLONG d = windowData->MapDeferSince;
+                    LogInfo("QGAPROTO,msg=HOLDTERMS,hwnd=0x%x,insets_ms=%lld,nopend_ms=%lld,"
+                        "chrome_ms=%lld,checks=%lu",
+                        (DWORD)(ULONG_PTR)windowData->Handle,
+                        windowData->HoldInsetsAt ? (LONGLONG)(windowData->HoldInsetsAt - d) : -1,
+                        windowData->HoldNoPendAt ? (LONGLONG)(windowData->HoldNoPendAt - d) : -1,
+                        windowData->HoldChromeAt ? (LONGLONG)(windowData->HoldChromeAt - d) : -1,
+                        windowData->HoldChecks);
+                }
                 (void)SendWindowDamageEvent(windowData->Handle, 0, 0,
                     windowData->Width, windowData->Height);
             }
