@@ -3859,6 +3859,15 @@ static BOOL DirectWouldShowBlack(IN const WINDOW_DATA* entry)
 static BOOL CropReadyForMap(IN OUT WINDOW_DATA* entry)
 {
     RECT tmp;
+    // A window whose first capture was handed to the engine has an ALL-ZERO buffer until that
+    // capture lands. Mapping it now shows an empty window. Bounded exactly like every other
+    // hold by CROP_BEFORE_SHOW_TIMEOUT_MS, so it can never strand a window.
+    if (entry->PwAwaitFirstCap)
+    {
+        if (!WcHasCaptured(entry->Handle))
+            return FALSE;
+        entry->PwAwaitFirstCap = FALSE;
+    }
     if (IsMenuPopupWindow(entry))
     {
         // Evaluated into locals so the diagnostic can say WHICH term the hold was waiting on.
@@ -4115,6 +4124,7 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
         // just the de-slice configuration.
         if (entry->IsVisible && !entry->IsIconic &&
             (IsMenuPopupWindow(entry) || IsShellToastWindow(entry) ||
+             entry->PwAwaitFirstCap ||
              (g_DeSlice && entry->PwSliceFed) ||
              (g_SliceMapHold && entry->PwSliceFed)) &&
             !CropReadyForMap(entry))
