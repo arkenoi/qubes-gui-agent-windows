@@ -533,6 +533,13 @@ DWORD ProcessButtonEvent(IN HWND window, IN int bx, IN int by, IN unsigned int b
                 x += rect.left;
                 y += rect.top;
             }
+            else if (!window)
+            {
+                // Window 0 IS the desktop: dom0's coordinates are already screen-space, so the
+                // unadjusted origin is the CORRECT one and there is nothing to look up. Logging a
+                // GetWindowRect failure here made every click in non-seamless print an error.
+                positionTrusted = TRUE;
+            }
             else
             {
                 // Unlike a motion event, a button event is never dropped: swallowing a
@@ -1354,6 +1361,35 @@ static DWORD HandleFocus(IN HWND window)
 
     if (focusMsg.type == 9) // focus gain
     {
+        // WINDOW 0 IS THE DESKTOP, AND IT IS NEVER IN THE WATCHED LIST. In non-seamless the whole
+        // guest desktop is one dom0 window, so dom0 sends focus for window 0 - and this handler
+        // resolved it with FindWindowByHandle, found nothing, logged "not tracked" and returned.
+        // Nothing in the guest was then brought to the foreground, so synthesized keystrokes
+        // (HandleKeypress ignores the window and uses SendInput, which goes to whatever the guest
+        // focuses) had nowhere to land. That is the owner's report: the non-seamless desktop
+        // "does not deliver input to apps" (Jev: this drop is a real defect, 0.75).
+        //
+        // Windows manages focus INSIDE the desktop itself once a click arrives, so the agent must
+        // not pick a window on dom0's behalf. The one thing it must ensure is that the session
+        // has SOME active window, because with none, keys go nowhere at all.
+        if (!window)
+        {
+            const HWND fg = GetForegroundWindow();
+            if (fg)
+            {
+                LogDebug("desktop focus gain; guest foreground is already 0x%x", fg);
+            }
+            else
+            {
+                const HWND top = GetTopWindow(NULL);
+                LogInfo("QGAFSFOCUS desktop focus gain with NO guest foreground window - "
+                    L"activating 0x%x so keystrokes have a destination", top);
+                if (top)
+                    SetForegroundWindow(top);
+            }
+            return ERROR_SUCCESS;
+        }
+
         EnterCriticalSection(&g_csWatchedWindows);
         WINDOW_DATA* data = FindWindowByHandle(window);
         if (!data)
