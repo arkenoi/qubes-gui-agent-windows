@@ -8397,15 +8397,23 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 }
                                 else if (bs->TickPw)
                                 {
-                                    // Polled PrintWindow - the path EVERY menu takes. firstpoll_ms
-                                    // is the wait before the broker first looked at this window;
-                                    // pwret_ms - firstpoll_ms is the synchronous PrintWindow call
-                                    // on the window's own UI thread; polls > 1 means the earlier
-                                    // renders were black or unchanged, i.e. the app had not painted.
+                                    // Polled PrintWindow - the path EVERY menu takes.
+                                    // fallback_ms: the WGC attempt was abandoned (it cannot
+                                    //   succeed for an override-redirect popup) and we fell back.
+                                    // firstpoll_ms: first poll ENTERED. Reconcile opens and polls
+                                    //   in the SAME loop iteration, so this contains no waiting.
+                                    // pwret_ms - firstpoll_ms: the synchronous PrintWindow call on
+                                    //   the window's own UI thread.
+                                    // polls: polls entered for this open UP TO THIS READ - it is
+                                    //   NOT "renders that came back black": publish_ms == pwret_ms
+                                    //   here, i.e. the FIRST render published, and the extra polls
+                                    //   are ordinary refreshes that happened before the agent
+                                    //   consumed the frame. Do not read it as app-not-painted.
                                     LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,valid=1,"
-                                        "path=printwindow,firstpoll_ms=%lld,pwret_ms=%lld,"
-                                        "publish_ms=%lld,polls=%d,consumed_ms=%lld",
+                                        "path=printwindow,fallback_ms=%lld,firstpoll_ms=%lld,"
+                                        "pwret_ms=%lld,publish_ms=%lld,polls=%d,consumed_ms=%lld",
                                         (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+                                        bs->ItemTick          ? bs->ItemTick - o          : -1,
                                         bs->StartTick         ? bs->StartTick - o         : -1,
                                         bs->FirstArrivedTick  ? bs->FirstArrivedTick - o  : -1,
                                         bs->FirstPublishTick  ? bs->FirstPublishTick - o  : -1,
