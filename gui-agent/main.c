@@ -355,6 +355,15 @@ static volatile BOOL g_NonSeamlessPending = FALSE;
 #define FS_WAIT_GRANT  1   /* waiting for the desktop monitor to be plugged */
 #define FS_WAIT_SHRINK 2   /* waiting for the desktop to shrink below host size */
 static volatile LONG g_NonSeamlessWait = FS_WAIT_NONE;
+// Has dom0 been sent the window-0 DUMP for the current plug? Making the grant is not enough: dom0
+// destroys and unmaps window 0 on the way out of non-seamless, so on the way back in it has no
+// image until the refs are re-sent. Measured 2026-09-24: the FIRST entry logged
+// "A6ACK window-0 dump ack received" + "A6ACKREPAINT full damage" and rendered a correct desktop;
+// every LATER entry logged only "Seamless mode changed to 0", and dom0 showed a blank frozen
+// window - two captures ten seconds apart, with typing in between, were byte-identical at 2610
+// bytes for a 5120x1384 image. The cause was the StagingEnsure early-out: the grant already
+// existed, so nothing re-sent the dump.
+static volatile BOOL g_DesktopDumpSent = FALSE;
 static volatile ULONGLONG g_NonSeamlessPendingSince = 0;
 static volatile ULONGLONG g_FrameCount = 0;
 
@@ -5541,7 +5550,10 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     if (!seamlessMode)
     {
         g_DesktopGrantWanted = TRUE;
-        if (!CaptureScreenGrantLive())
+        // The grant being live is NOT sufficient - dom0 also needs the window-0 dump, and it
+        // has none after an earlier unplug destroyed window 0. So the entry waits for the dump,
+        // not merely for the grant, and asks for the replug that produces it either way.
+        if (!CaptureScreenGrantLive() || !g_DesktopDumpSent)
         {
             LogInfo("QGAFSFLASH non-seamless requested with no desktop grant - plugging the "
                 L"desktop monitor (capture replug); the switch completes when it is live");
@@ -5690,6 +5702,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
         if (g_DesktopGrantWanted && !g_NonSeamlessPending)
         {
             g_DesktopGrantWanted = FALSE;
+            g_DesktopDumpSent = FALSE;   // dom0 unmaps window 0; its copy of the image is gone
             LogInfo("QGAFSFLASH seamless restored - desktop monitor unplugged (window 0 unmapped; "
                 L"the existing grant is kept, revoking it mid-life is unsafe)");
         }
@@ -9631,6 +9644,7 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
             (*capture)->width, (*capture)->height);
         if (ERROR_SUCCESS != status)
             return win_perror2(status, "SendScreenGrants");
+        g_DesktopDumpSent = TRUE;   // dom0 now has the desktop image for this plug
     }
 
     // this (re)initializes watched windows list
@@ -9653,7 +9667,8 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
         const BOOL shrunk = (g_HostScreenWidth > 0 &&
             g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
             g_ScreenHeight < (g_HostScreenHeight * 99) / 100);
-        const BOOL plugged = (g_DesktopGrantWanted && CaptureScreenGrantLive());
+        const BOOL plugged = (g_DesktopGrantWanted && CaptureScreenGrantLive() &&
+                              g_DesktopDumpSent);
         const BOOL ready = (g_NonSeamlessWait == FS_WAIT_GRANT)  ? plugged :
                            (g_NonSeamlessWait == FS_WAIT_SHRINK) ? shrunk  : FALSE;
         if (ready)
@@ -10689,7 +10704,8 @@ static ULONG WINAPI WatchForEvents(void)
             const BOOL shrunkNow = (g_HostScreenWidth > 0 &&
                 g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
                 g_ScreenHeight < (g_HostScreenHeight * 99) / 100);
-            const BOOL pluggedNow = (g_DesktopGrantWanted && CaptureScreenGrantLive());
+            const BOOL pluggedNow = (g_DesktopGrantWanted && CaptureScreenGrantLive() &&
+                                     g_DesktopDumpSent);
             const BOOL ready = (g_NonSeamlessWait == FS_WAIT_GRANT)  ? pluggedNow :
                                (g_NonSeamlessWait == FS_WAIT_SHRINK) ? shrunkNow  : FALSE;
             if (ready)
