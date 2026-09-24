@@ -42,7 +42,13 @@ extern "C" BOOL g_ProtoTrace;
 
 namespace {
 
-const DWORD SWEEP_INTERVAL_MS = 250;  // one round-robin slot per this interval
+const DWORD SWEEP_INTERVAL_MS = 250;
+// A channel that keeps answering "nothing changed" is swept at double the interval each time, up
+// to this cap. It still CONVERGES - the sweep exists because an occluded window is invisible to
+// the desktop-duplication producer - it just stops costing an expensive application its UI thread
+// several times a second to say nothing. Any real mark (WcMarkDirty) resets it to the base
+// interval immediately, so a window that actually changes is never penalised.
+const DWORD SWEEP_BACKOFF_MAX_MS = 2000;  // one round-robin slot per this interval
 const int DEAD_AFTER_FAILURES = 5;    // consecutive PrintWindow failures => dead
 
 struct Channel
@@ -68,6 +74,17 @@ struct Channel
     // different channels are independent (every GDI object in CaptureAndDiff is local to the
     // call and it does not touch the Engine at all).
     std::atomic<bool> busy{ false };
+    // SWEEP BACKOFF. The round-robin sweep marks a channel speculatively - nothing has said its
+    // content changed - and a capture costs a full PrintWindow on the target window's own UI
+    // thread. Measured 2026-09-24 with a slow window present: 30 captures, median 334 ms each, of
+    // which 28 produced NO DAMAGE - about 9.4 seconds of another application's UI thread spent
+    // discovering nothing had changed, with the engine ~97% occupied by it. So a channel whose
+    // SPECULATIVE captures keep coming back unchanged is swept progressively less often.
+    // realMark separates the two producers: a mark from WcMarkDirty means something ACTUALLY saw
+    // this window's screen region change, and must never be backed off.
+    std::atomic<bool>  realMark{ false };
+    std::atomic<DWORD> sweepDelay{ 0 };   // current speculative interval, 0 = base
+    std::atomic<DWORD> sweepDue{ 0 };     // tick from which this channel may be swept again
     int failures = 0;
     bool dead = false;
     // Telemetry (added for the 2026-08-27 field black-window diagnosis: this engine
@@ -381,12 +398,16 @@ DWORD WINAPI CaptureThread(LPVOID param)
             for (size_t k = 0; k < n; k++)
             {
                 Channel& sc = *e.channels[(e.sweepNext + k) % n];
-                if (!sc.dead && !sc.ddaOwned.load())
-                {
-                    sc.dirty.store(true);
-                    e.sweepNext = (e.sweepNext + k + 1) % n;
-                    break;
-                }
+                if (sc.dead || sc.ddaOwned.load())
+                    continue;
+                // Backed off: not due yet. Signed compare so tick wraparound is handled.
+                if ((LONG)(now - sc.sweepDue.load()) < 0)
+                    continue;
+                sc.dirty.store(true);
+                const DWORD d = sc.sweepDelay.load();
+                sc.sweepDue.store(now + (d ? d : SWEEP_INTERVAL_MS));
+                e.sweepNext = (e.sweepNext + k + 1) % n;
+                break;
             }
         }
 
@@ -448,11 +469,27 @@ DWORD WINAPI CaptureThread(LPVOID param)
                         (DWORD)(ULONG_PTR)c.hwnd, id, isFirst ? 1 : 0, us,
                         (capOk && dmg.hwnd) ? 1 : 0);
             }
+            // Was this capture asked for by a producer that SAW a change, or merely swept?
+            const bool wasReal = c.realMark.exchange(false);
             if (capOk)
             {
                 c.failures = 0;
                 if (dmg.hwnd)
+                {
                     fired.push_back(dmg);
+                    // Produced real damage: this channel is worth watching closely again.
+                    c.sweepDelay.store(0);
+                    c.sweepDue.store(GetTickCount());
+                }
+                else if (!wasReal)
+                {
+                    // A SPECULATIVE capture that produced nothing. Double the interval, capped.
+                    const DWORD cur = c.sweepDelay.load();
+                    DWORD next = cur ? cur * 2 : SWEEP_INTERVAL_MS * 2;
+                    if (next > SWEEP_BACKOFF_MAX_MS) next = SWEEP_BACKOFF_MAX_MS;
+                    c.sweepDelay.store(next);
+                    c.sweepDue.store(GetTickCount() + next);
+                }
             }
             else if (++c.failures >= DEAD_AFTER_FAILURES)
             {
@@ -697,6 +734,9 @@ void WcMarkDirty(HWND hwnd)
     for (auto& ch : g_eng->channels)
         if (ch->hwnd == hwnd)
         {
+            ch->realMark.store(true);
+            ch->sweepDelay.store(0);     // something SAW a change: watch this channel closely again
+            ch->sweepDue.store(GetTickCount());
             ch->dirty.store(true);
             WakeCapture(*g_eng);
             break;
