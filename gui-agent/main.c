@@ -10741,13 +10741,17 @@ static ULONG WINAPI WatchForEvents(void)
             if (nowTick2 - capStatLast >= 10000)
             {
                 LONG acqP = 0, acqN = 0, acqT = 0, acqE = 0, acqHr = 0;
+                LONG loops = 0, inside = 0, enabled = 0;
+                LONGLONG loopAge = -1, insideMs = -1;
                 capStatLast = nowTick2;
                 CaptureAcquireStats(&acqP, &acqN, &acqT, &acqE, &acqHr);
+                CaptureThreadStats(&loops, &loopAge, &inside, &insideMs, &enabled);
                 LogInfo("QGACAPSTAT,mode=nonseamless,screen=%ux%u,frames=%I64u,present=%d,"
-                    L"nopresent=%d,timeout=%d,err=%d,lasthr=0x%08x,grant=%d,dump=%d,capture=%d",
+                    L"nopresent=%d,timeout=%d,err=%d,lasthr=0x%08x,grant=%d,dump=%d,capture=%d,"
+                    L"loops=%d,loop_age_ms=%I64d,inside=%d,inside_ms=%I64d,enabled=%d",
                     g_ScreenWidth, g_ScreenHeight, g_FrameCount, acqP, acqN, acqT, acqE,
                     (DWORD)acqHr, CaptureScreenGrantLive() ? 1 : 0, g_DesktopDumpSent ? 1 : 0,
-                    capture ? 1 : 0);
+                    capture ? 1 : 0, loops, loopAge, inside, insideMs, enabled);
             }
         }
 

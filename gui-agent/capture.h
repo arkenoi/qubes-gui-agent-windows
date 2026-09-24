@@ -108,6 +108,9 @@ BOOL CaptureScreenGrantLive(void);
 // from every acquire timing out, and from DXGI reporting nothing presented.
 void CaptureAcquireStats(OUT LONG* present, OUT LONG* noPresent, OUT LONG* timeout,
                          OUT LONG* error, OUT LONG* lastHr);
+// Loop iterations, how long since the last one, and whether the thread is INSIDE the acquire.
+void CaptureThreadStats(OUT LONG* loops, OUT LONGLONG* loopAgeMs, OUT LONG* inside,
+                        OUT LONGLONG* insideMs, OUT LONG* enabled);
 
 // start the capture thread
 HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx);

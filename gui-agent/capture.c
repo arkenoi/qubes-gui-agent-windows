@@ -111,6 +111,14 @@ static volatile LONG g_AcqNoPresent = 0;   // acquired, LastPresentTime == 0 (me
 static volatile LONG g_AcqTimeout   = 0;   // DXGI_ERROR_WAIT_TIMEOUT (deliberately never logged)
 static volatile LONG g_AcqError     = 0;   // any other failure
 static volatile LONG g_AcqLastHr    = 0;   // the most recent failing HRESULT
+// Separating "blocked inside AcquireNextFrame" from "the thread is gone". The outcome counters
+// above freeze identically in both cases, and Jev refused to choose between them on those alone
+// (insufficient-evidence 0.60) - a loop counter decides it in one run (0.87), and a watchdog
+// before that was judged premature (0.33).
+static volatile LONG     g_AcqLoops    = 0;   // capture-thread loop iterations
+static volatile LONGLONG g_AcqLoopTick = 0;   // GetTickCount64 at the top of the last iteration
+static volatile LONG     g_AcqInside   = 0;   // 1 while the thread is INSIDE AcquireNextFrame
+static volatile LONGLONG g_AcqEnterTick= 0;   // when that call was entered
 
 void CaptureAcquireStats(OUT LONG* present, OUT LONG* noPresent, OUT LONG* timeout,
                          OUT LONG* error, OUT LONG* lastHr)
@@ -120,6 +128,18 @@ void CaptureAcquireStats(OUT LONG* present, OUT LONG* noPresent, OUT LONG* timeo
     if (timeout)   *timeout   = g_AcqTimeout;
     if (error)     *error     = g_AcqError;
     if (lastHr)    *lastHr    = g_AcqLastHr;
+}
+
+void CaptureThreadStats(OUT LONG* loops, OUT LONGLONG* loopAgeMs, OUT LONG* inside,
+                        OUT LONGLONG* insideMs, OUT LONG* enabled)
+{
+    const ULONGLONG now = GetTickCount64();
+    if (loops)     *loops     = g_AcqLoops;
+    if (loopAgeMs) *loopAgeMs = g_AcqLoopTick ? (LONGLONG)(now - (ULONGLONG)g_AcqLoopTick) : -1;
+    if (inside)    *inside    = g_AcqInside;
+    if (insideMs)  *insideMs  = (g_AcqInside && g_AcqEnterTick)
+                                 ? (LONGLONG)(now - (ULONGLONG)g_AcqEnterTick) : -1;
+    if (enabled)   *enabled   = (LONG)InterlockedCompareExchange(&g_CaptureThreadEnable, 0, 0);
 }
 
 // Guaranteed minimum capacity; the actual capacity is the larger of this and the
@@ -1059,8 +1079,11 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
     assert(!ctx->frame.texture);
 
     LONGLONG perf_t0 = PerfNow();
+    g_AcqEnterTick = (LONGLONG)GetTickCount64();
+    _InterlockedExchange(&g_AcqInside, 1);
     HRESULT status = IDXGIOutputDuplication_AcquireNextFrame(ctx->duplication,
         timeout, &ctx->frame.info, &ctx->frame.texture);
+    _InterlockedExchange(&g_AcqInside, 0);
     ctx->frame.perf.acquire_ticks = PerfNow() - perf_t0;
     if (FAILED(status))
     {
@@ -1288,6 +1311,8 @@ static DWORD WINAPI CaptureThread(void* param)
     while (TRUE)
     {
         LogVerbose("loop start");
+        _InterlockedIncrement(&g_AcqLoops);
+        g_AcqLoopTick = (LONGLONG)GetTickCount64();
         if (!InterlockedCompareExchange(&g_CaptureThreadEnable, FALSE, FALSE))
         {
             LogDebug("stopping (disabled)");
