@@ -8382,9 +8382,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                         "valid=0,reason=%s,consumed_ms=%lld",
                                         (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
                                         (bs->TickHwnd != (UINT64)(ULONG_PTR)entry->Handle)
-                                            ? "slot-reopened-for-another-window"
-                                            : (!bs->TickOpenOk ? "last-open-failed-early"
-                                                               : "no-open-recorded"),
+                                            ? L"slot-reopened-for-another-window"
+                                            : (!bs->TickOpenOk ? L"last-open-failed-early"
+                                                               : L"no-open-recorded"),
                                         o ? (LONGLONG)GetTickCount64() - o : -1);
                                 }
                                 else
