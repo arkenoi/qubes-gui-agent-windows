@@ -5553,7 +5553,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
         // The grant being live is NOT sufficient - dom0 also needs the window-0 dump, and it
         // has none after an earlier unplug destroyed window 0. So the entry waits for the dump,
         // not merely for the grant, and asks for the replug that produces it either way.
-        if (!CaptureScreenGrantLive() || !g_DesktopDumpSent)
+        if (!CaptureScreenGrantLive())
         {
             LogInfo("QGAFSFLASH non-seamless requested with no desktop grant - plugging the "
                 L"desktop monitor (capture replug); the switch completes when it is live");
@@ -9667,8 +9667,7 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
         const BOOL shrunk = (g_HostScreenWidth > 0 &&
             g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
             g_ScreenHeight < (g_HostScreenHeight * 99) / 100);
-        const BOOL plugged = (g_DesktopGrantWanted && CaptureScreenGrantLive() &&
-                              g_DesktopDumpSent);
+        const BOOL plugged = (g_DesktopGrantWanted && CaptureScreenGrantLive());
         const BOOL ready = (g_NonSeamlessWait == FS_WAIT_GRANT)  ? plugged :
                            (g_NonSeamlessWait == FS_WAIT_SHRINK) ? shrunk  : FALSE;
         if (ready)
@@ -9977,6 +9976,7 @@ static ULONG WINAPI WatchForEvents(void)
     BOOL captureDegraded = FALSE;
     ULONGLONG captureRetryDue = 0;
     ULONGLONG fsStallLast = 0;      // QGAFSSTALL rate limit
+    ULONGLONG capStatLast = 0;      // QGACAPSTAT rate limit
     ULONGLONG degradedLogLast = 0;
 
     while (TRUE)
@@ -10704,8 +10704,7 @@ static ULONG WINAPI WatchForEvents(void)
             const BOOL shrunkNow = (g_HostScreenWidth > 0 &&
                 g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
                 g_ScreenHeight < (g_HostScreenHeight * 99) / 100);
-            const BOOL pluggedNow = (g_DesktopGrantWanted && CaptureScreenGrantLive() &&
-                                     g_DesktopDumpSent);
+            const BOOL pluggedNow = (g_DesktopGrantWanted && CaptureScreenGrantLive());
             const BOOL ready = (g_NonSeamlessWait == FS_WAIT_GRANT)  ? pluggedNow :
                                (g_NonSeamlessWait == FS_WAIT_SHRINK) ? shrunkNow  : FALSE;
             if (ready)
@@ -10727,6 +10726,28 @@ static ULONG WINAPI WatchForEvents(void)
                     g_ScreenWidth, g_ScreenHeight, g_HostScreenWidth, g_HostScreenHeight,
                     CaptureScreenGrantLive() ? 1 : 0, capture ? 1 : 0, captureDegraded ? 1 : 0,
                     g_FrameCount, g_SeamlessMode ? 1 : 0, g_DesktopGrantWanted ? 1 : 0);
+            }
+        }
+
+        // NON-SEAMLESS HEALTH. While the guest desktop is the thing dom0 is showing, report what
+        // the capture thread is actually doing. A blank frozen window and a healthy one look
+        // identical from outside, and the content-frame counter alone cannot tell "thread stuck"
+        // from "every acquire timed out" from "DXGI says nothing was presented" (Jev: that
+        // counter was misleading, 0.89). Only while non-seamless is up, so a seamless guest -
+        // which never shows window 0 - stays quiet.
+        if (!g_SeamlessMode && !exitLoop && g_VchanClientConnected)
+        {
+            const ULONGLONG nowTick2 = GetTickCount64();
+            if (nowTick2 - capStatLast >= 10000)
+            {
+                LONG acqP = 0, acqN = 0, acqT = 0, acqE = 0, acqHr = 0;
+                capStatLast = nowTick2;
+                CaptureAcquireStats(&acqP, &acqN, &acqT, &acqE, &acqHr);
+                LogInfo("QGACAPSTAT,mode=nonseamless,screen=%ux%u,frames=%I64u,present=%d,"
+                    L"nopresent=%d,timeout=%d,err=%d,lasthr=0x%08x,grant=%d,dump=%d,capture=%d",
+                    g_ScreenWidth, g_ScreenHeight, g_FrameCount, acqP, acqN, acqT, acqE,
+                    (DWORD)acqHr, CaptureScreenGrantLive() ? 1 : 0, g_DesktopDumpSent ? 1 : 0,
+                    capture ? 1 : 0);
             }
         }
 

@@ -104,6 +104,10 @@ typedef struct _CAPTURE_CONTEXT
 // initialize capture interfaces and map framebuffer
 CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event);
 BOOL CaptureScreenGrantLive(void);
+// Acquire outcomes, so a frozen content-frame counter can be told apart from a stuck thread,
+// from every acquire timing out, and from DXGI reporting nothing presented.
+void CaptureAcquireStats(OUT LONG* present, OUT LONG* noPresent, OUT LONG* timeout,
+                         OUT LONG* error, OUT LONG* lastHr);
 
 // start the capture thread
 HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx);

@@ -101,6 +101,27 @@ typedef struct _STAGING_GRANT
 
 static STAGING_GRANT g_Staging;
 
+// ACQUIRE OUTCOMES. A counter at the top of ProcessNewFrame counts frames WITH CONTENT, and its
+// being frozen is consistent with three different states of this thread: stuck, every acquire
+// timing out, or acquires succeeding while DXGI reports nothing presented. Reporting that counter
+// as "frames frozen" asserted more than it could support (Jev: misleading 0.89). These four
+// distinguish them, and cost an increment on a path that already does a cross-process copy.
+static volatile LONG g_AcqPresent   = 0;   // acquired AND DXGI reported a new present
+static volatile LONG g_AcqNoPresent = 0;   // acquired, LastPresentTime == 0 (metadata only)
+static volatile LONG g_AcqTimeout   = 0;   // DXGI_ERROR_WAIT_TIMEOUT (deliberately never logged)
+static volatile LONG g_AcqError     = 0;   // any other failure
+static volatile LONG g_AcqLastHr    = 0;   // the most recent failing HRESULT
+
+void CaptureAcquireStats(OUT LONG* present, OUT LONG* noPresent, OUT LONG* timeout,
+                         OUT LONG* error, OUT LONG* lastHr)
+{
+    if (present)   *present   = g_AcqPresent;
+    if (noPresent) *noPresent = g_AcqNoPresent;
+    if (timeout)   *timeout   = g_AcqTimeout;
+    if (error)     *error     = g_AcqError;
+    if (lastHr)    *lastHr    = g_AcqLastHr;
+}
+
 // Guaranteed minimum capacity; the actual capacity is the larger of this and the
 // dom0 host resolution from msg_xconf (known before capture ever initializes:
 // HandleXconf runs before StartFrameProcessing).
@@ -1045,10 +1066,20 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
     {
         if (status != DXGI_ERROR_WAIT_TIMEOUT) // don't spam log with timeouts
         {
+            _InterlockedIncrement(&g_AcqError);
+            g_AcqLastHr = (LONG)status;
             win_perror2(status, "duplication->AcquireNextFrame()");
+        }
+        else
+        {
+            _InterlockedIncrement(&g_AcqTimeout);
         }
         goto fail1;
     }
+    if (ctx->frame.info.LastPresentTime.QuadPart == 0)
+        _InterlockedIncrement(&g_AcqNoPresent);
+    else
+        _InterlockedIncrement(&g_AcqPresent);
 
     // STAGING: a pending full copy must not take this early-out - after a geometry
     // change the staging content is laid out at the old pitch and must be refilled
