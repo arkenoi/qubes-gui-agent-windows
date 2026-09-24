@@ -5601,10 +5601,25 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     // ...unless DOM0 asked for this size: the user sizing or maximizing the qube's window is
     // the one explicit, legitimate way for a qube to fill the screen, and it must not be
     // second-guessed. Only guest-originated host-sized geometry is refused/shrunk below.
-    if (!seamlessMode && !g_ResolutionFromDom0 &&
-        g_HostScreenWidth > 0 && g_HostScreenHeight > 0 &&
-        g_ScreenWidth >= (g_HostScreenWidth * 99) / 100 &&
-        g_ScreenHeight >= (g_HostScreenHeight * 99) / 100)
+    // A FRESH ENTRY NEVER INHERITS "dom0 asked for it". g_ResolutionFromDom0 is sticky: once dom0
+    // has ever sized this guest, the guard below was skipped for ever after, so leaving seamless
+    // re-used whatever size was remembered - and the owner got a desktop covering their screen
+    // without asking for it ("why the fuck it was maximized at all?"). The sanctioned exception in
+    // the rule is the user sizing or maximizing the qube window, which is an action they take in
+    // THIS session on a window that already exists; a remembered number from an earlier one is not
+    // that. So on the seamless -> non-seamless transition the guard applies regardless, and the
+    // user can maximize afterwards if they want to - which sets the size from dom0 and is honoured.
+    //
+    // The threshold is also widened. It required >= 99% of the host in BOTH dimensions, so
+    // 5120x1384 on a 5120x1440 host - full width, 96% of height, visually the whole screen - did
+    // not trip it (Jev: that violates the binding never-fullscreen rule, 0.60). Covering the full
+    // width and nearly the full height IS covering the screen.
+    const BOOL enteringNonSeamless = (!seamlessMode && g_SeamlessMode);
+    const BOOL coversHost =
+        (g_HostScreenWidth > 0 && g_HostScreenHeight > 0 &&
+         g_ScreenWidth  >= (g_HostScreenWidth  * 95) / 100 &&
+         g_ScreenHeight >= (g_HostScreenHeight * 90) / 100);
+    if (!seamlessMode && coversHost && (enteringNonSeamless || !g_ResolutionFromDom0))
     {
         // The desktop is still host-sized (seamless forces that, see the seamless branch
         // below), so mapping window 0 now would cover the user's whole display. Do NOT do
