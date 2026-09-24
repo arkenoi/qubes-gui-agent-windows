@@ -6838,6 +6838,23 @@ static void ProcessWindowEvents(void)
 // per-frame enumeration Phase 2A removed (which called GetWindowLong/GetWindowRect per window).
 static BOOL g_ZOrderValid = FALSE;
 
+// SEPARATE FROM g_ZOrderValid, DELIBERATELY. g_ZOrderValid means "the ordering may be used to CLIP
+// another window's damage". This one means only "the ordering may be used to decide whether THIS
+// window can be copied from the composited framebuffer instead of PrintWindow'd".
+//
+// They were the same flag until 2026-09-24, and that cost three blank windows: validating the
+// order every frame to win the capture decision also switched DAMAGE CLIPPING on, and windows
+// below others then had their damage clipped away and rendered nothing (measured: 493-byte
+// uniform-fill captures against 59622/59793/54390 bytes once reverted).
+//
+// The asymmetry is about CONSEQUENCE, not confidence. A wrong clip verdict makes a window receive
+// NOTHING - the source warns a mis-sorted desktop window "claims everything as covered and NOTHING
+// else receives damage - the entire qube renders stale". A wrong capture verdict shows one
+// window's pixels inside another, which is also bad but is bounded and self-correcting on the next
+// capture. So clipping keeps the stricter gate it has always had, unchanged, and only the capture
+// decision is allowed to use the ordering this flag describes.
+static BOOL g_ZOrderCaptureValid = FALSE;
+
 // DDA-eligibility probe counters (ProtoTrace only; see the DDAPROBE block in ProcessNewFrame).
 static ULONGLONG g_DdaProbeSeen = 0, g_DdaProbeNotFg = 0, g_DdaProbeNotFgFree = 0;
 static ULONGLONG g_DdaProbeZCmp = 0, g_DdaProbeZDanger = 0, g_DdaProbeZCons = 0;
@@ -6884,6 +6901,7 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
     // when one is on screen - which is a second or two at a time. Paying a full EnumWindows
     // on every frame for a case that is almost never active cost roughly 4x the Phase 2A
     // drag figure. Skip it, and report the order as unknown so nothing clips.
+    BOOL noPopupCaptureOnly = FALSE;
     BOOL anyPopup = FALSE;
     WINDOW_DATA* scan = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
     while (scan != (WINDOW_DATA*)&g_WatchedWindowsList)
@@ -6898,17 +6916,14 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
     }
     if (!anyPopup)
     {
-        // still hand back the window list, just without a trustworthy order
-        UINT n = 0;
-        WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
-        while (e != (WINDOW_DATA*)&g_WatchedWindowsList && n < capacity)
-        {
-            e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
-            sorted[n++] = e;
-            e = (WINDOW_DATA*)e->ListEntry.Flink;
-        }
-        g_ZOrderValid = FALSE;
-        return n;
+        // NO POPUP: clipping stays off exactly as before - g_ZOrderValid will remain FALSE below
+        // and nothing will clip. But the snapshot is still TAKEN, because it is what lets a
+        // BACKGROUND window be copied from the composite instead of paying a PrintWindow on its
+        // own application's UI thread (32-438 ms measured). The objection to taking it every
+        // frame does not survive measurement on this guest: enumeration is 5 us median and a
+        // WHOLE frame is 515-574 us. The list is returned in its CURRENT order, NOT re-sorted,
+        // so iteration order and everything depending on it are unchanged.
+        noPopupCaptureOnly = TRUE;
     }
 
     int next = 0;
@@ -6917,8 +6932,9 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
     // worse than not clipping: if the desktop window (which spans the whole screen) sorts
     // first it claims everything as covered and NOTHING else receives damage - the entire
     // qube renders stale. Failure must degrade to "do not clip", never to "clip wrongly".
-    g_ZOrderValid = EnumWindows(ZOrderProc, (LPARAM)&next) ? TRUE : FALSE;
-    if (!g_ZOrderValid)
+    const BOOL zEnumOk = EnumWindows(ZOrderProc, (LPARAM)&next) ? TRUE : FALSE;
+    g_ZOrderValid = zEnumOk;
+    if (!zEnumOk)
     {
         static DWORD lastComplaint = 0;
         DWORD now = GetTickCount();
@@ -6964,6 +6980,17 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
             g_ZOrderValid = FALSE;
             break;
         }
+    }
+
+    // THE SPLIT. g_ZOrderValid now carries its original, narrower meaning - usable for CLIPPING -
+    // and is therefore only allowed to be true when a popup is on screen, exactly as before this
+    // work began. g_ZOrderCaptureValid records the same ordering's usability for the far weaker
+    // CAPTURE decision. Nothing but PwDdaEligible reads it.
+    g_ZOrderCaptureValid = g_ZOrderValid;
+    if (noPopupCaptureOnly)
+    {
+        g_ZOrderValid = FALSE;   // clipping stays off: unchanged behaviour
+        return count;            // and the list is returned UNSORTED, also unchanged
     }
 
     // insertion sort: the list is small (single digits) and nearly ordered in practice
@@ -7372,6 +7399,29 @@ static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child)
 // "this is the foreground window", which by definition has nothing above it but topmost
 // windows. Together they are sound without paying for an ordering, and they cover exactly the
 // case that matters for typing and scrolling: the window the user is working in.
+// Occlusion using the ORDERING: is any watched window ABOVE this one overlapping it? Valid only
+// when g_ZOrderCaptureValid - see the flag's comment for why that is a different, weaker claim
+// than the one damage clipping makes. Reads nothing but ZOrder and rectangles; in particular it
+// does NOT touch rgnCovered, so it cannot enable or influence clipping.
+static BOOL PwOccludedByAbove(IN const WINDOW_DATA* self, IN const RECT* rect)
+{
+    RECT hit;
+    WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
+    {
+        e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (e != self && e->IsVisible && !e->IsIconic && !e->DeletePending &&
+            e->Width > 0 && e->Height > 0 && e->ZOrder < self->ZOrder)   // strictly ABOVE
+        {
+            RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
+            if (IntersectRect(&hit, &other, rect))
+                return TRUE;
+        }
+        e = (WINDOW_DATA*)e->ListEntry.Flink;
+    }
+    return FALSE;
+}
+
 static BOOL PwAnyVisibleOverlap(IN const WINDOW_DATA* self, IN const RECT* rect)
 {
     RECT hit;
@@ -7553,7 +7603,19 @@ static BOOL PwDdaEligible(IN const WINDOW_DATA* entry, IN const RECT* rect,
     // typed at 5.2-6.2 %CPU, reps where it did not at 20.4 - and the cause was invisible
     // because these refusals were not counted. Same reasoning as PwScreenUnchanged: with a valid Z-order use it,
     // otherwise "is the foreground window" plus "no other visible window overlaps".
-    if (!g_ZOrderValid)
+    if (g_ZOrderCaptureValid)
+    {
+        // The ordering is usable for THIS decision: a background window that nothing above it
+        // overlaps is genuinely unoccluded, so the composite holds its pixels and it needs no
+        // PrintWindow. Measured 2026-09-24: 846 of 846 non-foreground considerations were of
+        // such windows, each otherwise paying 32-438 ms on its own application's UI thread.
+        if (PwOccludedByAbove(entry, rect))
+        {
+            PerfNotePwRefusal(PW_REFUSE_DDA_OVERLAP);
+            return FALSE;
+        }
+    }
+    else if (!g_ZOrderValid)
     {
         if (entry->Handle != foreground)
         {
