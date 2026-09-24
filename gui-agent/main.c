@@ -5693,6 +5693,18 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
 
     g_SeamlessMode = seamlessMode;
 
+    // The switch HAS happened, so nothing is pending any more. Without this the flag survived a
+    // switch that completed by the DIRECT route (preconditions already met, so neither deferral
+    // fired) and QGAFSSTALL then reported a stall for ever against a desktop that was up and
+    // correct - measured 2026-09-24: age_ms climbing past 130 s with seamless=0 and window 0
+    // mapped, while the dom0 window showed a live 5120x1384 desktop. A stale "still pending" is
+    // how a working feature gets diagnosed as broken.
+    if (!seamlessMode && g_NonSeamlessPending)
+    {
+        g_NonSeamlessPending = FALSE;
+        LogInfo("QGAFSFLASH non-seamless switch complete - nothing pending");
+    }
+
     // Shadows are dom0's job in seamless (disabled — they surface as separate o-r shadow companion
     // windows and add nothing) and the guest's own in fullscreen (restored). Owner 2026-09-02:
     // disabled permanently in seamless. The seamless disable may no-op if the shell isn't up yet
