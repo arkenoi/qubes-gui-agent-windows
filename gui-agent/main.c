@@ -341,6 +341,46 @@ volatile BOOL g_OnSecureDesktop = FALSE;
 // requested a windowed resolution first and completes the switch once that lands.
 static volatile BOOL g_NonSeamlessPending = FALSE;
 
+// THE DESKTOP SURFACE IS A MONITOR WE PLUG AND UNPLUG (owner, 2026-09-24: "we just plug and
+// unplug a new monitor if we grant the switch. at same moment we map and unmap what we need").
+//
+// Non-seamless is ONE dom0 window showing the whole guest desktop, and that window's image IS
+// the screen grant. P2 (g_NoScreenGrant) leaves that grant unmade on a seamless-only guest -
+// which is why leaving seamless used to be REFUSED outright unless service.gui-fullscreen was
+// set at Init: with no grant the desktop window would be black. Refusing was invisible to dom0
+// (qubes.SetGuiMode is fire-and-forget: it sets a named event, returns, and never learns the
+// outcome), so the switch simply did nothing - forum 42717 post 160, "it simply ignores the
+// setting", and Jev put the cause at feature-gate-off 0.97 and the root defect at
+// silent-refusal-no-backchannel 1.00.
+//
+// Now the grant's LIFETIME follows the mode instead of a start-time flag: entering non-seamless
+// plugs the monitor (grant made, window 0 mapped), returning to seamless unplugs it (window 0
+// unmapped, grant lapses at the next capture start). A seamless guest still never holds a
+// desktop grant, so P2's benefits are kept rather than traded away.
+//
+// The anti-takeover property is NOT weakened: it is enforced by the geometry guard below, which
+// is deliberately independent of any feature and shrinks the desktop before window 0 can be
+// mapped. Mode 1 (LogonUI) stays refused unconditionally, and Mode 2 (borderless fullscreen APP
+// windows) stays gated by service.gui-fullscreen. Jev: design E 0.74, safety_preserved 0.77.
+//
+// HONEST RESIDUAL, recorded rather than glossed: Jev split 0.48 on whether tying the grant to a
+// device lifetime is genuinely different from the forbidden "grant on demand" runtime flip, or
+// the same flip in device clothing. The distinction rests on the monitor actually arriving and
+// departing; if that stops being true, this becomes the thing the start-time rule forbids.
+static volatile BOOL g_DesktopGrantWanted = FALSE;
+
+// Set once in WinMain so a mode switch can ask for the capture replug from anywhere. Signalling
+// it runs the SAME path a desktop switch or resolution change takes: stop capture, wait for the
+// daemon's confirming MSG_DESTROY for window 0, then restart - which is what makes the re-grant
+// protocol-safe instead of a revoke under the daemon's feet.
+static HANDLE g_CaptureErrorEvent = NULL;
+
+// The desktop grant is suppressed only while we are SEAMLESS and not on our way out of it.
+BOOL NoScreenGrantActive(void)
+{
+    return g_NoScreenGrant && !g_DesktopGrantWanted;
+}
+
 // Last window the foreground re-raise in AddAllWindows acted on. Cleared by ResetWatch so
 // the corrective re-fires on the first pass after every mass re-announce.
 static HWND g_LastForeground = NULL;
@@ -5476,10 +5516,25 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     // the intentional whole-screen fullscreen mode (dom0 fullscreens the qube window), which is
     // part of "fullscreen conditionally allowed". Coerce to seamless when off: per-window
     // mapping stays alive (no black screen), window 0 never mapped.
-    if (!seamlessMode && !g_ShowFullscreenScreen)
+    // PLUG THE MONITOR. The desktop window's image is the screen grant, so it has to exist
+    // before window 0 is mapped. If it does not, ask for it and defer THIS pass: the capture
+    // replug below re-runs StagingEnsure, which now sees g_DesktopGrantWanted and makes the
+    // grant, and the deferred switch completes from the same hooks the shrink path uses.
+    if (!seamlessMode)
     {
-        LogInfo("QGAFSFLASH fullscreen mode refused (service.gui-fullscreen off) - staying seamless");
-        seamlessMode = TRUE;
+        g_DesktopGrantWanted = TRUE;
+        if (!CaptureScreenGrantLive())
+        {
+            LogInfo("QGAFSFLASH non-seamless requested with no desktop grant - plugging the "
+                L"desktop monitor (capture replug); the switch completes when it is live");
+            g_NonSeamlessPending = TRUE;
+            if (g_CaptureErrorEvent)
+                SetEvent(g_CaptureErrorEvent);
+            else
+                LogWarning("QGAFSFLASH no capture-replug handle - the grant cannot be made, "
+                    L"staying seamless");
+            seamlessMode = TRUE;   // stay seamless for THIS pass
+        }
     }
 
     // HARD GEOMETRY GUARD (owner, 2026-08-27: "never fucking ever non-seamless mode goes
@@ -5592,6 +5647,16 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
         {
             win_perror2(status, "SendWindowUnmap(NULL)");
             goto end;
+        }
+        // UNPLUG THE MONITOR: window 0 is down, so the desktop image is no longer anyone's to
+        // show. The grant itself lapses at the next capture start (StagingEnsure then suppresses
+        // it again) - revoking it here, under a daemon that has only just been told to unmap,
+        // is the unsafe ordering this path exists to avoid.
+        if (g_DesktopGrantWanted)
+        {
+            g_DesktopGrantWanted = FALSE;
+            LogInfo("QGAFSFLASH seamless restored - desktop monitor unplugged, the grant lapses "
+                L"at the next capture start");
         }
     }
 
@@ -9478,7 +9543,7 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
     // grant_refs was actually allocated for - the exact per-geometry count on the
     // direct-map path, the CONSTANT staging capacity under StagingGrant (the daemon
     // accepts a larger-than-needed count; only a too-small one is exit(1), see capture.h).
-    if (g_NoScreenGrant)
+    if (NoScreenGrantActive())
     {
         // P2 probe: no refs exist to send (StagingEnsure skipped the grant). gui-daemon
         // never requires a screen image - every g->screen_window use is NULL-guarded and
@@ -9703,6 +9768,7 @@ static ULONG WINAPI WatchForEvents(void)
     LogDebug("start");
     HANDLE newFrameEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
     HANDLE captureErrorEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    g_CaptureErrorEvent = captureErrorEvent;   // lets a mode switch ask for the capture replug
 
     // This will not block.
     // KEEP-FATAL: no vchan could even be set up, so no daemon is connected - exiting
@@ -10114,7 +10180,7 @@ static ULONG WINAPI WatchForEvents(void)
                         capture->width, capture->height);
                     ResolutionNoteTransitSize(capture->width, capture->height);
                 }
-                else if (capture->grants_changed && g_NoScreenGrant)
+                else if (capture->grants_changed && NoScreenGrantActive())
                 {
                     // P2 probe: nothing was granted, so there is nothing to republish.
                     // Keep the cursor re-blank (externally-driven mode changes reload the
@@ -11167,12 +11233,16 @@ static ULONG Init(void)
     // never be needed and the grant can never be missed. With it on, the guest keeps the grant
     // it may be asked for - no runtime flip, no window where dom0 asks for a desktop we have
     // no longer granted. g_ShowFullscreenScreen is resolved above, before this point.
+    // The feature no longer decides this. It used to: a guest with service.gui-fullscreen on
+    // kept the grant live from Init because it "can be asked for the whole-desktop window", and
+    // a guest without it could never enter non-seamless at all. That made the switch refusable
+    // for a reason the user could not see. The grant now follows the MODE (see
+    // g_DesktopGrantWanted): suppressed while seamless, made when the desktop monitor is
+    // plugged. So a fullscreen-capable guest starts seamless WITHOUT the grant too, and gains it
+    // on the switch - which is the point.
     if (g_NoScreenGrant && g_ShowFullscreenScreen)
-    {
-        LogInfo("P2NOGRANT not applied: service.gui-fullscreen is on, so this guest can be asked "
-            L"for the whole-desktop window, whose image is that grant - it stays live");
-        g_NoScreenGrant = FALSE;
-    }
+        LogInfo("P2NOGRANT stays armed although service.gui-fullscreen is on: the desktop grant "
+            L"is now made when the monitor is plugged, not held from start");
     if (g_NoScreenGrant)
         LogInfo("P2NOGRANT active: desktop framebuffer stays ungranted, window-0 dump suppressed "
             L"(seamless-only guest; dom0 renders exclusively from per-window grants)");

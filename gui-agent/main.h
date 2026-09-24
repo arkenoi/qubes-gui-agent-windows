@@ -38,6 +38,10 @@ extern DWORD g_HostScreenHeight;
 extern BOOL g_VchanClientConnected;
 extern BOOL g_StagingGrant;
 extern BOOL g_NoScreenGrant;
+// TRUE while the desktop grant must stay suppressed: P2 is armed AND the desktop monitor is not
+// plugged (we are seamless and not on our way out of it). Callers use this, never g_NoScreenGrant
+// directly - the flag is the policy, this is the policy applied to the current mode.
+BOOL NoScreenGrantActive(void);
 extern HWND g_DesktopWindow;
 extern volatile BOOL g_OnSecureDesktop;
 // Window currently being dragged with a held mouse button (input path); NULL when none.

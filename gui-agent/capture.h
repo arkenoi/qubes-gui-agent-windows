@@ -103,6 +103,7 @@ typedef struct _CAPTURE_CONTEXT
 
 // initialize capture interfaces and map framebuffer
 CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event);
+BOOL CaptureScreenGrantLive(void);
 
 // start the capture thread
 HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx);

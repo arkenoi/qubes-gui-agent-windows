@@ -588,6 +588,15 @@ static void XcLogger(IN XENCONTROL_LOG_LEVEL logLevel, IN const char* function, 
 // grant is live. On failure everything is released and the next CaptureInitialize
 // retries (at most one grant attempt per init - no accumulation). Called only from
 // CaptureInitialize, so single-threaded by construction.
+// Is the whole-desktop grant LIVE right now? The desktop window's image IS this grant, so a
+// non-seamless switch must not map window 0 before it exists (dom0 would show black). Under P2
+// StagingEnsure deliberately leaves it ungranted and marks that with xc == NULL. On the direct
+// per-geometry path there is no staging grant and the refs are always sent, so it is always live.
+BOOL CaptureScreenGrantLive(void)
+{
+    return g_StagingGrant ? (g_Staging.xc != NULL) : TRUE;
+}
+
 static BOOL StagingEnsure(void)
 {
     if (g_Staging.handle)
@@ -621,7 +630,7 @@ static BOOL StagingEnsure(void)
         return FALSE;
     }
 
-    if (g_NoScreenGrant)
+    if (NoScreenGrantActive())
     {
         // P2 probe: the staging buffer is the LOCAL pixel source only (slice-fed windows,
         // the DDA-owned channel and synth patches all read it) - dom0 never maps it. refs
