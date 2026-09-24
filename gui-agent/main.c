@@ -6937,6 +6937,23 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
     {
         if (sorted[i]->ZOrder == INT_MAX)
         {
+            // WHICH window, and is it synthesized? A single unreported entry disables the whole
+            // ordering, and the ordering is what lets a BACKGROUND but unoccluded window be served
+            // from the composited framebuffer instead of a 32-438 ms PrintWindow into its own
+            // application's UI thread (PwDdaEligible falls back to foreground-only without it).
+            // Measured 2026-09-24: ddfg=1 on every frame, i.e. that fallback is what is running.
+            // Rate-limited; identifying the culprit is the step before touching the rule at all.
+            static DWORD zlast = 0;
+            DWORD znow = GetTickCount();
+            if (znow - zlast > 5000)
+            {
+                zlast = znow;
+                LogInfo("QGAPROTO,msg=ZORDERINVALID,hwnd=0x%x,class=%s,synth=%d,visible=%d,"
+                    "iconic=%d,watched=%u",
+                    (DWORD)(ULONG_PTR)sorted[i]->Handle, sorted[i]->Class,
+                    sorted[i]->Synthesized ? 1 : 0, sorted[i]->IsVisible ? 1 : 0,
+                    sorted[i]->IsIconic ? 1 : 0, count);
+            }
             g_ZOrderValid = FALSE;
             break;
         }
