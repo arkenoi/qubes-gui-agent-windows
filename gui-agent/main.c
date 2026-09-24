@@ -6838,6 +6838,11 @@ static void ProcessWindowEvents(void)
 // per-frame enumeration Phase 2A removed (which called GetWindowLong/GetWindowRect per window).
 static BOOL g_ZOrderValid = FALSE;
 
+// DDA-eligibility probe counters (ProtoTrace only; see the DDAPROBE block in ProcessNewFrame).
+static ULONGLONG g_DdaProbeSeen = 0, g_DdaProbeNotFg = 0, g_DdaProbeNotFgFree = 0;
+static ULONGLONG g_DdaProbeZCmp = 0, g_DdaProbeZDanger = 0, g_DdaProbeZCons = 0;
+static ULONGLONG g_DdaProbeLast = 0;
+
 static BOOL CALLBACK ZOrderProc(HWND window, LPARAM lParam)
 {
     int* next = (int*)lParam;
@@ -8623,6 +8628,58 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // predicate fails. Any residual source difference is a one-time
                         // transition, never a repeating flicker. Whether the sources actually
                         // differ is a separate question that must now be MEASURED, not assumed.
+                        // ---- DDA-ELIGIBILITY PROBE (ProtoTrace only) --------------------
+                        // The Z-order snapshot is deliberately skipped unless an
+                        // override-redirect popup is on screen, so g_ZOrderValid is false in
+                        // ordinary use and PwDdaEligible falls back to FOREGROUND-ONLY. Every
+                        // background window therefore pays a full PrintWindow on its own
+                        // application's UI thread (32-438 ms measured) instead of a free copy
+                        // out of the framebuffer already captured here.
+                        //
+                        // Two questions decide what to do about that, and neither may be
+                        // guessed (Jev rated the order-free test's safety alone at only 0.22):
+                        //   PRIZE  - how often is a NON-FOREGROUND window genuinely unoccluded,
+                        //            i.e. how many of those PrintWindows could have been free?
+                        //   SAFETY - when a REAL Z-order is available, does the order-free
+                        //            test ever disagree with it? The dangerous direction is
+                        //            order-free saying "unoccluded" when the Z-order says
+                        //            covered: that would paint an occluder's pixels into this
+                        //            window.
+                        // Counted, not logged per window - this runs per window per frame.
+                        if (g_ProtoTrace)
+                        {
+                            const BOOL isFg = (entry->Handle == pwForeground);
+                            const BOOL ofFree = !PwAnyVisibleOverlap(entry, &pwRect);
+                            g_DdaProbeSeen++;
+                            if (!isFg)
+                            {
+                                g_DdaProbeNotFg++;
+                                if (ofFree)
+                                    g_DdaProbeNotFgFree++;   // the prize
+                            }
+                            if (g_ZOrderValid && rgnCovered)
+                            {
+                                // Ground truth for THIS window: is any part of it covered by a
+                                // window ABOVE it? rgnCovered holds exactly that, accumulated
+                                // as the z-ordered loop walks down.
+                                const BOOL zFree = !RectInRegion(rgnCovered, &pwRect);
+                                g_DdaProbeZCmp++;
+                                if (ofFree && !zFree)
+                                    g_DdaProbeZDanger++;     // order-free too permissive
+                                else if (!ofFree && zFree)
+                                    g_DdaProbeZCons++;       // order-free merely conservative
+                            }
+                            const ULONGLONG pnow = GetTickCount64();
+                            if (pnow - g_DdaProbeLast > 5000)
+                            {
+                                g_DdaProbeLast = pnow;
+                                LogInfo("QGAPROTO,msg=DDAPROBE,seen=%llu,notfg=%llu,"
+                                    "notfg_unoccluded=%llu,zcmp=%llu,zdanger=%llu,zcons=%llu",
+                                    g_DdaProbeSeen, g_DdaProbeNotFg, g_DdaProbeNotFgFree,
+                                    g_DdaProbeZCmp, g_DdaProbeZDanger, g_DdaProbeZCons);
+                            }
+                        }
+
                         BOOL ddaHandled = FALSE;
                         if (DdaCaptureEnabled() &&
                             (g_ZOrderValid ? !RectInRegion(rgnCovered, &pwRect) : TRUE) &&
