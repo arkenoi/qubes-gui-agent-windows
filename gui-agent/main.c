@@ -8364,7 +8364,32 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 const WGCBRK_SLOT* bs =
                                     &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
                                 const LONGLONG o = bs->OpenTick;
-                                LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,"
+                                // Are these ticks OURS? Slots are RECYCLED, and OpenChannel
+                                // stamps OpenTick then zeroes the stages before it can fail on
+                                // a window that has already gone - so a later FAILED open of
+                                // this slot overwrites the record of the successful open that
+                                // actually produced the frame being reported. That is what made
+                                // this probe measure nothing in 4.3.32: OpenTick present and all
+                                // five stages zero. Print numbers only when the slot says they
+                                // describe THIS window and that open got past CreateForWindow;
+                                // otherwise say WHY, rather than emit -1s that look measured.
+                                const BOOL ticksMine =
+                                    (bs->TickHwnd == (UINT64)(ULONG_PTR)entry->Handle) &&
+                                    bs->TickOpenOk && o;
+                                if (!ticksMine)
+                                {
+                                    LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,"
+                                        "valid=0,reason=%s,consumed_ms=%lld",
+                                        (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+                                        (bs->TickHwnd != (UINT64)(ULONG_PTR)entry->Handle)
+                                            ? "slot-reopened-for-another-window"
+                                            : (!bs->TickOpenOk ? "last-open-failed-early"
+                                                               : "no-open-recorded"),
+                                        o ? (LONGLONG)GetTickCount64() - o : -1);
+                                }
+                                else
+                                {
+                                LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,valid=1,"
                                     "item_ms=%lld,pool_ms=%lld,start_ms=%lld,"
                                     "arrived_ms=%lld,publish_ms=%lld,consumed_ms=%lld",
                                     (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
@@ -8374,6 +8399,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                     bs->FirstArrivedTick  ? bs->FirstArrivedTick - o  : -1,
                                     bs->FirstPublishTick  ? bs->FirstPublishTick - o  : -1,
                                     o ? (LONGLONG)GetTickCount64() - o : -1);
+                                }
                             }
                         }
                     }

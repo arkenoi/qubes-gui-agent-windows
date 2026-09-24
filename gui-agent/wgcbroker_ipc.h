@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  2u   /* 2: per-slot first-frame timing ticks */
+#define WGCBRK_ABI_VERSION  3u   /* 3: first-frame ticks carry the hwnd they describe */
 #define WGCBRK_MAX_SLOTS    32
 #define WGCBRK_RING         2             /* double buffer; 3 kills reader retries at 1.5x mem */
 
@@ -77,6 +77,15 @@ typedef struct _WGCBRK_SLOT {
      * took that long to set up" from "the session was ready and the application had not
      * painted yet" - which have completely different fixes. These six ticks split exactly
      * that. Diagnostic only: the agent never makes a decision on them. */
+    /* The window these ticks describe, and whether that open got past CreateForWindow. Slots are
+     * RECYCLED - menus churn through one slot constantly - and OpenChannel stamps OpenTick then
+     * ZEROES the rest before it can fail on `!IsWindow(hwnd)` for a window that has already gone.
+     * Without this the agent read the ticks of a LATER, FAILED open of the same slot while the
+     * frame it was reporting on came from an earlier successful one: OpenTick present, all five
+     * stages zero, which is exactly what shipped in 4.3.32 and measured nothing. */
+    volatile UINT64   TickHwnd;          /* Hwnd the ticks below belong to; 0 = never opened */
+    volatile LONG     TickOpenOk;        /* 1 once CreateForWindow returned for THAT open */
+    volatile LONG     _padTick;
     volatile LONGLONG OpenTick;          /* OpenChannel entered */
     volatile LONGLONG ItemTick;          /* CreateForWindow/CreateForMonitor returned */
     volatile LONGLONG PoolTick;          /* frame pool + capture session created */
