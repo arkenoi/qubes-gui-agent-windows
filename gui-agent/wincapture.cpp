@@ -57,6 +57,8 @@ struct Channel
     // ~2.5-point idle CPU floor over stock). Direct WcPrefill calls are unaffected -
     // the frame loop uses them to establish the buffer it is taking ownership of.
     std::atomic<bool> ddaOwned{ false };
+    // A channel that has never been captured jumps the queue - see the two-pass service loop.
+    std::atomic<bool> firstPending{ true };
     int failures = 0;
     bool dead = false;
     // Telemetry (added for the 2026-08-27 field black-window diagnosis: this engine
@@ -334,14 +336,33 @@ DWORD WINAPI CaptureThread(LPVOID param)
             }
         }
 
+        // TWO PASSES, and the order is the point. Every capture below is a PrintWindow that
+        // round-trips synchronously into a DIFFERENT application's UI thread, and this is the
+        // only thread that services channels - so whatever is serviced first delays everything
+        // after it by that application's paint time (measured on this guest: 32-438 ms EACH).
+        // A window that has never been captured is the one case where the delay is visible as
+        // "the new window has not appeared yet", because dom0 has nothing for it at all; an
+        // already-captured window merely refreshes slightly later. So first captures go FIRST.
+        //
+        // This is what the owner observed and called counterintuitive: "the first window was
+        // snappy. subsequent ones were not" - with nothing else open a new window's first capture
+        // ran immediately, and with other windows open it queued behind their refreshes. Jev put
+        // the cause at 0.95, called the serial design a structural latency defect at 0.92, and
+        // named this fix at 0.94.
+        for (int pass = 0; pass < 2; pass++)
         for (auto& cp : e.channels)
         {
             Channel& c = *cp;
+            const bool isFirst = c.firstPending.load();
+            if ((pass == 0) != isFirst)
+                continue;                      // pass 0: first captures only; pass 1: the rest
             // ddaOwned checked BEFORE consuming dirty: a mark arriving while the frame
             // loop owns the buffer stays pending and is served when ownership drops,
             // instead of being eaten here or triggering a write into an owned buffer.
             if (c.dead || c.ddaOwned.load() || !c.dirty.exchange(false))
                 continue;
+            if (isFirst)
+                c.firstPending.store(false);   // cleared once served, success or not
             didWork = true;
             DamageOut dmg{ nullptr, 0, 0, 0 };
             if (CaptureAndDiff(e, c, &dmg))

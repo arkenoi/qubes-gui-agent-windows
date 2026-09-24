@@ -8136,9 +8136,31 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // SliceMapHold defer) only once it is actually painted.
                         PwNoteSliceContent(entry);
                         if (firstBrokerFrame)
+                        {
                             LogInfo("BROKERFRAME first WGC frame consumed hwnd 0x%x slot %d %ux%u",
                                     (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
                                     entry->PwWidth, entry->PwHeight);
+                            // ATTRIBUTION (ABI 2). Split this window's first-content latency into
+                            // the broker's session setup versus the wait for the application to
+                            // render. Measured menu held_ms spans 156-547 ms with registration
+                            // count constant, and those two have completely different fixes.
+                            // All ticks are the broker's GetTickCount64, same clock as ours.
+                            {
+                                const WGCBRK_SLOT* bs =
+                                    &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
+                                const LONGLONG o = bs->OpenTick;
+                                LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,"
+                                    "item_ms=%lld,pool_ms=%lld,start_ms=%lld,"
+                                    "arrived_ms=%lld,publish_ms=%lld,consumed_ms=%lld",
+                                    (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+                                    bs->ItemTick          ? bs->ItemTick - o          : -1,
+                                    bs->PoolTick          ? bs->PoolTick - o          : -1,
+                                    bs->StartTick         ? bs->StartTick - o         : -1,
+                                    bs->FirstArrivedTick  ? bs->FirstArrivedTick - o  : -1,
+                                    bs->FirstPublishTick  ? bs->FirstPublishTick - o  : -1,
+                                    o ? (LONGLONG)GetTickCount64() - o : -1);
+                            }
+                        }
                     }
                     // else: no new broker frame this pass -> nothing changed, skip
 

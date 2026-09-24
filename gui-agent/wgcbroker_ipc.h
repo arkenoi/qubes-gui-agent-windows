@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  1u
+#define WGCBRK_ABI_VERSION  2u   /* 2: per-slot first-frame timing ticks */
 #define WGCBRK_MAX_SLOTS    32
 #define WGCBRK_RING         2             /* double buffer; 3 kills reader retries at 1.5x mem */
 
@@ -70,6 +70,19 @@ typedef struct _WGCBRK_SLOT {
      * The agent tightens the crop to these instead of UIA's +/-1-2px estimate; they never cut
      * opaque content. 0/0/0/0 = not reported (agent keeps UIA). Occupies the old _pad1[16]. */
     volatile LONG   OpaqueL, OpaqueT, OpaqueR, OpaqueB;
+    /* ---- DIAGNOSTIC: broker writes, agent reads. GetTickCount64 at each stage of the
+     * first-frame path for this slot, so a slot's first-content latency can be ATTRIBUTED
+     * instead of guessed. 0 = stage not reached. Measured 2026-09-24: menu held_ms spans
+     * 156-547 ms with everything else constant, and nothing distinguishes "the WGC session
+     * took that long to set up" from "the session was ready and the application had not
+     * painted yet" - which have completely different fixes. These six ticks split exactly
+     * that. Diagnostic only: the agent never makes a decision on them. */
+    volatile LONGLONG OpenTick;          /* OpenChannel entered */
+    volatile LONGLONG ItemTick;          /* CreateForWindow/CreateForMonitor returned */
+    volatile LONGLONG PoolTick;          /* frame pool + capture session created */
+    volatile LONGLONG StartTick;         /* StartCapture returned, AckState ACTIVE */
+    volatile LONGLONG FirstArrivedTick;  /* first FrameArrived callback for this channel */
+    volatile LONGLONG FirstPublishTick;  /* first PublishFrame completed for this channel */
 } WGCBRK_SLOT;
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))
