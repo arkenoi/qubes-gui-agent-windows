@@ -686,7 +686,12 @@ static const struct
 {
     { EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND }, // minimize/restore
     { EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH }, // secure desktop etc
-    { EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE }, // create/destroy/show/hide
+    // ...REORDER included deliberately: it is the ONLY signal that a window changed Z-ORDER
+    // without changing focus or the top window, and the z-order cache treats its absence as
+    // evidence that nothing reordered. Without it a raise of B above C, while A stays on top and
+    // focus does not move, is invisible - and a cached order used as truth after that paints an
+    // occluder's pixels into another window. EVENT_OBJECT_REORDER is 0x8004, one past HIDE.
+    { EVENT_OBJECT_CREATE, EVENT_OBJECT_REORDER }, // create/destroy/show/hide/reorder
     { EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_NAMECHANGE }, // state/location/name (window moves)
     { EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED }, // DWM cloaking = invisible for us
 };
@@ -722,8 +727,28 @@ static BOOL WindowEventForcesReexamine(IN DWORD event)
 
 // Record that something happened to a window (or, with resync=TRUE, that the
 // whole list needs to be rebuilt). Called from the hook thread.
+// Bumped by every hooked event that can change the Z-ORDER (see WindowEventMayReorder), which now
+// includes EVENT_OBJECT_REORDER. Used only to decide whether a cached Z-order snapshot may still
+// be trusted: if this moved, it may not. It is a DOUBT signal, never a truth signal - see
+// ZOrderCacheUsable().
+static volatile LONG g_WindowEventGen = 0;
+
+// Does this event potentially change the Z-ORDER? Create/destroy/show/hide/cloak/uncloak and
+// minimize/restore can; a LOCATIONCHANGE cannot - moving a window does not reorder it, and those
+// arrive at INPUT RATE during a drag, so counting them would invalidate the z-order cache on every
+// dragged frame and reinstate the per-frame EnumWindows the cache exists to avoid.
+static BOOL WindowEventMayReorder(IN DWORD event)
+{
+    return (event >= EVENT_OBJECT_CREATE && event <= EVENT_OBJECT_REORDER) ||
+           event == EVENT_OBJECT_CLOAKED || event == EVENT_OBJECT_UNCLOAKED ||
+           event == EVENT_SYSTEM_MINIMIZESTART || event == EVENT_SYSTEM_MINIMIZEEND ||
+           event == EVENT_SYSTEM_DESKTOPSWITCH;
+}
+
 static void QueueWindowEvent(IN HWND window, IN DWORD event, IN BOOL resync)
 {
+    if (WindowEventMayReorder(event))
+        _InterlockedIncrement(&g_WindowEventGen);
     BOOL signal = TRUE;
 
     EnterCriticalSection(&g_csWindowEvents);
@@ -6838,6 +6863,79 @@ static void ProcessWindowEvents(void)
 // per-frame enumeration Phase 2A removed (which called GetWindowLong/GetWindowRect per window).
 static BOOL g_ZOrderValid = FALSE;
 
+// Z-ORDER SNAPSHOT CACHE.
+//
+// The snapshot (a full EnumWindows) is deliberately skipped unless an override-redirect popup is
+// on screen, because paying it per frame cost "roughly 4x the Phase 2A drag figure". The
+// unintended consequence, measured 2026-09-24: PwDdaEligible then falls back to FOREGROUND-ONLY,
+// so EVERY background window is captured with a full PrintWindow on its own application's UI
+// thread - 32-438 ms each - when a copy out of the already-captured framebuffer would do. In one
+// run 846 of 846 non-foreground considerations were of genuinely UNOCCLUDED windows.
+//
+// Recomputing whenever that would help is not an option: measured, it would fire on 91% of frames
+// (795/875), i.e. per-frame EnumWindows in all but name.
+//
+// So the snapshot is CACHED, and the cache is used only while there is POSITIVE evidence that
+// nothing could have reordered the windows since it was taken:
+//   - no hooked window event has arrived (g_WindowEventGen unchanged) - covers create, destroy,
+//     show, hide, cloak, uncloak, minimize, state and location changes;
+//   - the foreground window is the same;
+//   - the top of the z-order is the same window.
+// EVENT_OBJECT_REORDER is now hooked (the range was extended from HIDE to REORDER) precisely so
+// that a raise which changes NEITHER the foreground window NOR the top window still bumps the
+// generation - that case was the hole: raising B above C while A stays on top and focus does not
+// move is invisible to focus and top-window checks alike. The foreground and top-window checks are
+// kept as CORROBORATION, since an event stream is not a proof.
+//
+// ON ANY DOUBT THE CACHE IS NOT USED AND BEHAVIOUR IS EXACTLY WHAT IT IS TODAY - order unknown,
+// nothing clips, DDA falls back to foreground-only. It NEVER degrades to a stale order used as
+// truth, because a wrong order is far worse than none: the source warns a mis-sorted desktop
+// window "claims everything as covered and NOTHING else receives damage", and on the capture side
+// a wrong occlusion verdict paints an occluder's pixels into another window's buffer.
+// Jev: caching-with-invalidation as such 0.13; this fallback-to-unknown variant 0.90, recommended
+// at 1.00.
+static BOOL  g_ZCacheValid = FALSE;
+static LONG  g_ZCacheGen   = -1;
+static HWND  g_ZCacheFg    = NULL;
+static HWND  g_ZCacheTop   = NULL;
+// Prototype accounting (ProtoTrace): how much of the prize the cache actually captures.
+static ULONGLONG g_ZCacheHit = 0, g_ZCacheMiss = 0, g_ZCacheFresh = 0;
+
+// A cached order is trusted for at most this many consecutive frames before a fresh snapshot is
+// taken regardless. WinEvent delivery to an out-of-context hook is BEST EFFORT - events can be
+// coalesced or dropped under load - so a REORDER can in principle be missed, and the failure mode
+// of a stale order trusted as truth is WRONG PIXELS (an occluder's content inside another window),
+// not slowness. Jev named exactly that as the residual risk at 0.98 while still recommending this
+// ship. This bounds the exposure to roughly a second at a cost of about one EnumWindows per
+// second, against the per-frame cost the cache exists to remove. It is a ceiling on how long a
+// heuristic may be believed, not a substitute for the signal.
+#define ZCACHE_MAX_CONSECUTIVE_HITS 60
+
+static ULONG g_ZCacheRun = 0;
+
+static BOOL ZOrderCacheUsable(void)
+{
+    if (!g_ZCacheValid)
+        return FALSE;
+    if (g_ZCacheRun >= ZCACHE_MAX_CONSECUTIVE_HITS)
+        return FALSE;
+    if (g_ZCacheGen != g_WindowEventGen)
+        return FALSE;
+    if (g_ZCacheFg != GetForegroundWindow())
+        return FALSE;
+    if (g_ZCacheTop != GetTopWindow(NULL))
+        return FALSE;
+    return TRUE;
+}
+
+static void ZOrderCacheStamp(BOOL valid)
+{
+    g_ZCacheValid = valid;
+    g_ZCacheGen   = g_WindowEventGen;
+    g_ZCacheFg    = GetForegroundWindow();
+    g_ZCacheTop   = GetTopWindow(NULL);
+}
+
 // DDA-eligibility probe counters (ProtoTrace only; see the DDAPROBE block in ProcessNewFrame).
 static ULONGLONG g_DdaProbeSeen = 0, g_DdaProbeNotFg = 0, g_DdaProbeNotFgFree = 0;
 static ULONGLONG g_DdaProbeZCmp = 0, g_DdaProbeZDanger = 0, g_DdaProbeZCons = 0;
@@ -6896,20 +6994,48 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
         }
         scan = (WINDOW_DATA*)scan->ListEntry.Flink;
     }
-    if (!anyPopup)
+    if (!anyPopup && ZOrderCacheUsable())
     {
-        // still hand back the window list, just without a trustworthy order
+        // Nothing could have reordered the windows since the last snapshot, so the ZOrder values
+        // already on the entries are still good. Hand back the list in the SAME order the last
+        // snapshot produced, and declare it valid - no EnumWindows this frame.
         UINT n = 0;
-        WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
-        while (e != (WINDOW_DATA*)&g_WatchedWindowsList && n < capacity)
+        WINDOW_DATA* e2 = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+        while (e2 != (WINDOW_DATA*)&g_WatchedWindowsList && n < capacity)
         {
-            e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
-            sorted[n++] = e;
-            e = (WINDOW_DATA*)e->ListEntry.Flink;
+            e2 = CONTAINING_RECORD(e2, WINDOW_DATA, ListEntry);
+            if (e2->ZOrder == INT_MAX)
+            {
+                // A window with no position from the last snapshot: the cache cannot describe it,
+                // so the whole ordering is untrustworthy. Fall through to today's behaviour.
+                n = 0;
+                break;
+            }
+            sorted[n++] = e2;
+            e2 = (WINDOW_DATA*)e2->ListEntry.Flink;
         }
-        g_ZOrderValid = FALSE;
-        return n;
+        if (n > 0)
+        {
+            for (UINT i = 0; i + 1 < n; i++)
+                for (UINT j = i + 1; j < n; j++)
+                    if (sorted[j]->ZOrder < sorted[i]->ZOrder)
+                    {
+                        WINDOW_DATA* t = sorted[i]; sorted[i] = sorted[j]; sorted[j] = t;
+                    }
+            g_ZOrderValid = TRUE;
+            g_ZCacheHit++;
+            g_ZCacheRun++;
+            return n;
+        }
+        g_ZCacheValid = FALSE;   // stale entry seen: do not trust this cache again
     }
+    // CACHE MISS. Something that can reorder windows has happened since the last snapshot, so
+    // take a fresh one - ONCE per such change, not once per frame. That is the whole economy of
+    // this cache: the old code paid EnumWindows per frame (and so was made to skip it entirely
+    // unless a popup was up); this pays it per ORDERING CHANGE. A drag does not reorder anything,
+    // so LOCATIONCHANGE does not bump the generation and a drag costs nothing here.
+    if (!anyPopup)
+        g_ZCacheMiss++;
 
     int next = 0;
     // EnumWindows can fail (observed: ERROR_INVALID_HANDLE). If it does, every ZOrder stays
@@ -6963,6 +7089,23 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
             }
             g_ZOrderValid = FALSE;
             break;
+        }
+    }
+
+    // A fresh snapshot was just taken (this is the only path that runs EnumWindows). Record the
+    // evidence it was taken under, so the next frames can tell whether it is still good.
+    ZOrderCacheStamp(g_ZOrderValid);
+    g_ZCacheRun = 0;          // fresh truth: the trust window restarts
+    g_ZCacheFresh++;
+    if (g_ProtoTrace)
+    {
+        static ULONGLONG zlast2 = 0;
+        const ULONGLONG znow2 = GetTickCount64();
+        if (znow2 - zlast2 > 5000)
+        {
+            zlast2 = znow2;
+            LogInfo("QGAPROTO,msg=ZCACHE,fresh=%llu,hit=%llu,miss=%llu,valid=%d",
+                g_ZCacheFresh, g_ZCacheHit, g_ZCacheMiss, g_ZOrderValid ? 1 : 0);
         }
     }
 
