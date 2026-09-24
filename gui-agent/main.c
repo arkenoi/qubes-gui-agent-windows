@@ -5649,14 +5649,19 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
             goto end;
         }
         // UNPLUG THE MONITOR: window 0 is down, so the desktop image is no longer anyone's to
-        // show. The grant itself lapses at the next capture start (StagingEnsure then suppresses
-        // it again) - revoking it here, under a daemon that has only just been told to unmap,
-        // is the unsafe ordering this path exists to avoid.
+        // show, and no further window-0 dump will be sent.
+        // HONEST LIMIT, stated because the first version of this comment claimed otherwise: the
+        // grant itself is NOT revoked here and does not lapse. Revoking a live grant mid-life,
+        // under a daemon that may still map those pages, is the unsafe ordering this whole path
+        // exists to avoid. So a guest that has entered non-seamless once keeps the desktop grant
+        // for the rest of the boot. A guest that never switches still never makes one, which is
+        // what P2 was for; "never granted" simply becomes "not granted until you ask for the
+        // desktop, once".
         if (g_DesktopGrantWanted)
         {
             g_DesktopGrantWanted = FALSE;
-            LogInfo("QGAFSFLASH seamless restored - desktop monitor unplugged, the grant lapses "
-                L"at the next capture start");
+            LogInfo("QGAFSFLASH seamless restored - desktop monitor unplugged (window 0 unmapped; "
+                L"the existing grant is kept, revoking it mid-life is unsafe)");
         }
     }
 

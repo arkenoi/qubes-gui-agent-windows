@@ -600,7 +600,28 @@ BOOL CaptureScreenGrantLive(void)
 static BOOL StagingEnsure(void)
 {
     if (g_Staging.handle)
-        return TRUE;
+    {
+        // The staging buffer SURVIVES capture restarts, and a bare "we already have one"
+        // early-out froze its GRANT state with it. That is what made the first two plug
+        // attempts never complete (measured on the rig 2026-09-24, twice): the buffer had been
+        // created UNGRANTED while seamless, so every later init returned here and the grant the
+        // switch was waiting for was never made.
+        if (CaptureScreenGrantLive() || NoScreenGrantActive())
+            return TRUE;   // state already matches what this mode wants
+
+        // Ungranted buffer, and the desktop monitor has just been plugged: the grant has to be
+        // made at allocation time, so release this one and fall through to build a granted one.
+        // Safe without any handshake - xc == NULL means dom0 was never given these pages (the
+        // same reasoning as the ungranted branch of CaptureStagingRevokeOnExit). The reverse
+        // direction is deliberately NOT done here: revoking a LIVE grant mid-life, under a
+        // daemon that may still map it, is the unsafe ordering, so an unplugged monitor leaves
+        // the grant in place until the process exits.
+        LogInfo("STAGING ungranted buffer released so the desktop grant can be made "
+            L"(monitor plugged, %lu pages)", (ULONG)g_Staging.page_count);
+        free(g_Staging.refs);
+        VirtualFree(g_Staging.buffer, 0, MEM_RELEASE);
+        ZeroMemory(&g_Staging, sizeof(g_Staging));
+    }
 
     if (!g_StagingGrant)
         return FALSE; // registry gate: direct-map A/B build
