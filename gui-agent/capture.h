@@ -104,6 +104,8 @@ typedef struct _CAPTURE_CONTEXT
 // initialize capture interfaces and map framebuffer
 CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event);
 BOOL CaptureScreenGrantLive(void);
+// Grant the already-allocated staging buffer in place, without tearing capture down.
+BOOL CaptureStagingGrantNow(void);
 // Acquire outcomes, so a frozen content-frame counter can be told apart from a stuck thread,
 // from every acquire timing out, and from DXGI reporting nothing presented.
 void CaptureAcquireStats(OUT LONG* present, OUT LONG* noPresent, OUT LONG* timeout,

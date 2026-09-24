@@ -653,6 +653,56 @@ BOOL CaptureScreenGrantLive(void)
     return g_StagingGrant ? (g_Staging.xc != NULL) : TRUE;
 }
 
+// GRANT THE EXISTING BUFFER, IN PLACE. Entering non-seamless needs the desktop grant, and the
+// only way to make one used to be a capture REPLUG - tear capture down, wait for the gui-daemon's
+// confirming MSG_DESTROY, restart. That is a dead end: measured 2026-09-25, the confirm does not
+// always arrive, and the agent sits in "CAPTUREGATE ... waiting for the gui-daemon confirm" with
+// capture down for ever. Two attempts to build on it each produced a worse failure than the one
+// they fixed.
+//
+// Nothing about making the grant actually requires any of that. Under P2 the staging buffer is
+// already allocated and already the local pixel source; it is simply UNGRANTED (xc == NULL, refs
+// zeroed). Granting it is one XcGnttabPermitForeignAccess2 over pages that are not moving. No
+// teardown, no handshake, no gate.
+BOOL CaptureStagingGrantNow(void)
+{
+    if (!g_StagingGrant)   return FALSE;  // direct-map build: the refs are always live
+    if (!g_Staging.handle) return FALSE;  // no buffer yet - CaptureInitialize will make a granted one
+    if (g_Staging.xc)      return TRUE;   // already granted
+
+    PXENCONTROL_CONTEXT xc = NULL;
+    DWORD status = XcOpen(XcLogger, &xc);
+    if (status != ERROR_SUCCESS || !xc)
+    {
+        win_perror2(status, "XcOpen (staging grant-in-place)");
+        return FALSE;
+    }
+    XcSetLogLevel(xc, LogGetLevel());
+
+    void* handle = NULL;
+    status = XcGnttabPermitForeignAccess2(xc,
+        g_GuiDomainId,
+        g_Staging.buffer,
+        (ULONG)g_Staging.page_count,
+        0,
+        0,
+        XENIFACE_GNTTAB_READONLY,
+        &handle,
+        g_Staging.refs);
+    if (status != ERROR_SUCCESS)
+    {
+        win_perror2(status, "XcGnttabPermitForeignAccess2 (staging grant-in-place)");
+        XcClose(xc);
+        return FALSE;
+    }
+
+    g_Staging.xc = xc;
+    g_Staging.handle = handle;
+    LogInfo("STAGING granted IN PLACE %lu pages - desktop monitor plugged with NO capture replug",
+        (ULONG)g_Staging.page_count);
+    return TRUE;
+}
+
 static BOOL StagingEnsure(void)
 {
     if (g_Staging.handle)

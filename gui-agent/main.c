@@ -364,6 +364,9 @@ static volatile LONG g_NonSeamlessWait = FS_WAIT_NONE;
 // bytes for a 5120x1384 image. The cause was the StagingEnsure early-out: the grant already
 // existed, so nothing re-sent the dump.
 static volatile BOOL g_DesktopDumpSent = FALSE;
+// Set when the grant was made IN PLACE (no capture restart), so nothing has sent dom0 the refs.
+// The main loop owns the capture context, so it does the send on its next pass.
+static volatile BOOL g_DesktopDumpNeeded = FALSE;
 static volatile ULONGLONG g_NonSeamlessPendingSince = 0;
 static volatile ULONGLONG g_FrameCount = 0;
 
@@ -5555,17 +5558,29 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
         // not merely for the grant, and asks for the replug that produces it either way.
         if (!CaptureScreenGrantLive())
         {
-            LogInfo("QGAFSFLASH non-seamless requested with no desktop grant - plugging the "
-                L"desktop monitor (capture replug); the switch completes when it is live");
-            g_NonSeamlessPending = TRUE;
-            g_NonSeamlessWait = FS_WAIT_GRANT;
-            g_NonSeamlessPendingSince = GetTickCount64();
-            if (g_CaptureErrorEvent)
-                SetEvent(g_CaptureErrorEvent);
+            // Plug the monitor by GRANTING THE EXISTING BUFFER IN PLACE. The old path asked for a
+            // capture replug, which tears capture down and waits for the gui-daemon's confirming
+            // MSG_DESTROY - a confirm that does not always arrive, leaving capture down for ever
+            // (measured 2026-09-25; two fixes built on it each made things worse). Nothing about
+            // making the grant needs a teardown: the buffer is already allocated and already the
+            // local pixel source, it is only ungranted.
+            if (CaptureStagingGrantNow())
+            {
+                g_DesktopDumpNeeded = TRUE;   // dom0 has no refs yet; the main loop sends them
+                LogInfo("QGAFSFLASH desktop monitor plugged in place - no capture replug; "
+                    L"dom0's refs go out on the next pass");
+            }
             else
-                LogWarning("QGAFSFLASH no capture-replug handle - the grant cannot be made, "
-                    L"staying seamless");
-            seamlessMode = TRUE;   // stay seamless for THIS pass
+            {
+                // No buffer yet (capture has not initialised), so a restart IS the only way to
+                // get one - and that restart is the normal startup path, not a forced replug.
+                LogInfo("QGAFSFLASH no staging buffer to grant yet - deferring the switch until "
+                    L"capture has one");
+                g_NonSeamlessPending = TRUE;
+                g_NonSeamlessWait = FS_WAIT_GRANT;
+                g_NonSeamlessPendingSince = GetTickCount64();
+                seamlessMode = TRUE;   // stay seamless for THIS pass
+            }
         }
     }
 
@@ -10727,6 +10742,26 @@ static ULONG WINAPI WatchForEvents(void)
                     g_ScreenWidth, g_ScreenHeight, g_HostScreenWidth, g_HostScreenHeight,
                     CaptureScreenGrantLive() ? 1 : 0, capture ? 1 : 0, captureDegraded ? 1 : 0,
                     g_FrameCount, g_SeamlessMode ? 1 : 0, g_DesktopGrantWanted ? 1 : 0);
+            }
+        }
+
+        // An in-place grant leaves dom0 without the refs: send them here, where the capture
+        // context lives. This is the same SendScreenGrants the capture-start path uses, so dom0
+        // adopts it exactly as it would a normal window-0 dump and answers with A6ACK.
+        if (g_DesktopDumpNeeded && capture && !exitLoop && g_VchanClientConnected)
+        {
+            g_DesktopDumpNeeded = FALSE;
+            const ULONG dumpStatus = SendScreenGrants(CaptureGrantPageCount(capture),
+                capture->grant_refs, capture->width, capture->height);
+            if (dumpStatus == ERROR_SUCCESS)
+            {
+                g_DesktopDumpSent = TRUE;
+                LogInfo("QGAFSFLASH window-0 refs sent for the in-place grant (%ux%u)",
+                    capture->width, capture->height);
+            }
+            else
+            {
+                win_perror2(dumpStatus, "SendScreenGrants (in-place grant)");
             }
         }
 
