@@ -345,6 +345,16 @@ static volatile BOOL g_NonSeamlessPending = FALSE;
 // because both completion hooks log when they FIRE and nothing logs when they do not, and an idle
 // guest now writes nothing at all. Jev, asked what would settle why the switch stalls, put a
 // main-loop stall reporter at 0.97 and refused a blind fix at 0.13.
+// WHY the entry is deferred. A single boolean conflated the two waits and made them fight: once
+// the monitor was plugged, "plugged" stayed true for ever, so the completion re-entered
+// SetSeamlessMode on every loop tick and re-requested the shrink before the previous one could
+// land - measured 2026-09-24, three flip cycles producing "Seamless mode changed to 1" fourteen
+// times and "changed to 0" never. Each deferral now records its own condition and is answered
+// only by that condition.
+#define FS_WAIT_NONE   0
+#define FS_WAIT_GRANT  1   /* waiting for the desktop monitor to be plugged */
+#define FS_WAIT_SHRINK 2   /* waiting for the desktop to shrink below host size */
+static volatile LONG g_NonSeamlessWait = FS_WAIT_NONE;
 static volatile ULONGLONG g_NonSeamlessPendingSince = 0;
 static volatile ULONGLONG g_FrameCount = 0;
 
@@ -5511,6 +5521,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     {
         LogInfo("QGAFSFLASH deferred non-seamless switch cancelled - seamless requested again");
         g_NonSeamlessPending = FALSE;
+        g_NonSeamlessWait = FS_WAIT_NONE;
     }
 
     LogVerbose("start");
@@ -5535,6 +5546,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
             LogInfo("QGAFSFLASH non-seamless requested with no desktop grant - plugging the "
                 L"desktop monitor (capture replug); the switch completes when it is live");
             g_NonSeamlessPending = TRUE;
+            g_NonSeamlessWait = FS_WAIT_GRANT;
             g_NonSeamlessPendingSince = GetTickCount64();
             if (g_CaptureErrorEvent)
                 SetEvent(g_CaptureErrorEvent);
@@ -5590,6 +5602,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
             L"shrinking to %ux%u first so window 0 cannot cover the screen; the switch completes "
             L"when the new mode lands", g_ScreenWidth, g_ScreenHeight, ww, wh);
         g_NonSeamlessPending = TRUE;
+        g_NonSeamlessWait = FS_WAIT_SHRINK;
         g_NonSeamlessPendingSince = GetTickCount64();
         (void)RequestResolutionChange((LONG)ww, (LONG)wh, L"non-seamless-entry");
         seamlessMode = TRUE;   // stay seamless for THIS pass
@@ -5702,6 +5715,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     if (!seamlessMode && g_NonSeamlessPending)
     {
         g_NonSeamlessPending = FALSE;
+        g_NonSeamlessWait = FS_WAIT_NONE;
         LogInfo("QGAFSFLASH non-seamless switch complete - nothing pending");
     }
 
@@ -5710,11 +5724,26 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     // disabled permanently in seamless. The seamless disable may no-op if the shell isn't up yet
     // (cold boot) — DaemonSettleSweep retries it until it sticks.
     if (seamlessMode)
+    {
         g_SeamlessShadowsDone = ApplyGuestShadows(FALSE);   // retried by the sweep until applied
+        // The rest of the seamless tweaks, applied HERE rather than only at Init. They were
+        // written when the mode never changed after startup, so Init was the only place they
+        // could go; now that dom0 can switch the mode at will they have to follow it (owner,
+        // 2026-09-24). Blank cursors: dom0 draws the pointer, so the guest's own would be a
+        // second one. No drop shadow, no window animation: dom0 draws the shadow, and an
+        // animation can never be smooth across the protocol.
+        HideCursors();
+        DisableEffects();
+    }
     else
     {
         ApplyGuestShadows(TRUE);                            // restore for fullscreen
         g_SeamlessShadowsDone = TRUE;                       // nothing to retry
+        // ...and hand the guest its own desktop back. Inside ONE dom0 window showing a whole
+        // Windows desktop, Windows should look like Windows: its own cursor (dom0 no longer
+        // draws one per guest window) and its ordinary shadows and animations.
+        RestoreCursors();
+        EnableEffects();
     }
 
     // The published IDD mode set is seamless-dependent (the host size is only in
@@ -8118,11 +8147,12 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
     // RecreateDuplication, which does NOT go through StartFrameProcessing - so a completion
     // hook there is never reached (measured 2026-08-28: the shrink landed, the switch did
     // not). Frames resuming is the one signal that always arrives.
-    if (g_NonSeamlessPending && g_HostScreenWidth > 0 &&
+    if (g_NonSeamlessPending && g_NonSeamlessWait == FS_WAIT_SHRINK && g_HostScreenWidth > 0 &&
         g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
         g_ScreenHeight < (g_HostScreenHeight * 99) / 100)
     {
         g_NonSeamlessPending = FALSE;
+        g_NonSeamlessWait = FS_WAIT_NONE;
         LogInfo("QGAFSFLASH desktop is now %ux%u (host %ux%u) - completing the deferred "
             L"non-seamless switch", g_ScreenWidth, g_ScreenHeight,
             g_HostScreenWidth, g_HostScreenHeight);
@@ -9617,9 +9647,12 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
             g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
             g_ScreenHeight < (g_HostScreenHeight * 99) / 100);
         const BOOL plugged = (g_DesktopGrantWanted && CaptureScreenGrantLive());
-        if (shrunk || plugged)
+        const BOOL ready = (g_NonSeamlessWait == FS_WAIT_GRANT)  ? plugged :
+                           (g_NonSeamlessWait == FS_WAIT_SHRINK) ? shrunk  : FALSE;
+        if (ready)
         {
             g_NonSeamlessPending = FALSE;
+            g_NonSeamlessWait = FS_WAIT_NONE;
             LogInfo("QGAFSFLASH completing the deferred non-seamless switch (%s): desktop "
                 L"%ux%u, host %ux%u", shrunk ? L"shrunk" : L"monitor plugged",
                 g_ScreenWidth, g_ScreenHeight, g_HostScreenWidth, g_HostScreenHeight);
@@ -10237,7 +10270,7 @@ static ULONG WINAPI WatchForEvents(void)
                     // is skipped with the dump.
                     capture->grants_changed = FALSE;
                     LogInfo("P2NOGRANT window-0 re-dump suppressed after duplication recovery");
-                    HideCursors();
+                    if (g_SeamlessMode) HideCursors();   // seamless only: see SetSeamlessMode
                 }
                 else if (capture->grants_changed)
                 {
@@ -10265,7 +10298,7 @@ static ULONG WINAPI WatchForEvents(void)
                         }
                     // externally-driven mode changes (not via SetVideoMode) also
                     // reload the cursor scheme - re-blank here too
-                    HideCursors();
+                    if (g_SeamlessMode) HideCursors();   // seamless only: see SetSeamlessMode
 
                         // A6: the re-grant may carry a new geometry (in-place resize).
                         // Follow the dump with MSG_CONFIGURE for window 0 at the granted
@@ -10650,9 +10683,12 @@ static ULONG WINAPI WatchForEvents(void)
                 g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
                 g_ScreenHeight < (g_HostScreenHeight * 99) / 100);
             const BOOL pluggedNow = (g_DesktopGrantWanted && CaptureScreenGrantLive());
-            if (shrunkNow || pluggedNow)
+            const BOOL ready = (g_NonSeamlessWait == FS_WAIT_GRANT)  ? pluggedNow :
+                               (g_NonSeamlessWait == FS_WAIT_SHRINK) ? shrunkNow  : FALSE;
+            if (ready)
             {
                 g_NonSeamlessPending = FALSE;
+                g_NonSeamlessWait = FS_WAIT_NONE;
                 LogInfo("QGAFSFLASH completing the deferred non-seamless switch from the loop "
                     L"(%s): desktop %ux%u, host %ux%u, frames=%I64u",
                     shrunkNow ? L"shrunk" : L"monitor plugged", g_ScreenWidth, g_ScreenHeight,

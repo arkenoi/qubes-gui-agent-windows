@@ -25,6 +25,8 @@
 extern DWORD g_DisableCursor;
 
 ULONG HideCursors(void);
+ULONG RestoreCursors(void);   // undo HideCursors when the guest leaves seamless
+ULONG EnableEffects(void);    // undo DisableEffects when the guest leaves seamless
 ULONG DisableEffects(void);
 HANDLE CreateNamedEvent(IN const WCHAR *name); // returns NULL on failure
 HANDLE CreateNamedMailslot(IN const WCHAR *name); // returns NULL on failure

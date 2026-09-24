@@ -1716,7 +1716,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
     // HideCursors()' blanked system cursors - the guest "shadow cursor" returns
     // (user-reported after resizes). Re-blank after every applied mode change;
     // HideCursors self-guards on DisableCursor and is idempotent.
-    HideCursors();
+    if (g_SeamlessMode) HideCursors();   // only a seamless guest wants blank cursors
 
     // M7: this size is now APPLIED (every RESKEEP path returned above), so it
     // earns its place in the LRU and will be published with the next mode set -
@@ -1863,7 +1863,8 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
             LogWarning("EnumDisplaySettings(ENUM_CURRENT_SETTINGS) failed, cannot verify applied resolution");
         }
 
-        HideCursors(); // mode change reloads the cursor scheme - re-blank (see exact path)
+        if (g_SeamlessMode)
+            HideCursors();   // a mode change reloads the cursor scheme - re-blank, seamless only
         g_ScreenWidth = width;
         g_ScreenHeight = height;
         // save last-set resolution to use on next startup
