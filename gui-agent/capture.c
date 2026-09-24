@@ -46,6 +46,21 @@
 
 volatile LONG g_CaptureThreadEnable = 0;
 
+// WHO CLEARS THE FLAG. A dead capture thread under a live capture pointer freezes dom0's desktop
+// while every log line says the agent is healthy, and the flag is the only thing that says the
+// thread left. There are four assignment sites and the log never said which one ran, so the
+// departure could not be attributed (Jev: stop-restart-race 0.71, but insufficient-evidence 0.80
+// on whether it is even new). Clearing it is rare - a stop, a failed start, or a thread giving up
+// - so naming the site costs nothing and answers the question in one run.
+#define CaptureEnableSet(v, site)  CaptureEnableSetAt((v), (site))
+static void CaptureEnableSetAt(LONG value, const WCHAR* site)
+{
+    const LONG prev = (LONG)InterlockedExchange(&g_CaptureThreadEnable, value);
+    if (prev != value)
+        LogInfo("QGACAPENABLE %s -> %d (was %d) [%s]",
+                value ? L"ENABLED" : L"CLEARED", value, prev, site);
+}
+
 // M0BLINK phase marker for the applied->repaint tail. The 470 ms between the mode
 // APPLY and the repaint is spent entirely on this thread plus one vchan round trip,
 // and until now nothing inside it was timestamped. Silent unless a novel-size obtain
@@ -965,11 +980,11 @@ HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx)
 {
     LogVerbose("start");
     HRESULT status = ERROR_SUCCESS;
-    InterlockedExchange(&g_CaptureThreadEnable, TRUE);
+    CaptureEnableSet(TRUE, L"CaptureStart");
     ctx->thread = CreateThread(NULL, 0, CaptureThread, ctx, 0, NULL);
     if (!ctx->thread)
     {
-        InterlockedExchange(&g_CaptureThreadEnable, FALSE);
+        CaptureEnableSet(FALSE, L"CaptureStart/CreateThread-failed");
         status = win_perror("CreateThread");
     }
 
@@ -980,7 +995,7 @@ HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx)
 void CaptureStop(IN OUT CAPTURE_CONTEXT* ctx)
 {
     LogVerbose("start");
-    InterlockedExchange(&g_CaptureThreadEnable, FALSE);
+    CaptureEnableSet(FALSE, L"CaptureStop");
     if (ctx->thread)
     {
         if (WaitForSingleObject(ctx->thread, 2 * FRAME_TIMEOUT) != WAIT_OBJECT_0)
@@ -1378,7 +1393,7 @@ static DWORD WINAPI CaptureThread(void* param)
                 LogWarning("failed to get frame");
             }
 
-            InterlockedExchange(&g_CaptureThreadEnable, FALSE);
+            CaptureEnableSet(FALSE, L"CaptureThread/get-frame-failed");
             // notify main loop, it'll reinitialize everything
             SetEvent(capture->error_event);
             break;
