@@ -340,6 +340,13 @@ volatile BOOL g_OnSecureDesktop = FALSE;
 // A non-seamless switch was asked for while the desktop was still host-sized: the agent
 // requested a windowed resolution first and completes the switch once that lands.
 static volatile BOOL g_NonSeamlessPending = FALSE;
+// When the pending switch was armed, and how many frames have reached ProcessNewFrame. Both exist
+// only for QGAFSSTALL below: a deferred switch that never completes is currently INVISIBLE,
+// because both completion hooks log when they FIRE and nothing logs when they do not, and an idle
+// guest now writes nothing at all. Jev, asked what would settle why the switch stalls, put a
+// main-loop stall reporter at 0.97 and refused a blind fix at 0.13.
+static volatile ULONGLONG g_NonSeamlessPendingSince = 0;
+static volatile ULONGLONG g_FrameCount = 0;
 
 // THE DESKTOP SURFACE IS A MONITOR WE PLUG AND UNPLUG (owner, 2026-09-24: "we just plug and
 // unplug a new monitor if we grant the switch. at same moment we map and unmap what we need").
@@ -5528,6 +5535,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
             LogInfo("QGAFSFLASH non-seamless requested with no desktop grant - plugging the "
                 L"desktop monitor (capture replug); the switch completes when it is live");
             g_NonSeamlessPending = TRUE;
+            g_NonSeamlessPendingSince = GetTickCount64();
             if (g_CaptureErrorEvent)
                 SetEvent(g_CaptureErrorEvent);
             else
@@ -5582,6 +5590,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
             L"shrinking to %ux%u first so window 0 cannot cover the screen; the switch completes "
             L"when the new mode lands", g_ScreenWidth, g_ScreenHeight, ww, wh);
         g_NonSeamlessPending = TRUE;
+        g_NonSeamlessPendingSince = GetTickCount64();
         (void)RequestResolutionChange((LONG)ww, (LONG)wh, L"non-seamless-entry");
         seamlessMode = TRUE;   // stay seamless for THIS pass
     }
@@ -8090,6 +8099,7 @@ static BOOL FrameRedundant(IN const CAPTURE_FRAME* frame, IN const BYTE* fb, IN 
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
     IN UINT fbWidth, IN UINT fbHeight)
 {
+    g_FrameCount++;   // QGAFSSTALL only; nothing is logged on the frame path
     // Complete a deferred non-seamless switch as soon as frames flow again at the smaller
     // size. This lives on the FRAME path deliberately: a resolution change can take the
     // capture down with 0x887a0026 (keyed mutex abandoned) and recover via
@@ -9899,6 +9909,7 @@ static ULONG WINAPI WatchForEvents(void)
     // A7/NEVEREXIT degraded no-capture state (see EnterCaptureDegraded)
     BOOL captureDegraded = FALSE;
     ULONGLONG captureRetryDue = 0;
+    ULONGLONG fsStallLast = 0;      // QGAFSSTALL rate limit
     ULONGLONG degradedLogLast = 0;
 
     while (TRUE)
@@ -10595,6 +10606,28 @@ static ULONG WINAPI WatchForEvents(void)
             else
                 DiscardWindowEvents();
             break;
+        }
+
+        // A DEFERRED SWITCH THAT NEVER COMPLETES MUST NOT BE SILENT. Both completion hooks log
+        // only when they fire, so a switch stuck behind them left no trace at all - measured
+        // 2026-09-24: the shrink landed (1280x800 confirmed from outside the agent) and then the
+        // log was empty for 95 s, which is indistinguishable from a healthy idle guest now that
+        // logging is conservative. This reports from the MAIN LOOP, so it speaks even when no
+        // frame ever arrives - which is the case the evidence could not exclude (Jev put the
+        // cause at insufficient-evidence 0.75 and this instrument at 0.97).
+        if (g_NonSeamlessPending && !exitLoop)
+        {
+            const ULONGLONG nowTick = GetTickCount64();
+            if (nowTick - fsStallLast >= 3000)
+            {
+                fsStallLast = nowTick;
+                LogWarning("QGAFSSTALL,age_ms=%I64u,screen=%ux%u,host=%ux%u,grant=%d,"
+                    L"capture=%d,degraded=%d,frames=%I64u,seamless=%d,wanted=%d",
+                    g_NonSeamlessPendingSince ? nowTick - g_NonSeamlessPendingSince : 0,
+                    g_ScreenWidth, g_ScreenHeight, g_HostScreenWidth, g_HostScreenHeight,
+                    CaptureScreenGrantLive() ? 1 : 0, capture ? 1 : 0, captureDegraded ? 1 : 0,
+                    g_FrameCount, g_SeamlessMode ? 1 : 0, g_DesktopGrantWanted ? 1 : 0);
+            }
         }
 
         // A7/NEVEREXIT: degraded-state capture re-init. Runs on the wait timeout armed
