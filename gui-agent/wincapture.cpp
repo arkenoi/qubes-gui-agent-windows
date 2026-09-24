@@ -97,7 +97,21 @@ struct Channel
 // anyway AND competes with the application's own painting - and a burst of Explorer windows is
 // exactly that case. Two workers keep one slow application from blocking every other window
 // (the structural defect, rated 0.92) without piling four synchronous renders onto one shell.
-#define WC_WORKERS 2
+// ONE. Parallel capture was built, measured on a validated instrument, and did not earn its
+// keep. With a deliberately slow-painting (not hung) window present, two workers improved a new
+// window's TIME TO APPEAR (median 613 -> 493 ms) but regressed its TIME TO STABLE (median 829 ->
+// 1372 ms) - and time-to-stable is the metric Jev rated as matching what the owner actually
+// perceives (0.84), with time-to-first-pixels rated as flattering (0.87). Jev's verdict on the
+// result leaned revert (0.46 revert / 0.29 insufficient / 0.14 keep).
+// The structural criticism remains TRUE and is recorded rather than fixed: this is one thread, and
+// every capture blocks it for another application's paint time, so one slow application still
+// delays every other window's refresh. What is NOT true is that four - or two - concurrent
+// PrintWindows are an improvement: PrintWindow executes on the TARGET window's UI thread, so
+// concurrency there competes with the very painting it is waiting for. A real fix has to stop
+// blocking on other processes, not do more of it at once.
+// The pool machinery is kept (per-channel busy claim, per-worker wake) so the count is one
+// constant away, but it ships at 1 until something measures better.
+#define WC_WORKERS 1
 
 struct Engine
 {
