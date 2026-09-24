@@ -110,7 +110,15 @@ void PwInit(void)
     // The knob exists so the two can be A/B'd on one build instead of shipping a binary per
     // hypothesis; it is read once, like every other capability here.
     DWORD workers = 1;
-    CfgReadDword(NULL, L"CaptureWorkers", &workers, NULL);
+    {
+        // CfgReadDword(NULL, ...) does NOT read the module key - measured 2026-09-24: the value
+        // was present under ...\Qubes Tools\gui-agent, beside a ProtoTrace that the agent reads
+        // fine, and this call never saw it. Every knob that works here passes an explicit module
+        // name from CfgGetModuleName (see perf.c); do the same.
+        WCHAR mod[CFG_MODULE_MAX];
+        if (ERROR_SUCCESS == CfgGetModuleName(mod, RTL_NUMBER_OF(mod)))
+            (void)CfgReadDword(mod, L"CaptureWorkers", &workers, NULL);
+    }
     status = WcInit(PwOnDamage, workers);
     if (status != ERROR_SUCCESS)
     {
