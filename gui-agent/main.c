@@ -10398,7 +10398,15 @@ static ULONG WINAPI WatchForEvents(void)
 
         case 3:
             LogVerbose("fullscreen off");
-            status = SetSeamlessMode(TRUE, FALSE);
+            // forceUpdate, NOT the bare mode compare. dom0 asking for seamless must RE-ASSERT,
+            // because the state it has to repair is precisely the one where g_SeamlessMode is
+            // already TRUE: a non-seamless entry that shrank the desktop and then never
+            // completed leaves the guest seamless at 1280x800, and the early-out
+            // `g_SeamlessMode == seamlessMode && !forceUpdate` returned before the
+            // seamless branch could force the host resolution back. Measured 2026-09-24:
+            // three flip cycles, every one reporting screen=1280x800, only ONE mode change
+            // logged - the guest was stranded small and every later request was a no-op.
+            status = SetSeamlessMode(TRUE, TRUE);
             if (ERROR_SUCCESS != status)
             {
                 // NEVEREXIT (CONVERT, was exitLoop): see case 2.
@@ -10630,7 +10638,28 @@ static ULONG WINAPI WatchForEvents(void)
         if (g_NonSeamlessPending && !exitLoop)
         {
             const ULONGLONG nowTick = GetTickCount64();
-            if (nowTick - fsStallLast >= 3000)
+            // COMPLETE IT HERE. The frame-path hook carries the comment "Frames resuming is the
+            // one signal that always arrives"; measured 2026-09-24 that is FALSE on this path -
+            // the counter sat frozen at 344 across three full flip cycles while the switch waited
+            // for it. The loop tick is a signal that actually always arrives. Completing from
+            // here was rated 0.02 by Jev while it was still possible that window 0 would be
+            // mapped over a framebuffer nothing refreshes; that risk is now excluded by
+            // measurement - a per-window capture of the mapped desktop showed a LIVE 5120x1384
+            // Windows desktop, not black and not frozen.
+            const BOOL shrunkNow = (g_HostScreenWidth > 0 &&
+                g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
+                g_ScreenHeight < (g_HostScreenHeight * 99) / 100);
+            const BOOL pluggedNow = (g_DesktopGrantWanted && CaptureScreenGrantLive());
+            if (shrunkNow || pluggedNow)
+            {
+                g_NonSeamlessPending = FALSE;
+                LogInfo("QGAFSFLASH completing the deferred non-seamless switch from the loop "
+                    L"(%s): desktop %ux%u, host %ux%u, frames=%I64u",
+                    shrunkNow ? L"shrunk" : L"monitor plugged", g_ScreenWidth, g_ScreenHeight,
+                    g_HostScreenWidth, g_HostScreenHeight, g_FrameCount);
+                (void)SetSeamlessMode(FALSE, TRUE);
+            }
+            else if (nowTick - fsStallLast >= 3000)
             {
                 fsStallLast = nowTick;
                 LogWarning("QGAFSSTALL,age_ms=%I64u,screen=%ux%u,host=%ux%u,grant=%d,"
