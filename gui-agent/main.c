@@ -5739,10 +5739,17 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     {
         ApplyGuestShadows(TRUE);                            // restore for fullscreen
         g_SeamlessShadowsDone = TRUE;                       // nothing to retry
-        // ...and hand the guest its own desktop back. Inside ONE dom0 window showing a whole
-        // Windows desktop, Windows should look like Windows: its own cursor (dom0 no longer
-        // draws one per guest window) and its ordinary shadows and animations.
-        RestoreCursors();
+        // ...and hand the guest its shadows and animations back: inside ONE dom0 window showing
+        // a whole Windows desktop, Windows should look like Windows.
+        //
+        // The CURSOR deliberately does NOT come back. I restored it here first and the owner
+        // caught it: the guest cursor stays blanked in BOTH modes. The README is the
+        // specification and says so - dom0 "draws its own pointer over the guest window while
+        // the guest also paints one into the captured frame, IN EVERY MODE" - and non-seamless
+        // changes nothing about that, because dom0 still draws its pointer over the one desktop
+        // window exactly as it does over a per-window one. Restoring it would hand back the
+        // doubled cursor this build exists to remove. (Jev: stay-blanked-both-modes 0.74,
+        // README binds 0.75.)
         EnableEffects();
     }
 
@@ -10270,7 +10277,7 @@ static ULONG WINAPI WatchForEvents(void)
                     // is skipped with the dump.
                     capture->grants_changed = FALSE;
                     LogInfo("P2NOGRANT window-0 re-dump suppressed after duplication recovery");
-                    if (g_SeamlessMode) HideCursors();   // seamless only: see SetSeamlessMode
+                    HideCursors();
                 }
                 else if (capture->grants_changed)
                 {
@@ -10298,7 +10305,7 @@ static ULONG WINAPI WatchForEvents(void)
                         }
                     // externally-driven mode changes (not via SetVideoMode) also
                     // reload the cursor scheme - re-blank here too
-                    if (g_SeamlessMode) HideCursors();   // seamless only: see SetSeamlessMode
+                    HideCursors();
 
                         // A6: the re-grant may carry a new geometry (in-place resize).
                         // Follow the dump with MSG_CONFIGURE for window 0 at the granted

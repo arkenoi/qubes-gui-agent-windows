@@ -262,17 +262,6 @@ ULONG EnableEffects(void)
     return ERROR_SUCCESS;
 }
 
-// Undo HideCursors. SPI_SETCURSORS reloads every system cursor from the registry scheme, which is
-// the documented way to drop the blank cursors SetSystemCursor installed - there is no per-cursor
-// "give it back", because SetSystemCursor destroys the previous handle.
-ULONG RestoreCursors(void)
-{
-    LogDebug("restoring system cursors");
-    if (!SystemParametersInfo(SPI_SETCURSORS, 0, NULL, SPIF_SENDCHANGE))
-        return win_perror("SystemParametersInfo(SPI_SETCURSORS)");
-    return ERROR_SUCCESS;
-}
-
 ULONG DisableEffects(void)
 {
     ANIMATIONINFO animationInfo;
