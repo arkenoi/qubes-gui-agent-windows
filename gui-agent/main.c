@@ -5657,7 +5657,15 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
         // for the rest of the boot. A guest that never switches still never makes one, which is
         // what P2 was for; "never granted" simply becomes "not granted until you ask for the
         // desktop, once".
-        if (g_DesktopGrantWanted)
+        // ...but ONLY when this is a real return to seamless. The geometry guard reaches this
+        // same branch by COERCING seamlessMode back to TRUE while it shrinks the desktop, and
+        // that is a deferral of the switch, not a cancellation of it: unplugging there undid the
+        // plug that had just succeeded, one line after it succeeded (measured on the rig
+        // 2026-09-24 - "completing the deferred non-seamless switch (monitor plugged)" followed
+        // immediately by "desktop monitor unplugged"). A genuine seamless request clears
+        // g_NonSeamlessPending at the top of this function, so a pending switch here means the
+        // guard is still working and the monitor must stay plugged.
+        if (g_DesktopGrantWanted && !g_NonSeamlessPending)
         {
             g_DesktopGrantWanted = FALSE;
             LogInfo("QGAFSFLASH seamless restored - desktop monitor unplugged (window 0 unmapped; "
