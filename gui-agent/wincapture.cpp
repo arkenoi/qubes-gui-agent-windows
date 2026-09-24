@@ -59,6 +59,11 @@ struct Channel
     std::atomic<bool> ddaOwned{ false };
     // A channel that has never been captured jumps the queue - see the two-pass service loop.
     std::atomic<bool> firstPending{ true };
+    // Claimed by exactly one capture worker at a time. CaptureAndDiff writes this channel's
+    // buffer and its failure counters, so two workers must never be inside the same channel;
+    // different channels are independent (every GDI object in CaptureAndDiff is local to the
+    // call and it does not touch the Engine at all).
+    std::atomic<bool> busy{ false };
     int failures = 0;
     bool dead = false;
     // Telemetry (added for the 2026-08-27 field black-window diagnosis: this engine
@@ -76,9 +81,19 @@ struct Channel
     int maskCount = 0;
 };
 
+// CAPTURE WORKERS. Every capture is a PrintWindow that round-trips synchronously into a
+// DIFFERENT application's UI thread, measured at 32-438 ms each on this guest, so with a single
+// thread one slow application delayed the refresh of every other window and a new window's first
+// frame queued behind all of them. The owner saw it as "the first window was snappy. subsequent
+// ones were not." Jev rated the serial design a structural latency defect at 0.92 and parallel
+// capture as the fix at 0.86. Four is chosen to cover the handful of windows that are actually
+// changing at once without multiplying PrintWindow pressure on the shell; the work is I/O-ish
+// (waiting on other processes), not CPU-bound, so this is not sized to core count.
+#define WC_WORKERS 4
+
 struct Engine
 {
-    HANDLE thread = nullptr;
+    HANDLE threads[WC_WORKERS] = {};
     std::atomic<bool> quit{ false };
     SRWLOCK lock = SRWLOCK_INIT;                 // guards channels vector
     std::vector<std::unique_ptr<Channel>> channels;
@@ -90,15 +105,22 @@ struct Engine
     // the loop waits on it instead of Sleep(8). Before this the thread woke ~125x/s for
     // the agent's whole life on an idle desktop, taking the lock and walking every
     // channel to find nothing, and a dirty mark could sit up to 8 ms before service.
-    HANDLE wake = nullptr;
+    // One auto-reset wake per worker: an auto-reset event releases exactly ONE waiter, so a
+    // single shared event would wake one worker and leave the others asleep with work pending.
+    HANDLE wake[WC_WORKERS] = {};
 };
+
+// Per-worker start context (the thread proc needs to know which slot it is).
+struct WorkerCtx { Engine* eng; int id; };
+static WorkerCtx g_wctx[WC_WORKERS];
 
 // Set-after-store: an auto-reset event stays signalled until a wait consumes it, so a
 // mark landing between the consumer's channel walk and its wait is never lost.
 void WakeCapture(Engine& e)
 {
-    if (e.wake)
-        SetEvent(e.wake);
+    for (int i = 0; i < WC_WORKERS; i++)
+        if (e.wake[i])
+            SetEvent(e.wake[i]);
 }
 
 Engine* g_eng = nullptr;
@@ -308,7 +330,9 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
 
 DWORD WINAPI CaptureThread(LPVOID param)
 {
-    Engine& e = *(Engine*)param;
+    WorkerCtx* wc = (WorkerCtx*)param;
+    Engine& e = *wc->eng;
+    const int id = wc->id;
     AttachThreadToInputDesktop();
     std::vector<DamageOut> fired;
     while (!e.quit.load())
@@ -320,8 +344,11 @@ DWORD WINAPI CaptureThread(LPVOID param)
 
         // round-robin sweep slot: pick one live channel per interval and mark it
         // dirty, so guest-occluded windows (invisible to DDA) still converge
+        // Only worker 0 runs the round-robin bookkeeping: lastSweep/sweepNext are shared
+        // cursors, not per-channel state, and marking is cheap. Every worker then SERVICES
+        // whatever is dirty, so the sweep's single owner is not a bottleneck.
         DWORD now = GetTickCount();
-        if (n > 0 && (now - e.lastSweep) >= SWEEP_INTERVAL_MS)
+        if (id == 0 && n > 0 && (now - e.lastSweep) >= SWEEP_INTERVAL_MS)
         {
             e.lastSweep = now;
             for (size_t k = 0; k < n; k++)
@@ -359,8 +386,17 @@ DWORD WINAPI CaptureThread(LPVOID param)
             // ddaOwned checked BEFORE consuming dirty: a mark arriving while the frame
             // loop owns the buffer stays pending and is served when ownership drops,
             // instead of being eaten here or triggering a write into an owned buffer.
-            if (c.dead || c.ddaOwned.load() || !c.dirty.exchange(false))
+            if (c.dead || c.ddaOwned.load())
                 continue;
+            // Claim BEFORE consuming dirty, so a channel another worker is already capturing
+            // is skipped without swallowing its mark.
+            if (c.busy.exchange(true))
+                continue;
+            if (!c.dirty.exchange(false))
+            {
+                c.busy.store(false);
+                continue;
+            }
             if (isFirst)
                 c.firstPending.store(false);   // cleared once served, success or not
             didWork = true;
@@ -386,6 +422,7 @@ DWORD WINAPI CaptureThread(LPVOID param)
                 AttachThreadToInputDesktop();
                 c.dirty.store(true);
             }
+            c.busy.store(false);
         }
         ReleaseSRWLockShared(&e.lock);
 
@@ -412,8 +449,8 @@ DWORD WINAPI CaptureThread(LPVOID param)
                 waitMs = sinceSweep >= SWEEP_INTERVAL_MS ? 1 : SWEEP_INTERVAL_MS - sinceSweep;
             }
         }
-        if (e.wake)
-            WaitForSingleObject(e.wake, waitMs);
+        if (e.wake[id])
+            WaitForSingleObject(e.wake[id], waitMs);
         else
             Sleep(waitMs);
     }
@@ -440,16 +477,39 @@ ULONG WcInit(WC_DAMAGE_CALLBACK callback)
         return ERROR_ALREADY_INITIALIZED;
     auto e = std::make_unique<Engine>();
     e->callback = callback;
-    e->wake = CreateEventW(nullptr, FALSE /*auto-reset*/, FALSE, nullptr);
-    if (!e->wake)
-        return GetLastError();
-    e->thread = CreateThread(nullptr, 0, CaptureThread, e.get(), 0, nullptr);
-    if (!e->thread)
+    for (int i = 0; i < WC_WORKERS; i++)
+    {
+        e->wake[i] = CreateEventW(nullptr, FALSE /*auto-reset*/, FALSE, nullptr);
+        if (!e->wake[i])
+        {
+            ULONG err = GetLastError();
+            for (int j = 0; j < i; j++) CloseHandle(e->wake[j]);
+            return err;
+        }
+    }
+    // The pool must be fully constructed before any worker runs: a worker dereferences
+    // g_wctx[i].eng immediately, and worker 0 owns the sweep cursors.
+    int started = 0;
+    for (int i = 0; i < WC_WORKERS; i++)
+    {
+        g_wctx[i].eng = e.get();
+        g_wctx[i].id = i;
+        e->threads[i] = CreateThread(nullptr, 0, CaptureThread, &g_wctx[i], 0, nullptr);
+        if (!e->threads[i])
+            break;
+        started++;
+    }
+    if (started == 0)
     {
         ULONG err = GetLastError();
-        CloseHandle(e->wake);
+        for (int i = 0; i < WC_WORKERS; i++) CloseHandle(e->wake[i]);
         return err;
     }
+    // A partially started pool is FINE and is not silently accepted: it still captures, just
+    // with less parallelism, and worker 0 (the sweep owner) is started first.
+    if (started < WC_WORKERS)
+        LogWarning("WCPOOL only %d of %d capture workers started (0x%x) - capture continues "
+            "with reduced parallelism", started, WC_WORKERS, GetLastError());
     g_eng = e.release();
     return ERROR_SUCCESS;
 }
@@ -460,13 +520,21 @@ void WcShutdown(void)
         return;
     g_eng->quit.store(true);
     WakeCapture(*g_eng); // the idle wait is now up to SWEEP_INTERVAL_MS; cut it short
-    WaitForSingleObject(g_eng->thread, 5000);
-    CloseHandle(g_eng->thread);
+    for (int i = 0; i < WC_WORKERS; i++)
+    {
+        if (!g_eng->threads[i])
+            continue;
+        // Each worker can be parked inside a PrintWindow on a hung application, so give the
+        // same 5 s per worker the single thread used to get - they wait concurrently.
+        WaitForSingleObject(g_eng->threads[i], 5000);
+        CloseHandle(g_eng->threads[i]);
+    }
     AcquireSRWLockExclusive(&g_eng->lock);
     g_eng->channels.clear();
     ReleaseSRWLockExclusive(&g_eng->lock);
-    if (g_eng->wake)
-        CloseHandle(g_eng->wake);
+    for (int i = 0; i < WC_WORKERS; i++)
+        if (g_eng->wake[i])
+            CloseHandle(g_eng->wake[i]);
     delete g_eng;
     g_eng = nullptr;
 }
