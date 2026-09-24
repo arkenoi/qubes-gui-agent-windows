@@ -9977,6 +9977,7 @@ static ULONG WINAPI WatchForEvents(void)
     ULONGLONG captureRetryDue = 0;
     ULONGLONG fsStallLast = 0;      // QGAFSSTALL rate limit
     ULONGLONG capStatLast = 0;      // QGACAPSTAT rate limit
+    BOOL capDeadReported = FALSE;   // QGACAPDEAD fires once per departure, not once per pass
     ULONGLONG degradedLogLast = 0;
 
     while (TRUE)
@@ -10745,14 +10746,24 @@ static ULONG WINAPI WatchForEvents(void)
             LONG cLoops = 0, cInside = 0, cEnabled = 1;
             LONGLONG cAge = -1, cInsideMs = -1;
             CaptureThreadStats(&cLoops, &cAge, &cInside, &cInsideMs, &cEnabled);
-            if (!cEnabled)
+            // ONCE per departure, not once per pass. Unrate-limited this re-fired the
+            // capture-error event on every main-loop iteration the moment the flag was clear,
+            // which churned the capture gate and left the agent RESTART-LOOPING - four log files
+            // in twelve minutes, measured 2026-09-25. The detection is sound; firing it in a loop
+            // was not. Re-arms only after the thread is seen enabled again.
+            if (!cEnabled && !capDeadReported)
             {
+                capDeadReported = TRUE;
                 LogWarning("QGACAPDEAD capture thread has left (enabled=0) while a capture "
                     L"context is live - loops=%d, last loop %I64d ms ago, inside=%d. dom0's "
-                    L"desktop image is frozen; forcing the capture-error recovery path.",
+                    L"desktop image is frozen; forcing the capture-error recovery path ONCE.",
                     cLoops, cAge, cInside);
                 if (g_CaptureErrorEvent)
                     SetEvent(g_CaptureErrorEvent);
+            }
+            else if (cEnabled)
+            {
+                capDeadReported = FALSE;   // thread is back: re-arm the detection
             }
         }
 
