@@ -10763,7 +10763,16 @@ static ULONG WINAPI WatchForEvents(void)
         // An in-place grant leaves dom0 without the refs: send them here, where the capture
         // context lives. This is the same SendScreenGrants the capture-start path uses, so dom0
         // adopts it exactly as it would a normal window-0 dump and answers with A6ACK.
-        if (g_DesktopDumpNeeded && capture && !exitLoop && g_VchanClientConnected)
+        // ...but ONLY while the screen window is announced. A window-0 dump sent when the daemon
+        // has no CREATE(0) outstanding is a protocol violation, and gui-daemon answers a message
+        // without a CREATE by calling exit(1) - which takes the qube's whole GUI down with it.
+        // Measured 2026-09-25: after one good cycle the agent logged "no gui-daemon client in
+        // 90000 ms ... this is a LOST session, dom0's gui-daemon most likely exited", then exited
+        // for the watchdog to respawn it, and the following cycles mapped no windows at all. The
+        // same hazard is already called out in SetSeamlessMode, which records the mode only when
+        // the screen window is not announced rather than sending MAP/UNMAP into that state.
+        if (g_DesktopDumpNeeded && capture && !exitLoop && g_VchanClientConnected &&
+            g_ScreenAnnounced)
         {
             g_DesktopDumpNeeded = FALSE;
             const ULONG dumpStatus = SendScreenGrants(CaptureGrantPageCount(capture),
