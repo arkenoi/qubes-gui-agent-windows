@@ -5614,7 +5614,15 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     // 5120x1384 on a 5120x1440 host - full width, 96% of height, visually the whole screen - did
     // not trip it (Jev: that violates the binding never-fullscreen rule, 0.60). Covering the full
     // width and nearly the full height IS covering the screen.
-    const BOOL enteringNonSeamless = (!seamlessMode && g_SeamlessMode);
+    // The FIRST application after startup counts as an entry too. The mode persists in the
+    // registry, so a guest that was left non-seamless BOOTS straight into it and never makes a
+    // seamless -> non-seamless transition - measured 2026-09-25: cycles 2 and 3 entered at
+    // 1280x800 as intended while cycle 1, straight off a cold boot, came up at 5120x1384 and
+    // covered the host screen again. Booting is not the user asking for that size either.
+    static BOOL s_modeAppliedOnce = FALSE;
+    const BOOL firstApply = !s_modeAppliedOnce;
+    s_modeAppliedOnce = TRUE;
+    const BOOL enteringNonSeamless = (!seamlessMode && (g_SeamlessMode || firstApply));
     const BOOL coversHost =
         (g_HostScreenWidth > 0 && g_HostScreenHeight > 0 &&
          g_ScreenWidth  >= (g_HostScreenWidth  * 95) / 100 &&
