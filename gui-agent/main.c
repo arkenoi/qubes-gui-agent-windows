@@ -7433,6 +7433,16 @@ static int PwCollectOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
     return n;
 }
 
+// ABI 5 reads the broker's first-frame stage ticks as QPC counts; this is the matching agent-side
+// read for "now". Independent of g_PerfEnabled - BROKERCHAIN must measure whether or not the perf
+// sink is on, and PerfNow() returns 0 when it is off.
+static LONGLONG QpcNowAgent(void)
+{
+    LARGE_INTEGER q;
+    if (!QueryPerformanceCounter(&q)) return 0;
+    return q.QuadPart;
+}
+
 static BOOL PwOccludedByAbove(IN const WINDOW_DATA* self, IN const RECT* rect)
 {
     RECT hit;
@@ -8364,6 +8374,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 const WGCBRK_SLOT* bs =
                                     &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
                                 const LONGLONG o = bs->OpenTick;
+                                // ABI 5: the stage ticks are QPC COUNTS. Cached once - the
+                                // frequency is fixed for the life of the system.
+                                static LONGLONG s_qpf = 0;
+                                if (!s_qpf)
+                                {
+                                    LARGE_INTEGER f;
+                                    if (QueryPerformanceFrequency(&f)) s_qpf = f.QuadPart;
+                                }
+                                #define BC_MS(t) ((s_qpf && (t)) \
+                                    ? (LONGLONG)(((t) - o) * 1000 / s_qpf) : (LONGLONG)-1)
+                                #define BC_NOW_MS() (s_qpf && o ? BC_MS(QpcNowAgent()) : (LONGLONG)-1)
                                 // Are these ticks OURS? Slots are RECYCLED, and OpenChannel
                                 // stamps OpenTick then zeroes the stages before it can fail on
                                 // a window that has already gone - so a later FAILED open of
@@ -8393,7 +8414,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                             ? L"ticks-describe-another-window"
                                             : (!bs->TickOpenOk ? L"open-not-completed"
                                                                : L"no-open-recorded"),
-                                        o ? (LONGLONG)GetTickCount64() - o : -1);
+                                        BC_NOW_MS());
                                 }
                                 else if (bs->TickPw)
                                 {
@@ -8413,12 +8434,12 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                         "path=printwindow,fallback_ms=%lld,firstpoll_ms=%lld,"
                                         "pwret_ms=%lld,publish_ms=%lld,polls=%d,consumed_ms=%lld",
                                         (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
-                                        bs->ItemTick          ? bs->ItemTick - o          : -1,
-                                        bs->StartTick         ? bs->StartTick - o         : -1,
-                                        bs->FirstArrivedTick  ? bs->FirstArrivedTick - o  : -1,
-                                        bs->FirstPublishTick  ? bs->FirstPublishTick - o  : -1,
+                                        BC_MS(bs->ItemTick),
+                                        BC_MS(bs->StartTick),
+                                        BC_MS(bs->FirstArrivedTick),
+                                        BC_MS(bs->FirstPublishTick),
                                         (int)bs->PollCount,
-                                        o ? (LONGLONG)GetTickCount64() - o : -1);
+                                        BC_NOW_MS());
                                 }
                                 else
                                 {
@@ -8426,13 +8447,15 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                     "path=wgc,item_ms=%lld,pool_ms=%lld,start_ms=%lld,"
                                     "arrived_ms=%lld,publish_ms=%lld,consumed_ms=%lld",
                                     (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
-                                    bs->ItemTick          ? bs->ItemTick - o          : -1,
-                                    bs->PoolTick          ? bs->PoolTick - o          : -1,
-                                    bs->StartTick         ? bs->StartTick - o         : -1,
-                                    bs->FirstArrivedTick  ? bs->FirstArrivedTick - o  : -1,
-                                    bs->FirstPublishTick  ? bs->FirstPublishTick - o  : -1,
-                                    o ? (LONGLONG)GetTickCount64() - o : -1);
+                                    BC_MS(bs->ItemTick),
+                                    BC_MS(bs->PoolTick),
+                                    BC_MS(bs->StartTick),
+                                    BC_MS(bs->FirstArrivedTick),
+                                    BC_MS(bs->FirstPublishTick),
+                                    BC_NOW_MS());
                                 }
+                                #undef BC_NOW_MS
+                                #undef BC_MS
                             }
                         }
                     }

@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  4u   /* 4: ticks cover the PrintWindow path too (TickPw/PollCount) */
+#define WGCBRK_ABI_VERSION  5u   /* 5: first-frame stage ticks are QPC counts, not ms */
 #define WGCBRK_MAX_SLOTS    32
 #define WGCBRK_RING         2             /* double buffer; 3 kills reader retries at 1.5x mem */
 
@@ -93,6 +93,13 @@ typedef struct _WGCBRK_SLOT {
     volatile UINT64   TickHwnd;          /* Hwnd the ticks below belong to; 0 = never opened */
     volatile LONG     TickOpenOk;        /* 1 once this open is past the point that can fail */
     volatile LONG     TickPw;            /* 1 = polled PrintWindow path, 0 = WGC */
+    /* ABI 5: these six are QueryPerformanceCounter COUNTS, not milliseconds - the reader divides
+     * by QueryPerformanceFrequency. GetTickCount64 advances in ~15.6 ms steps and every component
+     * of a menu's first-content latency measured 16-31 ms, i.e. one or two of those steps: across
+     * 4 runs of ONE unchanged binary the ranking of the four components inverted every time and
+     * each was both largest and smallest at least once (Jev: clock-resolution 0.81). The split was
+     * quantisation noise. The heartbeat and CaptureTick fields stay on GetTickCount64 - they are
+     * compared against it elsewhere. */
     volatile LONGLONG OpenTick;          /* OpenChannel entered (both paths) */
     volatile LONGLONG ItemTick;          /* WGC: CreateForWindow returned.     PW: unused (0) */
     volatile LONGLONG PoolTick;          /* WGC: pool + session created.       PW: unused (0) */
