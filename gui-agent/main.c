@@ -9567,14 +9567,27 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
     // window 0 can now be mapped at a size that does not cover the host screen.
     if (g_NonSeamlessPending)
     {
-        if (g_HostScreenWidth > 0 &&
+        // Two different waits end here, and BOTH must be answered before the re-apply below,
+        // because that re-apply passes g_SeamlessMode (still TRUE) and would hit the
+        // "seamless requested again" cancel at the top of SetSeamlessMode - which is exactly
+        // what swallowed the first plug attempt (measured 2026-09-24: plug logged, then
+        // "deferred non-seamless switch cancelled" 1.4 s later, from this very call).
+        //   (a) waiting for the desktop to SHRINK so window 0 cannot cover the host screen;
+        //   (b) waiting for the desktop MONITOR to be plugged - the grant that the desktop
+        //       window's image comes from. Nothing can be mapped before it exists, and once it
+        //       does the switch is retried; the geometry guard inside SetSeamlessMode then
+        //       performs (a) itself if the desktop is still host-sized, so the two compose
+        //       instead of racing.
+        const BOOL shrunk = (g_HostScreenWidth > 0 &&
             g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
-            g_ScreenHeight < (g_HostScreenHeight * 99) / 100)
+            g_ScreenHeight < (g_HostScreenHeight * 99) / 100);
+        const BOOL plugged = (g_DesktopGrantWanted && CaptureScreenGrantLive());
+        if (shrunk || plugged)
         {
             g_NonSeamlessPending = FALSE;
-            LogInfo("QGAFSFLASH desktop is now %ux%u (host %ux%u) - completing the deferred "
-                L"non-seamless switch", g_ScreenWidth, g_ScreenHeight,
-                g_HostScreenWidth, g_HostScreenHeight);
+            LogInfo("QGAFSFLASH completing the deferred non-seamless switch (%s): desktop "
+                L"%ux%u, host %ux%u", shrunk ? L"shrunk" : L"monitor plugged",
+                g_ScreenWidth, g_ScreenHeight, g_HostScreenWidth, g_HostScreenHeight);
             status = SetSeamlessMode(FALSE, TRUE);
             if (status != ERROR_SUCCESS)
                 win_perror2(status, "SetSeamlessMode(FALSE) after shrink");
