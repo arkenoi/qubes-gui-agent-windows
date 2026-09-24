@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  3u   /* 3: first-frame ticks carry the hwnd they describe */
+#define WGCBRK_ABI_VERSION  4u   /* 4: ticks cover the PrintWindow path too (TickPw/PollCount) */
 #define WGCBRK_MAX_SLOTS    32
 #define WGCBRK_RING         2             /* double buffer; 3 kills reader retries at 1.5x mem */
 
@@ -83,15 +83,24 @@ typedef struct _WGCBRK_SLOT {
      * Without this the agent read the ticks of a LATER, FAILED open of the same slot while the
      * frame it was reporting on came from an earlier successful one: OpenTick present, all five
      * stages zero, which is exactly what shipped in 4.3.32 and measured nothing. */
+    /* ABI 4. The block is claimed by EITHER capture path, and TickPw says which - because the
+     * path that menus actually take was the one not instrumented. WGC CreateForWindow REJECTS
+     * override-redirect menus/popups, so OpenChannel falls back to polled PrintWindow; the ABI-3
+     * tick writes sat inside the WGC success branch, so for every menu they never ran and
+     * TickHwnd still held the last WGC window. The agent then reported "slot reopened for another
+     * window" for all five menus of a run - a false cause (Jev 0.87), and no measurement of the
+     * only path menus use. Stage meanings differ per path, hence TickPw rather than one schema. */
     volatile UINT64   TickHwnd;          /* Hwnd the ticks below belong to; 0 = never opened */
-    volatile LONG     TickOpenOk;        /* 1 once CreateForWindow returned for THAT open */
-    volatile LONG     _padTick;
-    volatile LONGLONG OpenTick;          /* OpenChannel entered */
-    volatile LONGLONG ItemTick;          /* CreateForWindow/CreateForMonitor returned */
-    volatile LONGLONG PoolTick;          /* frame pool + capture session created */
-    volatile LONGLONG StartTick;         /* StartCapture returned, AckState ACTIVE */
-    volatile LONGLONG FirstArrivedTick;  /* first FrameArrived callback for this channel */
-    volatile LONGLONG FirstPublishTick;  /* first PublishFrame completed for this channel */
+    volatile LONG     TickOpenOk;        /* 1 once this open is past the point that can fail */
+    volatile LONG     TickPw;            /* 1 = polled PrintWindow path, 0 = WGC */
+    volatile LONGLONG OpenTick;          /* OpenChannel entered (both paths) */
+    volatile LONGLONG ItemTick;          /* WGC: CreateForWindow returned.     PW: unused (0) */
+    volatile LONGLONG PoolTick;          /* WGC: pool + session created.       PW: unused (0) */
+    volatile LONGLONG StartTick;         /* WGC: StartCapture returned.        PW: first poll entered */
+    volatile LONGLONG FirstArrivedTick;  /* WGC: first FrameArrived.           PW: first PrintWindow returned */
+    volatile LONGLONG FirstPublishTick;  /* first publish completed (both paths) */
+    volatile LONG     PollCount;         /* PW: polls entered for this open; WGC: 0 */
+    volatile LONG     _padTick2;
 } WGCBRK_SLOT;
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))

@@ -8371,26 +8371,51 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 // actually produced the frame being reported. That is what made
                                 // this probe measure nothing in 4.3.32: OpenTick present and all
                                 // five stages zero. Print numbers only when the slot says they
-                                // describe THIS window and that open got past CreateForWindow;
-                                // otherwise say WHY, rather than emit -1s that look measured.
+                                // describe THIS window and that open got past the point where it
+                                // could still fail; otherwise say WHY, rather than emit -1s that
+                                // look measured.
                                 const BOOL ticksMine =
                                     (bs->TickHwnd == (UINT64)(ULONG_PTR)entry->Handle) &&
                                     bs->TickOpenOk && o;
                                 if (!ticksMine)
                                 {
+                                    // The reason must not name a cause it has not established.
+                                    // It used to say "slot-reopened-for-another-window" whenever
+                                    // TickHwnd differed - which was FALSE for every menu: menus are
+                                    // rejected by WGC and served by polled PrintWindow, a path that
+                                    // wrote no ticks at all under ABI 3, so the block simply still
+                                    // held an older window's record. Both remain possible now, and
+                                    // this probe cannot tell them apart, so it says exactly that.
                                     LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,"
                                         "valid=0,reason=%s,consumed_ms=%lld",
                                         (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
                                         (bs->TickHwnd != (UINT64)(ULONG_PTR)entry->Handle)
-                                            ? L"slot-reopened-for-another-window"
-                                            : (!bs->TickOpenOk ? L"last-open-failed-early"
+                                            ? L"ticks-describe-another-window"
+                                            : (!bs->TickOpenOk ? L"open-not-completed"
                                                                : L"no-open-recorded"),
+                                        o ? (LONGLONG)GetTickCount64() - o : -1);
+                                }
+                                else if (bs->TickPw)
+                                {
+                                    // Polled PrintWindow - the path EVERY menu takes. firstpoll_ms
+                                    // is the wait before the broker first looked at this window;
+                                    // pwret_ms - firstpoll_ms is the synchronous PrintWindow call
+                                    // on the window's own UI thread; polls > 1 means the earlier
+                                    // renders were black or unchanged, i.e. the app had not painted.
+                                    LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,valid=1,"
+                                        "path=printwindow,firstpoll_ms=%lld,pwret_ms=%lld,"
+                                        "publish_ms=%lld,polls=%d,consumed_ms=%lld",
+                                        (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+                                        bs->StartTick         ? bs->StartTick - o         : -1,
+                                        bs->FirstArrivedTick  ? bs->FirstArrivedTick - o  : -1,
+                                        bs->FirstPublishTick  ? bs->FirstPublishTick - o  : -1,
+                                        (int)bs->PollCount,
                                         o ? (LONGLONG)GetTickCount64() - o : -1);
                                 }
                                 else
                                 {
                                 LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,valid=1,"
-                                    "item_ms=%lld,pool_ms=%lld,start_ms=%lld,"
+                                    "path=wgc,item_ms=%lld,pool_ms=%lld,start_ms=%lld,"
                                     "arrived_ms=%lld,publish_ms=%lld,consumed_ms=%lld",
                                     (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
                                     bs->ItemTick          ? bs->ItemTick - o          : -1,
