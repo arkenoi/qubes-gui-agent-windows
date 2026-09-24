@@ -10729,6 +10729,33 @@ static ULONG WINAPI WatchForEvents(void)
             }
         }
 
+        // THE CAPTURE THREAD HAS LEFT AND NOBODY NOTICED. Measured 2026-09-25 with the guest
+        // untouched: enabled=0 (the thread's own flag is clear, so it is out of its loop) while
+        // this loop still held a live capture pointer and captureDegraded was FALSE - so neither
+        // the A7 degraded-retry nor the CAPTUREGATE restart could ever fire, and dom0's pixels
+        // stayed frozen while every log line said the agent was healthy. The fault injection in
+        // CaptureThread describes exactly this shape and notes the main loop "currently has no
+        // way to notice" it; this is that detection (Jev: worth adding on its own merits, 0.83).
+        //
+        // Driving the EXISTING capture-error path rather than inventing a new one: it already
+        // stops capture, waits for the daemon's confirming MSG_DESTROY for window 0, and
+        // restarts - the ordering that makes a re-grant protocol-safe.
+        if (capture && !exitLoop && g_VchanClientConnected)
+        {
+            LONG cLoops = 0, cInside = 0, cEnabled = 1;
+            LONGLONG cAge = -1, cInsideMs = -1;
+            CaptureThreadStats(&cLoops, &cAge, &cInside, &cInsideMs, &cEnabled);
+            if (!cEnabled)
+            {
+                LogWarning("QGACAPDEAD capture thread has left (enabled=0) while a capture "
+                    L"context is live - loops=%d, last loop %I64d ms ago, inside=%d. dom0's "
+                    L"desktop image is frozen; forcing the capture-error recovery path.",
+                    cLoops, cAge, cInside);
+                if (g_CaptureErrorEvent)
+                    SetEvent(g_CaptureErrorEvent);
+            }
+        }
+
         // NON-SEAMLESS HEALTH. While the guest desktop is the thing dom0 is showing, report what
         // the capture thread is actually doing. A blank frozen window and a healthy one look
         // identical from outside, and the content-frame counter alone cannot tell "thread stuck"
