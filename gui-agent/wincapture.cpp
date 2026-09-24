@@ -86,10 +86,18 @@ struct Channel
 // thread one slow application delayed the refresh of every other window and a new window's first
 // frame queued behind all of them. The owner saw it as "the first window was snappy. subsequent
 // ones were not." Jev rated the serial design a structural latency defect at 0.92 and parallel
-// capture as the fix at 0.86. Four is chosen to cover the handful of windows that are actually
-// changing at once without multiplying PrintWindow pressure on the shell; the work is I/O-ish
-// (waiting on other processes), not CPU-bound, so this is not sized to core count.
-#define WC_WORKERS 4
+// capture as the fix at 0.86. The work is waiting on other processes, not computing, so this is
+// NOT sized to core count.
+//
+// TWO, not four. Four was tried first and MEASURED WORSE overall: on a burst of 4 Explorer windows
+// opened 700 ms apart, four workers made windows APPEAR sooner (window 4 median 688 -> 423 ms,
+// 3/3 pairs) but FINISH later (sum of per-window time-to-stable medians 2294 -> 3438 ms). The
+// mechanism, rated credible at 0.84: PrintWindow executes ON THE TARGET WINDOW'S UI THREAD, so
+// capturing several windows of the SAME process concurrently serialises inside that process
+// anyway AND competes with the application's own painting - and a burst of Explorer windows is
+// exactly that case. Two workers keep one slow application from blocking every other window
+// (the structural defect, rated 0.92) without piling four synchronous renders onto one shell.
+#define WC_WORKERS 2
 
 struct Engine
 {
