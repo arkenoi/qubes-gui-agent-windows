@@ -6841,6 +6841,8 @@ static BOOL g_ZOrderValid = FALSE;
 // DDA-eligibility probe counters (ProtoTrace only; see the DDAPROBE block in ProcessNewFrame).
 static ULONGLONG g_DdaProbeSeen = 0, g_DdaProbeNotFg = 0, g_DdaProbeNotFgFree = 0;
 static ULONGLONG g_DdaProbeZCmp = 0, g_DdaProbeZDanger = 0, g_DdaProbeZCons = 0;
+static ULONGLONG g_DdaProbeFrames = 0, g_DdaProbeFramesWorth = 0;
+static BOOL      g_DdaProbeFrameHasNotFg = FALSE;
 static ULONGLONG g_DdaProbeLast = 0;
 
 static BOOL CALLBACK ZOrderProc(HWND window, LPARAM lParam)
@@ -8080,6 +8082,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         PerfNoteRedundantFrame();
         zCount = 0;
     }
+    // DDAPROBE frame accounting: how often would remedy B actually PAY for an EnumWindows?
+    // The Z-order snapshot is skipped unless an override-redirect popup is on screen, and the
+    // reason is cost - the source records paying it every frame at "roughly 4x the Phase 2A drag
+    // figure". Widening the trigger to "a DDA-eligible background window exists" is only worth it
+    // if that is true on SOME frames, not nearly all. Jev rated that risk real at 0.86 and this
+    // count as the step before implementing (1.00).
+    if (g_ProtoTrace)
+    {
+        g_DdaProbeFrames++;
+        g_DdaProbeFrameHasNotFg = FALSE;
+    }
     for (UINT zi = 0; zi < zCount; zi++)
     {
         entry = zSorted[zi];
@@ -8655,7 +8668,18 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             {
                                 g_DdaProbeNotFg++;
                                 if (ofFree)
+                                {
                                     g_DdaProbeNotFgFree++;   // the prize
+                                    // A frame containing at least one non-foreground window that
+                                    // is unoccluded is a frame where a real Z-order would have
+                                    // bought something - i.e. where remedy B would pay for its
+                                    // EnumWindows and get value back.
+                                    if (!g_DdaProbeFrameHasNotFg)
+                                    {
+                                        g_DdaProbeFrameHasNotFg = TRUE;
+                                        g_DdaProbeFramesWorth++;
+                                    }
+                                }
                             }
                             if (g_ZOrderValid && rgnCovered)
                             {
@@ -8674,9 +8698,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             {
                                 g_DdaProbeLast = pnow;
                                 LogInfo("QGAPROTO,msg=DDAPROBE,seen=%llu,notfg=%llu,"
-                                    "notfg_unoccluded=%llu,zcmp=%llu,zdanger=%llu,zcons=%llu",
+                                    "notfg_unoccluded=%llu,zcmp=%llu,zdanger=%llu,zcons=%llu,"
+                                    "frames=%llu,frames_worth=%llu",
                                     g_DdaProbeSeen, g_DdaProbeNotFg, g_DdaProbeNotFgFree,
-                                    g_DdaProbeZCmp, g_DdaProbeZDanger, g_DdaProbeZCons);
+                                    g_DdaProbeZCmp, g_DdaProbeZDanger, g_DdaProbeZCons,
+                                    g_DdaProbeFrames, g_DdaProbeFramesWorth);
                             }
                         }
 
