@@ -7403,6 +7403,36 @@ static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child)
 // when g_ZOrderCaptureValid - see the flag's comment for why that is a different, weaker claim
 // than the one damage clipping makes. Reads nothing but ZOrder and rectangles; in particular it
 // does NOT touch rgnCovered, so it cannot enable or influence clipping.
+#define PW_MAX_OCCLUDERS 16
+
+// Collect the rectangles of watched windows strictly ABOVE `self` that intersect `rect`.
+// Returns the count, or -1 if the list does not fit (caller must then treat the window as
+// occluded and decline, never as clear). Requires g_ZOrderCaptureValid.
+static int PwCollectOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
+                              OUT RECT* out, IN int maxOut)
+{
+    int n = 0;
+    RECT hit;
+    WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
+    {
+        e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (e != self && e->IsVisible && !e->IsIconic && !e->DeletePending &&
+            e->Width > 0 && e->Height > 0 && e->ZOrder < self->ZOrder)
+        {
+            RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
+            if (IntersectRect(&hit, &other, rect))
+            {
+                if (n >= maxOut)
+                    return -1;
+                out[n++] = hit;
+            }
+        }
+        e = (WINDOW_DATA*)e->ListEntry.Flink;
+    }
+    return n;
+}
+
 static BOOL PwOccludedByAbove(IN const WINDOW_DATA* self, IN const RECT* rect)
 {
     RECT hit;
@@ -7656,7 +7686,22 @@ static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN U
         return FALSE;
     }
 
-    // Anything above this window makes the screen an invalid proxy for its content.
+    // Anything above this window makes the screen an invalid proxy for its content - for the
+    // COVERED PART. The uncovered part is still this window's own pixels, and hashing just that
+    // is enough to answer the only question being asked: did anything the user can see change?
+    //
+    // WHY THIS MATTERS. Before this, a window that was merely NOT IN FRONT could never be
+    // skipped: the function declined to look and returned "changed", so the caller captured it.
+    // A capture is a PrintWindow on that window's OWN UI thread. Measured 2026-09-24 with two
+    // Explorer windows opened 9 s apart - the second landing over the first - the FIRST window
+    // took 117/119/118 captures costing 6057/5800/4735 ms of that application's UI thread, of
+    // which 113/115/116 produced NO DAMAGE. All Explorer windows share one process, so those
+    // wasted seconds starved the process that had to paint the NEW window, which took up to
+    // 11.8 s to finish assembling. That is the owner's "a new second explorer window is slow"
+    // and "explorer is unresponsive while something animates over it". Jev: mechanism 0.91,
+    // explains both 0.92, this fix 0.80.
+    int nOcc = 0;
+    RECT occ[PW_MAX_OCCLUDERS];
     if (g_ZOrderValid)
     {
         if (RectInRegion(rgnCoveredAbove, rect))
@@ -7665,9 +7710,20 @@ static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN U
             return FALSE;
         }
     }
+    else if (g_ZOrderCaptureValid)
+    {
+        nOcc = PwCollectOccluders(entry, rect, occ, PW_MAX_OCCLUDERS);
+        if (nOcc < 0)
+        {
+            // Too many occluders to describe: decline, exactly as before. Never treat an
+            // undescribable scene as clear.
+            PerfNotePwRefusal(PW_REFUSE_OCCLUDED);
+            return FALSE;
+        }
+    }
     else
     {
-        // No ordering available - use the order-free pair described above.
+        // No ordering available at all - use the order-free pair described above.
         if (entry->Handle != foreground)
         {
             PerfNotePwRefusal(PW_REFUSE_NOT_FOREGROUND);
@@ -7688,9 +7744,71 @@ static BOOL PwScreenUnchanged(IN OUT WINDOW_DATA* entry, IN const BYTE* fb, IN U
     for (LONG y = rect->top; y < rect->bottom; y++)
     {
         const BYTE* row = fb + (SIZE_T)y * pitch + (SIZE_T)rect->left * bpp;
-        for (UINT i = 0; i < rowBytes; i += 4)
+        if (nOcc == 0)
         {
-            h ^= (ULONGLONG)(*(const UINT32*)(row + i));
+            // UNOCCLUDED: byte-for-byte the original loop. The already-fast path pays nothing
+            // for this change beyond one integer test per row.
+            for (UINT i = 0; i < rowBytes; i += 4)
+            {
+                h ^= (ULONGLONG)(*(const UINT32*)(row + i));
+                h *= 1099511628211ULL;
+            }
+            continue;
+        }
+        // OCCLUDED: hash only the spans of this row that nothing above covers. The covered
+        // pixels belong to another window and are exactly what used to make this window look
+        // "changed" when it had not changed.
+        //
+        // Per row: take the occluders that span this row, clip them to the window, sort by
+        // start, merge overlaps, then hash the GAPS. Plain and obviously correct; nOcc is at
+        // most PW_MAX_OCCLUDERS, so the sort is a few comparisons.
+        LONG ivS[PW_MAX_OCCLUDERS], ivE[PW_MAX_OCCLUDERS];
+        int niv = 0;
+        for (int k = 0; k < nOcc; k++)
+        {
+            if (y < occ[k].top || y >= occ[k].bottom)
+                continue;
+            LONG a0 = occ[k].left  < rect->left  ? rect->left  : occ[k].left;
+            LONG b0 = occ[k].right > rect->right ? rect->right : occ[k].right;
+            if (b0 <= a0)
+                continue;
+            ivS[niv] = a0; ivE[niv] = b0; niv++;
+        }
+        for (int i = 1; i < niv; i++)          // insertion sort by start
+        {
+            LONG ss = ivS[i], ee = ivE[i];
+            int j = i - 1;
+            while (j >= 0 && ivS[j] > ss) { ivS[j+1] = ivS[j]; ivE[j+1] = ivE[j]; j--; }
+            ivS[j+1] = ss; ivE[j+1] = ee;
+        }
+        {
+            LONG cur = rect->left;
+            for (int i = 0; i < niv; i++)
+            {
+                LONG s0 = ivS[i], e0 = ivE[i];
+                while (i + 1 < niv && ivS[i+1] <= e0)   // merge overlapping/adjacent
+                {
+                    if (ivE[i+1] > e0) e0 = ivE[i+1];
+                    i++;
+                }
+                if (s0 > cur)
+                {
+                    for (LONG px = cur; px < s0; px++)
+                    {
+                        h ^= (ULONGLONG)(*(const UINT32*)(row + (SIZE_T)(px - rect->left) * bpp));
+                        h *= 1099511628211ULL;
+                    }
+                }
+                if (e0 > cur) cur = e0;
+            }
+            for (LONG px = cur; px < rect->right; px++)
+            {
+                h ^= (ULONGLONG)(*(const UINT32*)(row + (SIZE_T)(px - rect->left) * bpp));
+                h *= 1099511628211ULL;
+            }
+            // Fold the visible GEOMETRY in, so a change in WHICH parts are visible is itself a
+            // change even when the visible pixels happen to hash the same.
+            h ^= (ULONGLONG)niv * 1000003ULL + (ULONGLONG)cur;
             h *= 1099511628211ULL;
         }
     }
