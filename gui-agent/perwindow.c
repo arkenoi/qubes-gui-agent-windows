@@ -101,7 +101,17 @@ void PwInit(void)
     }
     XcSetLogLevel(g_PwXc, LogGetLevel());
 
-    status = WcInit(PwOnDamage);
+    // CAPTURE WORKERS - decided ONCE here, never revisited. Every capture is a PrintWindow that
+    // blocks on the TARGET window's own UI thread, so a single worker lets one slow application
+    // delay every other window's refresh (rated a structural latency defect at 0.92). More
+    // workers let captures of different windows proceed while one is blocked - but measured on
+    // 2026-09-24 two workers also REGRESSED a window's own time-to-stable (median 829 -> 1372 ms)
+    // for reasons that are NOT established (Jev 0.89), so the default stays 1 until they are.
+    // The knob exists so the two can be A/B'd on one build instead of shipping a binary per
+    // hypothesis; it is read once, like every other capability here.
+    DWORD workers = 1;
+    CfgReadDword(NULL, L"CaptureWorkers", &workers, NULL);
+    status = WcInit(PwOnDamage, workers);
     if (status != ERROR_SUCCESS)
     {
         win_perror2(status, "per-window capture disabled: WcInit");

@@ -23,7 +23,10 @@ extern "C" {
 typedef void (*WC_DAMAGE_CALLBACK)(HWND window, int x, int y, int w, int h);
 
 // Initialize D3D + capture thread. Returns ERROR_SUCCESS or a Win32/HRESULT-ish code.
-ULONG WcInit(WC_DAMAGE_CALLBACK callback);
+// workers: how many capture threads to run (clamped to 1..4). DECIDED ONCE by the caller at
+// init and never revisited. Every capture is a PrintWindow that blocks on the target window's own
+// UI thread, so more workers means captures of DIFFERENT windows can proceed while one is blocked.
+ULONG WcInit(WC_DAMAGE_CALLBACK callback, ULONG workers);
 
 // Stop the capture thread and drop all sessions. Buffers are caller-owned; none are
 // freed here.

@@ -32,6 +32,10 @@
 
 #include <log.h>
 
+// Diagnostic gate, defined in perf.c. Declared here rather than including perf.h, which is a C
+// header carrying agent-side structs this translation unit has no business seeing.
+extern "C" BOOL g_ProtoTrace;
+
 #ifndef PW_RENDERFULLCONTENT
 #define PW_RENDERFULLCONTENT 0x00000002
 #endif
@@ -111,11 +115,12 @@ struct Channel
 // blocking on other processes, not do more of it at once.
 // The pool machinery is kept (per-channel busy claim, per-worker wake) so the count is one
 // constant away, but it ships at 1 until something measures better.
-#define WC_WORKERS 1
+#define WC_WORKERS 4   // compile-time BOUND; the active count is chosen once at WcInit
 
 struct Engine
 {
     HANDLE threads[WC_WORKERS] = {};
+    int workers = 1;                 // ACTIVE worker count, decided once at WcInit
     std::atomic<bool> quit{ false };
     SRWLOCK lock = SRWLOCK_INIT;                 // guards channels vector
     std::vector<std::unique_ptr<Channel>> channels;
@@ -140,7 +145,7 @@ static WorkerCtx g_wctx[WC_WORKERS];
 // mark landing between the consumer's channel walk and its wait is never lost.
 void WakeCapture(Engine& e)
 {
-    for (int i = 0; i < WC_WORKERS; i++)
+    for (int i = 0; i < e.workers; i++)
         if (e.wake[i])
             SetEvent(e.wake[i]);
 }
@@ -423,7 +428,27 @@ DWORD WINAPI CaptureThread(LPVOID param)
                 c.firstPending.store(false);   // cleared once served, success or not
             didWork = true;
             DamageOut dmg{ nullptr, 0, 0, 0 };
-            if (CaptureAndDiff(e, c, &dmg))
+            // PER-CAPTURE COST (ProtoTrace only). Time-to-stable regressed under 2 workers in a
+            // harness where the two windows were DIFFERENT PROCESSES, which refutes
+            // same-application contention as the cause (Jev 0.86) and leaves the cause
+            // NOT ESTABLISHED (0.89). A capture is a PrintWindow on the target window's own UI
+            // thread, so the question is whether captures of a window get SLOWER, or merely more
+            // frequent, when another worker is running - and that needs the cost of each one.
+            LARGE_INTEGER capT0, capT1, capFreq;
+            const bool traceCap = g_ProtoTrace != FALSE;
+            if (traceCap) QueryPerformanceCounter(&capT0);
+            const bool capOk = CaptureAndDiff(e, c, &dmg);
+            if (traceCap)
+            {
+                QueryPerformanceCounter(&capT1);
+                QueryPerformanceFrequency(&capFreq);
+                const LONGLONG us = capFreq.QuadPart
+                    ? ((capT1.QuadPart - capT0.QuadPart) * 1000000) / capFreq.QuadPart : -1;
+                LogInfo("QGAPROTO,msg=WCCAP,hwnd=0x%x,worker=%d,first=%d,us=%lld,changed=%d",
+                        (DWORD)(ULONG_PTR)c.hwnd, id, isFirst ? 1 : 0, us,
+                        (capOk && dmg.hwnd) ? 1 : 0);
+            }
+            if (capOk)
             {
                 c.failures = 0;
                 if (dmg.hwnd)
@@ -493,26 +518,28 @@ BOOL WcIsSupported(void)
     return TRUE;
 }
 
-ULONG WcInit(WC_DAMAGE_CALLBACK callback)
+ULONG WcInit(WC_DAMAGE_CALLBACK callback, ULONG workers)
 {
     if (g_eng)
         return ERROR_ALREADY_INITIALIZED;
     auto e = std::make_unique<Engine>();
     e->callback = callback;
-    for (int i = 0; i < WC_WORKERS; i++)
+    // Decided ONCE, here, and never revisited - a capability, not a runtime knob.
+    e->workers = (int)(workers < 1 ? 1 : (workers > WC_WORKERS ? WC_WORKERS : workers));
+    for (int i = 0; i < e->workers; i++)
     {
         e->wake[i] = CreateEventW(nullptr, FALSE /*auto-reset*/, FALSE, nullptr);
         if (!e->wake[i])
         {
             ULONG err = GetLastError();
-            for (int j = 0; j < i; j++) CloseHandle(e->wake[j]);
+                for (int j = 0; j < i; j++) CloseHandle(e->wake[j]);
             return err;
         }
     }
     // The pool must be fully constructed before any worker runs: a worker dereferences
     // g_wctx[i].eng immediately, and worker 0 owns the sweep cursors.
     int started = 0;
-    for (int i = 0; i < WC_WORKERS; i++)
+    for (int i = 0; i < e->workers; i++)
     {
         g_wctx[i].eng = e.get();
         g_wctx[i].id = i;
@@ -524,14 +551,15 @@ ULONG WcInit(WC_DAMAGE_CALLBACK callback)
     if (started == 0)
     {
         ULONG err = GetLastError();
-        for (int i = 0; i < WC_WORKERS; i++) CloseHandle(e->wake[i]);
+        for (int i = 0; i < e->workers; i++) CloseHandle(e->wake[i]);
         return err;
     }
     // A partially started pool is FINE and is not silently accepted: it still captures, just
     // with less parallelism, and worker 0 (the sweep owner) is started first.
-    if (started < WC_WORKERS)
+    if (started < e->workers)
         LogWarning("WCPOOL only %d of %d capture workers started (0x%x) - capture continues "
-            "with reduced parallelism", started, WC_WORKERS, GetLastError());
+            "with reduced parallelism", started, e->workers, GetLastError());
+    LogInfo("WCPOOL %d capture worker(s)", e->workers);
     g_eng = e.release();
     return ERROR_SUCCESS;
 }
@@ -542,7 +570,7 @@ void WcShutdown(void)
         return;
     g_eng->quit.store(true);
     WakeCapture(*g_eng); // the idle wait is now up to SWEEP_INTERVAL_MS; cut it short
-    for (int i = 0; i < WC_WORKERS; i++)
+    for (int i = 0; i < g_eng->workers; i++)
     {
         if (!g_eng->threads[i])
             continue;
@@ -554,7 +582,7 @@ void WcShutdown(void)
     AcquireSRWLockExclusive(&g_eng->lock);
     g_eng->channels.clear();
     ReleaseSRWLockExclusive(&g_eng->lock);
-    for (int i = 0; i < WC_WORKERS; i++)
+    for (int i = 0; i < g_eng->workers; i++)
         if (g_eng->wake[i])
             CloseHandle(g_eng->wake[i]);
     delete g_eng;
