@@ -1338,8 +1338,45 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
         }
         else
         {
-            LogWarning("0x%x: inverted DWM bounds (%d,%d)-(%d,%d) and no usable GetWindowRect - rejecting",
-                window, dwmRect.left, dwmRect.top, dwmRect.right, dwmRect.bottom);
+            // TWO DIFFERENT CONDITIONS were being reported identically, and the routine one was
+            // 119 of 544 log lines (22%) and 75% of ALL warnings on a guest with nothing wrong.
+            // Measured 2026-09-24 by reproducing this exact predicate from outside the agent:
+            // the all-zero case fires for 47 zero-size INFRASTRUCTURE windows - IME (20),
+            // tooltips_class32 (5), DummyDWMListenerWindow (5), MSCTFIME UI (4), DDE/OleDde,
+            // ForegroundStaging, ATL message windows - owned mostly by explorer. Five carry
+            // WS_VISIBLE but have a (0,0)-(0,0) rect in BOTH sources, so they cannot show
+            // anything. Rejecting them is correct and unremarkable.
+            // The case this check was WRITTEN for is different: DWM garbage on a cloaked /
+            // mid-transition shell surface, measured -666 x -750 for a StartMenuExperienceHost
+            // CoreWindow (2026-08-12), which poisoned entry->X/Y and the slice rect. A non-empty
+            // inverted rect keeps its WARNING - that is the one carrying diagnostic value.
+            // A periodic INFO summary keeps the routine case VISIBLE in aggregate, so an
+            // operator or a field report can still see it happening without 119 separate lines
+            // (Jev: split the cases 0.93, but hides_degradation 0.56 - high enough not to make
+            // the routine case disappear entirely).
+            const BOOL allZero = (dwmRect.left == 0 && dwmRect.top == 0 &&
+                                  dwmRect.right == 0 && dwmRect.bottom == 0);
+            if (allZero)
+            {
+                static volatile LONG s_zeroRectCount = 0;
+                static ULONGLONG s_zeroRectLastReport = 0;
+                const LONG n = _InterlockedIncrement(&s_zeroRectCount);
+                LogDebug("0x%x: zero DWM bounds and no usable GetWindowRect - rejecting "
+                    "(zero-geometry window, e.g. IME/DDE/tooltip host)", window);
+                const ULONGLONG now = GetTickCount64();
+                if (now - s_zeroRectLastReport > 300000)   // at most one line per 5 minutes
+                {
+                    s_zeroRectLastReport = now;
+                    LogInfo("QGAZERORECT %d window(s) rejected for zero geometry since start "
+                        "(routine: IME/DDE/tooltip/DWM-listener windows; raise LogLevel to "
+                        "DEBUG for the per-window detail)", n);
+                }
+            }
+            else
+            {
+                LogWarning("0x%x: inverted DWM bounds (%d,%d)-(%d,%d) and no usable GetWindowRect - rejecting",
+                    window, dwmRect.left, dwmRect.top, dwmRect.right, dwmRect.bottom);
+            }
             return ERROR_INVALID_DATA;
         }
     }
@@ -2252,9 +2289,13 @@ static void SynthActivate(IN OUT WINDOW_DATA* entry, IN OUT WINDOW_DATA* owner)
     SynthUpdateMask(owner);
     PwPatchSynthRect(owner, entry);   // FI_NOSYNTHPAINT is enforced inside the paint chokepoint
     owner->SynthLastFullPatch = GetTickCount();
-    LogInfo("QGAPROTO,msg=SYNTH,hwnd=0x%x,owner=0x%x,x=%d,y=%d,w=%u,h=%u",
-        (uint32_t)(ULONG_PTR)entry->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
-        entry->X, entry->Y, entry->Width, entry->Height);
+    // Diagnostic protocol trace, not operator evidence: nothing outside this repo consumes it,
+    // and a guest nobody is debugging should not narrate it. Behind the EXISTING ProtoTrace flag
+    // (registry/env, read once at Init) like every other QGAPROTO probe - no new knob.
+    if (g_ProtoTrace)
+        LogInfo("QGAPROTO,msg=SYNTH,hwnd=0x%x,owner=0x%x,x=%d,y=%d,w=%u,h=%u",
+            (uint32_t)(ULONG_PTR)entry->Handle, (uint32_t)(ULONG_PTR)owner->Handle,
+            entry->X, entry->Y, entry->Width, entry->Height);
 }
 
 // Stop synthesizing (window gone, or it no longer qualifies). Does NOT announce the
@@ -8370,6 +8411,12 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             // render. Measured menu held_ms spans 156-547 ms with registration
                             // count constant, and those two have completely different fixes.
                             // All ticks are the broker's GetTickCount64, same clock as ours.
+                            // ProtoTrace-only: this is a measurement probe for OUR benchmarks,
+                            // not something an operator or a field report needs (Jev: gate the
+                            // pure probes 0.89, but KEEP per-window lifecycle lines like
+                            // BROKERFRAME above at INFO 0.35 - a first field report has to be
+                            // interpretable without a second round trip).
+                            if (g_ProtoTrace)
                             {
                                 const WGCBRK_SLOT* bs =
                                     &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
