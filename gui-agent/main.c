@@ -4102,6 +4102,47 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
     return FALSE;
 }
 
+// THE STRIPPED SET. Which windows had their caption taken is knowledge the caption code must own
+// itself. It used to be implicit in the watched-window list, and that list is REBUILT by
+// ResetWatch on every mode change - so by the time the reversal ran there was nothing left to
+// reverse, twice over ("captions over 0 window(s)"). It is also rebuilt in a path that defers and
+// re-enters, so "is it populated right now" was never a safe thing to depend on (Jev: a separate
+// persistent set, 0.81, against fixing the walk 0.11).
+//
+// Fixed size and pruned on use: an HWND can be recycled, so a stale entry must never be acted on.
+#define CAPSTRIP_MAX 512
+static HWND s_CapStripped[CAPSTRIP_MAX];
+static ULONG s_CapStrippedCount = 0;
+static CRITICAL_SECTION s_csCapStrip;
+static BOOL s_csCapStripReady = FALSE;
+
+static void CapStripRemember(IN HWND hwnd)
+{
+    if (!s_csCapStripReady || !hwnd) return;
+    EnterCriticalSection(&s_csCapStrip);
+    for (ULONG i = 0; i < s_CapStrippedCount; i++)
+        if (s_CapStripped[i] == hwnd) { LeaveCriticalSection(&s_csCapStrip); return; }
+    if (s_CapStrippedCount < CAPSTRIP_MAX)
+        s_CapStripped[s_CapStrippedCount++] = hwnd;
+    else
+        LogWarning("QGACAPSTRIP set full (%d) - 0x%x not recorded, its caption will not come back",
+            CAPSTRIP_MAX, (DWORD)(ULONG_PTR)hwnd);
+    LeaveCriticalSection(&s_csCapStrip);
+}
+
+static void CapStripForget(IN HWND hwnd)
+{
+    if (!s_csCapStripReady || !hwnd) return;
+    EnterCriticalSection(&s_csCapStrip);
+    for (ULONG i = 0; i < s_CapStrippedCount; i++)
+        if (s_CapStripped[i] == hwnd)
+        {
+            s_CapStripped[i] = s_CapStripped[--s_CapStrippedCount];
+            break;
+        }
+    LeaveCriticalSection(&s_csCapStrip);
+}
+
 // hide==FALSE puts the caption BACK. The strip is a seamless-only tweak (dom0 draws the frame)
 // and had no inverse, so a guest leaving seamless kept every window stripped - no title bar and a
 // black band where the frame belonged, inside the desktop window. See RestyleCaptionMain.
@@ -4109,6 +4150,11 @@ static void RestyleGuestCaption(IN WINDOW_DATA* entry, IN BOOL hide)
 {
     const WCHAR* verb = hide ? L"--restyle-caption" : L"--restore-caption";
     if (!g_HideGuestTitleBar)
+        return;
+    // Never strip while the guest is showing its whole desktop in one dom0 window: there is no
+    // dom0 frame to duplicate there, and a window announced in that mode would otherwise come up
+    // with no title bar and need restoring later (Jev: gate the strip itself, 0.86).
+    if (hide && !g_SeamlessMode)
         return;
     if (hide && entry->CaptionHidden)
         return;
@@ -4195,6 +4241,8 @@ static void RestyleGuestCaption(IN WINDOW_DATA* entry, IN BOOL hide)
     }
     entry->CaptionHidden = hide;
     entry->CaptionWasStripped = hide;   // only a real strip is restorable
+    if (hide) CapStripRemember(entry->Handle);
+    else      CapStripForget(entry->Handle);
     LogInfo("0x%x: caption %s helper launched as the window's owner (inset %d)",
         entry->Handle, hide ? L"strip" : L"restore", topInset);
 }
@@ -4240,23 +4288,33 @@ static void ApplySeamlessTweaks(IN BOOL seamless)
 
     // 3. Per-window captions: dom0 draws the frame in seamless, so the guest's own is a second
     //    title bar. In non-seamless there is no dom0 frame and Windows must draw its own.
+    // Captions come back from the stripped SET, which the caption code owns and which survives
+    // ResetWatch. Entering seamless needs no pass here: every window is re-announced and the
+    // announce path strips it.
     {
-        ULONG touched = 0;
-        EnterCriticalSection(&g_csWatchedWindows);
-        WINDOW_DATA* w = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
-        while (w != (WINDOW_DATA*)&g_WatchedWindowsList)
+        ULONG touched = 0, dead = 0;
+        if (!seamless && s_csCapStripReady)
         {
-            WINDOW_DATA* next = (WINDOW_DATA*)w->ListEntry.Flink;
-            if (w->Handle && IsWindow(w->Handle))
+            HWND snapshot[CAPSTRIP_MAX];
+            ULONG n = 0;
+            EnterCriticalSection(&s_csCapStrip);
+            n = s_CapStrippedCount;
+            if (n) memcpy(snapshot, s_CapStripped, n * sizeof(HWND));
+            s_CapStrippedCount = 0;          // consumed: each is restored or gone
+            LeaveCriticalSection(&s_csCapStrip);
+
+            for (ULONG i = 0; i < n; i++)
             {
-                RestyleGuestCaption(w, seamless);
+                if (!snapshot[i] || !IsWindow(snapshot[i])) { dead++; continue; }
+                WINDOW_DATA probe = { 0 };
+                probe.Handle = snapshot[i];
+                probe.CaptionWasStripped = TRUE;
+                RestyleGuestCaption(&probe, FALSE);
                 touched++;
             }
-            w = next;
         }
-        LeaveCriticalSection(&g_csWatchedWindows);
-        LogInfo("QGATWEAKS seamless=%d applied (shadows, effects, captions over %lu window(s))",
-            seamless ? 1 : 0, touched);
+        LogInfo("QGATWEAKS seamless=%d applied (shadows, effects; captions restored on %lu "
+            L"window(s), %lu already gone)", seamless ? 1 : 0, touched, dead);
     }
 }
 
@@ -11636,6 +11694,8 @@ static ULONG Init(void)
 
     InitializeListHead(&g_WatchedWindowsList);
     InitializeCriticalSection(&g_csWatchedWindows);
+    InitializeCriticalSection(&s_csCapStrip);
+    s_csCapStripReady = TRUE;
 
     // Attach the Qubes IDD and make it the sole active display BEFORE InitVideoModes() and
     // before the screen is mapped: both read the current topology, so doing this afterwards
