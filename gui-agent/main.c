@@ -5488,6 +5488,23 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
 
     LogVerbose("start");
 
+    InterlockedIncrement64(&g_C8InputDesktop);   // LEDGER C8
+    // LEDGER SUMMARY, at most once a minute. The per-window QGALEDGER line only appears when a
+    // window DIES, so without this a long-lived desktop reports nothing at all and the process-wide
+    // counters (engine deliveries, the C8 items) would never be visible. Follows the existing
+    // periodic-INFO pattern used for the zero-rect case: aggregate, rate-limited, still visible.
+    {
+        static ULONGLONG s_ledgerLastReport = 0;
+        const ULONGLONG nowTick = GetTickCount64();
+        if (nowTick - s_ledgerLastReport >= 60000)
+        {
+            s_ledgerLastReport = nowTick;
+            LogInfo("QGALEDGERSUM\tengineDamage=%lld\tc8DrainVchan=%lld\tc8WorkArea=%lld"
+                    "\tc8InputDesktop=%lld",
+                    (LONG64)g_PwLedgerEngineDamage, (LONG64)g_C8DrainVchanInput,
+                    (LONG64)g_C8WorkAreaApplied, (LONG64)g_C8InputDesktop);
+        }
+    }
     EnsureOnInputDesktop();
 
     // SECURE-DESKTOP FREEZE, enumeration leg (v3): a respawned agent initializing while a
@@ -8461,6 +8478,16 @@ static __inline BOOL PwLedgerHit(IN OUT WINDOW_DATA* entry, IN OUT ULONG64* coun
 // avoids by design - so this is reported as a total in the summary rather than faked per window.
 volatile LONG64 g_PwLedgerEngineDamage = 0;
 
+// ---- C8: CONTROL LOGIC THAT RIDES THE CAPTURE TICK ------------------------------------------
+// These have nothing to do with pixels, but they run on the frame event. Stage 6 wants the capture
+// thread not to exist in seamless on eligible guests; anything counted here would stop firing if
+// it were simply deleted, so stage 4 has to re-home it first. A ZERO here is the useful answer -
+// it means that item does NOT depend on the capture tick and stage 4 need not touch it. The
+// counters are global because these are process-wide events, not per-window ones.
+volatile LONG64 g_C8DrainVchanInput = 0;   // vchan input drained from the frame loop
+volatile LONG64 g_C8WorkAreaApplied = 0;   // work-area re-apply driven by the frame/tracking tick
+volatile LONG64 g_C8InputDesktop    = 0;   // input-desktop re-observe from the tracking pass
+
 static void PwLedgerAccount(IN OUT WINDOW_DATA* entry)
 {
     ULONG64 attributed;
@@ -10630,8 +10657,12 @@ static ULONG WINAPI WatchForEvents(void)
             // released before ProcessNewFrame takes g_csWatchedWindows (no inversion),
             // and input injection touches neither capture content nor the geometry/CREATE
             // contract. FIFO order is preserved (single thread, in-order drain).
-            if (g_VchanClientConnected && !DrainVchanInput(capture, &exitLoop))
-                break;
+            if (g_VchanClientConnected)
+            {
+                InterlockedIncrement64(&g_C8DrainVchanInput);   // LEDGER C8
+                if (!DrainVchanInput(capture, &exitLoop))
+                    break;
+            }
 
             // NEVEREXIT: capture can legitimately be NULL here - in the A7 degraded
             // state a stale frame event set by the torn-down capture generation can
@@ -10803,6 +10834,7 @@ static ULONG WINAPI WatchForEvents(void)
                 // two call sites make the check fire as long as frames OR window events
                 // flow, whichever drains the tracking tick - including after hook-thread
                 // death, when only frames arrive.
+                InterlockedIncrement64(&g_C8WorkAreaApplied);   // LEDGER C8
                 WorkAreaEnsureApplied();
             }
 

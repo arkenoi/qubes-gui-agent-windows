@@ -94,6 +94,11 @@ extern LIST_ENTRY g_WatchedWindowsList;
 struct _WINDOW_DATA;
 void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason);
 extern volatile LONG64 g_PwLedgerEngineDamage;   // engine deliveries, all windows
+// C8: control logic that currently runs on the capture tick. A zero is the useful answer - it
+// means stage 4 need not re-home that item before the capture can be deleted.
+extern volatile LONG64 g_C8DrainVchanInput;
+extern volatile LONG64 g_C8WorkAreaApplied;
+extern volatile LONG64 g_C8InputDesktop;
 
 typedef enum _PW_WINDOW_CLASS {
     PWC_ELIGIBLE = 0,   // has a usable redirection surface: gets its own buffer
