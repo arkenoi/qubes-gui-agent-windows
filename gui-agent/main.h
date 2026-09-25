@@ -514,9 +514,16 @@ typedef struct _WINDOW_DATA
     ULONG64 PwLedgerDdaSlice;            // C1: PwSliceCopyAndDamage out of the framebuffer
     ULONG64 PwLedgerDdaOwned;            // C4: the DDA-owned foreground channel
     ULONG64 PwLedgerDragSlice;           // C3: PwDragSliceRefresh during an input drag
-    ULONG64 PwLedgerEnginePw;            // the per-window PrintWindow engine
-    ULONG64 PwLedgerLegacy;              // C5: the legacy dirty-rect path
-    ULONG64 PwLedgerSynth;               // C6: synth composite source
+    // EnginePw and Legacy are DELIBERATELY ABSENT rather than present-and-always-zero. A counter
+    // that can never be set is worse than a missing one: its zero is indistinguishable from "this
+    // consumer never fired", which is the exact ambiguity this ledger exists to remove.
+    //   - the per-window ENGINE contribution cannot be attributed at PwOnDamage without taking the
+    //     window-list lock on the capture thread, which that callback avoids by design. It is
+    //     counted globally (g_PwLedgerEngineDamage) and flagged per window (PwLedgerEngineFed).
+    //   - LEGACY windows are not PwIsAttached, so the pass loop this ledger instruments never runs
+    //     for them. They are OUT OF SCOPE for stage 1 and the scope statement says so, rather than
+    //     being represented by a zero.
+    ULONG64 PwLedgerSynth;               // C6: synth composite patched into the owner's buffer
     ULONG64 PwLedgerNone;                // mapped, pass ran, nothing filled it
     ULONG64 PwLedgerUnattributed;        // INVARIANT BREACH: a copy site is not instrumented
     BOOL    PwLedgerUnattributedLogged;  // one loud line per window, not a flood

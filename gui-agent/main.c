@@ -7675,6 +7675,9 @@ static BOOL PwDragSliceRefresh(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRAME
 static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA* c,
                                      IN const RECT* area)
 {
+    // LEDGER C6: a synth child's pixels are patched into the OWNER's granted buffer, so the copy
+    // is attributed to the owner - that is whose buffer changed.
+    if (owner) owner->PwLedgerSynth++;
     // FI_NOSYNTHPAINT guards the SINGLE function every synth paint goes through. Guarding only
     // SynthActivate's one-shot call was measured insufficient on 2026-08-31: the bit fired
     // (banner gateoff=0x80, announce 1) yet RND-3 still passed, because the ongoing paint path
@@ -8456,8 +8459,7 @@ static void PwLedgerAccount(IN OUT WINDOW_DATA* entry)
     ULONG64 attributed;
     if (!entry) return;
     attributed = entry->PwLedgerBrokerWgc + entry->PwLedgerBrokerPw + entry->PwLedgerDdaSlice +
-                 entry->PwLedgerDdaOwned + entry->PwLedgerDragSlice + entry->PwLedgerEnginePw +
-                 entry->PwLedgerLegacy + entry->PwLedgerSynth;
+                 entry->PwLedgerDdaOwned + entry->PwLedgerDragSlice + entry->PwLedgerSynth;
     // A pass in which the copy primitive did not fire copied nothing. That is ORDINARY - an idle
     // window - and it is recorded as NONE, not as a breach. Getting this wrong made the first
     // build of this stage report every idle window as a missing copy site (Jev: 1.00).
@@ -8486,13 +8488,13 @@ void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason)
 {
     if (!entry || !entry->PwLedgerFramesSeen) return;
     LogInfo("QGALEDGER\thwnd=0x%x\tclass=%d\treason=%S\tseen=%llu\tbrokerWgc=%llu\tbrokerPw=%llu"
-            "\tddaSlice=%llu\tddaOwned=%llu\tdragSlice=%llu\tenginePw=%llu\tlegacy=%llu"
+            "\tddaSlice=%llu\tddaOwned=%llu\tdragSlice=%llu"
             "\tsynth=%llu\tnone=%llu\tcopies=%llu\tengineFed=%d\tengineDamageTotal=%lld"
             "\tunattributed=%llu",
             (DWORD)(ULONG_PTR)entry->Handle, (int)entry->PwLedgerClass, reason ? reason : L"-",
             entry->PwLedgerFramesSeen, entry->PwLedgerBrokerWgc, entry->PwLedgerBrokerPw,
             entry->PwLedgerDdaSlice, entry->PwLedgerDdaOwned, entry->PwLedgerDragSlice,
-            entry->PwLedgerEnginePw, entry->PwLedgerLegacy, entry->PwLedgerSynth,
+            entry->PwLedgerSynth,
             entry->PwLedgerNone, entry->PwLedgerCopies, entry->PwLedgerEngineFed ? 1 : 0,
             (LONG64)g_PwLedgerEngineDamage, entry->PwLedgerUnattributed);
 }
