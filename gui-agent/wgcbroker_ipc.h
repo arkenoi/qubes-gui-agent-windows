@@ -12,8 +12,12 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  5u   /* 5: first-frame stage ticks are QPC counts, not ms */
+#define WGCBRK_ABI_VERSION  6u   /* 6: per-slot frame-arrival/drop accounting (see FramesArrived) */
 #define WGCBRK_MAX_SLOTS    32
+/* Bounded retries for a failed capture-pool Recreate before the slot is marked FAILED. A
+ * transient deserves a few attempts; an endless retry would hide a dead feed behind an
+ * ACTIVE slot, which is exactly the state that made the Settings freeze unreadable. */
+#define WGCBRK_RECREATE_TRIES 8
 #define WGCBRK_RING         2             /* double buffer; 3 kills reader retries at 1.5x mem */
 
 typedef enum { WGCBRK_FREE=0, WGCBRK_REQUESTED=1, WGCBRK_ACTIVE=2, WGCBRK_FAILED=3 } WGCBRK_STATE;
@@ -108,6 +112,26 @@ typedef struct _WGCBRK_SLOT {
     volatile LONGLONG FirstPublishTick;  /* first publish completed (both paths) */
     volatile LONG     PollCount;         /* PW: polls entered for this open; WGC: 0 */
     volatile LONG     _padTick2;
+    /* ABI 6. WGC FRAME ACCOUNTING. Why: a window can sit with AckState==ACTIVE, a clean open
+     * (every stage tick populated) and a healthy broker, and still publish nothing ever again -
+     * measured 2026-09-25 on Settings, which published exactly 2 frames and then stopped for
+     * good while another slot published ~2/s throughout. From the outside that is indistinguishable
+     * from "WGC delivers nothing for this window class", but the two have OPPOSITE fixes, and
+     * the shared state could not tell them apart: FrameArrived drops a frame whose ContentSize
+     * differs from the pool, and if pool.Recreate() throws, poolW/poolH stay stale and EVERY
+     * later frame is dropped the same way - a permanent feed loss that looks identical to a
+     * dead feed. These count what actually happened, so the next capture says which it was
+     * instead of being argued about. Diagnostic only: the broker never decides on them. */
+    volatile LONG     FramesArrived;     /* FrameArrived callbacks entered for this channel */
+    volatile LONG     FramesPublished;   /* frames that reached the publish path */
+    volatile LONG     FramesDropSize;    /* dropped: ContentSize != pool size */
+    volatile LONG     RecreateOk;        /* pool.Recreate() succeeded */
+    volatile LONG     RecreateFail;      /* pool.Recreate() threw - the stale-pool trap */
+    volatile LONG     LastContentW;      /* ContentSize of the most recent arrival */
+    volatile LONG     LastContentH;
+    volatile LONG     PoolW;             /* the pool size it was compared against */
+    volatile LONG     PoolH;
+    volatile LONG     _padAbi6;
 } WGCBRK_SLOT;
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))
