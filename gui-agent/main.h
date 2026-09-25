@@ -38,6 +38,9 @@ extern DWORD g_HostScreenHeight;
 extern BOOL g_VchanClientConnected;
 extern BOOL g_StagingGrant;
 extern BOOL g_NoScreenGrant;
+// Input messages RECEIVED from dom0 (vchan-handlers.c). Reported by QGAINPUT so the
+// dom0 -> vchan -> agent hop can be proven with a single keystroke instead of argued.
+extern volatile LONG g_InKeypress, g_InButton, g_InMotion, g_InFocus;
 // TRUE while the desktop grant must stay suppressed: P2 is armed AND the desktop monitor is not
 // plugged (we are seamless and not on our way out of it). Callers use this, never g_NoScreenGrant
 // directly - the flag is the policy, this is the policy applied to the current mode.

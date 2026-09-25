@@ -347,8 +347,20 @@ static DWORD SynthesizeKeycode(IN UINT keycode, IN BOOL release)
     return ERROR_SUCCESS;
 }
 
+// WHAT ARRIVED FROM DOM0. The agent-side input path was demonstrated (the guest has a foreground
+// window in non-seamless and SendInput lands in it), but the hop that carries a real user
+// keystroke - dom0's gui-daemon -> vchan -> here - has no driver in the dev qube, so it could only
+// be argued from code reading. These counters make it observable: type one key with the guest in
+// non-seamless and QGAINPUT says whether it arrived, which separates "dom0 never sent it" from
+// "the agent received it and could not place it".
+volatile LONG g_InKeypress = 0;
+volatile LONG g_InButton   = 0;
+volatile LONG g_InMotion   = 0;
+volatile LONG g_InFocus    = 0;
+
 static DWORD HandleKeypress(IN HWND window)
 {
+    _InterlockedIncrement(&g_InKeypress);
     struct msg_keypress keyMsg;
     INPUT inputEvent;
     SHORT localCapslockState;
@@ -421,6 +433,7 @@ static DWORD HandleKeypress(IN HWND window)
 
 static DWORD HandleButton(IN HWND window)
 {
+    _InterlockedIncrement(&g_InButton);
     struct msg_button buttonMsg;
 
     LogVerbose("0x%x", window);
@@ -736,6 +749,7 @@ static DWORD HandleCrossing(IN HWND window)
 
 static DWORD HandleMotion(IN HWND window)
 {
+    _InterlockedIncrement(&g_InMotion);
     struct msg_motion motionMsg;
 
     LogVerbose("0x%x", window);
@@ -1350,6 +1364,7 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 
 static DWORD HandleFocus(IN HWND window)
 {
+    _InterlockedIncrement(&g_InFocus);
     struct msg_focus focusMsg;
 
     if (!VchanReceiveBuffer(g_Vchan, &focusMsg, sizeof(focusMsg), L"msg_focus"))

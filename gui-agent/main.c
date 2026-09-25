@@ -4116,6 +4116,23 @@ static ULONG s_CapStrippedCount = 0;
 static CRITICAL_SECTION s_csCapStrip;
 static BOOL s_csCapStripReady = FALSE;
 
+// The set must survive an AGENT RESTART, not just a mode switch. A window stripped by a previous
+// agent instance kept no title bar for ever: the instance that could restore it was gone and the
+// new one had no record. Persisted as indexed registry values - exact handles, never a guessed
+// "looks stripped" signature, which would risk putting a caption on an app that legitimately has
+// none (Jev rated that guess 0.02).
+static void CapStripPersist(void)
+{
+    if (!s_csCapStripReady) return;
+    WCHAR name[32];
+    (void)CfgWriteDword(NULL, L"CapStripCount", s_CapStrippedCount, NULL);
+    for (ULONG i = 0; i < s_CapStrippedCount; i++)
+    {
+        StringCchPrintf(name, RTL_NUMBER_OF(name), L"CapStrip%lu", i);
+        (void)CfgWriteDword(NULL, name, (DWORD)(ULONG_PTR)s_CapStripped[i], NULL);
+    }
+}
+
 static void CapStripRemember(IN HWND hwnd)
 {
     if (!s_csCapStripReady || !hwnd) return;
@@ -4123,7 +4140,10 @@ static void CapStripRemember(IN HWND hwnd)
     for (ULONG i = 0; i < s_CapStrippedCount; i++)
         if (s_CapStripped[i] == hwnd) { LeaveCriticalSection(&s_csCapStrip); return; }
     if (s_CapStrippedCount < CAPSTRIP_MAX)
+    {
         s_CapStripped[s_CapStrippedCount++] = hwnd;
+        CapStripPersist();
+    }
     else
         LogWarning("QGACAPSTRIP set full (%d) - 0x%x not recorded, its caption will not come back",
             CAPSTRIP_MAX, (DWORD)(ULONG_PTR)hwnd);
@@ -4138,6 +4158,7 @@ static void CapStripForget(IN HWND hwnd)
         if (s_CapStripped[i] == hwnd)
         {
             s_CapStripped[i] = s_CapStripped[--s_CapStrippedCount];
+            CapStripPersist();
             break;
         }
     LeaveCriticalSection(&s_csCapStrip);
@@ -4268,6 +4289,35 @@ static void HideGuestCaption(IN WINDOW_DATA* entry) { RestyleGuestCaption(entry,
 //   - the Windows-key block: already explicitly gated on g_SeamlessMode at its own site.
 //   - the work area: Jev could not judge it from the evidence (restore-full-desktop 0.51 against
 //     insufficient-evidence 0.39), so it is left alone rather than changed on a guess.
+// Re-adopt what a previous agent instance stripped. Called once at Init, before the first mode is
+// applied, so leaving seamless restores those windows too instead of stranding them.
+static void CapStripReload(void)
+{
+    DWORD n = 0;
+    if (!s_csCapStripReady) return;
+    if (ERROR_SUCCESS != CfgReadDword(NULL, L"CapStripCount", &n, NULL) || n == 0)
+        return;
+    if (n > CAPSTRIP_MAX) n = CAPSTRIP_MAX;
+    ULONG adopted = 0;
+    WCHAR name[32];
+    EnterCriticalSection(&s_csCapStrip);
+    for (DWORD i = 0; i < n && s_CapStrippedCount < CAPSTRIP_MAX; i++)
+    {
+        DWORD raw = 0;
+        StringCchPrintf(name, RTL_NUMBER_OF(name), L"CapStrip%lu", i);
+        if (ERROR_SUCCESS != CfgReadDword(NULL, name, &raw, NULL) || !raw)
+            continue;
+        HWND h = (HWND)(ULONG_PTR)raw;
+        if (!IsWindow(h)) continue;      // the window died with the old agent's session
+        s_CapStripped[s_CapStrippedCount++] = h;
+        adopted++;
+    }
+    LeaveCriticalSection(&s_csCapStrip);
+    if (adopted)
+        LogInfo("QGACAPSTRIP adopted %lu window(s) stripped by a previous agent instance - their "
+            L"captions can be restored when this guest leaves seamless", adopted);
+}
+
 static void ApplySeamlessTweaks(IN BOOL seamless)
 {
     // 1. Guest window shadows: dom0 draws them in seamless.
@@ -10965,6 +11015,9 @@ static ULONG WINAPI WatchForEvents(void)
                 capStatLast = nowTick2;
                 CaptureAcquireStats(&acqP, &acqN, &acqT, &acqE, &acqHr);
                 CaptureThreadStats(&loops, &loopAge, &inside, &insideMs, &enabled);
+                LogInfo("QGAINPUT,mode=nonseamless,keypress=%d,button=%d,motion=%d,focus=%d "
+                    L"(what dom0 has actually delivered since this agent started)",
+                    g_InKeypress, g_InButton, g_InMotion, g_InFocus);
                 LogInfo("QGACAPSTAT,mode=nonseamless,screen=%ux%u,frames=%I64u,present=%d,"
                     L"nopresent=%d,timeout=%d,err=%d,lasthr=0x%08x,grant=%d,dump=%d,capture=%d,"
                     L"loops=%d,loop_age_ms=%I64d,inside=%d,inside_ms=%I64d,enabled=%d",
@@ -11696,6 +11749,7 @@ static ULONG Init(void)
     InitializeCriticalSection(&g_csWatchedWindows);
     InitializeCriticalSection(&s_csCapStrip);
     s_csCapStripReady = TRUE;
+    CapStripReload();
 
     // Attach the Qubes IDD and make it the sole active display BEFORE InitVideoModes() and
     // before the screen is mapped: both read the current topology, so doing this afterwards
