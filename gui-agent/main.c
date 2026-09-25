@@ -8902,6 +8902,50 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             RECT pwRect = { entry->X, entry->Y,
                             entry->X + (int)entry->Width, entry->Y + (int)entry->Height };
             RECT pwHit;
+            // ---- DAMAGE FOR A PRINTWINDOW-ROUTED BROKER SLOT ---------------------------------
+            // WHY THIS HAS TO BE HERE. A WGC slot is driven by FrameArrived: something arrives and
+            // the broker publishes. A slot the broker has RE-ROUTED to PrintWindow has no such
+            // event - PrintWindow is a pull API, nothing arrives - so a tick has to be synthesised,
+            // and the broker was built to take that tick from the agent ("renders only when the
+            // agent says the window changed", 5a7b33f). It never received one. Measured on the rig
+            // 2026-09-26: PokeSeq=0 with PollsServiced == SafetyPolls == Polls, i.e. every render
+            // that slot ever had came from the 1 s backstop and none from damage.
+            //
+            // Two reasons, both structural rather than a typo. BrokerPokeDamage sits in the legacy
+            // dirty-rect loop, BELOW the `continue` that closes this very block, so it is
+            // unreachable for any attached window - and every broker-served window is attached by
+            // construction, since BrokerRegister requires PwSliceFed and the attach sets
+            // PwDumpSent and PwSliceFed together. And BrokerPokeWindow fires only from the vchan
+            // INPUT handlers, so with no dom0 input there is no poke at all. On an eligible guest
+            // the slice path below does not run either (it serves win10 / sub-26100 / the explicit
+            // opt-out), so NOTHING computed per-window damage for these windows.
+            //
+            // So compute it, once, where the window rect already is. Only for a slot the broker has
+            // actually routed to PrintWindow: a WGC slot needs no poke and paying for an
+            // intersection per dirty rect on every window would be the cost this is meant to avoid.
+            //
+            // HONEST CAVEAT, measured earlier and not contradicted: DDA dirty rects were seen NOT
+            // to cover cross-process-content windows (dr=2, area=2, sends=0 during an active
+            // drive). If that holds, this poke will still rarely fire for exactly the class that
+            // gets re-routed - which is why input was chosen as the trigger in the first place.
+            // That is now a MEASURABLE outcome rather than an assumption: PokeSeq on a re-routed
+            // slot says whether per-window DDA damage exists for it at all.
+            if (entry->PwBrokerSourced && g_WgcBase && frame->dirty_rects_count > 0 &&
+                entry->PwBrokerSlot >= 0 && entry->PwBrokerSlot < WGCBRK_MAX_SLOTS)
+            {
+                const WGCBRK_SLOT* ps = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
+                if (ps->TickPw && ps->Hwnd == (UINT64)(ULONG_PTR)entry->Handle)
+                {
+                    for (UINT ddi = 0; ddi < frame->dirty_rects_count; ddi++)
+                    {
+                        if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pwRect))
+                        {
+                            BrokerPokeDamage(entry);
+                            break;      // one poke per pass; the broker coalesces
+                        }
+                    }
+                }
+            }
             if (entry->PwSliceFed)
             {
                 // WGC BROKER (24H2+): if this window has a fresh, bounds-checked per-HWND
