@@ -48,6 +48,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define REG_CONFIG_FAULT_DUP_CREATE_VALUE   L"FaultDupCreate"
 #define REG_CONFIG_FAULT_LEGACY_SEND_VALUE  L"FaultLegacySend"
 #define REG_CONFIG_FAULT_PW_FAIL_VALUE      L"FaultPrintWindowFail"
+#define REG_CONFIG_FAULT_SLAB_BIND_VALUE    L"FaultSlabDoubleBind"
 #define REG_CONFIG_FAULT_GATE_OFF_VALUE     L"FaultGateOff"
 
 #define FAULT_DELAY_ENV_VALUE        L"QUBES_GUI_FAULT_DELAY"
@@ -60,6 +61,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define FAULT_DUP_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_DUP_CREATE"
 #define FAULT_LEGACY_SEND_ENV_VALUE  L"QUBES_GUI_FAULT_LEGACY_SEND"
 #define FAULT_PW_FAIL_ENV_VALUE      L"QUBES_GUI_FAULT_PRINTWINDOW_FAIL"
+#define FAULT_SLAB_BIND_ENV_VALUE    L"QUBES_GUI_FAULT_SLAB_DOUBLE_BIND"
 #define FAULT_GATE_OFF_ENV_VALUE     L"QUBES_GUI_FAULT_GATE_OFF"
 
 // Seconds between FiInit() and the first fault that may fire. See faultinject.h: every
@@ -80,6 +82,7 @@ static volatile LONG g_FiLegacySend  = 0;
 static volatile LONG g_FiCaptureExit = 0;
 static volatile LONG g_FiPumpStall   = 0;
 static volatile LONG g_FiPrintWindowFail = 0;
+static volatile LONG g_FiSlabDoubleBind  = 0;
 
 // [FI_GATE_OFF] Bitmask of ShouldAcceptWindow safeguard clauses to BYPASS.
 //
@@ -188,6 +191,7 @@ void FiInit(void)
     g_FiLegacySend  = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_LEGACY_SEND_VALUE,  FAULT_LEGACY_SEND_ENV_VALUE,  0);
     g_FiCaptureExit = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_CAPTURE_EXIT_VALUE, FAULT_CAPTURE_EXIT_ENV_VALUE, 0);
     g_FiPrintWindowFail = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_PW_FAIL_VALUE, FAULT_PW_FAIL_ENV_VALUE, 0);
+    g_FiSlabDoubleBind  = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_SLAB_BIND_VALUE, FAULT_SLAB_BIND_ENV_VALUE, 0);
     g_FiGateOff         = FiReadDword(moduleName, REG_CONFIG_FAULT_GATE_OFF_VALUE, FAULT_GATE_OFF_ENV_VALUE, 0);
 
     g_FiArmAt = GetTickCount64() + (ULONGLONG)delaySec * 1000ULL;
@@ -219,7 +223,7 @@ void FiInit(void)
 
     if (g_FiNegCreate > 0 || g_FiDupCreate > 0 || g_FiLegacySend > 0 ||
         g_FiCaptureExit > 0 || g_FiPumpStall > 0 || g_FiRingStallArmed || g_FiRawCreate ||
-        g_FiPrintWindowFail > 0 || g_FiGateOff != 0)
+        g_FiPrintWindowFail > 0 || g_FiSlabDoubleBind > 0 || g_FiGateOff != 0)
     {
         LogWarning("QGAFAULT-INIT FAULTS ARE ARMED - this agent will break itself on purpose "
             L"in %u s; results from this run describe the INJECTED defect, not the build", delaySec);
@@ -289,6 +293,28 @@ BOOL FiPrintWindowFail(void)
     LogWarning("QGAFAULT FI_PRINTWINDOW_FAIL firing: this capture reports PrintWindow "
         L"failure (%d shots left) - 5 consecutive on one channel must latch WCDEAD",
         g_FiPrintWindowFail);
+    return TRUE;
+}
+
+// [FI_SLAB_DOUBLE_BIND] Hand out a per-window slab that a LIVE window still holds, which is
+// the defect the PWCOLLISION alarm in PwAttachWindowCarry exists to catch. The open P2 is a
+// field report of one window's content rendering inside another window's frame, persistently;
+// that is what dom0 would draw if two windows were announced against one granted buffer. Without
+// this flag the alarm has never been seen to fire, so under CLAUDE.md's rule its silence is not
+// evidence of anything. Agent-local by construction: it changes which of OUR OWN already-granted
+// buffers this guest reuses for its own windows. No new grant is made, no dom0-side check is
+// weakened or bypassed, and nothing outside this qube's own display can be affected.
+BOOL FiSlabDoubleBind(void)
+{
+    if (g_FiSlabDoubleBind <= 0)
+        return FALSE;
+
+    if (!FiTakeShot(&g_FiSlabDoubleBind))
+        return FALSE;
+
+    LogWarning("QGAFAULT FI_SLAB_DOUBLE_BIND firing: this attach takes a slab that a live "
+        L"window still holds (%d shots left) - PWCOLLISION must name both windows",
+        g_FiSlabDoubleBind);
     return TRUE;
 }
 

@@ -193,6 +193,9 @@ BOOL FiShouldLegacySend(void);
 // engine loop's 2 ms cadence, so one channel consumes 5 shots before the sweep offers the
 // fault to another.
 BOOL FiPrintWindowFail(void);
+// [FI_SLAB_DOUBLE_BIND] TRUE once per armed shot: PwSlabAcquire must return a slab that a
+// live window still holds, so the PWCOLLISION alarm can be seen to fire.
+BOOL FiSlabDoubleBind(void);
 
 // [FI_GATE_OFF] TRUE while this safeguard clause is bypassed for the run. Not a shot and not
 // subject to the arming delay: a gate bypass is a mode, and it cannot disturb the handshake
@@ -216,6 +219,7 @@ static __forceinline BOOL  FiShouldCaptureExit(void) { return FALSE; }
 static __forceinline BOOL  FiShouldDupCreate(IN HWND window) { UNREFERENCED_PARAMETER(window); return FALSE; }
 static __forceinline BOOL  FiShouldLegacySend(void) { return FALSE; }
 static __forceinline BOOL  FiPrintWindowFail(void) { return FALSE; }
+static __forceinline BOOL  FiSlabDoubleBind(void) { return FALSE; }
 static __forceinline BOOL  FiGateOff(IN DWORD gateBit) { UNREFERENCED_PARAMETER(gateBit); return FALSE; }
 
 #endif

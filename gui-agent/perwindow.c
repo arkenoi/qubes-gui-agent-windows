@@ -13,6 +13,7 @@
 #include "perwindow.h"
 #include "pwcarry.h"
 #include "perf.h"
+#include "faultinject.h"
 
 #include <log.h>
 #include <config.h>
@@ -232,10 +233,17 @@ static PW_SLAB* PwSlabAcquire(IN ULONG pageCount)
     const ULONGLONG now = GetTickCount64();
     PW_SLAB* best = NULL;
 
+    // Deliberate defect, compiled out of anything shipped (QGA_FAULT_INJECTION). Ignoring InUse
+    // hands this window a buffer a LIVE window still holds, which is exactly the double-binding
+    // the PWCOLLISION alarm below exists to catch. Until this has driven that alarm, the alarm's
+    // silence proves nothing - a check never seen to fail is decoration, not evidence.
+    const BOOL fiDoubleBind = FiSlabDoubleBind();
+
     EnterCriticalSection(&g_PwSlabLock);
     for (PW_SLAB* s = g_PwSlabs; s; s = s->Next)
     {
-        if (s->InUse || s->Pages < pageCount || now < s->FreeAt)
+        if ((s->InUse && !fiDoubleBind) || s->Pages < pageCount ||
+            (now < s->FreeAt && !fiDoubleBind))
             continue;
         if (!best || s->Pages < best->Pages)   // smallest that fits: keep big slabs for big windows
             best = s;
@@ -603,8 +611,18 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     if (g_ProtoTrace)
     {
         const ULONGLONG pwTDump = GetTickCount64();
-        LogInfo("QGAPROTO,msg=PWATTACH,hwnd=0x%x,slicefed=%d,pre=%d,slab=%llu,add=%llu,prefill=%llu,dump=%llu,total=%llu",
+        // buf/ref0/pages identify WHICH SLAB this window was just announced to dom0 with.
+        // Without them the trace says a dump was sent but not what was in it, and the open P2
+        // ("Settings' right panel renders into a DIFFERENT window", forum 42717 post 160) is
+        // exactly a question about that: if two live windows are announced with the same buffer
+        // and the same first grant ref, one window's pixels are landing in another's frame and
+        // the collision is visible directly, with no theory needed. ref0 is the first entry of
+        // the ref array actually handed to SendWindowDump, so it is what the daemon was told -
+        // not what we believe we told it.
+        LogInfo("QGAPROTO,msg=PWATTACH,hwnd=0x%x,slicefed=%d,pre=%d,buf=0x%llx,ref0=%lu,pages=%lu,"
+                "dumppages=%lu,slab=%llu,add=%llu,prefill=%llu,dump=%llu,total=%llu",
             (uint32_t)(ULONG_PTR)entry->Handle, sliceFed ? 1 : 0, entry->PwPreExisting ? 1 : 0,
+            (unsigned long long)(ULONG_PTR)buffer, refs ? refs[0] : 0UL, grantedPages, pageCount,
             pwTSlab - pwT0, pwTAdd - pwTSlab, pwTPrefill - pwTAdd,
             pwTDump - pwTPrefill, pwTDump - pwT0);
     }
@@ -617,6 +635,34 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
         PwRevokeTick();
         return status;
     }
+
+    // COLLISION ALARM (always on - a correctness check, not a trace). The open P2 is a field
+    // report of one window's content appearing inside ANOTHER window's frame, persistently and
+    // navigable by keyboard (forum 42717 post 160). That is what a slab bound to two live windows
+    // at once would look like from dom0, and this is the only moment such a binding can be
+    // created: right here, as this window takes ownership of `buffer`. PwSlabAcquire hands out
+    // only slabs with InUse==FALSE, so a hit means the pool and the window records DISAGREE - the
+    // pool believes the slab is free while a live window still points at it. The two existing
+    // guards (PW_SLAB_QUARANTINE_MS, and the memset on reuse) both target a transient race and
+    // neither would make this visible, which is why the report reads as permanent rather than as
+    // a flash. Report it and name both windows; do not recover here - a component that was
+    // working and then stops is a failure to diagnose, never something to paper over quietly.
+    EnterCriticalSection(&g_csWatchedWindows);
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
+    {
+        const WINDOW_DATA* other = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (other != entry && other->PwBuffer == buffer)
+        {
+            LogWarning("PWCOLLISION hwnd=0x%x took slab buf=0x%llx ref0=%lu while live window "
+                       "hwnd=0x%x still holds it - two windows now share one granted buffer, so "
+                       "dom0 paints one window's pixels into the other's frame",
+                       (uint32_t)(ULONG_PTR)entry->Handle,
+                       (unsigned long long)(ULONG_PTR)buffer, refs ? refs[0] : 0UL,
+                       (uint32_t)(ULONG_PTR)other->Handle);
+            break;
+        }
+    }
+    LeaveCriticalSection(&g_csWatchedWindows);
 
     entry->PwBuffer = buffer;
     entry->PwPageCount = pageCount;
