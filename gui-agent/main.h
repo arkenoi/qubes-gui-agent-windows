@@ -508,6 +508,9 @@ BOOL WgcBrokerActive(void);
 // the whole-desktop composite is NOT an allowed source for a per-window window. See main.c.
 BOOL DirectRequired(void);
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry);
+// Tell the broker a window's pixels are likely to have changed. Called from the input path:
+// desktop-duplication damage is measured not to cover cross-process-content windows.
+void BrokerPokeWindow(IN HWND window);
 // TRUE when a resize can keep this window's existing broker slot: it is registered, the slot is
 // still ours, and the new size still fits the arena buffers the slot already owns.
 BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG newHeight);

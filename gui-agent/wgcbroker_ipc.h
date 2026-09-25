@@ -17,6 +17,12 @@
 /* Longest a PrintWindow-captured window may go unrendered when no damage poke arrives. A bound
  * on staleness, not a polling rate: with a working poke path it should almost never fire. */
 #define WGCBRK_POKE_SAFETY_MS 1000
+/* Minimum gap between two PrintWindow renders of the same window, however many pokes arrive.
+ * Input can poke at input rate, and PrintWindow costs p50 31.7 ms on a large window rendered on
+ * the application's own UI thread, so without this a mouse moving across a window would restore
+ * exactly the fixed-tick cost this design exists to avoid. 100 ms caps it at ~10 renders/s while
+ * interacting and 0 when idle. It is a CEILING ON COST, not a refresh rate. */
+#define WGCBRK_POKE_MIN_INTERVAL_MS 100
 #define WGCBRK_RING         2             /* double buffer; 3 kills reader retries at 1.5x mem */
 
 typedef enum { WGCBRK_FREE=0, WGCBRK_REQUESTED=1, WGCBRK_ACTIVE=2, WGCBRK_FAILED=3 } WGCBRK_STATE;
@@ -42,7 +48,14 @@ typedef struct _WGCBRK_HEADER {          /* 128 bytes */
     volatile LONG      AgentPid;         /* the launcher agent's pid; broker exits if it changes */
     volatile LONG      BrokerPid;
     volatile LONG      ControlGen;       /* agent bumps on ANY capture-list change */
-    volatile LONG      _pad1;
+    /* Input pokes dropped because the watched-window lock was busy. The input path acquires that
+     * lock with TryEnterCriticalSection and never waits, so dom0's input is never delayed by a
+     * poke - but a dropped poke means that repaint waits for the staleness bound instead. This
+     * project's rule is that a fallback firing is logged loudly and diagnosed, never silent, so
+     * count it: a PokeLockMiss that climbs alongside SafetyPolls says the contention is real and
+     * the design needs a different signal, not that it is working. Layout-compatible - it takes
+     * the place of a pad, so no ABI bump is needed and no reader is invalidated. */
+    volatile LONG      PokeLockMiss;
     BYTE               _pad2[56];
 } WGCBRK_HEADER;
 

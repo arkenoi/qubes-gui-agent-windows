@@ -361,6 +361,10 @@ volatile LONG g_InFocus    = 0;
 static DWORD HandleKeypress(IN HWND window)
 {
     _InterlockedIncrement(&g_InKeypress);
+    // Input for this window: its pixels are about to change, and the broker's PrintWindow
+    // path renders only when told. Desktop-duplication damage does not cover this class of
+    // window (measured), so input is the signal that keeps interaction responsive.
+    BrokerPokeWindow(window);
     struct msg_keypress keyMsg;
     INPUT inputEvent;
     SHORT localCapslockState;
@@ -434,6 +438,10 @@ static DWORD HandleKeypress(IN HWND window)
 static DWORD HandleButton(IN HWND window)
 {
     _InterlockedIncrement(&g_InButton);
+    // Input for this window: its pixels are about to change, and the broker's PrintWindow
+    // path renders only when told. Desktop-duplication damage does not cover this class of
+    // window (measured), so input is the signal that keeps interaction responsive.
+    BrokerPokeWindow(window);
     struct msg_button buttonMsg;
 
     LogVerbose("0x%x", window);
@@ -750,6 +758,10 @@ static DWORD HandleCrossing(IN HWND window)
 static DWORD HandleMotion(IN HWND window)
 {
     _InterlockedIncrement(&g_InMotion);
+    // Input for this window: its pixels are about to change, and the broker's PrintWindow
+    // path renders only when told. Desktop-duplication damage does not cover this class of
+    // window (measured), so input is the signal that keeps interaction responsive.
+    BrokerPokeWindow(window);
     struct msg_motion motionMsg;
 
     LogVerbose("0x%x", window);

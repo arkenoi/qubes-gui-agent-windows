@@ -3697,7 +3697,7 @@ BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG 
 // Cheap by construction: an interlocked increment and a SetEvent on an auto-reset event the
 // broker is already waiting on. Bumping more than once for a frame is harmless - the broker
 // compares against the value it last serviced, it does not count pokes.
-static void BrokerPokeDamage(IN const WINDOW_DATA* entry)
+void BrokerPokeDamage(IN const WINDOW_DATA* entry)
 {
     if (!g_WgcBase || !entry->PwBrokerSourced ||
         entry->PwBrokerSlot < 0 || entry->PwBrokerSlot >= WGCBRK_MAX_SLOTS)
@@ -3705,6 +3705,50 @@ static void BrokerPokeDamage(IN const WINDOW_DATA* entry)
     WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
     _InterlockedIncrement(&s->PokeSeq);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
+}
+
+// Poke by HWND, for the input path. dom0's keyboard/mouse/focus messages name the window they
+// are for, and input is the moment a user notices latency.
+//
+// WHY INPUT AND NOT DAMAGE. The damage poke this sits beside is driven by the desktop's DDA dirty
+// rects, and those are measured NOT to cover this class of window: with Settings being actively
+// driven - 12 keystrokes, content visibly changing - the per-frame diagnostics reported a
+// TWO-PIXEL dirty area and no window damage for the whole drive, while dom0 only updated via the
+// 1 s staleness bound. The content lives in a separate composition target, which is the same
+// shape as the original defect. Jev on that measurement: dda-unusable 0.67, best remaining source
+// input-and-focus 0.60 (winevent object events 0.38 - the next lever if this leaves gaps),
+// combine-with-the-staleness-bound 0.87.
+//
+// Takes the watched-window lock itself; CRITICAL_SECTION is recursive, so a caller already
+// holding it is fine.
+void BrokerPokeWindow(IN HWND window)
+{
+    if (!g_WgcBase || !window)
+        return;
+    // TRY, never wait. This runs on the VCHAN HANDLER thread, in front of injecting a keystroke
+    // or a mouse event. The capture thread holds this same lock for its whole per-window damage
+    // pass, and sends to the vchan inside it - so a blocking acquire here would put dom0's input
+    // behind a frame, and behind a full vchan ring. Input latency is the thing this change exists
+    // to improve; paying for it with input latency would be self-defeating.
+    //
+    // It also makes the lock-order question moot rather than argued: this path can now hold at
+    // most one lock and never waits for one, so it cannot take part in a cycle. Jev rated that
+    // risk blocking at 0.86 with worst_risk=lock-order 1.00 before this was written.
+    //
+    // A skipped poke is not a lost frame: the broker's 1 s staleness bound still repaints the
+    // window, and the next input event pokes again.
+    if (!TryEnterCriticalSection(&g_csWatchedWindows))
+    {
+        // Counted, not swallowed: if this climbs alongside SafetyPolls the contention is real and
+        // the poke needs a different signal. A silent skip here would look exactly like a working
+        // design that simply had nothing to report.
+        _InterlockedIncrement(&WGCBRK_HDR(g_WgcBase)->PokeLockMiss);
+        return;
+    }
+    const WINDOW_DATA* entry = FindWindowByHandle(window);
+    if (entry)
+        BrokerPokeDamage(entry);
+    LeaveCriticalSection(&g_csWatchedWindows);
 }
 
 BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
