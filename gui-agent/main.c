@@ -9345,7 +9345,16 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // changed underneath) holds the last content; the settle
                         // recapture repairs it.
                         if (PwDragSliceRefresh(entry, frame, framebuffer))
-                            entry->PwLedgerDragSlice++;   // LEDGER C3: fed from the desktop composite
+                        {
+                            // LEDGER C3: fed from the desktop composite. BOTH counters, because
+                            // PwDragSliceRefresh does its own memcpy and never reaches
+                            // PwSliceCopyAndDamageSrc - so without the discriminator here a
+                            // drag-slice copy could never surface as UNATTRIBUTED. Found by
+                            // tools/tests/ledger-invariant-audit.py, which is the check that
+                            // exists because the same hole in the synth path was found by hand.
+                            entry->PwLedgerDragSlice++;
+                            entry->PwLedgerCopies++;
+                        }
                     }
                     else if (entry->PwDragSlice)
                     {
