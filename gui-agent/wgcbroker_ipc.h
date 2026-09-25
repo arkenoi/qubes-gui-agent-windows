@@ -12,8 +12,11 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  6u   /* 6: per-slot frame-arrival/drop accounting (see FramesArrived) */
+#define WGCBRK_ABI_VERSION  7u   /* 7: damage-driven PrintWindow polling (PokeSeq/PokeAck) */
 #define WGCBRK_MAX_SLOTS    32
+/* Longest a PrintWindow-captured window may go unrendered when no damage poke arrives. A bound
+ * on staleness, not a polling rate: with a working poke path it should almost never fire. */
+#define WGCBRK_POKE_SAFETY_MS 1000
 #define WGCBRK_RING         2             /* double buffer; 3 kills reader retries at 1.5x mem */
 
 typedef enum { WGCBRK_FREE=0, WGCBRK_REQUESTED=1, WGCBRK_ACTIVE=2, WGCBRK_FAILED=3 } WGCBRK_STATE;
@@ -128,6 +131,32 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG     PoolW;             /* the pool size it was compared against */
     volatile LONG     PoolH;
     volatile LONG     _padAbi6;
+    /* ABI 7. DAMAGE-DRIVEN POLLING for the PrintWindow path.
+     *
+     * WHY. A window whose content is rendered by a CROSS-PROCESS CHILD has an empty surface of its
+     * own, so a WGC session on it delivers nothing - measured 2026-09-25: PrintWindow(flags=0) on
+     * the Settings frame returned ONE distinct colour over 1216x941 while PW_RENDERFULLCONTENT
+     * returned 191 and the whole page. Those windows must therefore be captured with PrintWindow.
+     * But PrintWindow is expensive and SYNCHRONOUS ON THE CAPTURED APPLICATION'S UI THREAD:
+     * measured p50 31.7 ms (p90 38.9, max 53.3, n=40) on that window, and the broker's polled path
+     * runs at ~13.5/s, i.e. about 43% of one core, for ONE window, for ever. Jev on those numbers:
+     * unacceptable-as-is 1.00, damage-driven-polling 0.87.
+     *
+     * So the agent, which already computes per-window damage by intersecting the desktop's dirty
+     * rects with each window rect, bumps PokeSeq when this window's pixels actually changed. The
+     * broker renders only when PokeSeq != PokeAck, then stores the value it serviced. A window
+     * nobody is touching costs nothing.
+     *
+     * SafetyPolls bounds staleness if the damage signal is ever wrong: the broker still polls
+     * after WGCBRK_POKE_SAFETY_MS of silence. That is a BOUND, not a fallback - it is counted, and
+     * a SafetyPolls that climbs while PollsSkipped climbs means the poke path is not working and
+     * must be diagnosed, not tolerated. */
+    volatile LONG     PokeSeq;           /* agent: bumped when this window's pixels changed */
+    volatile LONG     PokeAck;           /* broker: the PokeSeq value it last rendered for */
+    volatile LONG     PollsServiced;     /* renders actually performed */
+    volatile LONG     PollsSkipped;      /* ticks where nothing had changed, so nothing was done */
+    volatile LONG     SafetyPolls;       /* renders forced by the staleness bound, not by a poke */
+    volatile LONG     _padAbi7;
 } WGCBRK_SLOT;
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))

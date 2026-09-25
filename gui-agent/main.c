@@ -3686,6 +3686,27 @@ BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG 
     return TRUE;
 }
 
+// Tell the broker this window's pixels changed.
+//
+// The broker's PrintWindow path renders the full window synchronously on the CAPTURED
+// APPLICATION's UI thread - p50 31.7 ms on a 1216x941 window, measured 2026-09-25 - so polling it
+// on a fixed tick spends about 43% of a core per window whether or not anything moved. The agent
+// is already the one place that knows what changed: this damage pass intersects the desktop's
+// dirty rects with each window rect. So say so, and let the broker render only then.
+//
+// Cheap by construction: an interlocked increment and a SetEvent on an auto-reset event the
+// broker is already waiting on. Bumping more than once for a frame is harmless - the broker
+// compares against the value it last serviced, it does not count pokes.
+static void BrokerPokeDamage(IN const WINDOW_DATA* entry)
+{
+    if (!g_WgcBase || !entry->PwBrokerSourced ||
+        entry->PwBrokerSlot < 0 || entry->PwBrokerSlot >= WGCBRK_MAX_SLOTS)
+        return;
+    WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
+    _InterlockedIncrement(&s->PokeSeq);
+    if (g_WgcCtl) SetEvent(g_WgcCtl);
+}
+
 BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
 {
     if (!BrokerCanKeepSlot(entry, entry->Width, entry->Height))
@@ -9685,6 +9706,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         {
             if (IntersectRect(&changedArea, &frame->dirty_rects[i], &windowRect))
             {
+                // This window's pixels changed: wake the broker's PrintWindow path for it. Cheap,
+                // and it is what lets that path stop polling a window nobody is touching.
+                BrokerPokeDamage(entry);
                 LogVerbose("damage for 0x%x: window (%d,%d) %dx%d, damage (%d,%d) %dx%d, intersect (%d,%d) %dx%d",
                     entry->Handle, entry->X, entry->Y, entry->Width, entry->Height,
                     frame->dirty_rects[i].left, frame->dirty_rects[i].top,
