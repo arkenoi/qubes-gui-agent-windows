@@ -4112,7 +4112,7 @@ static void RestyleGuestCaption(IN WINDOW_DATA* entry, IN BOOL hide)
         return;
     if (hide && entry->CaptionHidden)
         return;
-    if (!hide && !entry->CaptionHidden)
+    if (!hide && !entry->CaptionWasStripped)
         return;   // nothing was taken from this one
     // Popups have no caption to remove, and stripping one would flip IsPopup's verdict.
     if (entry->IsOverrideRedirect || entry->Synthesized)
@@ -4194,6 +4194,7 @@ static void RestyleGuestCaption(IN WINDOW_DATA* entry, IN BOOL hide)
         return;
     }
     entry->CaptionHidden = hide;
+    entry->CaptionWasStripped = hide;   // only a real strip is restorable
     LogInfo("0x%x: caption %s helper launched as the window's owner (inset %d)",
         entry->Handle, hide ? L"strip" : L"restore", topInset);
 }
@@ -5818,6 +5819,16 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
 
     // ResetWatch removes all watched windows.
     // If seamless mode is on, top-level windows are added to watch list.
+    // BEFORE ResetWatch, which EMPTIES the watched list when leaving seamless - measured
+    // 2026-09-25: the restore ran after it and reported "captions over 0 window(s)", so every
+    // pre-existing window kept its stripped caption and the desktop still looked wrong. The list
+    // is the only record of which windows were restyled, so the tweaks have to be reversed while
+    // it still exists.
+    if (seamlessMode)
+        ApplySeamlessTweaks(TRUE);
+    else
+        ApplySeamlessTweaks(FALSE);
+
     status = ResetWatch(seamlessMode);
     if (ERROR_SUCCESS != status)
     {
@@ -5844,17 +5855,10 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     // windows and add nothing) and the guest's own in fullscreen (restored). Owner 2026-09-02:
     // disabled permanently in seamless. The seamless disable may no-op if the shell isn't up yet
     // (cold boot) — DaemonSettleSweep retries it until it sticks.
+    // Blank cursors stay in BOTH modes (see ApplySeamlessTweaks for why); everything that is
+    // genuinely mode-dependent is applied above, before ResetWatch empties the watched list.
     if (seamlessMode)
-    {
-        // Blank cursors stay in BOTH modes (see ApplySeamlessTweaks for why); everything that is
-        // genuinely mode-dependent lives in that one function.
         HideCursors();
-        ApplySeamlessTweaks(TRUE);
-    }
-    else
-    {
-        ApplySeamlessTweaks(FALSE);
-    }
 
     // The published IDD mode set is seamless-dependent (the host size is only in
     // it while seamless is active - resolution.c BuildIddModeSet a1), so a

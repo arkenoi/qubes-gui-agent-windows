@@ -443,7 +443,12 @@ typedef struct _WINDOW_DATA
     // message naming a window it has no CREATE for, so UNMAP/DESTROY at teardown must
     // be gated on this - a window that was synthesized (or whose announce failed) must
     // die silently.
-    BOOL CaptionHidden;    // we stripped this window's caption once; never re-apply
+    BOOL CaptionHidden;    // caption decision made for this window; do not re-measure every pass
+    // ...and whether that decision was an actual STRIP. CaptionHidden is also set for a window we
+    // deliberately LEFT ALONE (an own-frame app: Chromium, Explorer's ribbon, a UWP frame), so it
+    // cannot drive the restore - putting WS_CAPTION on an app that draws its own header would be
+    // a new defect, not a repair. Only a window we really stripped gets its caption back.
+    BOOL CaptionWasStripped;
     BOOL CreateSent;
     BOOL Synthesized;      // this window is composited into SynthOwner, never announced
     HWND SynthOwner;       // owner hwnd at synthesis time
