@@ -4102,14 +4102,22 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
     return FALSE;
 }
 
-static void HideGuestCaption(IN WINDOW_DATA* entry)
+// hide==FALSE puts the caption BACK. The strip is a seamless-only tweak (dom0 draws the frame)
+// and had no inverse, so a guest leaving seamless kept every window stripped - no title bar and a
+// black band where the frame belonged, inside the desktop window. See RestyleCaptionMain.
+static void RestyleGuestCaption(IN WINDOW_DATA* entry, IN BOOL hide)
 {
-    if (!g_HideGuestTitleBar || entry->CaptionHidden)
+    const WCHAR* verb = hide ? L"--restyle-caption" : L"--restore-caption";
+    if (!g_HideGuestTitleBar)
         return;
+    if (hide && entry->CaptionHidden)
+        return;
+    if (!hide && !entry->CaptionHidden)
+        return;   // nothing was taken from this one
     // Popups have no caption to remove, and stripping one would flip IsPopup's verdict.
     if (entry->IsOverrideRedirect || entry->Synthesized)
         return;
-    if (!HasFlags(entry->Style, WS_CAPTION))
+    if (hide && !HasFlags(entry->Style, WS_CAPTION))
         return;
 
     RECT wr;
@@ -4117,7 +4125,7 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
     if (!GetWindowRect(entry->Handle, &wr) || !ClientToScreen(entry->Handle, &cl))
         return;
     const int topInset = cl.y - wr.top;
-    if (topInset < TITLEBAR_MIN_INSET)
+    if (hide && topInset < TITLEBAR_MIN_INSET)
     {
         // The app draws its own header (Chromium, Explorer's ribbon, UWP frames). Leave it.
         LogVerbose("0x%x: own-frame app (top inset %d), keeping its caption",
@@ -4156,8 +4164,8 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
         if (GetModuleFileName(NULL, self, RTL_NUMBER_OF(self)))
         {
             WCHAR cmd[MAX_PATH + 64];
-            StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\" --restyle-caption %llx",
-                self, (unsigned long long)(ULONG_PTR)entry->Handle);
+            StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\" %s %llx",
+                self, verb, (unsigned long long)(ULONG_PTR)entry->Handle);
 
             STARTUPINFO si = { 0 };
             PROCESS_INFORMATION pi = { 0 };
@@ -4172,7 +4180,7 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
             }
             else
             {
-                win_perror("CreateProcessAsUser(--restyle-caption)");
+                win_perror("CreateProcessAsUser(caption helper)");
             }
         }
     }
@@ -4185,8 +4193,70 @@ static void HideGuestCaption(IN WINDOW_DATA* entry)
         LogWarning("0x%x: could not launch the restyle helper as the window's owner", entry->Handle);
         return;
     }
-    LogInfo("0x%x: restyle helper launched as the window's owner (inset %d)",
-        entry->Handle, topInset);
+    entry->CaptionHidden = hide;
+    LogInfo("0x%x: caption %s helper launched as the window's owner (inset %d)",
+        entry->Handle, hide ? L"strip" : L"restore", topInset);
+}
+
+static void HideGuestCaption(IN WINDOW_DATA* entry) { RestyleGuestCaption(entry, TRUE); }
+
+// THE ONE PLACE THE SEAMLESS TWEAKS ARE APPLIED AND REVERSED.
+//
+// They used to be scattered - some at Init, some per window at announce, some in SetSeamlessMode -
+// and each site was individually responsible for remembering the mode. That is how the caption
+// strip was missed: it is applied at announce, regardless of mode, with no inverse anywhere, so a
+// guest that left seamless kept every window stripped and its desktop looked wrong. The owner had
+// asked specifically which tweaks are applied at boot and how they are turned off again; a list
+// that lives in one function can be answered by reading it, and a new tweak added here is
+// reversed by construction (Jev: a single apply/reverse function, 1.00, against per-site mode
+// checks 0.00).
+//
+// NOT here, deliberately, each for a stated reason:
+//   - blank cursors: correct in BOTH modes. dom0 draws its pointer over the guest window whether
+//     that window is one app or the whole desktop, so restoring the guest's would give two again
+//     (the README says the doubling happens "in every mode"; Jev 0.74).
+//   - PromptOnSecureDesktop=0: documented as deliberately unconditional in both modes.
+//   - the Windows-key block: already explicitly gated on g_SeamlessMode at its own site.
+//   - the work area: Jev could not judge it from the evidence (restore-full-desktop 0.51 against
+//     insufficient-evidence 0.39), so it is left alone rather than changed on a guess.
+static void ApplySeamlessTweaks(IN BOOL seamless)
+{
+    // 1. Guest window shadows: dom0 draws them in seamless.
+    if (seamless)
+        g_SeamlessShadowsDone = ApplyGuestShadows(FALSE);   // retried by the sweep until applied
+    else
+    {
+        ApplyGuestShadows(TRUE);
+        g_SeamlessShadowsDone = TRUE;                       // nothing to retry
+    }
+
+    // 2. Drop shadow and window animation: dom0 draws the shadow, and the animation can never be
+    //    smooth across the protocol. Inside one desktop window, Windows should look like Windows.
+    if (seamless)
+        DisableEffects();
+    else
+        EnableEffects();
+
+    // 3. Per-window captions: dom0 draws the frame in seamless, so the guest's own is a second
+    //    title bar. In non-seamless there is no dom0 frame and Windows must draw its own.
+    {
+        ULONG touched = 0;
+        EnterCriticalSection(&g_csWatchedWindows);
+        WINDOW_DATA* w = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+        while (w != (WINDOW_DATA*)&g_WatchedWindowsList)
+        {
+            WINDOW_DATA* next = (WINDOW_DATA*)w->ListEntry.Flink;
+            if (w->Handle && IsWindow(w->Handle))
+            {
+                RestyleGuestCaption(w, seamless);
+                touched++;
+            }
+            w = next;
+        }
+        LeaveCriticalSection(&g_csWatchedWindows);
+        LogInfo("QGATWEAKS seamless=%d applied (shadows, effects, captions over %lu window(s))",
+            seamless ? 1 : 0, touched);
+    }
 }
 
 ULONG AddWindow(IN WINDOW_DATA* entry)
@@ -5776,32 +5846,14 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     // (cold boot) — DaemonSettleSweep retries it until it sticks.
     if (seamlessMode)
     {
-        g_SeamlessShadowsDone = ApplyGuestShadows(FALSE);   // retried by the sweep until applied
-        // The rest of the seamless tweaks, applied HERE rather than only at Init. They were
-        // written when the mode never changed after startup, so Init was the only place they
-        // could go; now that dom0 can switch the mode at will they have to follow it (owner,
-        // 2026-09-24). Blank cursors: dom0 draws the pointer, so the guest's own would be a
-        // second one. No drop shadow, no window animation: dom0 draws the shadow, and an
-        // animation can never be smooth across the protocol.
+        // Blank cursors stay in BOTH modes (see ApplySeamlessTweaks for why); everything that is
+        // genuinely mode-dependent lives in that one function.
         HideCursors();
-        DisableEffects();
+        ApplySeamlessTweaks(TRUE);
     }
     else
     {
-        ApplyGuestShadows(TRUE);                            // restore for fullscreen
-        g_SeamlessShadowsDone = TRUE;                       // nothing to retry
-        // ...and hand the guest its shadows and animations back: inside ONE dom0 window showing
-        // a whole Windows desktop, Windows should look like Windows.
-        //
-        // The CURSOR deliberately does NOT come back. I restored it here first and the owner
-        // caught it: the guest cursor stays blanked in BOTH modes. The README is the
-        // specification and says so - dom0 "draws its own pointer over the guest window while
-        // the guest also paints one into the captured frame, IN EVERY MODE" - and non-seamless
-        // changes nothing about that, because dom0 still draws its pointer over the one desktop
-        // window exactly as it does over a per-window one. Restoring it would hand back the
-        // doubled cursor this build exists to remove. (Jev: stay-blanked-both-modes 0.74,
-        // README binds 0.75.)
-        EnableEffects();
+        ApplySeamlessTweaks(FALSE);
     }
 
     // The published IDD mode set is seamless-dependent (the host size is only in
@@ -11740,13 +11792,37 @@ static int SetShadowsMain(LPSTR cmdLine)
 
 static int RestyleCaptionMain(LPSTR cmdLine)
 {
+    // Two verbs now. Stripping the caption is a SEAMLESS tweak - dom0 draws the frame, so the
+    // guest's own would be a second title bar - and it had no inverse, so a guest that left
+    // seamless kept every window stripped: inside the desktop window Notepad had no title bar and
+    // a black band where its frame belonged. Found by finally LOOKING at a capture instead of
+    // comparing its byte size (Jev: the caption must be reversed on leaving seamless, 0.86).
     unsigned long long raw = 0;
-    if (sscanf_s(cmdLine, "--restyle-caption %llx", &raw) != 1 || raw == 0)
+    BOOL restore = FALSE;
+    if (sscanf_s(cmdLine, "--restyle-caption %llx", &raw) == 1 && raw != 0)
+        restore = FALSE;
+    else if (sscanf_s(cmdLine, "--restore-caption %llx", &raw) == 1 && raw != 0)
+        restore = TRUE;
+    else
         return ERROR_INVALID_PARAMETER;
 
     const HWND hwnd = (HWND)(ULONG_PTR)raw;
     if (!IsWindow(hwnd))
         return ERROR_INVALID_WINDOW_HANDLE;
+
+    if (restore)
+    {
+        // Put the caption back and drop the dom0-managed pair we added with it. WS_SYSMENU is
+        // left alone: a normal window has one anyway, and removing it from one that did not
+        // would be a second, unasked-for change.
+        const LONG_PTR rex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+        SetWindowLongPtr(hwnd, GWL_EXSTYLE, rex & ~(LONG_PTR)WS_EX_APPWINDOW);
+        const LONG_PTR rstyle = GetWindowLongPtr(hwnd, GWL_STYLE);
+        SetWindowLongPtr(hwnd, GWL_STYLE, rstyle | WS_CAPTION);
+        SetWindowPos(hwnd, NULL, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        return (GetWindowLongPtr(hwnd, GWL_STYLE) & WS_CAPTION) ? ERROR_SUCCESS : ERROR_ACCESS_DENIED;
+    }
 
     const LONG_PTR ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
     SetWindowLongPtr(hwnd, GWL_EXSTYLE, ex | WS_EX_APPWINDOW);
@@ -11768,6 +11844,8 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     UNREFERENCED_PARAMETER(nCmdShow);
 
     if (lpCmdLine && 0 == strncmp(lpCmdLine, "--restyle-caption", 17))
+        return RestyleCaptionMain(lpCmdLine);
+    if (lpCmdLine && 0 == strncmp(lpCmdLine, "--restore-caption", 17))
         return RestyleCaptionMain(lpCmdLine);
     if (lpCmdLine && 0 == strncmp(lpCmdLine, "--set-shadows", 13))
         return SetShadowsMain(lpCmdLine);
