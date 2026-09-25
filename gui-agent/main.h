@@ -99,6 +99,8 @@ extern volatile LONG64 g_PwLedgerEngineDamage;   // engine deliveries, all windo
 extern volatile LONG64 g_C8DrainVchanInput;
 extern volatile LONG64 g_C8WorkAreaApplied;
 extern volatile LONG64 g_C8InputDesktop;
+extern volatile LONG64 g_C8NonSeamlessDone;
+extern volatile LONG64 g_C8MapHoldRelease;
 
 typedef enum _PW_WINDOW_CLASS {
     PWC_ELIGIBLE = 0,   // has a usable redirection surface: gets its own buffer

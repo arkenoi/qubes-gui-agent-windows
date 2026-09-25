@@ -3972,6 +3972,7 @@ static void PwNoteSliceFedMap(IN OUT WINDOW_DATA* entry)
     if (!entry->PwSliceFed || entry->PwSliceMapTick != 0)
         return;
     entry->PwSliceMapTick = GetTickCount64();
+    InterlockedIncrement64(&g_C8MapHoldRelease);   // LEDGER C8: a held slice-fed map was released
     // painted=1 means the buffer passed SlicePainted before this map (no black frame possible);
     // painted=0 with held_ms >= CROP_BEFORE_SHOW_TIMEOUT_MS is the bounded fail-open release
     // (mapped unpainted because nothing painted in time - the QGASLICEBLACK line before it
@@ -5500,9 +5501,10 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
         {
             s_ledgerLastReport = nowTick;
             LogInfo("QGALEDGERSUM\tengineDamage=%lld\tc8DrainVchan=%lld\tc8WorkArea=%lld"
-                    "\tc8InputDesktop=%lld",
+                    "\tc8InputDesktop=%lld\tc8NonSeamlessDone=%lld\tc8MapHoldRelease=%lld",
                     (LONG64)g_PwLedgerEngineDamage, (LONG64)g_C8DrainVchanInput,
-                    (LONG64)g_C8WorkAreaApplied, (LONG64)g_C8InputDesktop);
+                    (LONG64)g_C8WorkAreaApplied, (LONG64)g_C8InputDesktop,
+                    (LONG64)g_C8NonSeamlessDone, (LONG64)g_C8MapHoldRelease);
         }
     }
     EnsureOnInputDesktop();
@@ -8487,6 +8489,8 @@ volatile LONG64 g_PwLedgerEngineDamage = 0;
 volatile LONG64 g_C8DrainVchanInput = 0;   // vchan input drained from the frame loop
 volatile LONG64 g_C8WorkAreaApplied = 0;   // work-area re-apply driven by the frame/tracking tick
 volatile LONG64 g_C8InputDesktop    = 0;   // input-desktop re-observe from the tracking pass
+volatile LONG64 g_C8NonSeamlessDone = 0;   // deferred non-seamless switch completed on the frame path
+volatile LONG64 g_C8MapHoldRelease  = 0;   // a held slice-fed map released (the bounded fail-open)
 
 static void PwLedgerAccount(IN OUT WINDOW_DATA* entry)
 {
@@ -8547,6 +8551,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         g_ScreenWidth < (g_HostScreenWidth * 99) / 100 &&
         g_ScreenHeight < (g_HostScreenHeight * 99) / 100)
     {
+        InterlockedIncrement64(&g_C8NonSeamlessDone);   // LEDGER C8
         g_NonSeamlessPending = FALSE;
         g_NonSeamlessWait = FS_WAIT_NONE;
         LogInfo("QGAFSFLASH desktop is now %ux%u (host %ux%u) - completing the deferred "
