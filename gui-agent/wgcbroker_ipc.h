@@ -23,6 +23,9 @@
  * exactly the fixed-tick cost this design exists to avoid. 100 ms caps it at ~10 renders/s while
  * interacting and 0 when idle. It is a CEILING ON COST, not a refresh rate. */
 #define WGCBRK_POKE_MIN_INTERVAL_MS 100
+/* Ceiling for the adaptive backoff. A window whose renders keep changing nothing is asked less
+ * and less often, up to this; any changed render or any input poke snaps it back to the floor. */
+#define WGCBRK_POKE_BACKOFF_MAX_MS 8000
 #define WGCBRK_RING         2             /* double buffer; 3 kills reader retries at 1.5x mem */
 
 typedef enum { WGCBRK_FREE=0, WGCBRK_REQUESTED=1, WGCBRK_ACTIVE=2, WGCBRK_FAILED=3 } WGCBRK_STATE;
@@ -175,6 +178,9 @@ typedef struct _WGCBRK_SLOT {
      * window stays on a session that will never deliver. A previous attempt at this fix failed
      * for exactly that reason, so the recovery is counted rather than silent. */
     volatile LONG     Reroutes;
+    /* Current adaptive interval, ms. Visible so the gate can be judged from the rig instead of
+     * assumed: an idle window should climb to the ceiling, and a self-updating one should not. */
+    volatile LONG     BackoffMs;
 } WGCBRK_SLOT;
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))
