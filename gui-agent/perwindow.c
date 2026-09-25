@@ -61,6 +61,10 @@ static void PwOnDamage(HWND window, int x, int y, int w, int h)
 {
     if (!g_VchanClientConnected)
         return;
+    // LEDGER: the engine delivered pixels for SOME window. Counted globally and with an
+    // interlocked add because this runs on the capture thread; attributing it per window would
+    // mean taking the window-list lock here, which this callback avoids by design.
+    InterlockedIncrement64(&g_PwLedgerEngineDamage);
     ULONG status = SendWindowDamageEvent(window, x, y, w, h);
     if (status != ERROR_SUCCESS)
         LogVerbose("SendWindowDamageEvent(0x%x) failed: 0x%x", window, status);
@@ -688,6 +692,9 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     // read whatever the window's styles happen to be then, not what the routing decision was made
     // on - and a layered window can change its attributes after attach.
     entry->PwLedgerClass = PwWindowClassify(entry);
+    // An eligible, non-slice-fed window is fed by the capture-thread engine, so quiet passes are
+    // its normal state; the ledger marks it so a reader does not mistake NONE for a missing source.
+    entry->PwLedgerEngineFed = !sliceFed;
     entry->PwSliceNeedsFull = sliceFed; // first frame does one full-window copy
     // Fresh attach: re-arm the one-shot BROKERHOLD diagnostic (see the ProcessNewFrame hold arm)
     // and the one-shot QGASLICEBLACK diagnostic (PwNoteSliceContent: copied-but-black hold).

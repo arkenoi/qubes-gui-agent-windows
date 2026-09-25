@@ -93,6 +93,7 @@ extern LIST_ENTRY g_WatchedWindowsList;
 // RemoveWindow (main.c, earlier in the file) emits before teardown.
 struct _WINDOW_DATA;
 void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason);
+extern volatile LONG64 g_PwLedgerEngineDamage;   // engine deliveries, all windows
 
 typedef enum _PW_WINDOW_CLASS {
     PWC_ELIGIBLE = 0,   // has a usable redirection surface: gets its own buffer
@@ -519,6 +520,18 @@ typedef struct _WINDOW_DATA
     ULONG64 PwLedgerNone;                // mapped, pass ran, nothing filled it
     ULONG64 PwLedgerUnattributed;        // INVARIANT BREACH: a copy site is not instrumented
     BOOL    PwLedgerUnattributedLogged;  // one loud line per window, not a flood
+    // THE DISCRIMINATOR. Incremented by the copy PRIMITIVE itself (PwSliceCopyAndDamageSrc), so it
+    // counts copies that happened regardless of whether any call site was instrumented. Without it
+    // the ledger cannot tell "this pass legitimately copied nothing" from "a copy happened that no
+    // counter claimed", and every idle window would trip the invariant - the defect Jev rated 1.00
+    // on the first build of this stage.
+    ULONG64 PwLedgerCopies;
+    ULONG64 PwLedgerCopiesPrev;          // value at the previous pass, to detect a quiet pass
+    // Engine-fed windows get their pixels on the CAPTURE THREAD, not in this pass, so a quiet pass
+    // is their normal state and must not read as a missing copy site. PwOnDamage deliberately takes
+    // no window-list lock, so per-window engine attribution is not available there; the engine's
+    // contribution is counted globally instead and this flag keeps the per-window line honest.
+    BOOL    PwLedgerEngineFed;
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(

@@ -7496,6 +7496,10 @@ static BOOL PwSliceCopyAndDamageSrc(IN OUT WINDOW_DATA* entry, IN const BYTE* sr
                                     IN int srcPitch, IN int srcOriginX, IN int srcOriginY,
                                     IN const RECT* area)
 {
+    // LEDGER DISCRIMINATOR: every slice-style copy passes through here, whoever called it. This is
+    // what lets a quiet pass and an unclaimed copy be told apart.
+    if (entry) entry->PwLedgerCopies++;
+
     if (!srcBase || srcPitch <= 0 || !entry->PwBuffer)
         return FALSE;
 
@@ -8442,23 +8446,37 @@ static __inline BOOL PwLedgerHit(IN OUT WINDOW_DATA* entry, IN OUT ULONG64* coun
 // NONE. Anything else means a copy site exists that nobody instrumented, and that is reported
 // LOUDLY against a named window instead of silently deflating some other row. Jev rated the
 // missed-copy-site hazard 0.82 and named this check as the thing the plan was missing (0.78).
+// Engine (capture-thread) damage events, counted globally. Per-window attribution is not possible
+// at the callback without taking the window-list lock on the capture thread, which the callback
+// avoids by design - so this is reported as a total in the summary rather than faked per window.
+volatile LONG64 g_PwLedgerEngineDamage = 0;
+
 static void PwLedgerAccount(IN OUT WINDOW_DATA* entry)
 {
     ULONG64 attributed;
     if (!entry) return;
     attributed = entry->PwLedgerBrokerWgc + entry->PwLedgerBrokerPw + entry->PwLedgerDdaSlice +
                  entry->PwLedgerDdaOwned + entry->PwLedgerDragSlice + entry->PwLedgerEnginePw +
-                 entry->PwLedgerLegacy + entry->PwLedgerSynth + entry->PwLedgerNone;
-    if (attributed >= entry->PwLedgerFramesSeen) return;
-    entry->PwLedgerUnattributed = entry->PwLedgerFramesSeen - attributed;
+                 entry->PwLedgerLegacy + entry->PwLedgerSynth;
+    // A pass in which the copy primitive did not fire copied nothing. That is ORDINARY - an idle
+    // window - and it is recorded as NONE, not as a breach. Getting this wrong made the first
+    // build of this stage report every idle window as a missing copy site (Jev: 1.00).
+    if (entry->PwLedgerCopies == entry->PwLedgerCopiesPrev)
+        entry->PwLedgerNone++;
+    entry->PwLedgerCopiesPrev = entry->PwLedgerCopies;
+    // The invariant is now GLOBAL rather than per-pass: every copy the primitive performed must be
+    // claimed by exactly one source counter. An excess means a call site nobody instrumented.
+    if (entry->PwLedgerCopies <= attributed)
+        return;
+    entry->PwLedgerUnattributed = entry->PwLedgerCopies - attributed;
     if (!entry->PwLedgerUnattributedLogged)
     {
         entry->PwLedgerUnattributedLogged = TRUE;
-        LogWarning("QGALEDGERGAP hwnd=0x%x class=%d seen=%llu attributed=%llu unattributed=%llu "
-                   "- a pixel copy site is NOT instrumented; the provenance ledger is incomplete "
-                   "for this window class and stage 1 cannot be accepted while this fires",
+        LogWarning("QGALEDGERGAP hwnd=0x%x class=%d copies=%llu attributed=%llu unattributed=%llu "
+                   "- a pixel copy site is NOT instrumented; stage 1 cannot be accepted while this "
+                   "fires, and the gap names the window class to go and find it in",
                    (DWORD)(ULONG_PTR)entry->Handle, (int)entry->PwLedgerClass,
-                   entry->PwLedgerFramesSeen, attributed, entry->PwLedgerUnattributed);
+                   entry->PwLedgerCopies, attributed, entry->PwLedgerUnattributed);
     }
 }
 
@@ -8469,12 +8487,14 @@ void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason)
     if (!entry || !entry->PwLedgerFramesSeen) return;
     LogInfo("QGALEDGER\thwnd=0x%x\tclass=%d\treason=%S\tseen=%llu\tbrokerWgc=%llu\tbrokerPw=%llu"
             "\tddaSlice=%llu\tddaOwned=%llu\tdragSlice=%llu\tenginePw=%llu\tlegacy=%llu"
-            "\tsynth=%llu\tnone=%llu\tunattributed=%llu",
+            "\tsynth=%llu\tnone=%llu\tcopies=%llu\tengineFed=%d\tengineDamageTotal=%lld"
+            "\tunattributed=%llu",
             (DWORD)(ULONG_PTR)entry->Handle, (int)entry->PwLedgerClass, reason ? reason : L"-",
             entry->PwLedgerFramesSeen, entry->PwLedgerBrokerWgc, entry->PwLedgerBrokerPw,
             entry->PwLedgerDdaSlice, entry->PwLedgerDdaOwned, entry->PwLedgerDragSlice,
             entry->PwLedgerEnginePw, entry->PwLedgerLegacy, entry->PwLedgerSynth,
-            entry->PwLedgerNone, entry->PwLedgerUnattributed);
+            entry->PwLedgerNone, entry->PwLedgerCopies, entry->PwLedgerEngineFed ? 1 : 0,
+            (LONG64)g_PwLedgerEngineDamage, entry->PwLedgerUnattributed);
 }
 
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
