@@ -14,10 +14,6 @@
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
 #define WGCBRK_ABI_VERSION  6u   /* 6: per-slot frame-arrival/drop accounting (see FramesArrived) */
 #define WGCBRK_MAX_SLOTS    32
-/* Bounded retries for a failed capture-pool Recreate before the slot is marked FAILED. A
- * transient deserves a few attempts; an endless retry would hide a dead feed behind an
- * ACTIVE slot, which is exactly the state that made the Settings freeze unreadable. */
-#define WGCBRK_RECREATE_TRIES 8
 #define WGCBRK_RING         2             /* double buffer; 3 kills reader retries at 1.5x mem */
 
 typedef enum { WGCBRK_FREE=0, WGCBRK_REQUESTED=1, WGCBRK_ACTIVE=2, WGCBRK_FAILED=3 } WGCBRK_STATE;
