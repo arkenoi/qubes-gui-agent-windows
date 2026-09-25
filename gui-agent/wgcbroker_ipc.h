@@ -26,6 +26,14 @@
 /* Ceiling for the adaptive backoff. A window whose renders keep changing nothing is asked less
  * and less often, up to this; any changed render or any input poke snaps it back to the floor. */
 #define WGCBRK_POKE_BACKOFF_MAX_MS 8000
+/* How long a VISIBLE window's WGC feed may stay silent before we conclude WGC is not serving it
+ * and re-route to PrintWindow. Keyed on the symptom rather than on window structure. Liberal on
+ * purpose: a wrong re-route now costs a single render before the adaptive backoff decays it. */
+#define WGCBRK_WGC_QUIET_MS 2000
+/* After a quiet re-route turns out to have been wrong - the window was merely static - do not
+ * re-test it for this long. Without the hysteresis a static window is re-tested every quiet
+ * period for ever, which is a churn loop costing a render every couple of seconds. */
+#define WGCBRK_WGC_PROBE_BACKOFF_MS 30000
 #define WGCBRK_RING         2             /* double buffer; 3 kills reader retries at 1.5x mem */
 
 typedef enum { WGCBRK_FREE=0, WGCBRK_REQUESTED=1, WGCBRK_ACTIVE=2, WGCBRK_FAILED=3 } WGCBRK_STATE;
@@ -181,6 +189,14 @@ typedef struct _WGCBRK_SLOT {
     /* Current adaptive interval, ms. Visible so the gate can be judged from the rig instead of
      * assumed: an idle window should climb to the ceiling, and a self-updating one should not. */
     volatile LONG     BackoffMs;
+    /* Re-routes triggered by the BEHAVIOURAL test (a visible window whose WGC feed never spoke),
+     * as opposed to the structural fast path. Separated so the two can be told apart on the rig:
+     * if QuietReroutes carries the load, the structural test is not earning its place. */
+    volatile LONG     QuietReroutes;
+    /* Quiet re-routes the first PrintWindow render DISPROVED - the card matched what WGC had
+     * already published, so the window was static rather than broken and was handed back. This
+     * is the false-positive rate of the behavioural detector, measured rather than argued. */
+    volatile LONG     ProbeBounces;
 } WGCBRK_SLOT;
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))
