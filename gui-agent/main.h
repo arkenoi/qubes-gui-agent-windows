@@ -85,6 +85,23 @@ extern CRITICAL_SECTION g_csWatchedWindows;
 // entries from the tracking thread.
 extern LIST_ENTRY g_WatchedWindowsList;
 
+// Why a window is, or is not, eligible for its own per-window capture. This is the ROUTER's own
+// answer: PwWindowEligible derives its BOOL from PwWindowClassify, so the provenance ledger and
+// the routing decision cannot disagree. Re-implementing the same style tests beside the router is
+// how a ledger silently drifts from the thing it claims to describe.
+// Stage-1 provenance ledger: emit one line for a window. Defined in main.c; declared here because
+// RemoveWindow (main.c, earlier in the file) emits before teardown.
+struct _WINDOW_DATA;
+void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason);
+
+typedef enum _PW_WINDOW_CLASS {
+    PWC_ELIGIBLE = 0,   // has a usable redirection surface: gets its own buffer
+    PWC_OR,             // override-redirect: menus, tooltips, bubbles, splash overlays
+    PWC_NRB,            // WS_EX_NOREDIRECTIONBITMAP: DirectComposition-only, no GDI surface
+    PWC_ULW,            // layered, UpdateLayeredWindow style (GetLayeredWindowAttributes fails)
+    PWC_COLORKEY        // layered with LWA_COLORKEY
+} PW_WINDOW_CLASS;
+
 typedef struct _WINDOW_DATA
 {
     HWND Handle;
@@ -474,6 +491,34 @@ typedef struct _WINDOW_DATA
     // (ZeroMemory) and on channel attach/detach - a fresh channel has no mask.
     int SynthMaskLastCount;
     RECT SynthMaskLast[8]; // == WC_MAX_MASK; C_ASSERTed in main.c
+
+    // ---- STAGE 1: PIXEL-PROVENANCE LEDGER (instrument only) --------------------------------
+    // WHY. Nobody can say what the in-guest desktop capture is still load-bearing for, and the
+    // whole de-slice programme's scope depends on that answer. Source reading produced a list of
+    // candidate consumers; three of them were then verified in source (the drag-slice feeding the
+    // DRAGGED eligible window from the composite, the DDA-owned foreground channel, and the
+    // damage poke being unreachable for broker slots). The rest are still hypotheses. These
+    // counters replace the reading with a count taken AT THE SITE THAT COPIES PIXELS, not at the
+    // site that decides to.
+    //
+    // The invariant is the point: PwLedgerFramesSeen must equal the sum of the source counters
+    // plus PwLedgerNone. A copy site nobody instrumented shows up as PwLedgerUnattributed, which
+    // is a LOUD failure naming a real window - rather than as a zero in some row that cannot be
+    // told apart from "this consumer never fires". Jev rated the missed-copy-site hazard 0.82 and
+    // named this invariant as the thing the plan was missing (0.78).
+    PW_WINDOW_CLASS PwLedgerClass;       // as the ROUTER decided it, never recomputed here
+    ULONG64 PwLedgerFramesSeen;          // passes over this window while mapped
+    ULONG64 PwLedgerBrokerWgc;           // broker frame consumed, slot not routed to PrintWindow
+    ULONG64 PwLedgerBrokerPw;            // broker frame consumed, slot routed to PrintWindow
+    ULONG64 PwLedgerDdaSlice;            // C1: PwSliceCopyAndDamage out of the framebuffer
+    ULONG64 PwLedgerDdaOwned;            // C4: the DDA-owned foreground channel
+    ULONG64 PwLedgerDragSlice;           // C3: PwDragSliceRefresh during an input drag
+    ULONG64 PwLedgerEnginePw;            // the per-window PrintWindow engine
+    ULONG64 PwLedgerLegacy;              // C5: the legacy dirty-rect path
+    ULONG64 PwLedgerSynth;               // C6: synth composite source
+    ULONG64 PwLedgerNone;                // mapped, pass ran, nothing filled it
+    ULONG64 PwLedgerUnattributed;        // INVARIANT BREACH: a copy site is not instrumented
+    BOOL    PwLedgerUnattributedLogged;  // one loud line per window, not a flood
 } WINDOW_DATA;
 
 BOOL ShouldAcceptWindow(

@@ -5055,6 +5055,10 @@ void DaemonSettleSweep(void)
 // Watched windows list critical section must be entered.
 ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
 {
+    // LEDGER: emit before teardown, while the counters and the class are still here. A
+    // window that lived and was never attributed anywhere is exactly what stage 1 exists
+    // to surface, so the line goes out even when every counter but `seen` is zero.
+    PwLedgerEmit(entry, L"destroy");
     // Stop per-window capture and queue its grant for revocation before any protocol
     // messages: the daemon releases its mapping on UNMAP/DESTROY below, after which
     // the queued revoke succeeds on a tick.
@@ -8424,6 +8428,55 @@ static BOOL FrameRedundant(IN const CAPTURE_FRAME* frame, IN const BYTE* fb, IN 
     return FALSE;
 }
 
+// ---- STAGE 1 LEDGER HELPERS (instrument only; no behaviour change) -------------------------
+// PwLedgerHit is transparent: it returns exactly what it was given and increments only on a real
+// copy. Wrapping the call rather than adding a line after it keeps the counter at the SITE THAT
+// COPIED, which is the whole point - a counter next to the decision counts intentions.
+static __inline BOOL PwLedgerHit(IN OUT WINDOW_DATA* entry, IN OUT ULONG64* counter, IN BOOL hit)
+{
+    if (hit && entry && counter) (*counter)++;
+    return hit;
+}
+
+// The invariant. Every pass over a mapped window must be attributed to exactly one source, or to
+// NONE. Anything else means a copy site exists that nobody instrumented, and that is reported
+// LOUDLY against a named window instead of silently deflating some other row. Jev rated the
+// missed-copy-site hazard 0.82 and named this check as the thing the plan was missing (0.78).
+static void PwLedgerAccount(IN OUT WINDOW_DATA* entry)
+{
+    ULONG64 attributed;
+    if (!entry) return;
+    attributed = entry->PwLedgerBrokerWgc + entry->PwLedgerBrokerPw + entry->PwLedgerDdaSlice +
+                 entry->PwLedgerDdaOwned + entry->PwLedgerDragSlice + entry->PwLedgerEnginePw +
+                 entry->PwLedgerLegacy + entry->PwLedgerSynth + entry->PwLedgerNone;
+    if (attributed >= entry->PwLedgerFramesSeen) return;
+    entry->PwLedgerUnattributed = entry->PwLedgerFramesSeen - attributed;
+    if (!entry->PwLedgerUnattributedLogged)
+    {
+        entry->PwLedgerUnattributedLogged = TRUE;
+        LogWarning("QGALEDGERGAP hwnd=0x%x class=%d seen=%llu attributed=%llu unattributed=%llu "
+                   "- a pixel copy site is NOT instrumented; the provenance ledger is incomplete "
+                   "for this window class and stage 1 cannot be accepted while this fires",
+                   (DWORD)(ULONG_PTR)entry->Handle, (int)entry->PwLedgerClass,
+                   entry->PwLedgerFramesSeen, attributed, entry->PwLedgerUnattributed);
+    }
+}
+
+// One tab-separated line per window, emitted at destroy. Parsed by the harness; the counters are
+// absolute, never rates, so a short scene and a long one are comparable by ratio.
+void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason)
+{
+    if (!entry || !entry->PwLedgerFramesSeen) return;
+    LogInfo("QGALEDGER\thwnd=0x%x\tclass=%d\treason=%S\tseen=%llu\tbrokerWgc=%llu\tbrokerPw=%llu"
+            "\tddaSlice=%llu\tddaOwned=%llu\tdragSlice=%llu\tenginePw=%llu\tlegacy=%llu"
+            "\tsynth=%llu\tnone=%llu\tunattributed=%llu",
+            (DWORD)(ULONG_PTR)entry->Handle, (int)entry->PwLedgerClass, reason ? reason : L"-",
+            entry->PwLedgerFramesSeen, entry->PwLedgerBrokerWgc, entry->PwLedgerBrokerPw,
+            entry->PwLedgerDdaSlice, entry->PwLedgerDdaOwned, entry->PwLedgerDragSlice,
+            entry->PwLedgerEnginePw, entry->PwLedgerLegacy, entry->PwLedgerSynth,
+            entry->PwLedgerNone, entry->PwLedgerUnattributed);
+}
+
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
     IN UINT fbWidth, IN UINT fbHeight)
 {
@@ -8782,6 +8835,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         // them are clipped as before.
         if (PwIsAttached(entry))
         {
+            // LEDGER: one pass over a mapped window. Every pass must end attributed to exactly
+            // one source or to NONE; PwLedgerAccount before the `continue` enforces that.
+            entry->PwLedgerFramesSeen++;
             RECT pwRect = { entry->X, entry->Y,
                             entry->X + (int)entry->Width, entry->Y + (int)entry->Height };
             RECT pwHit;
@@ -8818,6 +8874,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // buffer and closes the map/first-content pair (releasing a
                         // SliceMapHold defer) only once it is actually painted.
                         PwNoteSliceContent(entry);
+                        // LEDGER: a broker frame actually landed in the granted buffer. Split by
+                        // the slot's own route flag so "WGC delivered" and "the broker fell back
+                        // to PrintWindow" never collapse into one number - that collapse is what
+                        // made a starved slot and a re-routed slot look alike all evening.
+                        {
+                            const WGCBRK_SLOT* ls = (g_WgcBase && entry->PwBrokerSlot >= 0 &&
+                                                     entry->PwBrokerSlot < WGCBRK_MAX_SLOTS)
+                                ? &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot] : NULL;
+                            if (ls && ls->TickPw) entry->PwLedgerBrokerPw++;
+                            else                    entry->PwLedgerBrokerWgc++;
+                        }
                         if (firstBrokerFrame)
                         {
                             LogInfo("BROKERFRAME first WGC frame consumed hwnd 0x%x slot %d %ux%u",
@@ -8986,7 +9053,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
                             sliceEvidence = TRUE;
                     entry->PwSliceNeedsFull = FALSE;
-                    if (PwSliceCopyAndDamage(entry, frame, framebuffer, &pwRect) &&
+                    if (PwLedgerHit(entry, &entry->PwLedgerDdaSlice,   /* LEDGER C1 */
+                                    PwSliceCopyAndDamage(entry, frame, framebuffer, &pwRect)) &&
                         sliceEvidence)
                         PwNoteSliceContent(entry);
                 }
@@ -8994,7 +9062,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 {
                     for (UINT pdi = 0; pdi < frame->dirty_rects_count; pdi++)
                         if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
-                            if (PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit))
+                            if (PwLedgerHit(entry, &entry->PwLedgerDdaSlice,  /* LEDGER C1 */
+                                            PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit)))
                                 PwNoteSliceContent(entry);
                 }
 
@@ -9214,7 +9283,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // persisting. A FALSE return (fully off-screen, geometry
                         // changed underneath) holds the last content; the settle
                         // recapture repairs it.
-                        (void)PwDragSliceRefresh(entry, frame, framebuffer);
+                        if (PwDragSliceRefresh(entry, frame, framebuffer))
+                            entry->PwLedgerDragSlice++;   // LEDGER C3: fed from the desktop composite
                     }
                     else if (entry->PwDragSlice)
                     {
@@ -9479,7 +9549,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 BOOL copied = FALSE;
                                 for (UINT ddi = 0; ddi < frame->dirty_rects_count; ddi++)
                                     if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pwRect))
-                                        if (PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit))
+                                        if (PwLedgerHit(entry, &entry->PwLedgerDdaOwned,  /* LEDGER C4 */
+                                            PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit)))
                                             copied = TRUE;
                                 // Only "handled" if a copy actually happened. The copy declines
                                 // silently on a null buffer, a geometry mismatch or an empty
@@ -9577,6 +9648,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 entry->X + (int)entry->Width, entry->Y + (int)entry->Height);
             if (g_ZOrderValid && ClaimsOcclusionArea(entry))
                 CombineRgn(rgnCovered, rgnCovered, rgnWindow, RGN_OR);
+            PwLedgerAccount(entry);   // LEDGER: the invariant, checked once per pass
             continue;
         }
 

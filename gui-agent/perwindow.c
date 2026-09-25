@@ -397,7 +397,7 @@ void PwRevokeTick(void)
 // discriminator; colorkeyed windows are equally uncapturable (the key color would show as
 // opaque). Plain SetLayeredWindowAttributes alpha windows paint via WM_PAINT and capture
 // fine (menus fading in were validated on the per-window path) - keep those attached.
-BOOL PwWindowEligible(IN const WINDOW_DATA* entry)
+PW_WINDOW_CLASS PwWindowClassify(IN const WINDOW_DATA* entry)
 {
     // Override-redirect windows (menus, tooltips, bubbles, splash overlays) are slice-fed
     // as a class. They are topmost by nature, so the composited screen region IS their
@@ -408,7 +408,7 @@ BOOL PwWindowEligible(IN const WINDOW_DATA* entry)
     // row-diffs as "no change" against the blank prefill, so the failure mode is a
     // permanently black window with a healthy-looking channel.
     if (entry->IsOverrideRedirect)
-        return FALSE;
+        return PWC_OR;
 
     // No GDI redirection surface AT ALL (DirectComposition-only content): PrintWindow
     // has nothing to read regardless of layering. Edge's true first-run takeover window
@@ -417,19 +417,29 @@ BOOL PwWindowEligible(IN const WINDOW_DATA* entry)
 #define WS_EX_NOREDIRECTIONBITMAP 0x00200000L
 #endif
     if (entry->ExStyle & WS_EX_NOREDIRECTIONBITMAP)
-        return FALSE;
+        return PWC_NRB;
 
     if (!(entry->ExStyle & WS_EX_LAYERED))
-        return TRUE;
+        return PWC_ELIGIBLE;
 
     COLORREF key;
     BYTE alpha;
     DWORD lwFlags;
     if (!GetLayeredWindowAttributes(entry->Handle, &key, &alpha, &lwFlags))
-        return FALSE; // ULW-style layered window
+        return PWC_ULW; // ULW-style layered window
     if (lwFlags & LWA_COLORKEY)
-        return FALSE;
-    return TRUE;
+        return PWC_COLORKEY;
+    return PWC_ELIGIBLE;
+}
+
+// Unchanged in meaning: the router's BOOL is now DERIVED from the class rather than computed
+// beside it, so the provenance ledger records exactly the reason the router acted on. An offline
+// truth-table test (tools/tests/pwclass-truth-table) drives every style combination this reads
+// and asserts the mapping, because a refactor of the live router in an instrument-only stage is
+// the one place this stage can change behaviour by accident (Jev: refactor_risk 0.78).
+BOOL PwWindowEligible(IN const WINDOW_DATA* entry)
+{
+    return PwWindowClassify(entry) == PWC_ELIGIBLE;
 }
 
 // CARRY THE PIXELS ACROSS A REBUILD (owner 2026-09-13: "fix the black blink, it is ugly af").
@@ -674,6 +684,10 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     entry->PwOriginY = entry->Y;
     entry->PwDumpSent = TRUE;
     entry->PwSliceFed = sliceFed;
+    // Record the ROUTER's own reason, once, at the moment it routed. Recomputing it later would
+    // read whatever the window's styles happen to be then, not what the routing decision was made
+    // on - and a layered window can change its attributes after attach.
+    entry->PwLedgerClass = PwWindowClassify(entry);
     entry->PwSliceNeedsFull = sliceFed; // first frame does one full-window copy
     // Fresh attach: re-arm the one-shot BROKERHOLD diagnostic (see the ProcessNewFrame hold arm)
     // and the one-shot QGASLICEBLACK diagnostic (PwNoteSliceContent: copied-but-black hold).

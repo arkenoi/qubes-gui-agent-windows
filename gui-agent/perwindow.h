@@ -50,6 +50,8 @@ void PwRefreshCrop(IN const WINDOW_DATA* entry);
 // FALSE if PrintWindow cannot produce correct pixels for this window (ULW-style or
 // colorkeyed layered windows) - such windows must stay on the legacy screen-slice path.
 BOOL PwWindowEligible(IN const WINDOW_DATA* entry);
+// The reason behind that BOOL. PwWindowEligible is `PwWindowClassify(entry) == PWC_ELIGIBLE`.
+PW_WINDOW_CLASS PwWindowClassify(IN const WINDOW_DATA* entry);
 
 // Detach an attached window at runtime and force the daemon to release its stale image
 // via an unmap/map cycle, dropping the window to the legacy path.
