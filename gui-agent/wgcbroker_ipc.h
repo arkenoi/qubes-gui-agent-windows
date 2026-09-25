@@ -156,7 +156,12 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG     PollsServiced;     /* renders actually performed */
     volatile LONG     PollsSkipped;      /* ticks where nothing had changed, so nothing was done */
     volatile LONG     SafetyPolls;       /* renders forced by the staleness bound, not by a poke */
-    volatile LONG     _padAbi7;
+    /* Times this slot was re-routed from WGC to PrintWindow because the cross-process content
+     * child appeared AFTER the session opened. The frame exists before the app creates its
+     * content, so the first routing decision is usually taken too early; without a re-check the
+     * window stays on a session that will never deliver. A previous attempt at this fix failed
+     * for exactly that reason, so the recovery is counted rather than silent. */
+    volatile LONG     Reroutes;
 } WGCBRK_SLOT;
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))
