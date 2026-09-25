@@ -7677,7 +7677,14 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
 {
     // LEDGER C6: a synth child's pixels are patched into the OWNER's granted buffer, so the copy
     // is attributed to the owner - that is whose buffer changed.
-    if (owner) owner->PwLedgerSynth++;
+    //
+    // BOTH counters, deliberately. This path does NOT go through PwSliceCopyAndDamageSrc, so
+    // without bumping PwLedgerCopies here the global invariant would not cover the synth path at
+    // all and a synth copy could never surface as UNATTRIBUTED - a hole in the very check that
+    // exists to catch uninstrumented copies. Every future copy site added to this ledger must do
+    // the same: increment its own source counter AND the discriminator, or it is invisible to the
+    // invariant. That is the rule, not an incident.
+    if (owner) { owner->PwLedgerSynth++; owner->PwLedgerCopies++; }
     // FI_NOSYNTHPAINT guards the SINGLE function every synth paint goes through. Guarding only
     // SynthActivate's one-shot call was measured insufficient on 2026-08-31: the bit fired
     // (banner gateoff=0x80, announce 1) yet RND-3 still passed, because the ongoing paint path
