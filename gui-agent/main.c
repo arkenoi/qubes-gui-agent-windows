@@ -1383,9 +1383,52 @@ static BOOL GetMonitorSettings(IN HMONITOR monitor, OUT MONITORINFOEX* monInfo, 
 // invisible grip handles managed by DWM. This function returns actual visible window size.
 // This function also accounts for a clipping region possibly defined for the window
 // and returns a minimal bounding rectangle that covers the visible region.
+// A UWP app is TWO windows in two processes: ApplicationFrameHost owns the frame
+// (ApplicationFrameWindow) and the app owns a Windows.UI.Core.CoreWindow child that carries the
+// actual UI. Return that child for a frame window, else NULL.
+//
+// WHY THIS EXISTS. Measured 2026-09-25 with per-slot frame counters (wgcbroker ABI 6): a WGC
+// session on the Settings ApplicationFrameWindow delivered arrived=4 published=4 dropsize=0
+// recreateFail=0 and then stopped being called at all, while another window on the SAME broker
+// and the SAME WGC path ran 137 -> 148 arrivals in the same six seconds. Nothing was dropped by
+// us - the frames stop coming. The two frames that did arrive are the splash ApplicationFrameHost
+// paints into the frame itself; everything after that is rendered by the app into the CoreWindow,
+// which is a different composition target in a different process. So dom0 showed a blank page
+// with a spinning gear for ever while the guest had the page fully drawn and answering keystrokes
+// (forum 42717 post 160). Capturing the frame captures the wrong surface.
+//
+// Jev on that measurement: wgc-stops-delivering-to-the-frame-window 1.00, and the remedy
+// "capture the CoreWindow" rated plausible-but-UNVERIFIED 1.00 - so this is written to be
+// MEASURED by the same counters, not assumed: if arrivals climb on the retargeted slot it worked.
+static HWND UwpContentWindow(IN HWND window)
+{
+    WCHAR cls[64];
+    if (!window || !GetClassName(window, cls, RTL_NUMBER_OF(cls)))
+        return NULL;
+    if (wcscmp(cls, L"ApplicationFrameWindow") != 0)
+        return NULL;
+    // Immediate children only: the CoreWindow is a direct child of the frame (measured).
+    HWND content = FindWindowEx(window, NULL, L"Windows.UI.Core.CoreWindow", NULL);
+    if (!content || !IsWindowVisible(content))
+        return NULL;
+    return content;
+}
+
 ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
 {
     RECT dwmRect;
+    // For a UWP host, measure the CONTENT window, not the frame. The broker publishes the card as
+    // a sub-rect of the captured surface (PublishFrame lifts ReqWidth/Height at ReqCropX/Y out of
+    // the capture texture, and refuses a card that does not fit), so the card and the capture
+    // target have to be the same window or nothing can ever be published. Retargeting the capture
+    // without this would put the card partly ABOVE the CoreWindow - the frame's card includes the
+    // caption strip the CoreWindow does not cover - i.e. a negative crop, which the broker
+    // rejects outright. The window's IDENTITY to dom0 is unchanged: MSG_CREATE/CONFIGURE, focus
+    // and z-order all still key on the frame HWND; only the rectangle we present changes, losing
+    // the guest's own min/max/close strip, which dom0 draws itself anyway.
+    HWND content = UwpContentWindow(window);
+    if (content)
+        window = content;
     // get real rect of the window as managed by DWM
     HRESULT hresult = DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &dwmRect, sizeof(RECT));
     if (hresult != S_OK)
@@ -3650,7 +3693,20 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;  // "not measured yet" until the broker reports
     s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
     MemoryBarrier();
-    s->Hwnd = (UINT64)(ULONG_PTR)entry->Handle;
+    // Capture the CONTENT window for a UWP host. The frame window's own surface stops producing
+    // frames once the app takes over (measured: 4 arrivals then none, while a control slot ran
+    // 137->148 on the same broker), so a session on the frame captures a splash and then nothing.
+    // GetRealWindowRect measures the same content window, so the card fits the capture exactly.
+    // dom0 still knows this window by entry->Handle; only the capture target changes.
+    HWND capture = UwpContentWindow(entry->Handle);
+    if (capture)
+        LogInfo("QGAUWPTARGET hwnd=0x%x capturing CoreWindow 0x%x instead of the frame "
+                "(%ux%u) - the frame's surface stops updating once the app renders",
+                (DWORD)(ULONG_PTR)entry->Handle, (DWORD)(ULONG_PTR)capture,
+                entry->Width, entry->Height);
+    else
+        capture = entry->Handle;
+    s->Hwnd = (UINT64)(ULONG_PTR)capture;
     s->ReqState = WGCBRK_REQUESTED;
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&h->ControlGen);
