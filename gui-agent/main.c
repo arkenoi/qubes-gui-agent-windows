@@ -4338,29 +4338,6 @@ static void ApplySeamlessTweaks(IN BOOL seamless)
 
     // 3. Per-window captions: dom0 draws the frame in seamless, so the guest's own is a second
     //    title bar. In non-seamless there is no dom0 frame and Windows must draw its own.
-    // A DESKTOP WITH NO ACTIVE WINDOW SWALLOWS EVERY KEYSTROKE. HandleKeypress ignores the window
-    // and synthesises with SendInput, which goes to whatever the guest focuses - so with nothing
-    // focused, keys go nowhere at all. That was the owner's report ("does not deliver input to
-    // apps"), caused by HandleFocus dropping window 0. Fixing the drop made input depend on dom0
-    // SENDING a focus message; this makes it not depend on that at all. Entering the desktop view
-    // ensures the session has an active window, once, without choosing on dom0's behalf: an
-    // existing foreground is left exactly as it is.
-    if (!seamless)
-    {
-        const HWND fg = GetForegroundWindow();
-        if (!fg)
-        {
-            const HWND top = GetTopWindow(NULL);
-            LogInfo("QGAFSFOCUS entering the desktop view with NO guest foreground window - "
-                L"activating 0x%x so keystrokes have a destination", top);
-            if (top) SetForegroundWindow(top);
-        }
-        else
-        {
-            LogDebug("entering the desktop view; guest foreground is already 0x%x", fg);
-        }
-    }
-
     // Captions come back from the stripped SET, which the caption code owns and which survives
     // ResetWatch. Entering seamless needs no pass here: every window is re-announced and the
     // announce path strips it.

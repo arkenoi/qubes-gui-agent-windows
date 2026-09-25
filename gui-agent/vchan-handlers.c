@@ -1389,19 +1389,18 @@ static DWORD HandleFocus(IN HWND window)
         // has SOME active window, because with none, keys go nowhere at all.
         if (!window)
         {
-            const HWND fg = GetForegroundWindow();
-            if (fg)
-            {
-                LogDebug("desktop focus gain; guest foreground is already 0x%x", fg);
-            }
-            else
-            {
-                const HWND top = GetTopWindow(NULL);
-                LogInfo("QGAFSFOCUS desktop focus gain with NO guest foreground window - "
-                    L"activating 0x%x so keystrokes have a destination", top);
-                if (top)
-                    SetForegroundWindow(top);
-            }
+            // WINDOW 0 IS THE DESKTOP, and it is never in the watched list, so FindWindowByHandle
+            // below would fail it and log "not tracked". Accept it and do NOTHING: the agent does
+            // not pick a window to focus on dom0's behalf.
+            //
+            // An earlier version activated the top-level window when nothing held the foreground,
+            // reasoning that synthesized keys would otherwise have nowhere to land. The owner
+            // rejected that outright - "i do not want it to intercept focus" - and the measurement
+            // agrees it was never needed: with this branch simply returning, dom0 delivered
+            // button=7, motion=1061, focus=35 to the non-seamless desktop and the owner confirmed
+            // "all fine, input works too". Windows manages focus inside its own desktop from the
+            // first click, exactly as it does on real hardware.
+            LogDebug("desktop focus event for window 0 - nothing to forward");
             return ERROR_SUCCESS;
         }
 
