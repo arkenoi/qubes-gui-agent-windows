@@ -1428,7 +1428,20 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
     // the guest's own min/max/close strip, which dom0 draws itself anyway.
     HWND content = UwpContentWindow(window);
     if (content)
-        window = content;
+    {
+        // DWMWA_EXTENDED_FRAME_BOUNDS is a TOP-LEVEL attribute. Asking it about the CoreWindow -
+        // a child - fails, and this function returns that HRESULT, which its callers read as "this
+        // window is gone". Measured 2026-09-25: doing exactly that mapped Settings and then
+        // UNMAPPED it 3 s later, i.e. my first attempt at this retarget made the window disappear
+        // outright instead of merely showing a stale splash. A child's GetWindowRect IS its bounds
+        // in screen coordinates - there is no invisible resize border to subtract, which is the
+        // only reason the DWM call is used for top-level windows in the first place.
+        if (GetWindowRect(content, rect) &&
+            rect->right > rect->left && rect->bottom > rect->top)
+            return ERROR_SUCCESS;
+        // Fall through and measure the frame: a content window that cannot be measured must not
+        // take the whole window down with it.
+    }
     // get real rect of the window as managed by DWM
     HRESULT hresult = DwmGetWindowAttribute(window, DWMWA_EXTENDED_FRAME_BOUNDS, &dwmRect, sizeof(RECT));
     if (hresult != S_OK)
@@ -3638,6 +3651,25 @@ static void WgcArenaReapPending(void)
 // ProcessNewFrame. (An earlier comment credited toasts to the "notifhost interceptor" -
 // that component was never launched; see toastcrop for how toast surfaces are handled.)
 // Returns TRUE if registered.
+// The window whose PIXELS this entry's slot captures. For a UWP host that is the CoreWindow, not
+// the frame; for everything else it is the window itself. Every place that reads or writes a
+// slot's Hwnd goes through here, because the two must never disagree: BrokerCanKeepSlot compares
+// the slot's Hwnd to decide whether a resize can keep the session, and comparing against the
+// frame while the slot holds the content window would force a full re-registration on every
+// single resize.
+//
+// It is re-evaluated rather than cached deliberately. At the moment a UWP window is first
+// registered the CoreWindow usually does NOT exist yet - the frame appears first and the app
+// creates its content a moment later - so the first registration legitimately targets the frame,
+// and the retarget happens when the content window turns up. Measured 2026-09-25: the first
+// version of this change looked only at registration time, never matched, and logged no
+// QGAUWPTARGET at all.
+static HWND BrokerCaptureTarget(IN const WINDOW_DATA* entry)
+{
+    HWND content = UwpContentWindow(entry->Handle);
+    return content ? content : entry->Handle;
+}
+
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
 {
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1;
@@ -3698,14 +3730,12 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     // 137->148 on the same broker), so a session on the frame captures a splash and then nothing.
     // GetRealWindowRect measures the same content window, so the card fits the capture exactly.
     // dom0 still knows this window by entry->Handle; only the capture target changes.
-    HWND capture = UwpContentWindow(entry->Handle);
-    if (capture)
+    const HWND capture = BrokerCaptureTarget(entry);
+    if (capture != entry->Handle)
         LogInfo("QGAUWPTARGET hwnd=0x%x capturing CoreWindow 0x%x instead of the frame "
                 "(%ux%u) - the frame's surface stops updating once the app renders",
                 (DWORD)(ULONG_PTR)entry->Handle, (DWORD)(ULONG_PTR)capture,
                 entry->Width, entry->Height);
-    else
-        capture = entry->Handle;
     s->Hwnd = (UINT64)(ULONG_PTR)capture;
     s->ReqState = WGCBRK_REQUESTED;
     _InterlockedIncrement(&s->ControlSeq);
@@ -3730,7 +3760,7 @@ BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG 
     const WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
     // Still OUR slot, and still serving. A slot the broker has already torn down, or one that
     // was reassigned, must go through the full registration path.
-    if (s->Hwnd != (UINT64)(ULONG_PTR)entry->Handle) return FALSE;
+    if (s->Hwnd != (UINT64)(ULONG_PTR)BrokerCaptureTarget(entry)) return FALSE;
     if (s->ReqState != WGCBRK_REQUESTED) return FALSE;
 
     // The arena buffers are allocated per registration and cannot grow. Keep the slot only when
