@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  7u   /* 7: damage-driven PrintWindow polling (PokeSeq/PokeAck) */
+#define WGCBRK_ABI_VERSION  8u   /* 8: Route + the DWM-thumbnail relay (RelayOk/RelayFail) */
 #define WGCBRK_MAX_SLOTS    32
 /* Longest a PrintWindow-captured window may go unrendered when no damage poke arrives. A bound
  * on staleness, not a polling rate: with a working poke path it should almost never fire. */
@@ -197,7 +197,22 @@ typedef struct _WGCBRK_SLOT {
      * already published, so the window was static rather than broken and was handed back. This
      * is the false-positive rate of the behavioural detector, measured rather than argued. */
     volatile LONG     ProbeBounces;
+    /* ABI 8: WHICH WRITER IS FEEDING THIS SLOT. TickPw already said "polled PrintWindow or not", but
+     * with the relay there are THREE answers and collapsing them loses the one that matters: a slot
+     * fed by a thumbnail relay is ARRIVAL-DRIVEN like a WGC slot, not polled like a PrintWindow one,
+     * and a ledger that cannot tell them apart cannot show the fallback going away. */
+    volatile LONG     Route;        /* WGCBRK_ROUTE_* */
+    volatile LONG     RelayOk;      /* thumbnail registrations that produced a capturable dest */
+    volatile LONG     RelayFail;    /* relay attempts that failed; the slot then falls back */
+    volatile UINT64   RelayDest;    /* the destination HWND we own, for cross-checking the agent's
+                                     * broker-owned-window exclusion from outside */
 } WGCBRK_SLOT;
+
+/* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
+ * move slots OFF route 2, and "how many slots are still on 2" must be a single readable number. */
+#define WGCBRK_ROUTE_WGC    0u   /* WGC on the window itself - arrival-driven */
+#define WGCBRK_ROUTE_RELAY  1u   /* WGC on a destination carrying a DWM thumbnail - arrival-driven */
+#define WGCBRK_ROUTE_PW     2u   /* polled PrintWindow - the fallback this relay exists to retire */
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))
 #define WGCBRK_SLOTS(base)     ((WGCBRK_SLOT*)((BYTE*)(base)+sizeof(WGCBRK_HEADER)))
