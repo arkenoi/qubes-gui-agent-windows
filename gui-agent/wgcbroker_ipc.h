@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  10u  /* 10: RelayStaticHolds - demotions declined because the SOURCE had not changed */
+#define WGCBRK_ABI_VERSION  11u  /* 11: the source-test outcome counters - why a relay was or was not held */
 #define WGCBRK_MAX_SLOTS    32
 /* Longest a PrintWindow-captured window may go unrendered when no damage poke arrives. A bound
  * on staleness, not a polling rate: with a working poke path it should almost never fire. */
@@ -232,6 +232,18 @@ typedef struct _WGCBRK_SLOT {
      * absent and the demotion was therefore declined - if it never advances, the new rule is not
      * firing and any pass is unproven. */
     volatile LONG     RelayStaticHolds;
+    /* ABI 11: WHY did the source test decide what it decided? RelayStaticHolds alone could not say.
+     * Measured 2026-09-26 on win11de-led3: three rogue classes held arrival-driven routes with the
+     * hold counter CLIMBING (37->48), while both ULW-layered slots FROZE at 1 and 4 and fell to the
+     * polled path - so the test had returned SAME a few times and then something else. Two
+     * mechanisms fit that equally (PrintWindow succeeding but returning unstable pixels on a
+     * per-pixel-alpha window, versus PrintWindow failing outright, which the code maps to CHANGED by
+     * design) and Jev rated the evidence `insufficient-evidence` 0.85 to separate them, naming
+     * exactly this instrumentation as the next measurement (0.83). One counter per outcome, so the
+     * two can never again be confused. */
+    volatile LONG     RelaySrcChanged;      /* measured: the source hash differed -> demotion allowed */
+    volatile LONG     RelaySrcUnmeasured;   /* throttled: no test ran, neither demote nor hold */
+    volatile LONG     RelayPwFail;          /* the test could not render the source at all */
 } WGCBRK_SLOT;
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
