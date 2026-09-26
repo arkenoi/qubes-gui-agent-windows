@@ -12,8 +12,25 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  12u  /* 12: PubColours - a signature of the frame actually delivered */
+#define WGCBRK_ABI_VERSION  13u  /* 13: PubTiles - a 32x32 mean-RGB reduction of the delivered frame */
 #define WGCBRK_MAX_SLOTS    32
+/* ABI 13: the delivered frame reduced to a fixed WGCBRK_TILES x WGCBRK_TILES grid of per-tile MEAN
+ * RGB. Fixed on BOTH sides regardless of either side's own dimensions, which is the whole point: the
+ * guest measures the WHOLE window (GetWindowRect) while the broker publishes the CONTENT it was
+ * handed - measured as 360x240 against 348x234, plus a crop the guest cannot see - so any comparison
+ * keyed on absolute pixel coordinates compares different physical pixels. Normalising both sides to
+ * the same grid reduces that difference to a slight blur at tile boundaries instead of a
+ * misalignment. 1024 regions encode spatial LAYOUT, which a distinct-colour count cannot: a shifted
+ * image, a blank region, the same palette arranged wrongly and a channel swap all move the mean
+ * absolute difference far outside any tolerance that absorbs a frame offset.
+ * Jev chose this over a 4x4/8x8 grid, a sorted-colour-multiset hash and an exact hash over an
+ * identical region, at confidence 1.00 - and warned that a PASS on it ALONE is not sufficient
+ * (sufficient_for_acceptance 0.23): a static comparison cannot detect a STALE frame, which needs a
+ * change driven on purpose with the delivered fingerprint required to follow it
+ * (stale_frame_needs_more 0.83). ALPHA IS EXCLUDED (0.95): the two sides need not agree on it and the
+ * GUI protocol carries no per-pixel alpha at all. */
+#define WGCBRK_TILES        32
+#define WGCBRK_TILE_BYTES   (WGCBRK_TILES*WGCBRK_TILES*3)
 /* Longest a PrintWindow-captured window may go unrendered when no damage poke arrives. A bound
  * on staleness, not a polling rate: with a working poke path it should almost never fire. */
 #define WGCBRK_POKE_SAFETY_MS 1000
@@ -257,6 +274,9 @@ typedef struct _WGCBRK_SLOT {
      * numbers mean the same thing and can be compared directly, per slot, with the slot's own Hwnd
      * giving an exact mapping instead of a guessed one. Computed at most once per second per slot. */
     volatile LONG     PubColours;
+    /* ABI 13. Row-major, WGCBRK_TILES rows of WGCBRK_TILES tiles, 3 bytes per tile in R,G,B order.
+     * Written at most once per second per slot, on the same throttle as PubColours. */
+    volatile BYTE     PubTiles[WGCBRK_TILE_BYTES];
 } WGCBRK_SLOT;
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
