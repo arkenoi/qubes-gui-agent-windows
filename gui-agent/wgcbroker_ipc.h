@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  11u  /* 11: the source-test outcome counters - why a relay was or was not held */
+#define WGCBRK_ABI_VERSION  12u  /* 12: PubColours - a signature of the frame actually delivered */
 #define WGCBRK_MAX_SLOTS    32
 /* Longest a PrintWindow-captured window may go unrendered when no damage poke arrives. A bound
  * on staleness, not a polling rate: with a working poke path it should almost never fire. */
@@ -244,6 +244,19 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG     RelaySrcChanged;      /* measured: the source hash differed -> demotion allowed */
     volatile LONG     RelaySrcUnmeasured;   /* throttled: no test ran, neither demote nor hold */
     volatile LONG     RelayPwFail;          /* the test could not render the source at all */
+    /* ABI 12: DO THE DELIVERED PIXELS MATCH WHAT THE WINDOW RENDERS? Route counters say where a
+     * frame came from, not whether it is right, and the census's in-guest test only shows that
+     * content exists outside a window's own surface. Asked to accept on that, Jev answered
+     * `bar_met` 0.20 with `residual_gap = relayed-pixels-never-read` at **1.00**.
+     * dom0's per-window capture cannot close it: OVERRIDE-REDIRECT windows are absent from
+     * `_NET_CLIENT_LIST` by definition, so the one class that most needs checking is structurally
+     * invisible there, and the alternative is photographing the whole desktop. Jev preferred
+     * reading the frame in the broker (0.63) over that (0.22).
+     * PubColours is the number of DISTINCT COLOURS in the frame just published, sampled every 9th
+     * pixel in x and y - the identical sampling guest/window-truth-survey.ps1 uses - so the two
+     * numbers mean the same thing and can be compared directly, per slot, with the slot's own Hwnd
+     * giving an exact mapping instead of a guessed one. Computed at most once per second per slot. */
+    volatile LONG     PubColours;
 } WGCBRK_SLOT;
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
