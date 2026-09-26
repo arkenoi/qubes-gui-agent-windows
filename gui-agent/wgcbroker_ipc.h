@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  14u  /* 14: session-lifecycle counters - is a frozen slot dead or STALE? */
+#define WGCBRK_ABI_VERSION  15u  /* 15: GenFrames - frames attributed to THIS session, not all of them */
 #define WGCBRK_MAX_SLOTS    32
 /* ABI 13: the delivered frame reduced to a fixed WGCBRK_TILES x WGCBRK_TILES grid of per-tile MEAN
  * RGB. Fixed on BOTH sides regardless of either side's own dimensions, which is the whole point: the
@@ -293,6 +293,18 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG     ChanCloses;   /* CloseChannel calls for this slot */
     volatile LONG     SessionLive;  /* 1 while a capture session+pool is held, 0 after a close */
     volatile LONG     ChanGen;      /* bumped on every open; identifies which session the counters belong to */
+    /* ABI 15: FRAMES DELIVERED BY THE CURRENT SESSION ONLY, zeroed at every open. Every other frame
+     * counter here is CUMULATIVE across the slot's whole life and is deliberately never zeroed on
+     * close - which meant a slot reading FramesArrived=89 said nothing about which SESSION delivered
+     * those 89. That matters because the routing ladder closes a quiet WGC-on-the-window channel and
+     * reopens it as a RELAY, so a frozen relay slot at gen=2 might have inherited every one of its
+     * frames from generation 1 and delivered NOTHING itself. Measured 2026-09-26: all the frozen relay
+     * slots read opens=2 closes=1 gen=2, so that is exactly the ambiguity in play, and it forced the
+     * withdrawal of a whole set of fidelity results that may have been measuring a frame left in the
+     * shared buffer by the previous session. Jev: misattribution_plausible 0.89,
+     * invalidates_fidelity 0.76, per-generation-frame-counters 0.87.
+     * With this, "the relay delivered N frames" is finally a statement that can be made or refuted. */
+    volatile LONG     GenFrames;
 } WGCBRK_SLOT;
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
