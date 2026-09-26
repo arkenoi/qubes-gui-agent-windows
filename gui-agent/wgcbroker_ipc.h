@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  15u  /* 15: GenFrames - frames attributed to THIS session, not all of them */
+#define WGCBRK_ABI_VERSION  16u  /* 16: RelayReregs - thumbnail re-registrations that repaired a channel */
 #define WGCBRK_MAX_SLOTS    32
 /* ABI 13: the delivered frame reduced to a fixed WGCBRK_TILES x WGCBRK_TILES grid of per-tile MEAN
  * RGB. Fixed on BOTH sides regardless of either side's own dimensions, which is the whole point: the
@@ -305,6 +305,19 @@ typedef struct _WGCBRK_SLOT {
      * invalidates_fidelity 0.76, per-generation-frame-counters 0.87.
      * With this, "the relay delivered N frames" is finally a statement that can be made or refuted. */
     volatile LONG     GenFrames;
+    /* ABI 16: DWM THUMBNAIL RE-REGISTRATIONS. Measured 2026-09-27: a relay channel opened by the broker
+     * instance that a GUEST COLD BOOT produces emits its opening frame and then never follows the source
+     * again (driven slot, route 1, `genFrames 1 -> 1` across a confirmed change), while restarting ONLY
+     * the agent on the SAME boot makes the very same code deliver (`1 -> 2`), and the standalone probe
+     * delivers indefinitely in every configuration. Jev's reading at 0.93: the thumbnail is registered
+     * while DWM is still coming up, the registration is ACCEPTED but never afterwards recomposed, and
+     * nothing ever re-registers it - a relay that has delivered is never demoted while its source is
+     * static, so nothing repaired it either.
+     * So the channel is now REPAIRED rather than abandoned: on the first measured source change with no
+     * frame behind it, the thumbnail is unregistered, re-registered and its properties re-applied. This
+     * counter exists because a repair that happens silently is indistinguishable from a bug that fixed
+     * itself - if it never advances on a cold boot, the repair is not firing and any pass is unproven. */
+    volatile LONG     RelayReregs;
 } WGCBRK_SLOT;
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
