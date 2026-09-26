@@ -8971,7 +8971,16 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 entry->PwBrokerSlot >= 0 && entry->PwBrokerSlot < WGCBRK_MAX_SLOTS)
             {
                 const WGCBRK_SLOT* ps = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
-                if (ps->TickPw && ps->Hwnd == (UINT64)(ULONG_PTR)entry->Handle)
+                // EVERY broker-sourced slot, not only the PrintWindow-routed ones. For a polled slot
+                // the poke is the RENDER TRIGGER. For a WGC or relay slot it is a LIVENESS SIGNAL:
+                // the broker's quiet detector cannot otherwise tell an IDLE arrival-driven channel
+                // from a BROKEN one, and it was demoting the healthy ones - measured 2026-09-26, a
+                // relay slot delivered 2934 frames, went idle, and was demoted to polling, which is
+                // backwards on cost (Jev 0.84). Silence plus a poke means damage happened and no
+                // frame followed; silence with no poke just means nothing changed.
+                // Jev picked this discriminator at 0.63 over "has never delivered" at 0.25 - the
+                // latter would never re-route the founding case, which had FramesArrived frozen at 3.
+                if (ps->Hwnd == (UINT64)(ULONG_PTR)entry->Handle)
                 {
                     for (UINT ddi = 0; ddi < frame->dirty_rects_count; ddi++)
                     {
