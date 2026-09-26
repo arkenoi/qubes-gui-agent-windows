@@ -271,6 +271,12 @@ static ULONGLONG g_WgcNextPoll = 0;
 // HANDLE at launch. g_WgcBrokerProc is opened from the pid the broker publishes, validated
 // (WgcOpenBrokerProcess), once its heartbeat is live; the heartbeat then backstops a HUNG broker.
 static LONG      g_WgcBrokerPidRejected = 0;   // last BrokerPid that failed validation (log once)
+// The pid whose process handle VALIDATED as a running wgcbroker.exe from the install dir in this
+// session. Kept separately from the shared section's BrokerPid because that field is USER-WRITABLE:
+// trusting it to decide what to map would let a guest process suppress the mapping of any window by
+// publishing its own pid. Written only where the validation succeeds, cleared where the handle is
+// closed.
+static volatile LONG g_WgcBrokerPidValidated = 0;
 static LONGLONG  g_WgcBrokerHbLast = 0;    // last BrokerHeartbeat value observed
 static ULONGLONG g_WgcBrokerHbSeenAt = 0;  // wall time we last saw it ADVANCE
 static ULONGLONG g_WgcLastLaunch = 0;      // throttle: don't relaunch while one is starting
@@ -2771,6 +2777,7 @@ static void BrokerSupervise(void)
         brokerExited = TRUE;
         GetExitCodeProcess(g_WgcBrokerProc, &brokerExitCode);
         CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
+        _InterlockedExchange(&g_WgcBrokerPidValidated, 0);   // a dead broker must not keep suppressing windows
     }
     if (!brokerExited && now < g_WgcNextPoll) return;
     g_WgcNextPoll = now + 1000;
@@ -2795,6 +2802,8 @@ static void BrokerSupervise(void)
         if (!g_WgcBrokerProc && pid != 0 && pid != g_WgcBrokerPidRejected)
         {
             g_WgcBrokerProc = WgcOpenBrokerProcess((DWORD)pid, sid);
+            if (g_WgcBrokerProc)
+                _InterlockedExchange(&g_WgcBrokerPidValidated, pid);
             if (!g_WgcBrokerProc)
             {
                 g_WgcBrokerPidRejected = pid;
@@ -2947,6 +2956,7 @@ static void BrokerSupervise(void)
                         L"most likely be refused by the singleton mutex", GetLastError());
             }
             CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
+        _InterlockedExchange(&g_WgcBrokerPidValidated, 0);   // a dead broker must not keep suppressing windows
         }
         // ZERO THE SHARED FIELD, not just our local copy. ROOT CAUSE of "broker death is never
         // detected", measured 2026-09-08: a dead broker's LAST heartbeat stays in shared memory,
@@ -2968,7 +2978,8 @@ static void BrokerShutdown(void)
 {
     if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->Shutdown = 1;   // broker self-exits on this flag
     WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
-    if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL; }
+    if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
+                           _InterlockedExchange(&g_WgcBrokerPidValidated, 0); }
 }
 
 // ---- notification bridge launch/supervise (gate g_NotifBridge) ---------------------------
@@ -6107,6 +6118,32 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 
     if (!(g_DiagWindowFilterOff & 1) && data->Handle == GetShellWindow())
         return FALSE;
+
+    // THE BROKER'S OWN WINDOWS ARE INFRASTRUCTURE, NEVER USER CONTENT. The user-session broker needs
+    // real top-level windows to receive DWM thumbnails of the classes that have no per-window pixel
+    // source - measured: a thumbnail reaches a destination placed off-screen or held at
+    // WS_EX_LAYERED alpha 0, but NOT one that is SW_HIDE, so the destination cannot simply be
+    // hidden. Without this test those destinations are ordinary windows to us: measured
+    // 2026-09-26, a probe's destinations at -9000,-9000 were accepted, classified slice-fed, given
+    // broker slot 3 and MAPPED to dom0 ("class=QubesThumbProbeDest ... QGAHELDMAP"). Any relay
+    // implementation would have manufactured dom0 windows the same way (Jev: this was a design
+    // error rather than a probe artefact, 0.75).
+    //
+    // Keyed on the VALIDATED broker pid, not on a class name and not on the shared section's
+    // BrokerPid field. That field is user-writable, so keying on it would let any guest process
+    // suppress the mapping of any window by publishing its own pid; a class name would let one do
+    // the same by naming a window. g_WgcBrokerPidValidated is only ever set where the handle has
+    // been proven to be a running wgcbroker.exe from the install dir in this session (Jev chose
+    // this mechanism over class and property at 1.00).
+    {
+        const LONG bpid = g_WgcBrokerPidValidated;
+        if (bpid != 0 && data->ProcessId == (DWORD)bpid)
+        {
+            LogDebug("0x%x: owned by the validated broker (pid %ld) - infrastructure, not mapped",
+                     data->Handle, bpid);
+            return FALSE;
+        }
+    }
 
     // FULLSCREEN-SIZED PER-WINDOW GATE (owner design 2026-08-19) - MODE 2 of 2: a normal APP
     // window that happens to span the whole guest screen. Conditionally allowed: mapped only
