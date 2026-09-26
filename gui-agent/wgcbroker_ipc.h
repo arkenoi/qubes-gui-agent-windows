@@ -67,7 +67,14 @@ typedef struct _WGCBRK_HEADER {          /* 128 bytes */
      * the design needs a different signal, not that it is working. Layout-compatible - it takes
      * the place of a pad, so no ABI bump is needed and no reader is invalidated. */
     volatile LONG      PokeLockMiss;
-    BYTE               _pad2[56];
+    /* ABI 8: the relay capability AS LATCHED, published so it is visible from outside. A capability
+     * that fails to latch must be LOUD - a silent off is the forbidden silent downgrade, and this one
+     * WAS silent: the first R1 build used VerifyVersionInfo, which the compatibility-manifest shim
+     * lies to, so the relay never engaged on a 26200 guest and the only symptom was relayOk=0 with
+     * relayFail=0. Taken from the reserved padding so the header size stays 128. */
+    volatile LONG      RelayCapable;   /* 1 = the broker latched the relay ON at startup */
+    volatile LONG      RelayOsBuild;   /* the build it decided from, via RtlGetVersion */
+    BYTE               _pad2[48];
 } WGCBRK_HEADER;
 
 typedef struct _WGCBRK_SLOT {
