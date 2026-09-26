@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  9u   /* 9: ArrivalRaw/ArrivalRejected - separate 'no event' from 'event dropped' */
+#define WGCBRK_ABI_VERSION  10u  /* 10: RelayStaticHolds - demotions declined because the SOURCE had not changed */
 #define WGCBRK_MAX_SLOTS    32
 /* Longest a PrintWindow-captured window may go unrendered when no damage poke arrives. A bound
  * on staleness, not a polling rate: with a working poke path it should almost never fire. */
@@ -221,6 +221,17 @@ typedef struct _WGCBRK_SLOT {
      * the raw invocation and the rejection, so the two cases can never be confused again. */
     volatile LONG     ArrivalRaw;       /* handler entered, before any guard */
     volatile LONG     ArrivalRejected;  /* guard returned early: pool null or a different sender */
+    /* ABI 10: A POKE IS NOT EVIDENCE THE SOURCE CHANGED. The agent derives damage from DESKTOP dirty
+     * rects, so a poke fires whenever anything repaints inside a window's screen rectangle - a
+     * passing cursor, an overlapping window - whether or not that window's own content moved. The
+     * quiet detector demoted on "a poke arrived and no frame followed", which a healthy relay on a
+     * STATIC window satisfies for ever: measured 2026-09-26 on win11de-led2, all four rogue classes
+     * sat on route 2 with relayOk=1, frames delivered (56/28/6/3) and then PokeSeq 11772 against
+     * FramesArrived 56. Jev: root_cause=quiet-rule-demotes-healthy-static-relays 1.00, and the fix
+     * is to require evidence the SOURCE changed (0.76). This counts the times that evidence was
+     * absent and the demotion was therefore declined - if it never advances, the new rule is not
+     * firing and any pass is unproven. */
+    volatile LONG     RelayStaticHolds;
 } WGCBRK_SLOT;
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
