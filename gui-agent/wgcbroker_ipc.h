@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  8u   /* 8: Route + the DWM-thumbnail relay (RelayOk/RelayFail) */
+#define WGCBRK_ABI_VERSION  9u   /* 9: ArrivalRaw/ArrivalRejected - separate 'no event' from 'event dropped' */
 #define WGCBRK_MAX_SLOTS    32
 /* Longest a PrintWindow-captured window may go unrendered when no damage poke arrives. A bound
  * on staleness, not a polling rate: with a working poke path it should almost never fire. */
@@ -213,6 +213,14 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG     RelayFail;    /* relay attempts that failed; the slot then falls back */
     volatile UINT64   RelayDest;    /* the destination HWND we own, for cross-checking the agent's
                                      * broker-owned-window exclusion from outside */
+    /* ABI 9: DID THE EVENT FIRE, OR DID WE THROW IT AWAY? FramesArrived is incremented AFTER the
+     * arrival handler's re-validation guard, so a guard that starts rejecting looks exactly like a
+     * feed that stopped - and the quiet detector then demotes a healthy channel. That is not
+     * hypothetical: five relay slots delivered 83/25/29/3/2 frames and were all demoted, and Jev put
+     * the guard at 0.70 as the mechanism against every other candidate below 0.19. These two count
+     * the raw invocation and the rejection, so the two cases can never be confused again. */
+    volatile LONG     ArrivalRaw;       /* handler entered, before any guard */
+    volatile LONG     ArrivalRejected;  /* guard returned early: pool null or a different sender */
 } WGCBRK_SLOT;
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
