@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  13u  /* 13: PubTiles - a 32x32 mean-RGB reduction of the delivered frame */
+#define WGCBRK_ABI_VERSION  14u  /* 14: session-lifecycle counters - is a frozen slot dead or STALE? */
 #define WGCBRK_MAX_SLOTS    32
 /* ABI 13: the delivered frame reduced to a fixed WGCBRK_TILES x WGCBRK_TILES grid of per-tile MEAN
  * RGB. Fixed on BOTH sides regardless of either side's own dimensions, which is the whole point: the
@@ -277,6 +277,22 @@ typedef struct _WGCBRK_SLOT {
     /* ABI 13. Row-major, WGCBRK_TILES rows of WGCBRK_TILES tiles, 3 bytes per tile in R,G,B order.
      * Written at most once per second per slot, on the same throttle as PubColours. */
     volatile BYTE     PubTiles[WGCBRK_TILE_BYTES];
+    /* ABI 14: THE SESSION'S OWN LIFECYCLE. Every counter before this one describes FRAMES; none
+     * describes the session carrying them, and that gap made two very different faults look
+     * identical from outside. Measured 2026-09-26: relay slots sat with FramesArrived frozen
+     * (53 -> 53 and 2 -> 2) while direct-WGC slots in the SAME broker process advanced, and the
+     * primitive was then cleared completely - a DWM thumbnail relayed into the broker's own style of
+     * destination delivered 437 arrivals over 240 s without decaying. So the fault is in this code.
+     * But the frame counters live HERE, in shared memory, while the session, pool and FrameArrived
+     * revoker live in the broker's per-channel struct: CloseChannel resets that struct and does NOT
+     * zero these, so a slot can display numbers from a PREVIOUS session while the current one is
+     * absent. Jev: stale_counters_plausible **0.81**, and if they are stale it is a DIFFERENT defect
+     * with the same symptom - a channel closed and never successfully reopened (0.83).
+     * These four make that distinguishable without a rebuild next time. */
+    volatile LONG     ChanOpens;    /* successful OpenChannel calls for this slot */
+    volatile LONG     ChanCloses;   /* CloseChannel calls for this slot */
+    volatile LONG     SessionLive;  /* 1 while a capture session+pool is held, 0 after a close */
+    volatile LONG     ChanGen;      /* bumped on every open; identifies which session the counters belong to */
 } WGCBRK_SLOT;
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
