@@ -12,7 +12,7 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  16u  /* 16: RelayReregs - thumbnail re-registrations that repaired a channel */
+#define WGCBRK_ABI_VERSION  16u  /* 16: ItemClosed - WGC closed the capture item, which nothing used to notice */
 #define WGCBRK_MAX_SLOTS    32
 /* ABI 13: the delivered frame reduced to a fixed WGCBRK_TILES x WGCBRK_TILES grid of per-tile MEAN
  * RGB. Fixed on BOTH sides regardless of either side's own dimensions, which is the whole point: the
@@ -305,19 +305,23 @@ typedef struct _WGCBRK_SLOT {
      * invalidates_fidelity 0.76, per-generation-frame-counters 0.87.
      * With this, "the relay delivered N frames" is finally a statement that can be made or refuted. */
     volatile LONG     GenFrames;
-    /* ABI 16: DWM THUMBNAIL RE-REGISTRATIONS. Measured 2026-09-27: a relay channel opened by the broker
-     * instance that a GUEST COLD BOOT produces emits its opening frame and then never follows the source
-     * again (driven slot, route 1, `genFrames 1 -> 1` across a confirmed change), while restarting ONLY
-     * the agent on the SAME boot makes the very same code deliver (`1 -> 2`), and the standalone probe
-     * delivers indefinitely in every configuration. Jev's reading at 0.93: the thumbnail is registered
-     * while DWM is still coming up, the registration is ACCEPTED but never afterwards recomposed, and
-     * nothing ever re-registers it - a relay that has delivered is never demoted while its source is
-     * static, so nothing repaired it either.
-     * So the channel is now REPAIRED rather than abandoned: on the first measured source change with no
-     * frame behind it, the thumbnail is unregistered, re-registered and its properties re-applied. This
-     * counter exists because a repair that happens silently is indistinguishable from a bug that fixed
-     * itself - if it never advances on a cold boot, the repair is not firing and any pass is unproven. */
-    volatile LONG     RelayReregs;
+    /* ABI 16: WGC CLOSED THE CAPTURE ITEM. A GraphicsCaptureItem can be CLOSED by the system, after
+     * which FrameArrived never fires again for that session. The broker never subscribed to
+     * GraphicsCaptureItem.Closed, so that state was INDISTINGUISHABLE from a window whose content
+     * simply stopped changing: no error anywhere, no counter, the slot still reading ACTIVE, and -
+     * measured 2026-09-27 - a FRESH WGC session opened on the very same window from another process
+     * returning a frame every second carrying the source's own content (colours=1080,
+     * nonBlack=1080/1080) while the broker's long-lived session got nothing. Jev on that evidence:
+     * brokers-own-capture-session-died 0.82, with the DWM-thumbnail and DWM-throttling readings at 0.00.
+     *
+     * THIS IS OBSERVATION ONLY AND DELIBERATELY CHANGES NO BEHAVIOUR. Jev rated "subscribe and observe"
+     * 0.96 at 0.95 confidence, and BOTH "recreate the session now" and "observe and repair in one build"
+     * 0.00 - so a repair does not get written until this counter has been seen to move on a channel that
+     * is actually deaf. If it never moves while a channel is deaf, the item was NOT closed and the
+     * mechanism is still unknown; a repair built now would have been built on a guess. */
+    volatile LONG     ItemClosed;
+    volatile LONGLONG ItemClosedTick;   /* GetTickCount64 of the last Closed, so it can be ordered
+                                         * against CaptureTick and the poke/damage timeline */
 } WGCBRK_SLOT;
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
