@@ -2862,7 +2862,7 @@ static void BrokerSupervise(void)
             // guess, and a fix built on another guess (the WGC teardown lock, 2026-09-27) changed nothing.
             static const wchar_t* const stgName[] = { L"loop", L"reconcile", L"open-channel",
                 L"close-channel", L"relay-dwm", L"probe", L"source-printwindow", L"polled-printwindow",
-                L"republish", L"sign" };
+                L"republish", L"sign", L"close-lock", L"close-reap" };
             const LONG stg = g_WgcBase ? WGCBRK_HDR(g_WgcBase)->BrokerStage : -1;
             const LONG code = stg >= 0 ? (stg >> 8) : -1;
             LogError("QGABROKERHUNG de-slice broker process is still RUNNING but its heartbeat has "

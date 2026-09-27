@@ -350,6 +350,8 @@ typedef struct _WGCBRK_SLOT {
 #define WGCBRK_STG_POLL_PW    7u   /* PublishPrintWindow: PrintWindow of a polled window */
 #define WGCBRK_STG_REPUBLISH  8u   /* RepublishRetained */
 #define WGCBRK_STG_SIGN       9u   /* FlushPendingSignatures */
+#define WGCBRK_STG_CLOSE_LOCK 10u  /* CloseChannel: acquiring the slot lock a FrameArrived handler may hold */
+#define WGCBRK_STG_CLOSE_REAP 11u  /* CloseChannel: handing the WGC teardown to its own thread (never waits) */
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
  * move slots OFF route 2, and "how many slots are still on 2" must be a single readable number. */
