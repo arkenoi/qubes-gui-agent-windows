@@ -12,8 +12,8 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  17u  /* 17: Republished - a card served from the retained capture after a
-                                  *     registration change no arrival answered; 16: ItemClosed */
+#define WGCBRK_ABI_VERSION  18u  /* 18: BrokerStage + HungSkips - which call a broker hang is in, and
+                                  *     PrintWindows skipped for an unresponsive target; 17: Republished */
 #define WGCBRK_MAX_SLOTS    32
 /* ABI 13: the delivered frame reduced to a fixed WGCBRK_TILES x WGCBRK_TILES grid of per-tile MEAN
  * RGB. Fixed on BOTH sides regardless of either side's own dimensions, which is the whole point: the
@@ -69,7 +69,12 @@ typedef struct _WGCBRK_HEADER {          /* 128 bytes */
     volatile LONG      SlotCount;        /* == WGCBRK_MAX_SLOTS */
     volatile LONG      Shutdown;         /* agent sets 1 on clean exit; broker exits */
     volatile LONG      Producing;        /* broker: 1 on Default desktop, 0 while secure (paused) */
-    volatile LONG      _pad0;
+    /* ABI 18 (was _pad0): the broker's CURRENT main-loop stage, (WGCBRK_STG_* << 8) | slot, set around every
+     * call that talks to another process. A hang stops the heartbeat with this still naming the call it is
+     * blocked in; the agent prints it in QGABROKERHUNG. Measured 2026-09-27: every broker "death" began
+     * within seconds of a window disappearing, and moving the WGC teardown out of the slot lock did not stop
+     * them - the blocking call has to be named, not guessed. */
+    volatile LONG      BrokerStage;
     volatile LONGLONG  ArenaOffset;      /* bytes from base to the pixel arena */
     volatile LONGLONG  ArenaBytes;       /* total arena budget */
     volatile LONGLONG  AgentHeartbeat;   /* GetTickCount64, bumped each supervise pass */
@@ -114,7 +119,9 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG   Stride;              /* == FrameWidth*4 (packed) */
     volatile LONG   ActiveBuffer;        /* index in [0,WGCBRK_RING) holding the latest frame */
     volatile LONG   Seq;                 /* SEQLOCK: odd = write in progress, even = stable */
-    volatile LONG   _pad0;
+    volatile LONG   HungSkips;           /* ABI 18 (was _pad0): PrintWindows skipped because the target did
+                                          * not answer a 100 ms WM_NULL probe (a hung window would block the
+                                          * broker's main loop in PrintWindow with no timeout) */
     volatile UINT64 FrameId;             /* monotonic; agent skips a slot with unchanged FrameId */
     volatile LONGLONG CaptureTick;       /* GetTickCount64 at publish; freshness vs secure-left */
     /* Pixel-exact crop: the broker PrintWindow-renders the FULL window (transparent margin comes
@@ -331,6 +338,18 @@ typedef struct _WGCBRK_SLOT {
     volatile LONGLONG ItemClosedTick;   /* GetTickCount64 of the last Closed, so it can be ordered
                                          * against CaptureTick and the poke/damage timeline */
 } WGCBRK_SLOT;
+
+/* ABI 18: WGCBRK_HEADER.BrokerStage codes (bits 8+; the low 8 bits are the slot). */
+#define WGCBRK_STG_LOOP       0u   /* main loop, between the stages below */
+#define WGCBRK_STG_RECONCILE  1u   /* Reconcile, between its calls */
+#define WGCBRK_STG_OPEN       2u   /* OpenChannel: CreateForWindow, frame pool, StartCapture */
+#define WGCBRK_STG_CLOSE      3u   /* CloseChannel teardown: revoke, session.Close, pool.Close */
+#define WGCBRK_STG_RELAY_DWM  4u   /* relay destination window + DwmRegister/UnregisterThumbnail */
+#define WGCBRK_STG_PROBE      5u   /* the WM_NULL responsiveness probe (bounded to 100 ms) */
+#define WGCBRK_STG_SRC_PW     6u   /* RelaySourceChanged: PrintWindow of a quiet window's source */
+#define WGCBRK_STG_POLL_PW    7u   /* PublishPrintWindow: PrintWindow of a polled window */
+#define WGCBRK_STG_REPUBLISH  8u   /* RepublishRetained */
+#define WGCBRK_STG_SIGN       9u   /* FlushPendingSignatures */
 
 /* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
  * move slots OFF route 2, and "how many slots are still on 2" must be a single readable number. */

@@ -2856,9 +2856,21 @@ static void BrokerSupervise(void)
             LogError("QGABROKEREXIT de-slice broker process EXITED (exit code %lu) - detected by "
                 L"process wait, not by heartbeat staleness.", brokerExitCode);
         else if (g_WgcBrokerProc && now - g_WgcBrokerHbSeenAt >= 6000)
+        {
+            // ABI 18: the broker publishes which call its main loop is in (WGCBRK_STG_* << 8 | slot), so a
+            // hang names its call instead of leaving it to be guessed - "most likely PrintWindow" was a
+            // guess, and a fix built on another guess (the WGC teardown lock, 2026-09-27) changed nothing.
+            static const wchar_t* const stgName[] = { L"loop", L"reconcile", L"open-channel",
+                L"close-channel", L"relay-dwm", L"probe", L"source-printwindow", L"polled-printwindow",
+                L"republish", L"sign" };
+            const LONG stg = g_WgcBase ? WGCBRK_HDR(g_WgcBase)->BrokerStage : -1;
+            const LONG code = stg >= 0 ? (stg >> 8) : -1;
             LogError("QGABROKERHUNG de-slice broker process is still RUNNING but its heartbeat has "
-                L"not advanced for %I64u ms - a hang (most likely a synchronous PrintWindow into a "
-                L"hung target window), not a crash.", now - g_WgcBrokerHbSeenAt);
+                L"not advanced for %I64u ms - a hang, not a crash; it is blocked in stage=%s (%ld) "
+                L"slot=%ld.", now - g_WgcBrokerHbSeenAt,
+                (code >= 0 && code < (LONG)(sizeof(stgName) / sizeof(stgName[0]))) ? stgName[code] : L"unknown",
+                code, stg >= 0 ? (stg & 0xFF) : -1L);
+        }
         LogError("QGABROKERDIED de-slice broker STOPPED HEARTBEATING after being ready (death #%lu, "
             L"pid was %ld). This is a MAJOR FAILURE, not a hiccup: while it is gone there is NO "
             L"composite fallback on an eligible guest, so toasts, menus and WinUI surfaces are "
