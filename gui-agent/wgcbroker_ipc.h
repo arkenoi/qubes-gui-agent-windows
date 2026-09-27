@@ -12,7 +12,8 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  16u  /* 16: ItemClosed - WGC closed the capture item, which nothing used to notice */
+#define WGCBRK_ABI_VERSION  17u  /* 17: Republished - a card served from the retained capture after a
+                                  *     registration change no arrival answered; 16: ItemClosed */
 #define WGCBRK_MAX_SLOTS    32
 /* ABI 13: the delivered frame reduced to a fixed WGCBRK_TILES x WGCBRK_TILES grid of per-tile MEAN
  * RGB. Fixed on BOTH sides regardless of either side's own dimensions, which is the whole point: the
@@ -320,6 +321,13 @@ typedef struct _WGCBRK_SLOT {
      * is actually deaf. If it never moves while a channel is deaf, the item was NOT closed and the
      * mechanism is still unknown; a repair built now would have been built on a guess. */
     volatile LONG     ItemClosed;
+    /* ABI 17: frames the broker published from its RETAINED full-window capture because the agent's
+     * registration changed (ControlSeq moved) and no arrival answered it - a static window whose card
+     * moved, measured on the toast host 2026-09-27 (ack=0 seq=0 for a whole census). A slot that is
+     * served after a re-registration with this at 0 was served by an arrival; with it above 0, by the
+     * retained capture. Lives in what was the 4-byte alignment gap before ItemClosedTick, so no other
+     * field moves and sizeof(WGCBRK_SLOT) stays 3424. */
+    volatile LONG     Republished;
     volatile LONGLONG ItemClosedTick;   /* GetTickCount64 of the last Closed, so it can be ordered
                                          * against CaptureTick and the poke/damage timeline */
 } WGCBRK_SLOT;
