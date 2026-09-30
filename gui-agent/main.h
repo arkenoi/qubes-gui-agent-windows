@@ -339,6 +339,7 @@ typedef struct _WINDOW_DATA
     // has been eligible this long without a painted frame - before that it is simply young,
     // which is a defined state, not a defect. 0 = not eligible yet.
     ULONGLONG PwDirectSince;
+    BOOL      PwRegFailLogged;   // QGABROKERREGFAIL said once for this window (cleared by a successful registration)
 
     // One-shot log: the raise-on-foreground corrective was skipped for this window because it has
     // its own per-window buffer (the corrective is a slice-era stacking workaround).

@@ -517,7 +517,13 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
 
     // Windows PrintWindow cannot capture still get their own buffer, fed from the
     // composited screen framebuffer by the frame loop (see PwSliceFed in main.h).
-    const BOOL sliceFed = !PwWindowEligible(entry);
+    // docs/ADR-capture.md section 18: on a direct-capable guest (26100+, broker eligible - DirectRequired, decided at
+    // start) EVERY window is fed from its own WGC capture through the broker, an ordinary window too. PrintWindow asks
+    // the application to paint - a Windows 11 Notepad repaints for it, and the repaint is the next change (the idle
+    // burn, 2026-09-30) - and the composited desktop is slicing, which the owner is removing entirely; WGC is neither,
+    // and it delivers a frame only when that window's own content changed. Below 26100 there is no broker, and an
+    // ordinary window keeps the PrintWindow engine as before.
+    const BOOL sliceFed = !PwWindowEligible(entry) || DirectRequired();
 
     ULONG status;
     const size_t imageBytes = (size_t)entry->Width * entry->Height * 4;
@@ -715,6 +721,12 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     {
         BrokerRegister(entry);
     }
+    // The direct-wait clock (QGADIRECTWAIT -> QGADIRECTSUPPRESS): started at the FIRST registration of this broker-fed
+    // episode, never restarted while it lasts (see the synth path). Was set only for synthesized menus, so a broker-fed
+    // window that never got a frame stayed "young" for ever and its loud declaration could not fire
+    // (docs/DESIGN-rest-zero-capture.md F).
+    if (sliceFed && DirectRequired() && entry->PwDirectSince == 0)
+        entry->PwDirectSince = GetTickCount64();
     // Fresh channel: no mask has been pushed to it yet, and no move state carries
     // over from a previous buffer (a resize rebuild lands here mid-drag).
     entry->SynthMaskLastCount = 0;

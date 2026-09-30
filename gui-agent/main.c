@@ -3635,7 +3635,19 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     int slot = -1;
     for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
         if (slots[i].Hwnd == 0 && slots[i].ReqState == WGCBRK_FREE) { slot = i; break; }
-    if (slot < 0) return FALSE;
+    if (slot < 0)
+    {
+        // LOUD (docs/DESIGN-rest-zero-capture.md F): a window with no slot is withheld with no source at all. Was a
+        // silent FALSE; once per window until a registration succeeds (the late-registration path retries it).
+        if (!entry->PwRegFailLogged)
+        {
+            entry->PwRegFailLogged = TRUE;
+            LogError("QGABROKERREGFAIL hwnd 0x%x (class %s, %ux%u): no free broker slot (all %d in use) - the window "
+                     L"is withheld until one frees",
+                     (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height, WGCBRK_MAX_SLOTS);
+        }
+        return FALSE;
+    }
 
     // SIZE CLASS, not the exact frame. Arena buffers are fixed at registration and cannot grow,
     // so an exact allocation makes the NEXT size up unservable and forces a full re-registration -
@@ -3656,8 +3668,17 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
         // safe to reclaim immediately) and stay on the slice for this window.
         if (off0) WgcArenaFree(off0, one);
         if (off1) WgcArenaFree(off1, one);
+        if (!entry->PwRegFailLogged)
+        {
+            entry->PwRegFailLogged = TRUE;
+            LogError("QGABROKERREGFAIL hwnd 0x%x (class %s, %ux%u): the broker arena (%lu bytes) has no room for two "
+                     L"%llu-byte buffers - the window is withheld until space frees",
+                     (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height,
+                     (unsigned long)g_WgcArenaBytes, (unsigned long long)one);
+        }
         return FALSE;
     }
+    entry->PwRegFailLogged = FALSE;
 
     WGCBRK_SLOT* s = &slots[slot];
     s->BufOffset[0] = (LONGLONG)off0; s->BufOffset[1] = (LONGLONG)off1;
@@ -7635,6 +7656,55 @@ static BOOL PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRA
     return PwSliceCopyAndDamageSrc(entry, fb, frame ? frame->rect.Pitch : 0, 0, 0, area);
 }
 
+// A broker frame is the WHOLE window each time the window changes (the broker does not pass WGC's dirty regions yet -
+// docs/DESIGN-rest-zero-capture.md S1b), and since 2026-10-01 every window on a direct-capable guest is broker-fed,
+// the foreground one included (ADR-capture section 18). Copying and damaging all of it would make dom0 repaint the
+// whole window for every keystroke, so each row is compared with what the granted buffer already holds and only the
+// bands that differ are copied and damaged. Clipping and ledger accounting as PwSliceCopyAndDamageSrc (one copy per
+// call); broker frames are window-relative, so the source origin is the window's own.
+static BOOL PwBrokerCopyDiff(IN OUT WINDOW_DATA* entry, IN const BYTE* srcBase, IN int srcPitch, IN const RECT* area)
+{
+    if (entry) entry->PwLedgerCopies++;
+    if (!srcBase || srcPitch <= 0 || !entry->PwBuffer)
+        return FALSE;
+    RECT screenR = { 0, 0, (LONG)min(g_ScreenWidth, g_FbWidth), (LONG)min(g_ScreenHeight, g_FbHeight) };
+    RECT winR = { entry->X, entry->Y, entry->X + (int)entry->PwWidth, entry->Y + (int)entry->PwHeight };
+    RECT r;
+    if (!IntersectRect(&r, area, &winR) || !IntersectRect(&r, &r, &screenR))
+        return FALSE;
+    const int relX = r.left - entry->X;
+    const int relY = r.top - entry->Y;
+    const int w = r.right - r.left;
+    const int h = r.bottom - r.top;
+    if (relX < 0 || relY < 0 || w <= 0 || h <= 0)
+        return FALSE;
+    if ((ULONG)(relX + w) > entry->PwWidth || (ULONG)(relY + h) > entry->PwHeight)
+        return FALSE; // buffer geometry changed underneath; the next full frame repaints
+    const BYTE* src = srcBase + (size_t)relY * srcPitch + (size_t)relX * 4;
+    BYTE* dst = (BYTE*)entry->PwBuffer + ((size_t)relY * entry->PwWidth + (size_t)relX) * 4;
+    const size_t rowBytes = (size_t)w * 4;
+    int band = -1;
+    for (int row = 0; row < h; row++)
+    {
+        if (memcmp(dst, src, rowBytes) != 0)
+        {
+            memcpy(dst, src, rowBytes);
+            if (band < 0)
+                band = row;
+        }
+        else if (band >= 0)
+        {
+            (void)SendWindowDamageEvent(entry->Handle, relX, relY + band, w, row - band);
+            band = -1;
+        }
+        src += srcPitch;
+        dst += (size_t)entry->PwWidth * 4;
+    }
+    if (band >= 0)
+        (void)SendWindowDamageEvent(entry->Handle, relX, relY + band, w, h - band);
+    return TRUE;
+}
+
 // Slice-content bookkeeping (ALWAYS ON) + map-hold release. Called when REAL content
 // provably landed in a slice-fed window's per-window buffer for the FIRST time: a consumed
 // per-HWND broker frame, or a composite slice copy backed by screen damage intersecting the
@@ -8637,6 +8707,188 @@ void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason)
             (LONG64)g_PwLedgerEngineDamage, entry->PwLedgerUnattributed);
 }
 
+// docs/ADR-capture.md section 18: take this broker-fed window's newest frame, if it has one. Returns TRUE when a
+// fresh frame exists (copied now, or already copied by an earlier pass - either way the window is being fed) and
+// FALSE when there is none, leaving the hold and slice arms to the caller. Shared by the desktop frame loop and the
+// broker's frame-published event (BrokerConsumePass), so a window whose own content changes while nothing else on the
+// desktop does - a covered one - is copied when ITS frame lands, not at the next unrelated desktop change.
+static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRectIn)
+{
+    const RECT pwRect = *pwRectIn;
+    const BYTE* bsrc = NULL; int bpitch = 0; UINT64 bid = 0;
+    if (!(entry->PwBrokerSourced && WgcBrokerActive() &&
+          BrokerFreshFrame(entry, &bsrc, &bpitch, &bid)))
+        return FALSE;
+    if (bid != entry->PwBrokerLastId || entry->PwSliceNeedsFull)
+    {
+        BOOL firstBrokerFrame = (entry->PwBrokerLastId == 0);
+        entry->PwSliceNeedsFull = FALSE;
+        entry->PwBrokerLastId = bid;
+        if (entry->PwBrokerFrames < 0xFFFFFFFFu) entry->PwBrokerFrames++;
+        PwBrokerCopyDiff(entry, bsrc, bpitch, &pwRect);
+        // Buffer is complete for this window: square off DWM's black rounded
+        // corners before the content check judges it.
+        FlattenBufferCorners(entry);
+        // Transparent gap between stacked toast cards arrives as opaque black
+        // (premultiplied WGC capture, no usable alpha) - fill it from the card
+        // above. Toast windows only; see ToastFillGapRows.
+        ToastFillGapRows(entry);
+        // A per-HWND broker frame is a COPY, not proof of content: the WGC
+        // publish path has no non-black check, so the first frame of a
+        // not-yet-rendered window is black. PwNoteSliceContent samples the
+        // buffer and closes the map/first-content pair (releasing a
+        // SliceMapHold defer) only once it is actually painted.
+        PwNoteSliceContent(entry);
+        // LEDGER: a broker frame actually landed in the granted buffer. Split by
+        // the slot's own route flag so "WGC delivered" and "the broker fell back
+        // to PrintWindow" never collapse into one number - that collapse is what
+        // made a starved slot and a re-routed slot look alike all evening.
+        {
+            const WGCBRK_SLOT* ls = (g_WgcBase && entry->PwBrokerSlot >= 0 &&
+                                     entry->PwBrokerSlot < WGCBRK_MAX_SLOTS)
+                ? &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot] : NULL;
+            if (ls && ls->TickPw) entry->PwLedgerBrokerPw++;
+            else                    entry->PwLedgerBrokerWgc++;
+        }
+        if (firstBrokerFrame)
+        {
+            LogInfo("BROKERFRAME first WGC frame consumed hwnd 0x%x slot %d %ux%u",
+                    (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+                    entry->PwWidth, entry->PwHeight);
+            // ATTRIBUTION (ABI 2). Split this window's first-content latency into
+            // the broker's session setup versus the wait for the application to
+            // render. Measured menu held_ms spans 156-547 ms with registration
+            // count constant, and those two have completely different fixes.
+            // All ticks are the broker's GetTickCount64, same clock as ours.
+            // ProtoTrace-only: this is a measurement probe for OUR benchmarks,
+            // not something an operator or a field report needs (Jev: gate the
+            // pure probes 0.89, but KEEP per-window lifecycle lines like
+            // BROKERFRAME above at INFO 0.35 - a first field report has to be
+            // interpretable without a second round trip).
+            if (g_ProtoTrace)
+            {
+                const WGCBRK_SLOT* bs =
+                    &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
+                const LONGLONG o = bs->OpenTick;
+                // ABI 5: the stage ticks are QPC COUNTS. Cached once - the
+                // frequency is fixed for the life of the system.
+                static LONGLONG s_qpf = 0;
+                if (!s_qpf)
+                {
+                    LARGE_INTEGER f;
+                    if (QueryPerformanceFrequency(&f)) s_qpf = f.QuadPart;
+                }
+                #define BC_MS(t) ((s_qpf && (t)) \
+                    ? (LONGLONG)(((t) - o) * 1000 / s_qpf) : (LONGLONG)-1)
+                #define BC_NOW_MS() (s_qpf && o ? BC_MS(QpcNowAgent()) : (LONGLONG)-1)
+                // Are these ticks OURS? Slots are RECYCLED, and OpenChannel
+                // stamps OpenTick then zeroes the stages before it can fail on
+                // a window that has already gone - so a later FAILED open of
+                // this slot overwrites the record of the successful open that
+                // actually produced the frame being reported. That is what made
+                // this probe measure nothing in 4.3.32: OpenTick present and all
+                // five stages zero. Print numbers only when the slot says they
+                // describe THIS window and that open got past the point where it
+                // could still fail; otherwise say WHY, rather than emit -1s that
+                // look measured.
+                const BOOL ticksMine =
+                    (bs->TickHwnd == (UINT64)(ULONG_PTR)entry->Handle) &&
+                    bs->TickOpenOk && o;
+                if (!ticksMine)
+                {
+                    // The reason must not name a cause it has not established.
+                    // It used to say "slot-reopened-for-another-window" whenever
+                    // TickHwnd differed - which was FALSE for every menu: menus are
+                    // rejected by WGC and served by polled PrintWindow, a path that
+                    // wrote no ticks at all under ABI 3, so the block simply still
+                    // held an older window's record. Both remain possible now, and
+                    // this probe cannot tell them apart, so it says exactly that.
+                    LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,"
+                        "valid=0,reason=%s,consumed_ms=%lld",
+                        (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+                        (bs->TickHwnd != (UINT64)(ULONG_PTR)entry->Handle)
+                            ? L"ticks-describe-another-window"
+                            : (!bs->TickOpenOk ? L"open-not-completed"
+                                               : L"no-open-recorded"),
+                        BC_NOW_MS());
+                }
+                else if (bs->TickPw)
+                {
+                    // Polled PrintWindow - the path EVERY menu takes.
+                    // fallback_ms: the WGC attempt was abandoned (it cannot
+                    //   succeed for an override-redirect popup) and we fell back.
+                    // firstpoll_ms: first poll ENTERED. Reconcile opens and polls
+                    //   in the SAME loop iteration, so this contains no waiting.
+                    // pwret_ms - firstpoll_ms: the synchronous PrintWindow call on
+                    //   the window's own UI thread.
+                    // polls: polls entered for this open UP TO THIS READ - it is
+                    //   NOT "renders that came back black": publish_ms == pwret_ms
+                    //   here, i.e. the FIRST render published, and the extra polls
+                    //   are ordinary refreshes that happened before the agent
+                    //   consumed the frame. Do not read it as app-not-painted.
+                    LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,valid=1,"
+                        "path=printwindow,fallback_ms=%lld,firstpoll_ms=%lld,"
+                        "pwret_ms=%lld,publish_ms=%lld,polls=%d,consumed_ms=%lld",
+                        (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+                        BC_MS(bs->ItemTick),
+                        BC_MS(bs->StartTick),
+                        BC_MS(bs->FirstArrivedTick),
+                        BC_MS(bs->FirstPublishTick),
+                        (int)bs->PollCount,
+                        BC_NOW_MS());
+                }
+                else
+                {
+                LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,valid=1,"
+                    "path=wgc,item_ms=%lld,pool_ms=%lld,start_ms=%lld,"
+                    "arrived_ms=%lld,publish_ms=%lld,consumed_ms=%lld",
+                    (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+                    BC_MS(bs->ItemTick),
+                    BC_MS(bs->PoolTick),
+                    BC_MS(bs->StartTick),
+                    BC_MS(bs->FirstArrivedTick),
+                    BC_MS(bs->FirstPublishTick),
+                    BC_NOW_MS());
+                }
+                #undef BC_NOW_MS
+                #undef BC_MS
+            }
+        }
+    }
+    // else: no new broker frame this pass -> nothing changed, skip
+
+    // Crop-before-show: a per-window broker frame is available, so the crop is now
+    // measurable; if this window's MAP is still held, poke the tracking pass to map
+    // it promptly rather than waiting for the 2 s resync.
+    if (entry->MapDeferred)
+        PokeWindowTracking();
+    return TRUE;
+}
+
+// The broker published a frame (g_WgcFrame): copy every broker-fed window's newest frame now. Before this the agent
+// copied broker frames only on its desktop frame loop, so a window whose content changed while the rest of the desktop
+// did not - a covered window makes no desktop damage at all - sat stale until something unrelated moved.
+static void BrokerConsumePass(void)
+{
+    if (!g_WgcBase || !WgcBrokerActive())
+        return;
+    // The frame path is frozen while the input desktop is secure (ProcessNewFrame); so is this one.
+    if (g_OnSecureDesktop)
+        return;
+    EnterCriticalSection(&g_csWatchedWindows);
+    for (LIST_ENTRY* le = g_WatchedWindowsList.Flink; le != &g_WatchedWindowsList; le = le->Flink)
+    {
+        WINDOW_DATA* w = CONTAINING_RECORD(le, WINDOW_DATA, ListEntry);
+        if (w->DeletePending || w->Synthesized || w->IsIconic || !w->IsVisible)
+            continue;
+        if (!PwIsAttached(w) || !w->PwSliceFed || !w->PwBrokerSourced)
+            continue;
+        const RECT r = { w->X, w->Y, w->X + (int)w->Width, w->Y + (int)w->Height };
+        (void)PwConsumeBrokerFrame(w, &r);
+    }
+    LeaveCriticalSection(&g_csWatchedWindows);
+}
+
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
     IN UINT fbWidth, IN UINT fbHeight)
 {
@@ -9093,153 +9345,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // desktop, torn read, size mismatch) -> the HOLD arm below keeps last content;
                 // broker INACTIVE (down / not ready / pre-24H2) -> the DDA slice fallback
                 // further below. Broker frames are window-relative: source origin = (entry->X, entry->Y).
-                const BYTE* bsrc = NULL; int bpitch = 0; UINT64 bid = 0;
-                if (entry->PwBrokerSourced && WgcBrokerActive() &&
-                    BrokerFreshFrame(entry, &bsrc, &bpitch, &bid))
+                if (PwConsumeBrokerFrame(entry, &pwRect))
                 {
-                    if (bid != entry->PwBrokerLastId || entry->PwSliceNeedsFull)
-                    {
-                        BOOL firstBrokerFrame = (entry->PwBrokerLastId == 0);
-                        entry->PwSliceNeedsFull = FALSE;
-                        entry->PwBrokerLastId = bid;
-                        if (entry->PwBrokerFrames < 0xFFFFFFFFu) entry->PwBrokerFrames++;
-                        PwSliceCopyAndDamageSrc(entry, bsrc, bpitch, entry->X, entry->Y, &pwRect);
-                        // Buffer is complete for this window: square off DWM's black rounded
-                        // corners before the content check judges it.
-                        FlattenBufferCorners(entry);
-                        // Transparent gap between stacked toast cards arrives as opaque black
-                        // (premultiplied WGC capture, no usable alpha) - fill it from the card
-                        // above. Toast windows only; see ToastFillGapRows.
-                        ToastFillGapRows(entry);
-                        // A per-HWND broker frame is a COPY, not proof of content: the WGC
-                        // publish path has no non-black check, so the first frame of a
-                        // not-yet-rendered window is black. PwNoteSliceContent samples the
-                        // buffer and closes the map/first-content pair (releasing a
-                        // SliceMapHold defer) only once it is actually painted.
-                        PwNoteSliceContent(entry);
-                        // LEDGER: a broker frame actually landed in the granted buffer. Split by
-                        // the slot's own route flag so "WGC delivered" and "the broker fell back
-                        // to PrintWindow" never collapse into one number - that collapse is what
-                        // made a starved slot and a re-routed slot look alike all evening.
-                        {
-                            const WGCBRK_SLOT* ls = (g_WgcBase && entry->PwBrokerSlot >= 0 &&
-                                                     entry->PwBrokerSlot < WGCBRK_MAX_SLOTS)
-                                ? &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot] : NULL;
-                            if (ls && ls->TickPw) entry->PwLedgerBrokerPw++;
-                            else                    entry->PwLedgerBrokerWgc++;
-                        }
-                        if (firstBrokerFrame)
-                        {
-                            LogInfo("BROKERFRAME first WGC frame consumed hwnd 0x%x slot %d %ux%u",
-                                    (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
-                                    entry->PwWidth, entry->PwHeight);
-                            // ATTRIBUTION (ABI 2). Split this window's first-content latency into
-                            // the broker's session setup versus the wait for the application to
-                            // render. Measured menu held_ms spans 156-547 ms with registration
-                            // count constant, and those two have completely different fixes.
-                            // All ticks are the broker's GetTickCount64, same clock as ours.
-                            // ProtoTrace-only: this is a measurement probe for OUR benchmarks,
-                            // not something an operator or a field report needs (Jev: gate the
-                            // pure probes 0.89, but KEEP per-window lifecycle lines like
-                            // BROKERFRAME above at INFO 0.35 - a first field report has to be
-                            // interpretable without a second round trip).
-                            if (g_ProtoTrace)
-                            {
-                                const WGCBRK_SLOT* bs =
-                                    &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
-                                const LONGLONG o = bs->OpenTick;
-                                // ABI 5: the stage ticks are QPC COUNTS. Cached once - the
-                                // frequency is fixed for the life of the system.
-                                static LONGLONG s_qpf = 0;
-                                if (!s_qpf)
-                                {
-                                    LARGE_INTEGER f;
-                                    if (QueryPerformanceFrequency(&f)) s_qpf = f.QuadPart;
-                                }
-                                #define BC_MS(t) ((s_qpf && (t)) \
-                                    ? (LONGLONG)(((t) - o) * 1000 / s_qpf) : (LONGLONG)-1)
-                                #define BC_NOW_MS() (s_qpf && o ? BC_MS(QpcNowAgent()) : (LONGLONG)-1)
-                                // Are these ticks OURS? Slots are RECYCLED, and OpenChannel
-                                // stamps OpenTick then zeroes the stages before it can fail on
-                                // a window that has already gone - so a later FAILED open of
-                                // this slot overwrites the record of the successful open that
-                                // actually produced the frame being reported. That is what made
-                                // this probe measure nothing in 4.3.32: OpenTick present and all
-                                // five stages zero. Print numbers only when the slot says they
-                                // describe THIS window and that open got past the point where it
-                                // could still fail; otherwise say WHY, rather than emit -1s that
-                                // look measured.
-                                const BOOL ticksMine =
-                                    (bs->TickHwnd == (UINT64)(ULONG_PTR)entry->Handle) &&
-                                    bs->TickOpenOk && o;
-                                if (!ticksMine)
-                                {
-                                    // The reason must not name a cause it has not established.
-                                    // It used to say "slot-reopened-for-another-window" whenever
-                                    // TickHwnd differed - which was FALSE for every menu: menus are
-                                    // rejected by WGC and served by polled PrintWindow, a path that
-                                    // wrote no ticks at all under ABI 3, so the block simply still
-                                    // held an older window's record. Both remain possible now, and
-                                    // this probe cannot tell them apart, so it says exactly that.
-                                    LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,"
-                                        "valid=0,reason=%s,consumed_ms=%lld",
-                                        (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
-                                        (bs->TickHwnd != (UINT64)(ULONG_PTR)entry->Handle)
-                                            ? L"ticks-describe-another-window"
-                                            : (!bs->TickOpenOk ? L"open-not-completed"
-                                                               : L"no-open-recorded"),
-                                        BC_NOW_MS());
-                                }
-                                else if (bs->TickPw)
-                                {
-                                    // Polled PrintWindow - the path EVERY menu takes.
-                                    // fallback_ms: the WGC attempt was abandoned (it cannot
-                                    //   succeed for an override-redirect popup) and we fell back.
-                                    // firstpoll_ms: first poll ENTERED. Reconcile opens and polls
-                                    //   in the SAME loop iteration, so this contains no waiting.
-                                    // pwret_ms - firstpoll_ms: the synchronous PrintWindow call on
-                                    //   the window's own UI thread.
-                                    // polls: polls entered for this open UP TO THIS READ - it is
-                                    //   NOT "renders that came back black": publish_ms == pwret_ms
-                                    //   here, i.e. the FIRST render published, and the extra polls
-                                    //   are ordinary refreshes that happened before the agent
-                                    //   consumed the frame. Do not read it as app-not-painted.
-                                    LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,valid=1,"
-                                        "path=printwindow,fallback_ms=%lld,firstpoll_ms=%lld,"
-                                        "pwret_ms=%lld,publish_ms=%lld,polls=%d,consumed_ms=%lld",
-                                        (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
-                                        BC_MS(bs->ItemTick),
-                                        BC_MS(bs->StartTick),
-                                        BC_MS(bs->FirstArrivedTick),
-                                        BC_MS(bs->FirstPublishTick),
-                                        (int)bs->PollCount,
-                                        BC_NOW_MS());
-                                }
-                                else
-                                {
-                                LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,valid=1,"
-                                    "path=wgc,item_ms=%lld,pool_ms=%lld,start_ms=%lld,"
-                                    "arrived_ms=%lld,publish_ms=%lld,consumed_ms=%lld",
-                                    (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
-                                    BC_MS(bs->ItemTick),
-                                    BC_MS(bs->PoolTick),
-                                    BC_MS(bs->StartTick),
-                                    BC_MS(bs->FirstArrivedTick),
-                                    BC_MS(bs->FirstPublishTick),
-                                    BC_NOW_MS());
-                                }
-                                #undef BC_NOW_MS
-                                #undef BC_MS
-                            }
-                        }
-                    }
-                    // else: no new broker frame this pass -> nothing changed, skip
-
-                    // Crop-before-show: a per-window broker frame is available, so the crop is now
-                    // measurable; if this window's MAP is still held, poke the tracking pass to map
-                    // it promptly rather than waiting for the 2 s resync.
-                    if (entry->MapDeferred)
-                        PokeWindowTracking();
+                    // fed from its own broker frame (copied now, or already current)
                 }
                 // DIRECT-REQUIRED HOLD - this arm is the fall-through blocker, and the gate is
                 // ELIGIBILITY (DirectRequired), not availability (WgcBrokerActive). We are here
@@ -10829,6 +10937,10 @@ static ULONG WINAPI WatchForEvents(void)
             // window by handle (queueing a NULL handle here would corrupt the pending list).
             if (g_MapDeferWake != 0)
                 g_MapDeferWake = 1;
+            // docs/DESIGN-rest-zero-capture.md S1: the frame itself is copied HERE, not at the next desktop frame - a
+            // covered window's change makes no desktop damage, so waiting for one left it stale indefinitely. The
+            // event is auto-reset, so a burst of broker frames folds into one pass that takes each window's newest.
+            BrokerConsumePass();
             continue;
         }
 
