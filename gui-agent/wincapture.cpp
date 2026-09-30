@@ -8,11 +8,11 @@
 // guest (Gate 0, 3/3 runs, negative control held), works under GDI in this context,
 // and needs no session broker. So the engine is PrintWindow-based:
 //
-//  - the agent's frame path calls WcMarkDirty(hwnd) when DDA dirty rects intersect a
-//    window (active windows refresh within one frame period);
-//  - a round-robin sweep refreshes one attached window per pass regardless, so windows
-//    occluded in the GUEST (whose updates never appear in DDA dirty rects, but which
-//    dom0 may be showing on top) converge too;
+//  - the agent's frame path calls WcMarkDirty(hwnd) when a window's own visible pixels changed and it cannot copy
+//    them from the desktop (a window at rest is copied from the desktop, covered or not - docs/ADR-capture.md
+//    sections 14-15), or when motion settles; nothing here is driven by a timer: at rest the engine does nothing
+//    and its threads sleep until a mark arrives (the round-robin sweep and the echo guard are gone, ADR sections
+//    4, 14 and 16);
 //  - every capture is row-diffed against the window's granted buffer: unchanged
 //    content costs one compare and produces NO vchan traffic; changed rows are copied
 //    and reported as window-relative damage.
@@ -42,27 +42,6 @@ extern "C" BOOL g_ProtoTrace;
 
 namespace {
 
-const DWORD SWEEP_INTERVAL_MS = 250;
-// A channel that keeps answering "nothing changed" is swept at double the interval each time, up
-// to this cap. It still CONVERGES - the sweep exists because an occluded window is invisible to
-// the desktop-duplication producer - it just stops costing an expensive application its UI thread
-// several times a second to say nothing. Any real mark (WcMarkDirty) resets it to the base
-// interval immediately, so a window that actually changes is never penalised.
-const DWORD SWEEP_BACKOFF_MAX_MS = 2000;  // one round-robin slot per this interval
-// ECHO GUARD (2026-09-30). Some applications RE-RENDER when PrintWindow asks them to paint, and the re-render changes a
-// few pixels (measured on w11-ds, 26100.1742: a bare PrintWindow loop on a Windows 11 Notepad, no agent running, made it
-// re-present its whole visible area ~4 times per call, a 19x18 px element changing each time). The frame loop sees that
-// as new damage and marks the window again, so two overlapping Notepads kept this engine re-rendering them ~15 times a
-// second for ~29 minutes after they opened - with DWM, the agent and the Notepads at ~150% of one core, where with our
-// agent stopped the same desktop was perfectly still. A mark that lands within WC_ECHO_MS of our own capture of that
-// window is treated as its echo.
-const ULONGLONG WC_ECHO_MS = 250;
-const int WC_ECHO_STREAK = 3;               // consecutive echoes before the first pause
-const DWORD WC_ECHO_PAUSE_MS = 1000;        // first pause; doubles while pauses pass quietly
-// 4 s, not longer: a single genuine change that lands inside the echo window just as a pause starts is only picked up by
-// the next capture after the pause, so the cap is also the worst-case staleness of that (rare) case; one capture per 4 s
-// keeps a looping Notepad at ~3% of its UI thread instead of the ~15 renders a second measured.
-const DWORD WC_ECHO_PAUSE_MAX_MS = 4000;
 const int DEAD_AFTER_FAILURES = 5;    // consecutive PrintWindow failures => dead
 
 struct Channel
@@ -74,12 +53,9 @@ struct Channel
     std::atomic<bool> dirty{ true }; // capture requested (starts dirty: initial fill)
     // While TRUE the frame loop owns the buffer (DDA slice copies) and the engine must
     // not write it: the async capture loop leaves the channel alone (a pending dirty
-    // stays pending and is honoured when ownership drops), and the round-robin sweep
-    // skips it - the sweep exists for guest-occluded windows invisible to DDA, and a
-    // DDA-active window is by definition foreground and unoccluded, so sweeping it is
-    // a full PrintWindow + whole-buffer diff 4x/s for nothing (measured: the agent's
-    // ~2.5-point idle CPU floor over stock). Direct WcPrefill calls are unaffected -
-    // the frame loop uses them to establish the buffer it is taking ownership of.
+    // stays pending and is honoured when ownership drops). Direct WcPrefill calls are
+    // unaffected - the frame loop uses them to establish the buffer it is taking
+    // ownership of.
     std::atomic<bool> ddaOwned{ false };
     // A channel that has never been captured jumps the queue - see the two-pass service loop.
     std::atomic<bool> firstPending{ true };
@@ -88,32 +64,6 @@ struct Channel
     // different channels are independent (every GDI object in CaptureAndDiff is local to the
     // call and it does not touch the Engine at all).
     std::atomic<bool> busy{ false };
-    // SWEEP BACKOFF. The round-robin sweep marks a channel speculatively - nothing has said its
-    // content changed - and a capture costs a full PrintWindow on the target window's own UI
-    // thread. Measured 2026-09-24 with a slow window present: 30 captures, median 334 ms each, of
-    // which 28 produced NO DAMAGE - about 9.4 seconds of another application's UI thread spent
-    // discovering nothing had changed, with the engine ~97% occupied by it. So a channel whose
-    // SPECULATIVE captures keep coming back unchanged is swept progressively less often.
-    // realMark separates the two producers: a mark from WcMarkDirty means something ACTUALLY saw
-    // this window's screen region change, and must never be backed off.
-    std::atomic<bool>  realMark{ false };
-    std::atomic<DWORD> sweepDelay{ 0 };   // current speculative interval, 0 = base
-    std::atomic<DWORD> sweepDue{ 0 };     // tick from which this channel may be swept again
-    // ECHO GUARD (see WcMarkDirty). capDoneTick: when the last capture of this channel returned. A mark that arrives
-    // within WC_ECHO_MS of it is the ECHO of our own render; WC_ECHO_STREAK of those in a row pause the channel (no
-    // captures, no sweep) for echoPauseMs, doubling up to WC_ECHO_PAUSE_MAX_MS while every pause passes quietly. Any mark
-    // that is NOT an echo - the window changed while we were not rendering it - ends the pause and the escalation.
-    std::atomic<ULONGLONG> capDoneTick{ 0 };
-    // TRUE while a capture of this channel is running. The echo lands DURING the capture as often as after it: the
-    // application re-renders inside PrintWindow, DWM composes that at once, and the frame loop marks the window while the
-    // ~120 ms call is still in progress - measured 2026-09-30, when a guard that timed echoes only from the capture's
-    // RETURN classified them as genuine changes and the loop kept its rate (captures ~1 per frame with the guard on).
-    std::atomic<bool>      capturing{ false };
-    std::atomic<int>       echoStreak{ 0 };
-    std::atomic<ULONGLONG> echoPauseUntil{ 0 };
-    std::atomic<DWORD>     echoPauseMs{ 0 };
-    std::atomic<LONG>      echoDropped{ 0 };
-    std::atomic<int>       echoResetLogs{ 0 };   // bounds the WCECHORESET diagnostic per channel
     int failures = 0;
     bool dead = false;
     // Telemetry (added for the 2026-08-27 field black-window diagnosis: this engine
@@ -171,8 +121,6 @@ struct Engine
     SRWLOCK lock = SRWLOCK_INIT;                 // guards channels vector
     std::vector<std::unique_ptr<Channel>> channels;
     WC_DAMAGE_CALLBACK callback = nullptr;
-    size_t sweepNext = 0;
-    DWORD lastSweep = 0;
     // Auto-reset wake for CaptureThread. Producers (WcMarkDirty, WcSetDdaOwned(FALSE),
     // WcSetCrop/WcSetMask, WcAddWindow, WcShutdown) set it after storing their flag;
     // the loop waits on it instead of Sleep(8). Before this the thread woke ~125x/s for
@@ -228,8 +176,9 @@ bool CaptureAndDiff(Engine& e, Channel& c, DamageOut* out)
     // PrintWindow round-trips synchronously into the target app with no timeout: a hung
     // app would park this thread inside the engine lock, and anything then waiting for
     // the lock exclusively (window removal, running under g_csWatchedWindows) would
-    // freeze the whole agent behind it. Skip hung windows as a transient condition; the
-    // periodic sweep re-marks them dirty, so they catch up when they recover.
+    // freeze the whole agent behind it. Skip hung windows as a transient condition: while
+    // hung the application paints nothing (DWM shows its ghost window instead), and the
+    // repaint that ends the hang is damage like any other, which marks the window again.
     if (IsHungAppWindow(c.hwnd))
         return true;
     RECT wr;
@@ -413,35 +362,6 @@ DWORD WINAPI CaptureThread(LPVOID param)
         bool didWork = false;
         fired.clear();
         AcquireSRWLockShared(&e.lock);
-        const size_t n = e.channels.size();
-
-        // round-robin sweep slot: pick one live channel per interval and mark it
-        // dirty, so guest-occluded windows (invisible to DDA) still converge
-        // Only worker 0 runs the round-robin bookkeeping: lastSweep/sweepNext are shared
-        // cursors, not per-channel state, and marking is cheap. Every worker then SERVICES
-        // whatever is dirty, so the sweep's single owner is not a bottleneck.
-        DWORD now = GetTickCount();
-        if (id == 0 && n > 0 && (now - e.lastSweep) >= SWEEP_INTERVAL_MS)
-        {
-            e.lastSweep = now;
-            for (size_t k = 0; k < n; k++)
-            {
-                Channel& sc = *e.channels[(e.sweepNext + k) % n];
-                if (sc.dead || sc.ddaOwned.load())
-                    continue;
-                // Echo-paused (see WcMarkDirty): a sweep would re-render it and feed the very loop the pause stops.
-                if (GetTickCount64() < sc.echoPauseUntil.load())
-                    continue;
-                // Backed off: not due yet. Signed compare so tick wraparound is handled.
-                if ((LONG)(now - sc.sweepDue.load()) < 0)
-                    continue;
-                sc.dirty.store(true);
-                const DWORD d = sc.sweepDelay.load();
-                sc.sweepDue.store(now + (d ? d : SWEEP_INTERVAL_MS));
-                e.sweepNext = (e.sweepNext + k + 1) % n;
-                break;
-            }
-        }
 
         // TWO PASSES, and the order is the point. Every capture below is a PrintWindow that
         // round-trips synchronously into a DIFFERENT application's UI thread, and this is the
@@ -490,7 +410,6 @@ DWORD WINAPI CaptureThread(LPVOID param)
             LARGE_INTEGER capT0, capT1, capFreq;
             const bool traceCap = g_ProtoTrace != FALSE;
             if (traceCap) QueryPerformanceCounter(&capT0);
-            c.capturing.store(true);
             const bool capOk = CaptureAndDiff(e, c, &dmg);
             if (traceCap)
             {
@@ -502,31 +421,11 @@ DWORD WINAPI CaptureThread(LPVOID param)
                         (DWORD)(ULONG_PTR)c.hwnd, id, isFirst ? 1 : 0, us,
                         (capOk && dmg.hwnd) ? 1 : 0);
             }
-            // The echo guard's clock: marks that land during this capture or shortly after it returned are our own
-            // render's echo. capDoneTick first, then capturing=false, so a mark in between sees one or the other.
-            c.capDoneTick.store(GetTickCount64());
-            c.capturing.store(false);
-            // Was this capture asked for by a producer that SAW a change, or merely swept?
-            const bool wasReal = c.realMark.exchange(false);
             if (capOk)
             {
                 c.failures = 0;
                 if (dmg.hwnd)
-                {
                     fired.push_back(dmg);
-                    // Produced real damage: this channel is worth watching closely again.
-                    c.sweepDelay.store(0);
-                    c.sweepDue.store(GetTickCount());
-                }
-                else if (!wasReal)
-                {
-                    // A SPECULATIVE capture that produced nothing. Double the interval, capped.
-                    const DWORD cur = c.sweepDelay.load();
-                    DWORD next = cur ? cur * 2 : SWEEP_INTERVAL_MS * 2;
-                    if (next > SWEEP_BACKOFF_MAX_MS) next = SWEEP_BACKOFF_MAX_MS;
-                    c.sweepDelay.store(next);
-                    c.sweepDue.store(GetTickCount() + next);
-                }
             }
             else if (++c.failures >= DEAD_AFTER_FAILURES)
             {
@@ -554,26 +453,12 @@ DWORD WINAPI CaptureThread(LPVOID param)
             for (auto& d : fired)
                 e.callback(d.hwnd, 0, d.y0, d.w, d.y1 - d.y0 + 1);
 
-        // Event-driven idle instead of Sleep(8) polling (audit 2026-09-08: 125 wakeups/s
-        // per agent on an idle desktop, each taking e.lock and walking every channel).
-        // After work: 2 ms pacing as before. Idle: sleep until the next round-robin sweep
-        // slot is due (the sweep is the only time-driven consumer), or until a producer
-        // signals e.wake - a dirty mark is then served immediately instead of <= 8 ms
-        // late. Bounded by SWEEP_INTERVAL_MS, never INFINITE: quit is a polled flag.
-        DWORD waitMs = 2;
-        if (!didWork)
-        {
-            waitMs = SWEEP_INTERVAL_MS;
-            if (n > 0)
-            {
-                const DWORD sinceSweep = GetTickCount() - e.lastSweep;
-                waitMs = sinceSweep >= SWEEP_INTERVAL_MS ? 1 : SWEEP_INTERVAL_MS - sinceSweep;
-            }
-        }
-        if (e.wake[id])
-            WaitForSingleObject(e.wake[id], waitMs);
-        else
-            Sleep(waitMs);
+        // After work: 2 ms pacing as before. Idle: sleep until a producer signals e.wake - a mark, or WcShutdown, which
+        // sets quit first and then signals every worker. No timeout: nothing in this engine is driven by a timer, and a
+        // desktop at rest must not wake it (docs/ADR-capture.md section 14; audit 2026-09-08 counted 125 wakeups/s here
+        // before the event, and the round-robin sweep that replaced them woke it 4 times a second until 2026-09-30).
+        // WcInit fails without the event, so e.wake[id] is always set here.
+        WaitForSingleObject(e.wake[id], didWork ? 2 : INFINITE);
     }
     return 0;
 }
@@ -611,7 +496,7 @@ ULONG WcInit(WC_DAMAGE_CALLBACK callback, ULONG workers)
         }
     }
     // The pool must be fully constructed before any worker runs: a worker dereferences
-    // g_wctx[i].eng immediately, and worker 0 owns the sweep cursors.
+    // g_wctx[i].eng immediately.
     int started = 0;
     for (int i = 0; i < e->workers; i++)
     {
@@ -629,7 +514,7 @@ ULONG WcInit(WC_DAMAGE_CALLBACK callback, ULONG workers)
         return err;
     }
     // A partially started pool is FINE and is not silently accepted: it still captures, just
-    // with less parallelism, and worker 0 (the sweep owner) is started first.
+    // with less parallelism.
     if (started < e->workers)
         LogWarning("WCPOOL only %d of %d capture workers started (0x%x) - capture continues "
             "with reduced parallelism", started, e->workers, GetLastError());
@@ -643,7 +528,7 @@ void WcShutdown(void)
     if (!g_eng)
         return;
     g_eng->quit.store(true);
-    WakeCapture(*g_eng); // the idle wait is now up to SWEEP_INTERVAL_MS; cut it short
+    WakeCapture(*g_eng); // the idle wait has no timeout: this is what ends it
     for (int i = 0; i < g_eng->workers; i++)
     {
         if (!g_eng->threads[i])
@@ -771,56 +656,6 @@ void WcMarkDirty(HWND hwnd)
     for (auto& ch : g_eng->channels)
         if (ch->hwnd == hwnd)
         {
-            // ECHO GUARD (see WC_ECHO_MS). The question is whether this window changed ON ITS OWN or because we rendered it.
-            const ULONGLONG now = GetTickCount64();
-            const ULONGLONG cap = ch->capDoneTick.load();
-            const bool echo = ch->capturing.load() || (cap != 0 && now - cap <= WC_ECHO_MS);
-            if (now < ch->echoPauseUntil.load())
-            {
-                if (echo)
-                {
-                    ch->echoDropped.fetch_add(1);     // the tail of our own render: we are paused, drop it
-                    break;
-                }
-                // Damage while we were NOT rendering it: the application changed by itself. End the pause and the
-                // escalation; this mark is served at once.
-                // DIAGNOSTIC (2026-09-30): how long after our last capture did that "own" change come? A tail of our own
-                // render that outlasts WC_ECHO_MS reads as ~250-600 ms here; a change caused by something else reads as
-                // anything. Bounded to the first 40 per channel.
-                if (ch->echoResetLogs.fetch_add(1) < 40)
-                    LogInfo("WCECHORESET 0x%x: a change %llu ms after our last capture ended a %lu ms pause",
-                            ch->hwnd, (unsigned long long)(cap ? now - cap : 0), ch->echoPauseMs.load());
-                ch->echoPauseUntil.store(0);
-                ch->echoPauseMs.store(0);
-                ch->echoStreak.store(0);
-            }
-            else if (echo)
-            {
-                if (ch->echoStreak.fetch_add(1) + 1 >= WC_ECHO_STREAK)
-                {
-                    const DWORD prev = ch->echoPauseMs.load();
-                    DWORD next = prev ? prev * 2 : WC_ECHO_PAUSE_MS;
-                    if (next > WC_ECHO_PAUSE_MAX_MS) next = WC_ECHO_PAUSE_MAX_MS;
-                    ch->echoPauseMs.store(next);
-                    ch->echoPauseUntil.store(now + next);
-                    // After a pause that passed quietly, one echo is enough to pause again (longer).
-                    ch->echoStreak.store(WC_ECHO_STREAK - 1);
-                    if (next != prev)   // one line per escalation step, not per pause
-                        LogInfo("WCECHO 0x%x: its damage keeps following our own captures (%ld echoes dropped so far) - "
-                                "pausing captures for %lu ms; any change it makes while we are NOT rendering it ends the pause",
-                                ch->hwnd, (long)ch->echoDropped.load(), next);
-                    ch->echoDropped.fetch_add(1);
-                    break;
-                }
-            }
-            else
-            {
-                ch->echoStreak.store(0);
-                ch->echoPauseMs.store(0);
-            }
-            ch->realMark.store(true);
-            ch->sweepDelay.store(0);     // something SAW a change: watch this channel closely again
-            ch->sweepDue.store(GetTickCount());
             ch->dirty.store(true);
             WakeCapture(*g_eng);
             break;
@@ -839,7 +674,7 @@ void WcSetDdaOwned(HWND hwnd, BOOL owned)
             ch->ddaOwned.store(owned ? true : false);
             // Ownership dropping is what releases a dirty mark that arrived while the
             // frame loop owned the buffer (kept pending, see CaptureThread); wake so it
-            // is served now rather than at the next sweep slot.
+            // is served now (nothing else would wake the engine for it).
             if (!owned)
                 WakeCapture(*g_eng);
             break;
@@ -866,10 +701,7 @@ ULONG WcPrefill(HWND hwnd)
     ULONG status = ERROR_NOT_FOUND;
     if (c)
     {
-        c->capturing.store(true);
         status = CaptureAndDiff(*g_eng, *c, NULL) ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
-        c->capDoneTick.store(GetTickCount64());   // a prefill renders the window too: its echo is ours
-        c->capturing.store(false);
     }
     ReleaseSRWLockShared(&g_eng->lock);
     return status;

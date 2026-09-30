@@ -50,7 +50,6 @@ BOOL     g_BlockMenuKey = TRUE;
 BOOL     g_FocusRaise  = FALSE;
 BOOL     g_DdaCapture  = TRUE;
 BOOL     g_FrameDrop   = FALSE;
-BOOL     g_SweepDdaExempt = TRUE;
 BOOL     g_InputDragFreeze = FALSE; // fallback tier only; the servo below is the default fix
 // DEFAULT OFF (2026-08-13). The Smith-predictor servo is an EXPERIMENT, not a shipped
 // fix: side-by-side on the guest the user judged servo-on vs servo-off "marginal, both
@@ -439,12 +438,9 @@ void PerfInit(void)
                 g_DdaCapture = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_FRAME_DROP_VALUE, &v, NULL))
                 g_FrameDrop = (v != 0);
-            if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SWEEP_EXEMPT_VALUE, &v, NULL))
-                g_SweepDdaExempt = (v != 0);
         }
         LogInfo("QGADDACAPTURE %s", g_DdaCapture ? L"on" : L"off");
         LogInfo("QGAFRAMEDROP %s", g_FrameDrop ? L"on" : L"off");
-        LogInfo("QGASWEEPEXEMPT %s", g_SweepDdaExempt ? L"on" : L"off");
     }
 
     // Drag-wobble / mis-render fixes and upd-spike experiments. Logged unconditionally,

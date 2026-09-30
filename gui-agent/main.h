@@ -457,6 +457,12 @@ typedef struct _WINDOW_DATA
     // memcmp-class hash (~0.2 ms). Valid ONLY while the window is unoccluded; see
     // PwScreenUnchanged.
     BOOL  PwDdaActive;       // serving this window from the composited desktop
+    // Occlusion as of the last frame that damaged this window (docs/ADR-capture.md section 15): a signature of its own
+    // rect and of the rectangles of the tracked windows above it that overlap it. A COVERED window is copied from the
+    // desktop only while this is unchanged since the previous such frame - an occluder that appeared, vanished, moved
+    // or was restacked in between may still be in this frame's picture where the window list says it no longer is.
+    ULONGLONG PwOccSig;
+    BOOL      PwOccSigValid;
     ULONGLONG PwScreenHash;
     BOOL PwScreenHashValid;
 

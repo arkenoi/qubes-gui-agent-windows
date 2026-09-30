@@ -8026,6 +8026,80 @@ static int PwCollectOpaqueOccluders(IN const WINDOW_DATA* self, IN const RECT* r
     return n;
 }
 
+// Signature of a window's occlusion: its own rect, and the rects (as PwCollectOccluders returns them) of the tracked
+// windows above it that overlap it. Equal signatures on consecutive frames mean nothing above the window appeared,
+// vanished, moved or was restacked in between (docs/ADR-capture.md section 15).
+static ULONGLONG PwOcclusionSignature(IN const RECT* self, IN const RECT* occ, IN int n)
+{
+    ULONGLONG h = 1469598103934665603ULL;
+    const LONG head[5] = { self->left, self->top, self->right, self->bottom, (LONG)n };
+    for (int i = 0; i < 5; i++)
+    {
+        h ^= (ULONGLONG)(ULONG)head[i];
+        h *= 1099511628211ULL;
+    }
+    for (int i = 0; i < n; i++)
+    {
+        const LONG v[4] = { occ[i].left, occ[i].top, occ[i].right, occ[i].bottom };
+        for (int k = 0; k < 4; k++)
+        {
+            h ^= (ULONGLONG)(ULONG)v[k];
+            h *= 1099511628211ULL;
+        }
+    }
+    return h;
+}
+
+// The parts of `area` that no rect in occ[0..n) covers, as at most maxOut rects in out[]. Returns the count (0 = all
+// of it is covered), or -1 if the region could not be computed or has more pieces than fit - the caller must then
+// treat the window as not copyable from the desktop this frame, never as fully covered.
+#define PW_MAX_VISIBLE_PIECES 64
+static int PwVisiblePieces(IN const RECT* area, IN const RECT* occ, IN int n, OUT RECT* out, IN int maxOut)
+{
+    HRGN r = CreateRectRgnIndirect(area);
+    if (!r)
+        return -1;
+    int kind = SIMPLEREGION;
+    for (int i = 0; i < n && kind != NULLREGION; i++)
+    {
+        HRGN o = CreateRectRgnIndirect(&occ[i]);
+        if (!o)
+        {
+            DeleteObject(r);
+            return -1;
+        }
+        kind = CombineRgn(r, r, o, RGN_DIFF);
+        DeleteObject(o);
+        if (kind == ERROR)
+        {
+            DeleteObject(r);
+            return -1;
+        }
+    }
+    if (kind == NULLREGION)
+    {
+        DeleteObject(r);
+        return 0;
+    }
+    union
+    {
+        RGNDATA data;
+        BYTE bytes[sizeof(RGNDATAHEADER) + PW_MAX_VISIBLE_PIECES * sizeof(RECT)];
+    } buf;
+    const DWORD need = GetRegionData(r, 0, NULL);
+    if (need == 0 || need > sizeof(buf) ||
+        GetRegionData(r, need, &buf.data) == 0 || buf.data.rdh.nCount > (DWORD)maxOut)
+    {
+        DeleteObject(r);
+        return -1;
+    }
+    const RECT* pieces = (const RECT*)buf.data.Buffer;
+    for (DWORD i = 0; i < buf.data.rdh.nCount; i++)
+        out[i] = pieces[i];
+    DeleteObject(r);
+    return (int)buf.data.rdh.nCount;
+}
+
 // ABI 5 reads the broker's first-frame stage ticks as QPC counts; this is the matching agent-side
 // read for "now". Independent of g_PerfEnabled - BROKERCHAIN must measure whether or not the perf
 // sink is on, and PerfNow() returns 0 when it is off.
@@ -8167,17 +8241,6 @@ static BOOL FrameDropEnabled(void)
     return !MarkerPresent(L"C:\\Users\\Public\\qga-frdrop-off", &tick, &off);
 }
 
-// See REG_CONFIG_SWEEP_EXEMPT_VALUE (perf.h): keep the engine's periodic sweep off the
-// window the DDA path is actively serving. Marker-file override so the exemption can be
-// A/B'd on one binary, like the other attribution switches.
-static BOOL SweepExemptEnabled(void)
-{
-    static DWORD tick = 0; static BOOL off = FALSE;
-    if (!g_SweepDdaExempt)
-        return FALSE;
-    return !MarkerPresent(L"C:\\Users\\Public\\qga-sweepdda-off", &tick, &off);
-}
-
 // How long a window must be STILL before the composited desktop is used as its source.
 // Measured: with no such guard, drag CPU went 11.106 -> 18.622 (+68%) while typing improved
 // 43%. The reason is that the legacy path deliberately does almost NOTHING while a window
@@ -8187,8 +8250,10 @@ static BOOL SweepExemptEnabled(void)
 // reintroduces exactly the work that optimisation removed. Stay out of the way while moving.
 #define PW_DDA_MOVE_QUIET_MS 300
 
+// allowOccluded: the caller has the rectangles of everything tracked above this window, unchanged since the previous
+// frame, and will copy only the parts they leave uncovered (docs/ADR-capture.md section 15) - so E6 does not apply.
 static BOOL PwDdaEligible(IN const WINDOW_DATA* entry, IN const RECT* rect,
-                          IN UINT fbWidth, IN UINT fbHeight, IN HWND foreground)
+                          IN UINT fbWidth, IN UINT fbHeight, IN HWND foreground, IN BOOL allowOccluded)
 {
     // E3, explicit: not moving, and not just-moved. The caller's branch already excludes the
     // frames where movement is in progress, but PwSettleDue clears between LOCATIONCHANGE
@@ -8210,10 +8275,12 @@ static BOOL PwDdaEligible(IN const WINDOW_DATA* entry, IN const RECT* rect,
         return FALSE;
     }
 
-    // E4: DDA holds no pixels off-screen; an off-screen band would freeze.
-    if (rect->left < 0 || rect->top < 0 ||
-        rect->right > (LONG)fbWidth || rect->bottom > (LONG)fbHeight ||
-        rect->right <= rect->left || rect->bottom <= rect->top)
+    // E4: some of it must be on the desktop. The part that is not is treated like a covered part (ADR-capture section
+    // 15): the desktop holds no pixels for it, and neither does dom0's screen, whose coordinates are the guest's; the
+    // copy clips to the screen, and a window moved back on-screen gets the settle capture that ends every move.
+    const RECT fbR = { 0, 0, (LONG)fbWidth, (LONG)fbHeight };
+    RECT onScreen;
+    if (rect->right <= rect->left || rect->bottom <= rect->top || !IntersectRect(&onScreen, rect, &fbR))
     {
         PerfNotePwRefusal(PW_REFUSE_DDA_OFFSCREEN);
         return FALSE;
@@ -8242,7 +8309,8 @@ static BOOL PwDdaEligible(IN const WINDOW_DATA* entry, IN const RECT* rect,
         // overlaps is genuinely unoccluded, so the composite holds its pixels and it needs no
         // PrintWindow. Measured 2026-09-24: 846 of 846 non-foreground considerations were of
         // such windows, each otherwise paying 32-438 ms on its own application's UI thread.
-        if (PwOccludedByAbove(entry, rect))
+        // A covered window qualifies too when the caller copies around what covers it (allowOccluded).
+        if (!allowOccluded && PwOccludedByAbove(entry, rect))
         {
             PerfNotePwRefusal(PW_REFUSE_DDA_OVERLAP);
             return FALSE;
@@ -9754,10 +9822,45 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             }
                         }
 
+                        // COVERED WINDOWS AT REST ARE COPIED TOO (docs/ADR-capture.md sections 14-15). A window that
+                        // something tracked above it overlaps used to be re-rendered with PrintWindow whenever its
+                        // visible pixels changed, and on a desktop at rest that WAS the idle load: a Windows 11 Notepad
+                        // repaints when PrintWindow asks it to paint, the repaint changes its visible pixels, and the
+                        // next PrintWindow follows (the burn, 2026-09-30). The damage names exactly the pixels that
+                        // changed, and they are on the desktop, so they are copied from it around the rectangles of
+                        // the windows above - nothing asks the application to paint. Only while the occlusion is
+                        // UNCHANGED since the previous frame: the window list is newer than this frame's picture, so an
+                        // occluder that just appeared, vanished, moved or was restacked may still be where the list
+                        // says it is not. Such a frame takes the PrintWindow path below as before - while windows move,
+                        // anything goes (owner 2026-09-30) - and the next one, with the occlusion settled, copies.
+                        RECT occ[PW_MAX_OCCLUDERS];
+                        int nOcc = -1;
+                        BOOL occStable = FALSE;
+                        if (g_ZOrderCaptureValid)
+                        {
+                            nOcc = PwCollectOccluders(entry, &pwRect, occ, PW_MAX_OCCLUDERS);
+                            const ULONGLONG occSig = PwOcclusionSignature(&pwRect, occ, nOcc > 0 ? nOcc : 0);
+                            occStable = nOcc >= 0 && entry->PwOccSigValid && entry->PwOccSig == occSig;
+                            entry->PwOccSig = occSig;
+                            entry->PwOccSigValid = nOcc >= 0;
+                        }
+                        else
+                        {
+                            entry->PwOccSigValid = FALSE;
+                        }
+                        const BOOL copyCovered = nOcc > 0 && occStable;
+                        BOOL copyOk;
+                        if (nOcc < 0)
+                            copyOk = g_ZOrderValid ? !RectInRegion(rgnCovered, &pwRect) : TRUE;   // as before
+                        else if (!occStable)
+                            copyOk = FALSE;
+                        else if (nOcc == 0)
+                            copyOk = g_ZOrderValid ? !RectInRegion(rgnCovered, &pwRect) : TRUE;   // as before
+                        else
+                            copyOk = TRUE;                                                           // copy around them
                         BOOL ddaHandled = FALSE;
-                        if (DdaCaptureEnabled() &&
-                            (g_ZOrderValid ? !RectInRegion(rgnCovered, &pwRect) : TRUE) &&
-                            PwDdaEligible(entry, &pwRect, fbWidth, fbHeight, pwForeground))
+                        if (DdaCaptureEnabled() && copyOk &&
+                            PwDdaEligible(entry, &pwRect, fbWidth, fbHeight, pwForeground, copyCovered))
                         {
                             if (!entry->PwDdaActive)
                             {
@@ -9775,18 +9878,38 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 // The race closes by construction rather than by locking.
                                 //
                                 // WcPrefill deliberately does not fire the damage callback, so
-                                // the full-window damage is sent here.
+                                // the full-window damage is sent here. For a covered window this
+                                // is also what brings its covered part up to date: from here on
+                                // only its visible part is copied (ADR-capture section 15).
                                 entry->PwDdaActive = TRUE;
                                 // Claim the buffer BEFORE the establish: from here on the
-                                // engine must neither sweep nor async-capture this channel
-                                // (WcPrefill below is a direct call and unaffected).
-                                WcSetDdaOwned(entry->Handle, SweepExemptEnabled());
+                                // engine must not async-capture this channel (WcPrefill below
+                                // is a direct call and unaffected).
+                                WcSetDdaOwned(entry->Handle, TRUE);
                                 PerfNotePwDecision(FALSE);
                                 if (WcPrefill(entry->Handle) == ERROR_SUCCESS)
                                 {
+                                    // A covered window: its whole VISIBLE part comes from this frame, not only what the
+                                    // next damage touches. The desktop holds the shadow a window above casts onto this
+                                    // one, and PrintWindow does not; copying the visible part once makes every later
+                                    // copy agree with it, instead of leaving shadowed patches wherever damage landed.
+                                    // The occlusion is unchanged since the previous frame (copyCovered), so this
+                                    // frame's picture holds this window's own pixels there.
+                                    if (copyCovered)
+                                    {
+                                        RECT vis[PW_MAX_VISIBLE_PIECES];
+                                        const int nv = PwVisiblePieces(&pwRect, occ, nOcc, vis, PW_MAX_VISIBLE_PIECES);
+                                        for (int vi = 0; vi < nv; vi++)
+                                            (void)PwLedgerHit(entry, &entry->PwLedgerDdaOwned,  /* LEDGER C4 */
+                                                PwSliceCopyAndDamage(entry, frame, framebuffer, &vis[vi]));
+                                    }
                                     (void)SendWindowDamageEvent(entry->Handle, 0, 0,
                                                                 entry->PwWidth, entry->PwHeight);
                                     ddaHandled = TRUE;
+                                    static LONG s_coveredEntryLogs = 0;
+                                    if (copyCovered && InterlockedIncrement(&s_coveredEntryLogs) <= 200)
+                                        LogInfo("QGADDACOVERED 0x%x: covered by %d window(s) above, copied from the desktop around them",
+                                                (DWORD)(ULONG_PTR)entry->Handle, nOcc);
                                 }
                                 else
                                 {
@@ -9798,27 +9921,49 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             }
                             else
                             {
-                                BOOL copied = FALSE;
-                                for (UINT ddi = 0; ddi < frame->dirty_rects_count; ddi++)
-                                    if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pwRect))
-                                        if (PwLedgerHit(entry, &entry->PwLedgerDdaOwned,  /* LEDGER C4 */
-                                            PwSliceCopyAndDamage(entry, frame, framebuffer, &pwHit)))
-                                            copied = TRUE;
-                                // Only "handled" if a copy actually happened. The copy declines
-                                // silently on a null buffer, a geometry mismatch or an empty
-                                // intersection, and treating an attempt as success would skip
-                                // PrintWindow too - sending nothing at all for this window.
-                                if (copied)
+                                // A covered window's damage is cut into the pieces nothing above it covers. Damage that
+                                // lies wholly under the windows above is theirs: there is nothing of this window's to
+                                // copy, and that is HANDLED - leaving the mode for it would re-establish with a
+                                // PrintWindow on the next frame, every time a window above repaints.
+                                BOOL copied = FALSE, declined = FALSE;
+                                RECT pieces[PW_MAX_VISIBLE_PIECES];
+                                for (UINT ddi = 0; ddi < frame->dirty_rects_count && !declined; ddi++)
                                 {
-                                    PerfNoteDdaCapture();
+                                    if (!IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pwRect))
+                                        continue;
+                                    int np = 1;
+                                    const RECT* pp = &pwHit;
+                                    if (copyCovered)
+                                    {
+                                        np = PwVisiblePieces(&pwHit, occ, nOcc, pieces, PW_MAX_VISIBLE_PIECES);
+                                        pp = pieces;
+                                        if (np < 0)
+                                        {
+                                            declined = TRUE;   // cannot describe what is visible: not a copy
+                                            break;
+                                        }
+                                    }
+                                    for (int pi = 0; pi < np; pi++)
+                                    {
+                                        if (PwLedgerHit(entry, &entry->PwLedgerDdaOwned,  /* LEDGER C4 */
+                                            PwSliceCopyAndDamage(entry, frame, framebuffer, &pp[pi])))
+                                            copied = TRUE;
+                                        else
+                                            declined = TRUE;
+                                    }
+                                }
+                                // "Handled" if a copy happened, or if nothing visible was damaged. The copy declines
+                                // silently on a null buffer or a geometry mismatch, and treating such an attempt as
+                                // success would skip PrintWindow too - sending nothing at all for this window.
+                                if (copied || !declined)
+                                {
+                                    if (copied)
+                                        PerfNoteDdaCapture();
                                     ddaHandled = TRUE;
-                                    // Re-asserted per steady-state frame (sub-us: one SRW
-                                    // shared acquire + a walk of <= a handful of channels)
-                                    // so a marker-file toggle applies within a second even
-                                    // with no eligibility transition, and so a channel
-                                    // re-created behind our back (detach/re-attach) does
-                                    // not linger sweepable while DDA-active.
-                                    WcSetDdaOwned(entry->Handle, SweepExemptEnabled());
+                                    // Re-asserted per steady-state frame (sub-us: one SRW shared acquire + a walk of
+                                    // <= a handful of channels) so a channel re-created behind our back (detach /
+                                    // re-attach) does not linger unowned while DDA-active.
+                                    WcSetDdaOwned(entry->Handle, TRUE);
                                 }
                                 else
                                 {

@@ -59,8 +59,8 @@ BOOL WcIsDead(HWND hwnd);
 void WcMarkDirty(HWND hwnd);
 
 // Declare frame-loop ownership of hwnd's buffer (DDA slice mode). While owned, the
-// engine neither captures the channel asynchronously nor sweeps it (a pending dirty
-// stays pending until ownership drops); direct WcPrefill calls still work. Set TRUE
+// engine does not capture the channel asynchronously (a pending dirty stays pending
+// until ownership drops); direct WcPrefill calls still work. Set TRUE
 // on entering DDA mode / per steady-state DDA frame, FALSE on leaving. Cheap.
 void WcSetDdaOwned(HWND hwnd, BOOL owned);
 
