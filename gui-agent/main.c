@@ -10665,12 +10665,8 @@ static ULONG WINAPI WatchForEvents(void)
     // desktop-capture pass, and a redundant desktop frame skipped that walk entirely, so a
     // painted window could sit unnoticed on a static desktop. Waking here lets a held map be
     // released the moment its pixels land instead of at desktop-capture cadence.
+    // (Placed per iteration below - see there.)
     int frameEventIdx = -1;
-    if (g_WgcFrame)
-    {
-        frameEventIdx = eventCount;
-        watchedEvents[eventCount++] = g_WgcFrame;
-    }
 
     CAPTURE_CONTEXT* capture = NULL;
 
@@ -10875,6 +10871,18 @@ static ULONG WINAPI WatchForEvents(void)
         eventCount = 7;
         if (g_WgcBrokerProc) watchedEvents[eventCount++] = g_WgcBrokerProc;
         if (g_NotifBridgeProc) watchedEvents[eventCount++] = g_NotifBridgeProc;
+        // BROKER FRAME PUBLISHED - appended LAST, EVERY iteration. It used to be placed once, before this loop, at
+        // index 7: the broker's section (and with it g_WgcFrame) is created later, by BrokerSupervise, so it was
+        // usually absent then - and when present, the two lines above overwrote index 7 with a process handle. The
+        // agent never woke for a broker frame; one published while the desktop was at rest sat uncopied. That is what
+        // withheld every window of the first rest-zero S2 build (2026-10-01, w11-ds: 8 of 8 QGADIRECTSUPPRESS while the
+        // broker held a published, painted frame for each).
+        frameEventIdx = -1;
+        if (g_WgcFrame)
+        {
+            frameEventIdx = (int)eventCount;
+            watchedEvents[eventCount++] = g_WgcFrame;
+        }
 
         // Wait for events.
         signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, waitTimeout);
