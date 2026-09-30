@@ -113,6 +113,7 @@ struct Channel
     std::atomic<ULONGLONG> echoPauseUntil{ 0 };
     std::atomic<DWORD>     echoPauseMs{ 0 };
     std::atomic<LONG>      echoDropped{ 0 };
+    std::atomic<int>       echoResetLogs{ 0 };   // bounds the WCECHORESET diagnostic per channel
     int failures = 0;
     bool dead = false;
     // Telemetry (added for the 2026-08-27 field black-window diagnosis: this engine
@@ -783,6 +784,12 @@ void WcMarkDirty(HWND hwnd)
                 }
                 // Damage while we were NOT rendering it: the application changed by itself. End the pause and the
                 // escalation; this mark is served at once.
+                // DIAGNOSTIC (2026-09-30): how long after our last capture did that "own" change come? A tail of our own
+                // render that outlasts WC_ECHO_MS reads as ~250-600 ms here; a change caused by something else reads as
+                // anything. Bounded to the first 40 per channel.
+                if (ch->echoResetLogs.fetch_add(1) < 40)
+                    LogInfo("WCECHORESET 0x%x: a change %llu ms after our last capture ended a %lu ms pause",
+                            ch->hwnd, (unsigned long long)(cap ? now - cap : 0), ch->echoPauseMs.load());
                 ch->echoPauseUntil.store(0);
                 ch->echoPauseMs.store(0);
                 ch->echoStreak.store(0);
