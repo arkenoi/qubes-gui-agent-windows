@@ -11619,6 +11619,9 @@ static ULONG WINAPI WatchForEvents(void)
     // screen window gets its UNMAP/DESTROY too, still on the open vchan. Both paths
     // no-op their sends if the client was declared gone above.
     ResetWatch(FALSE);
+    // The capture thread may be blocked in an acquire with no timeout (a direct-capable guest at rest); from here on
+    // the process is exiting, so it is left to the exit instead of waited on or terminated (CaptureStop).
+    CaptureSetExiting();
     if (capture)
         StopFrameProcessing(&capture);
 
@@ -11934,6 +11937,14 @@ static ULONG Init(void)
     // BrokerSupervise owns the flag (0 on ready, 1/2 on the hard-fail path).
     if (!(g_WgcBroker && g_OsBuild >= 26100))
         (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
+    // docs/DESIGN-rest-zero-capture.md B/S4: on a direct-capable guest every window is broker-fed, so the PrintWindow
+    // engine PwInit started above has nothing to capture - and its workers still woke four times a second for the
+    // sweep, at rest. Stop it; every engine entry point is a no-op without it, and no window reaches it here.
+    if (DirectRequired())
+    {
+        WcShutdown();
+        LogInfo("QGAENGINEOFF the PrintWindow engine is stopped: every window on this guest is broker-fed");
+    }
     {
         // Slice-content map-hold gate (DEFAULT ON since 2026-09-06, owner-directed + rig-validated
         // - the content half of crop-before-show that kills the zeroed-slab black flash). See

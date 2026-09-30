@@ -45,6 +45,9 @@
 #define A6_ACK_TIMEOUT_MS 5000
 
 volatile LONG g_CaptureThreadEnable = 0;
+// Set once the agent is exiting (CaptureSetExiting): CaptureStop then gives a thread parked in its acquire only a
+// moment before leaving it to the process exit (docs/DESIGN-rest-zero-capture.md S4).
+static volatile BOOL g_CaptureExiting = FALSE;
 
 // WHO CLEARS THE FLAG. A dead capture thread under a live capture pointer freezes dom0's desktop
 // while every log line says the agent is healthy, and the flag is the only thing that says the
@@ -954,6 +957,11 @@ fail:
 }
 
 // preserves last error
+void CaptureSetExiting(void)
+{
+    g_CaptureExiting = TRUE;
+}
+
 void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx)
 {
     LogVerbose("start");
@@ -967,6 +975,17 @@ void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx)
 
     DWORD status = GetLastError(); // preserve
     CaptureStop(ctx);
+    if (ctx->thread_abandoned)
+    {
+        // The thread is still parked in its acquire and HOLDS ctx->frame.lock (see CaptureStop): entering the lock here
+        // would block for ever and freeing the duplication under it is a use-after-free. Leave the whole context to the
+        // thread, which lets go and exits when it next wakes, or to the process exit. The published framebuffer pointer
+        // is withdrawn without the lock - the main loop is the only reader and it is the caller here.
+        PwInvalidateFramebuffer();
+        LogInfo("capture context left to its abandoned thread (not torn down)");
+        SetLastError(status);
+        return;
+    }
 
     // Same hazard as in RecreateDuplication: the mapped desktop surface is about to be
     // released, so stop publishing a pointer into it.
@@ -1045,13 +1064,25 @@ HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx)
 void CaptureStop(IN OUT CAPTURE_CONTEXT* ctx)
 {
     LogVerbose("start");
+    InterlockedExchange(&ctx->stop, 1);
     CaptureEnableSet(FALSE, L"CaptureStop");
     if (ctx->thread)
     {
-        if (WaitForSingleObject(ctx->thread, 2 * FRAME_TIMEOUT) != WAIT_OBJECT_0)
+        // No TerminateThread (docs/DESIGN-rest-zero-capture.md S4; Jev 2026-10-01): on a direct-capable guest the thread
+        // may sit in an acquire with no timeout, HOLDING ctx->frame.lock, and a terminated owner would leave that lock
+        // held for ever. Every mid-run caller follows the thread's own acquire error, so it has already left the acquire
+        // and this wait returns at once; at exit (CaptureSetExiting) it gets only a moment. A thread still parked is
+        // ABANDONED: its generation's stop flag makes it let go of its frame and leave when it next wakes, and
+        // CaptureTeardown leaves this context alone.
+        const DWORD waitMs = g_CaptureExiting ? 100 : 2 * FRAME_TIMEOUT;
+        if (WaitForSingleObject(ctx->thread, waitMs) != WAIT_OBJECT_0)
         {
-            LogWarning("capture thread timeout");
-            TerminateThread(ctx->thread, 0);
+            ctx->thread_abandoned = TRUE;
+            if (g_CaptureExiting)
+                LogInfo("capture thread left in its acquire at exit (no timeout by design); the exit ends it");
+            else
+                LogWarning("CAPTUREABANDON capture thread still in its acquire %lu ms after stop - abandoned, not "
+                           L"terminated; it leaves at the next desktop change", waitMs);
         }
     }
     ctx->thread = NULL;
@@ -1163,6 +1194,16 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
             _InterlockedIncrement(&g_AcqTimeout);
         }
         goto fail1;
+    }
+    // An ABANDONED generation woke (CaptureStop gave up on this thread while it sat in the acquire above - Jev
+    // 2026-10-01 review): touch nothing shared, in particular not the staging buffer a newer generation may be writing.
+    // Let go of the frame and report E_ABORT, which the loop turns into a quiet exit.
+    if (ctx->stop)
+    {
+        if (ctx->frame.texture)
+            IDXGIResource_Release(ctx->frame.texture);
+        status = E_ABORT;
+        goto fail2;
     }
     if (ctx->frame.info.LastPresentTime.QuadPart == 0)
         _InterlockedIncrement(&g_AcqNoPresent);
@@ -1367,6 +1408,20 @@ end:
     return status;
 }
 
+// docs/DESIGN-rest-zero-capture.md C/S4: on a direct-capable guest the acquire waits with NO timeout while no grant is
+// parked - a desktop at rest must not wake this thread (it woke once a second, FRAME_TIMEOUT, measured 2026-10-01). The
+// one job the timeout did at rest was retrying parked-grant revokes (A6), and at rest none is parked; while one is (a
+// screen-grant change in progress, not rest) the 1 s retry cadence stays. Below 26100 nothing changes.
+static DWORD CaptureAcquireTimeout(IN OUT CAPTURE_CONTEXT* ctx)
+{
+    if (!DirectRequired())
+        return FRAME_TIMEOUT;
+    EnterCriticalSection(&ctx->stale_lock);
+    const BOOL parked = (ctx->stale_grants != NULL);
+    LeaveCriticalSection(&ctx->stale_lock);
+    return parked ? FRAME_TIMEOUT : INFINITE;
+}
+
 static DWORD WINAPI CaptureThread(void* param)
 {
     DWORD status = ERROR_SUCCESS;
@@ -1378,7 +1433,7 @@ static DWORD WINAPI CaptureThread(void* param)
         LogVerbose("loop start");
         _InterlockedIncrement(&g_AcqLoops);
         g_AcqLoopTick = (LONGLONG)GetTickCount64();
-        if (!InterlockedCompareExchange(&g_CaptureThreadEnable, FALSE, FALSE))
+        if (!InterlockedCompareExchange(&g_CaptureThreadEnable, FALSE, FALSE) || capture->stop)
         {
             LogDebug("stopping (disabled)");
             break;
@@ -1397,14 +1452,21 @@ static DWORD WINAPI CaptureThread(void* param)
             break;
         }
 
-        // A6 timeout fallback: this loop runs at least once per FRAME_TIMEOUT even on an
-        // idle desktop, so parked grants whose ack deadline passed are retried here.
-        // One attempt per grant per pass - never a wait.
+        // A6 timeout fallback: this loop runs at least once per FRAME_TIMEOUT while a grant is
+        // parked (and, below 26100, always), so parked grants whose ack deadline passed are
+        // retried here. One attempt per grant per pass - never a wait.
         StaleGrantSweep(capture, FALSE, L"timeout");
 
-        status = GetFrame(capture, FRAME_TIMEOUT);
+        status = GetFrame(capture, CaptureAcquireTimeout(capture));
         if (FAILED(status))
         {
+            // This generation was stopped while the thread was parked: leave WITHOUT the failure path below, which
+            // clears the process-wide enable flag and signals the error event - both now belong to a newer generation.
+            if (status == E_ABORT && capture->stop)
+            {
+                LogInfo("abandoned capture generation woke; its frame released, exiting");
+                goto exit_thread;
+            }
             if (status == DXGI_ERROR_WAIT_TIMEOUT)
             {
                 LogVerbose("frame timeout");
@@ -1447,6 +1509,15 @@ static DWORD WINAPI CaptureThread(void* param)
             // notify main loop, it'll reinitialize everything
             SetEvent(capture->error_event);
             break;
+        }
+
+        // THIS generation was stopped while the thread sat in its acquire (CaptureStop gave up waiting and marked it
+        // abandoned): the main loop now serves a newer generation, so this frame must not reach it. Let go and leave.
+        if (capture->stop)
+        {
+            LogInfo("abandoned capture generation woke; releasing its frame and exiting");
+            ReleaseFrame(capture);
+            goto exit_thread;
         }
 
         // A pending re-dump must not be held hostage to a dirty frame. After
@@ -1503,7 +1574,7 @@ static DWORD WINAPI CaptureThread(void* param)
                     goto exit_thread;
                 }
 
-                if (!InterlockedCompareExchange(&g_CaptureThreadEnable, FALSE, FALSE))
+                if (!InterlockedCompareExchange(&g_CaptureThreadEnable, FALSE, FALSE) || capture->stop)
                 {
                     LogDebug("stop requested while waiting for frame processing");
                     ReleaseFrame(capture);

@@ -73,6 +73,8 @@ typedef struct _CAPTURE_CONTEXT
 	IDXGIOutput1* output;
 	IDXGIOutputDuplication* duplication;
 	HANDLE thread; // capture loop
+	volatile LONG stop;     // THIS generation stopped (CaptureStop); the thread leaves at its next wake
+	BOOL thread_abandoned;  // CaptureStop gave up on a thread parked in its acquire; teardown leaves the context alone
 	PXENCONTROL_CONTEXT xc;
 	// mapped framebuffer location is constant as long as the capture interface is valid
 	// this gets initialized when the first frame is acquired
@@ -118,6 +120,8 @@ void CaptureThreadStats(OUT LONG* loops, OUT LONGLONG* loopAgeMs, OUT LONG* insi
 HRESULT CaptureStart(IN OUT CAPTURE_CONTEXT* ctx);
 
 // stop the capture thread
+// The agent is exiting: CaptureStop gives a thread parked in its acquire only a moment, then leaves it to the exit.
+void CaptureSetExiting(void);
 void CaptureStop(IN OUT CAPTURE_CONTEXT* ctx);
 
 void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx);
