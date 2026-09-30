@@ -775,6 +775,25 @@ void WcMarkDirty(HWND hwnd)
             const ULONGLONG now = GetTickCount64();
             const ULONGLONG cap = ch->capDoneTick.load();
             const bool echo = ch->capturing.load() || (cap != 0 && now - cap <= WC_ECHO_MS);
+            // DIAGNOSTIC (2026-09-30): WHICH of our captures came last before a change that is NOT this window's echo -
+            // this window's own (a render tail outlasting WC_ECHO_MS), or ANOTHER window's (a cross-window echo, e.g. through
+            // a translucent border), or neither recently (a change of its own)? The owner asked what disturbs pixels on an
+            // unattended desktop; with our agent stopped the same desktop is perfectly still. Bounded per channel.
+            auto logSource = [&](const char* path) {
+                if (ch->echoResetLogs.fetch_add(1) >= 60) return;
+                HWND otherH = nullptr; ULONGLONG otherT = 0; bool otherBusy = false;
+                for (auto& o : g_eng->channels)
+                {
+                    if (o.get() == ch.get()) continue;
+                    if (o->capturing.load()) otherBusy = true;
+                    const ULONGLONG t = o->capDoneTick.load();
+                    if (t > otherT) { otherT = t; otherH = o->hwnd; }
+                }
+                LogInfo("WCECHOSRC 0x%x %s: %llu ms after our last capture of it; last capture of another window 0x%x %llu ms "
+                        "ago%s; pause was %lu ms", ch->hwnd, path, (unsigned long long)(cap ? now - cap : 0), otherH,
+                        (unsigned long long)(otherT ? now - otherT : 0), otherBusy ? " (another capture RUNNING)" : "",
+                        ch->echoPauseMs.load());
+            };
             if (now < ch->echoPauseUntil.load())
             {
                 if (echo)
@@ -784,12 +803,7 @@ void WcMarkDirty(HWND hwnd)
                 }
                 // Damage while we were NOT rendering it: the application changed by itself. End the pause and the
                 // escalation; this mark is served at once.
-                // DIAGNOSTIC (2026-09-30): how long after our last capture did that "own" change come? A tail of our own
-                // render that outlasts WC_ECHO_MS reads as ~250-600 ms here; a change caused by something else reads as
-                // anything. Bounded to the first 40 per channel.
-                if (ch->echoResetLogs.fetch_add(1) < 40)
-                    LogInfo("WCECHORESET 0x%x: a change %llu ms after our last capture ended a %lu ms pause",
-                            ch->hwnd, (unsigned long long)(cap ? now - cap : 0), ch->echoPauseMs.load());
+                logSource("ended-a-pause");
                 ch->echoPauseUntil.store(0);
                 ch->echoPauseMs.store(0);
                 ch->echoStreak.store(0);
@@ -815,6 +829,8 @@ void WcMarkDirty(HWND hwnd)
             }
             else
             {
+                if (ch->echoPauseMs.load() != 0)
+                    logSource("reset-an-episode");   // the second reset path: between pauses
                 ch->echoStreak.store(0);
                 ch->echoPauseMs.store(0);
             }
