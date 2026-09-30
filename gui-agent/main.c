@@ -7997,6 +7997,35 @@ static int PwCollectOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
     return n;
 }
 
+// PwCollectOccluders restricted to windows that are LIKELY OPAQUE: not WS_EX_LAYERED (a layered window may be translucent)
+// and not override-redirect (menus, tooltips and popups carry translucent shadows and acrylic). Used by the broker damage
+// poke, where excluding damage under a translucent window would hide a visible change of the window beneath it.
+static int PwCollectOpaqueOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
+                                    OUT RECT* out, IN int maxOut)
+{
+    int n = 0;
+    RECT hit;
+    WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
+    {
+        e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (e != self && e->IsVisible && !e->IsIconic && !e->DeletePending &&
+            e->Width > 0 && e->Height > 0 && e->ZOrder < self->ZOrder &&
+            !(e->ExStyle & WS_EX_LAYERED) && !e->IsOverrideRedirect)
+        {
+            RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
+            if (IntersectRect(&hit, &other, rect))
+            {
+                if (n >= maxOut)
+                    return -1;
+                out[n++] = hit;
+            }
+        }
+        e = (WINDOW_DATA*)e->ListEntry.Flink;
+    }
+    return n;
+}
+
 // ABI 5 reads the broker's first-frame stage ticks as QPC counts; this is the matching agent-side
 // read for "now". Independent of g_PerfEnabled - BROKERCHAIN must measure whether or not the perf
 // sink is on, and PerfNow() returns 0 when it is off.
@@ -9025,10 +9054,30 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // renders that published nothing new. A change confined to a window's two outermost pixels
                     // is only its border; losing it costs nothing, and the staleness bound still covers it.
                     const RECT pokeRect = { pwRect.left + 2, pwRect.top + 2, pwRect.right - 2, pwRect.bottom - 2 };
+                    // NOT UNDER A WINDOW ABOVE IT. Damage that lies wholly inside one window stacked ABOVE this one is
+                    // that window's, not ours - the screen there shows the other window. Measured 2026-09-30 on w11-ds:
+                    // Calculator sits over part of Microsoft Store; typing into Calculator poked Store's slot, Store's
+                    // WGC session correctly delivered nothing, and the broker's quiet test demoted the healthy session
+                    // twice, onto polled PrintWindow. Uses the same capture-grade z-order as the screen-hash decision,
+                    // counting only windows likely to be OPAQUE (PwCollectOpaqueOccluders: a layered or override-redirect
+                    // window above may be translucent, and a change beneath it would be visible); with no valid ordering,
+                    // or too many occluders to describe (-1), nothing is excluded - the behaviour before this. For a WGC
+                    // slot the poke is only a liveness hint, so a skipped poke cannot hide content.
+                    RECT occ[PW_MAX_OCCLUDERS];
+                    const int nOcc = g_ZOrderCaptureValid
+                        ? PwCollectOpaqueOccluders(entry, &pokeRect, occ, PW_MAX_OCCLUDERS) : 0;
                     for (UINT ddi = 0; ddi < frame->dirty_rects_count; ddi++)
                     {
                         if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pokeRect))
                         {
+                            BOOL above = FALSE;
+                            for (int oi = 0; oi < nOcc && !above; oi++)
+                            {
+                                RECT under;
+                                above = IntersectRect(&under, &pwHit, &occ[oi]) && EqualRect(&under, &pwHit);
+                            }
+                            if (above)
+                                continue;
                             BrokerPokeDamage(entry);
                             break;      // one poke per pass; the broker coalesces
                         }
