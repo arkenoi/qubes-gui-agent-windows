@@ -63,12 +63,6 @@ const DWORD WC_ECHO_PAUSE_MS = 1000;        // first pause; doubles while pauses
 // the next capture after the pause, so the cap is also the worst-case staleness of that (rare) case; one capture per 4 s
 // keeps a looping Notepad at ~3% of its UI thread instead of the ~15 renders a second measured.
 const DWORD WC_ECHO_PAUSE_MAX_MS = 4000;
-// An echo EPISODE outlives a single genuine change. Measured 2026-09-30 with the guard on (burn scene, w11-ds): one Notepad
-// settled at 4 s pauses, the other kept falling back to 1 s pauses - 14 x 1 s, 8 x 2 s, 6 x 4 s in 150 s - because every
-// change it made between pauses reset the escalation and the 3-echo streak, and each reset bought three more re-renders.
-// Within WC_ECHO_EPISODE_MS of the last pause a genuine change is still served at once, but the escalation is kept and
-// one echo re-pauses; only a window quiet of echoes for that long starts afresh.
-const ULONGLONG WC_ECHO_EPISODE_MS = 10000;
 const int DEAD_AFTER_FAILURES = 5;    // consecutive PrintWindow failures => dead
 
 struct Channel
@@ -120,7 +114,6 @@ struct Channel
     std::atomic<DWORD>     echoPauseMs{ 0 };
     std::atomic<LONG>      echoDropped{ 0 };
     std::atomic<int>       echoResetLogs{ 0 };   // bounds the WCECHORESET diagnostic per channel
-    std::atomic<ULONGLONG> echoLastPauseTick{ 0 };   // when this channel's last echo pause started (see the episode rule)
     int failures = 0;
     bool dead = false;
     // Telemetry (added for the 2026-08-27 field black-window diagnosis: this engine
@@ -585,21 +578,6 @@ DWORD WINAPI CaptureThread(LPVOID param)
     return 0;
 }
 
-// A change that was NOT an echo arrived (the window changed on its own). The change itself is served by the caller;
-// this decides what the guard remembers: inside an episode (a pause started within WC_ECHO_EPISODE_MS) the escalation
-// is kept and one echo re-pauses, otherwise the guard starts afresh.
-void EchoEpisodeKeepOrReset(Channel& c, ULONGLONG now)
-{
-    const ULONGLONG last = c.echoLastPauseTick.load();
-    if (last != 0 && now - last < WC_ECHO_EPISODE_MS)
-    {
-        c.echoStreak.store(WC_ECHO_STREAK - 1);
-        return;
-    }
-    c.echoStreak.store(0);
-    c.echoPauseMs.store(0);
-}
-
 } // namespace
 
 extern "C" {
@@ -813,7 +791,8 @@ void WcMarkDirty(HWND hwnd)
                     LogInfo("WCECHORESET 0x%x: a change %llu ms after our last capture ended a %lu ms pause",
                             ch->hwnd, (unsigned long long)(cap ? now - cap : 0), ch->echoPauseMs.load());
                 ch->echoPauseUntil.store(0);
-                EchoEpisodeKeepOrReset(*ch, now);
+                ch->echoPauseMs.store(0);
+                ch->echoStreak.store(0);
             }
             else if (echo)
             {
@@ -824,7 +803,6 @@ void WcMarkDirty(HWND hwnd)
                     if (next > WC_ECHO_PAUSE_MAX_MS) next = WC_ECHO_PAUSE_MAX_MS;
                     ch->echoPauseMs.store(next);
                     ch->echoPauseUntil.store(now + next);
-                    ch->echoLastPauseTick.store(now);
                     // After a pause that passed quietly, one echo is enough to pause again (longer).
                     ch->echoStreak.store(WC_ECHO_STREAK - 1);
                     if (next != prev)   // one line per escalation step, not per pause
@@ -836,7 +814,10 @@ void WcMarkDirty(HWND hwnd)
                 }
             }
             else
-                EchoEpisodeKeepOrReset(*ch, now);
+            {
+                ch->echoStreak.store(0);
+                ch->echoPauseMs.store(0);
+            }
             ch->realMark.store(true);
             ch->sweepDelay.store(0);     // something SAW a change: watch this channel closely again
             ch->sweepDue.store(GetTickCount());
