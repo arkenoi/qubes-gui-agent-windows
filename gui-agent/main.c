@@ -8994,9 +8994,18 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // latter would never re-route the founding case, which had FramesArrived frozen at 3.
                 if (ps->Hwnd == (UINT64)(ULONG_PTR)entry->Handle)
                 {
+                    // NOT THE BORDER. A damage rect that only reaches this window's outermost pixels is the
+                    // NEIGHBOUR's damage: Windows 11 draws a translucent one-pixel border, the window beneath
+                    // shows through it, and DWM's dirty region for that window runs one pixel into ours.
+                    // Measured 2026-09-30 on w11-ds: during the Notepad re-render burn, 72 of 168 frames had a
+                    // dirty rect touching Settings - every one of them by exactly one pixel, on its left, right
+                    // or bottom edge - and each poked the broker, which PrintWindow-ed Settings ~7x/s for 586
+                    // renders that published nothing new. A change confined to a window's two outermost pixels
+                    // is only its border; losing it costs nothing, and the staleness bound still covers it.
+                    const RECT pokeRect = { pwRect.left + 2, pwRect.top + 2, pwRect.right - 2, pwRect.bottom - 2 };
                     for (UINT ddi = 0; ddi < frame->dirty_rects_count; ddi++)
                     {
-                        if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pwRect))
+                        if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pokeRect))
                         {
                             BrokerPokeDamage(entry);
                             break;      // one poke per pass; the broker coalesces
