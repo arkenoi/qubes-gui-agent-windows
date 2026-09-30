@@ -6887,7 +6887,29 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
              bs->ReqHeight != (LONG)windowData->PwHeight ||
              bs->ReqCropX != (LONG)windowData->CropLeft ||
              bs->ReqCropY != (LONG)windowData->CropTop);
-        if (windowData->PwDimsStuck || reqStale)
+        // NEVER REGISTERED. A slice-fed window added while the broker could not take it - it was not ready yet, or it had
+        // died and was being relaunched, or the arena or the slots were full - has PwBrokerSourced FALSE, which the repair
+        // below never looks at, so nothing ever registered it and a direct-required window with no slot is WITHHELD from
+        // dom0 for good. Measured 2026-09-30 on w11-ds, twice in a row: after an agent restart the already-open Settings
+        // window was added at 16:50:09.831 (slicefed=1 brokerslot=-1), the broker reported ready at .842, and two minutes
+        // later the section still held no registration at all (ctlgen=0) while the window sat in QGADIRECTWAIT. The
+        // broker-recovery path names the same hole ("windows withheld during the outage were never shown"). The periodic
+        // resync brings every tracked window through here every WINDOW_RESYNC_INTERVAL_MS, so this is the retry.
+        if (!windowData->PwBrokerSourced)
+        {
+            // BrokerRegister clears PwDirectSuppressed before it can fail; a FAILED retry (arena or slots still full)
+            // must leave it as it was, or the suppress report below - an error line, a registry counter and a user
+            // notification - would fire again on every resync.
+            const BOOL suppressed = windowData->PwDirectSuppressed;
+            windowData->PwSliceNeedsFull = TRUE;   // its first frame must be a full copy
+            if (BrokerRegister(windowData))
+                LogWarning("BROKERLATEREG hwnd 0x%x registered with the broker LATE at %ux%u - it was added while the "
+                    L"broker could not take it, and was withheld until now", (DWORD)(ULONG_PTR)windowData->Handle,
+                    windowData->PwWidth, windowData->PwHeight);
+            else
+                windowData->PwDirectSuppressed = suppressed;
+        }
+        else if (windowData->PwDimsStuck || reqStale)
         {
             LogWarning("BROKERREREG hwnd 0x%x re-registering broker capture at %ux%u crop %d,%d "
                 L"(stuck=%d reqStale=%d)", (DWORD)(ULONG_PTR)windowData->Handle,
