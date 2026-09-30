@@ -104,6 +104,11 @@ struct Channel
     // captures, no sweep) for echoPauseMs, doubling up to WC_ECHO_PAUSE_MAX_MS while every pause passes quietly. Any mark
     // that is NOT an echo - the window changed while we were not rendering it - ends the pause and the escalation.
     std::atomic<ULONGLONG> capDoneTick{ 0 };
+    // TRUE while a capture of this channel is running. The echo lands DURING the capture as often as after it: the
+    // application re-renders inside PrintWindow, DWM composes that at once, and the frame loop marks the window while the
+    // ~120 ms call is still in progress - measured 2026-09-30, when a guard that timed echoes only from the capture's
+    // RETURN classified them as genuine changes and the loop kept its rate (captures ~1 per frame with the guard on).
+    std::atomic<bool>      capturing{ false };
     std::atomic<int>       echoStreak{ 0 };
     std::atomic<ULONGLONG> echoPauseUntil{ 0 };
     std::atomic<DWORD>     echoPauseMs{ 0 };
@@ -484,6 +489,7 @@ DWORD WINAPI CaptureThread(LPVOID param)
             LARGE_INTEGER capT0, capT1, capFreq;
             const bool traceCap = g_ProtoTrace != FALSE;
             if (traceCap) QueryPerformanceCounter(&capT0);
+            c.capturing.store(true);
             const bool capOk = CaptureAndDiff(e, c, &dmg);
             if (traceCap)
             {
@@ -495,8 +501,10 @@ DWORD WINAPI CaptureThread(LPVOID param)
                         (DWORD)(ULONG_PTR)c.hwnd, id, isFirst ? 1 : 0, us,
                         (capOk && dmg.hwnd) ? 1 : 0);
             }
-            // The echo guard's clock: marks that land shortly after THIS return are our own render's echo.
+            // The echo guard's clock: marks that land during this capture or shortly after it returned are our own
+            // render's echo. capDoneTick first, then capturing=false, so a mark in between sees one or the other.
             c.capDoneTick.store(GetTickCount64());
+            c.capturing.store(false);
             // Was this capture asked for by a producer that SAW a change, or merely swept?
             const bool wasReal = c.realMark.exchange(false);
             if (capOk)
@@ -765,7 +773,7 @@ void WcMarkDirty(HWND hwnd)
             // ECHO GUARD (see WC_ECHO_MS). The question is whether this window changed ON ITS OWN or because we rendered it.
             const ULONGLONG now = GetTickCount64();
             const ULONGLONG cap = ch->capDoneTick.load();
-            const bool echo = cap != 0 && now - cap <= WC_ECHO_MS;
+            const bool echo = ch->capturing.load() || (cap != 0 && now - cap <= WC_ECHO_MS);
             if (now < ch->echoPauseUntil.load())
             {
                 if (echo)
@@ -851,8 +859,10 @@ ULONG WcPrefill(HWND hwnd)
     ULONG status = ERROR_NOT_FOUND;
     if (c)
     {
+        c->capturing.store(true);
         status = CaptureAndDiff(*g_eng, *c, NULL) ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
         c->capDoneTick.store(GetTickCount64());   // a prefill renders the window too: its echo is ours
+        c->capturing.store(false);
     }
     ReleaseSRWLockShared(&g_eng->lock);
     return status;
