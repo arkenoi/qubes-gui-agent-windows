@@ -3874,18 +3874,11 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
         // composite to fall back to. So: reject the frame, and if the mismatch outlives
         // BROKER_DIMS_STUCK_MS, flag the window for re-registration and wake the tracking pass
         // that performs it (see the BROKERREREG arm in UpdateWindowData).
-        // UNLESS THE AGENT'S OWN REQUEST IS WHAT IS STALE. The broker publishes exactly the card this
-        // agent last REQUESTED (PublishCard), so if the slot's request already differs from the slab,
-        // nothing is in flight on the broker's side and waiting repairs nothing - and since this only
-        // runs when a frame arrives, a static window waits until its content next changes (measured
-        // 2026-09-30, cold boot: frames rejected for 16.4 s, 346x233 vs a 348x234 slab). Wake the
-        // BROKERREREG arm now, and say so loudly: the desync itself is a defect to find, not to hide.
         if (fw != (LONG)e->PwWidth || fh != (LONG)e->PwHeight || stride != fw * 4)
         {
             if (fw > 0 && fh > 0)
             {
                 ULONGLONG nowTick = GetTickCount64();
-                BOOL reqStale = s->ReqWidth != (LONG)e->PwWidth || s->ReqHeight != (LONG)e->PwHeight;
                 if (e->PwDimsSince == 0)
                     e->PwDimsSince = nowTick;
                 if (!e->PwDimsLogged)
@@ -3894,15 +3887,6 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
                     LogInfo("BROKERDIMS hwnd 0x%x slot %d frame %dx%d stride %d != slab %ux%u - frames rejected",
                             (DWORD)(ULONG_PTR)e->Handle, e->PwBrokerSlot, fw, fh, stride,
                             e->PwWidth, e->PwHeight);
-                }
-                if (!e->PwDimsStuck && reqStale)
-                {
-                    e->PwDimsStuck = TRUE;
-                    LogWarning("BROKERREQSTALE hwnd 0x%x the slot still requests %dx%d but the slab is %ux%u "
-                            L"(frame %dx%d) - the agent's own request is stale; re-registering now",
-                            (DWORD)(ULONG_PTR)e->Handle, s->ReqWidth, s->ReqHeight,
-                            e->PwWidth, e->PwHeight, fw, fh);
-                    PokeWindowTracking();
                 }
                 if (!e->PwDimsStuck && nowTick - e->PwDimsSince > BROKER_DIMS_STUCK_MS)
                 {
