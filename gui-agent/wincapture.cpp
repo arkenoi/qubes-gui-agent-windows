@@ -49,6 +49,20 @@ const DWORD SWEEP_INTERVAL_MS = 250;
 // several times a second to say nothing. Any real mark (WcMarkDirty) resets it to the base
 // interval immediately, so a window that actually changes is never penalised.
 const DWORD SWEEP_BACKOFF_MAX_MS = 2000;  // one round-robin slot per this interval
+// ECHO GUARD (2026-09-30). Some applications RE-RENDER when PrintWindow asks them to paint, and the re-render changes a
+// few pixels (measured on w11-ds, 26100.1742: a bare PrintWindow loop on a Windows 11 Notepad, no agent running, made it
+// re-present its whole visible area ~4 times per call, a 19x18 px element changing each time). The frame loop sees that
+// as new damage and marks the window again, so two overlapping Notepads kept this engine re-rendering them ~15 times a
+// second for ~29 minutes after they opened - with DWM, the agent and the Notepads at ~150% of one core, where with our
+// agent stopped the same desktop was perfectly still. A mark that lands within WC_ECHO_MS of our own capture of that
+// window is treated as its echo.
+const ULONGLONG WC_ECHO_MS = 250;
+const int WC_ECHO_STREAK = 3;               // consecutive echoes before the first pause
+const DWORD WC_ECHO_PAUSE_MS = 1000;        // first pause; doubles while pauses pass quietly
+// 4 s, not longer: a single genuine change that lands inside the echo window just as a pause starts is only picked up by
+// the next capture after the pause, so the cap is also the worst-case staleness of that (rare) case; one capture per 4 s
+// keeps a looping Notepad at ~3% of its UI thread instead of the ~15 renders a second measured.
+const DWORD WC_ECHO_PAUSE_MAX_MS = 4000;
 const int DEAD_AFTER_FAILURES = 5;    // consecutive PrintWindow failures => dead
 
 struct Channel
@@ -85,6 +99,15 @@ struct Channel
     std::atomic<bool>  realMark{ false };
     std::atomic<DWORD> sweepDelay{ 0 };   // current speculative interval, 0 = base
     std::atomic<DWORD> sweepDue{ 0 };     // tick from which this channel may be swept again
+    // ECHO GUARD (see WcMarkDirty). capDoneTick: when the last capture of this channel returned. A mark that arrives
+    // within WC_ECHO_MS of it is the ECHO of our own render; WC_ECHO_STREAK of those in a row pause the channel (no
+    // captures, no sweep) for echoPauseMs, doubling up to WC_ECHO_PAUSE_MAX_MS while every pause passes quietly. Any mark
+    // that is NOT an echo - the window changed while we were not rendering it - ends the pause and the escalation.
+    std::atomic<ULONGLONG> capDoneTick{ 0 };
+    std::atomic<int>       echoStreak{ 0 };
+    std::atomic<ULONGLONG> echoPauseUntil{ 0 };
+    std::atomic<DWORD>     echoPauseMs{ 0 };
+    std::atomic<LONG>      echoDropped{ 0 };
     int failures = 0;
     bool dead = false;
     // Telemetry (added for the 2026-08-27 field black-window diagnosis: this engine
@@ -400,6 +423,9 @@ DWORD WINAPI CaptureThread(LPVOID param)
                 Channel& sc = *e.channels[(e.sweepNext + k) % n];
                 if (sc.dead || sc.ddaOwned.load())
                     continue;
+                // Echo-paused (see WcMarkDirty): a sweep would re-render it and feed the very loop the pause stops.
+                if (GetTickCount64() < sc.echoPauseUntil.load())
+                    continue;
                 // Backed off: not due yet. Signed compare so tick wraparound is handled.
                 if ((LONG)(now - sc.sweepDue.load()) < 0)
                     continue;
@@ -469,6 +495,8 @@ DWORD WINAPI CaptureThread(LPVOID param)
                         (DWORD)(ULONG_PTR)c.hwnd, id, isFirst ? 1 : 0, us,
                         (capOk && dmg.hwnd) ? 1 : 0);
             }
+            // The echo guard's clock: marks that land shortly after THIS return are our own render's echo.
+            c.capDoneTick.store(GetTickCount64());
             // Was this capture asked for by a producer that SAW a change, or merely swept?
             const bool wasReal = c.realMark.exchange(false);
             if (capOk)
@@ -734,6 +762,47 @@ void WcMarkDirty(HWND hwnd)
     for (auto& ch : g_eng->channels)
         if (ch->hwnd == hwnd)
         {
+            // ECHO GUARD (see WC_ECHO_MS). The question is whether this window changed ON ITS OWN or because we rendered it.
+            const ULONGLONG now = GetTickCount64();
+            const ULONGLONG cap = ch->capDoneTick.load();
+            const bool echo = cap != 0 && now - cap <= WC_ECHO_MS;
+            if (now < ch->echoPauseUntil.load())
+            {
+                if (echo)
+                {
+                    ch->echoDropped.fetch_add(1);     // the tail of our own render: we are paused, drop it
+                    break;
+                }
+                // Damage while we were NOT rendering it: the application changed by itself. End the pause and the
+                // escalation; this mark is served at once.
+                ch->echoPauseUntil.store(0);
+                ch->echoPauseMs.store(0);
+                ch->echoStreak.store(0);
+            }
+            else if (echo)
+            {
+                if (ch->echoStreak.fetch_add(1) + 1 >= WC_ECHO_STREAK)
+                {
+                    const DWORD prev = ch->echoPauseMs.load();
+                    DWORD next = prev ? prev * 2 : WC_ECHO_PAUSE_MS;
+                    if (next > WC_ECHO_PAUSE_MAX_MS) next = WC_ECHO_PAUSE_MAX_MS;
+                    ch->echoPauseMs.store(next);
+                    ch->echoPauseUntil.store(now + next);
+                    // After a pause that passed quietly, one echo is enough to pause again (longer).
+                    ch->echoStreak.store(WC_ECHO_STREAK - 1);
+                    if (next != prev)   // one line per escalation step, not per pause
+                        LogInfo("WCECHO 0x%x: its damage keeps following our own captures (%ld echoes dropped so far) - "
+                                "pausing captures for %lu ms; any change it makes while we are NOT rendering it ends the pause",
+                                ch->hwnd, (long)ch->echoDropped.load(), next);
+                    ch->echoDropped.fetch_add(1);
+                    break;
+                }
+            }
+            else
+            {
+                ch->echoStreak.store(0);
+                ch->echoPauseMs.store(0);
+            }
             ch->realMark.store(true);
             ch->sweepDelay.store(0);     // something SAW a change: watch this channel closely again
             ch->sweepDue.store(GetTickCount());
@@ -781,7 +850,10 @@ ULONG WcPrefill(HWND hwnd)
     // lock-order inversion the async path avoids.
     ULONG status = ERROR_NOT_FOUND;
     if (c)
+    {
         status = CaptureAndDiff(*g_eng, *c, NULL) ? ERROR_SUCCESS : ERROR_UNIDENTIFIED_ERROR;
+        c->capDoneTick.store(GetTickCount64());   // a prefill renders the window too: its echo is ours
+    }
     ReleaseSRWLockShared(&g_eng->lock);
     return status;
 }
