@@ -9638,6 +9638,33 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             int budget = 256;
                             if (!PwRectVisibleBeyond(&pwHit, occ, nOcc, &budget))
                                 continue;
+                            // M7, A WGC SLOT IS POKED ONLY IF THE SCREEN SHOWS SOMETHING ITS LAST FRAME DOES NOT (Jev
+                            // 0.91 over per-tile hashes 0.02 and accepting 0.07). DDA's damage is coarser than a window's
+                            // own change: at focus changes and window appearances one band crosses many windows, WGC
+                            // rightly delivers nothing for the unchanged ones, and each became a session recreate 2 s later
+                            // (9-12 per acceptance pass, all in activity, rz3b-rz5 on w11-ds). The window's buffer holds its
+                            // last delivered frame; where the damaged screen equals it, WGC is already current - no poke.
+                            // Where it differs, WGC has not delivered that yet (lag or deaf): poke, as before. RGB only,
+                            // corners excluded (8 px: DWM's rounding is not in WGC's frame). Unreadable pixels poke.
+                            if (ps->Route == WGCBRK_ROUTE_WGC && entry->PwBuffer && entry->PwBrokerFrames > 0)
+                            {
+                                const RECT inner = { pwRect.left + 8, pwRect.top + 8, pwRect.right - 8, pwRect.bottom - 8 };
+                                RECT cmpR;
+                                BOOL differs = TRUE;
+                                if (IntersectRect(&cmpR, &pwHit, &inner) &&
+                                    CaptureFrameCompare(frame, &cmpR, (const BYTE*)entry->PwBuffer, (INT)entry->PwWidth * 4,
+                                                        entry->X, entry->Y, (INT)entry->PwWidth, (INT)entry->PwHeight,
+                                                        &differs) &&
+                                    !differs)
+                                {
+                                    const ULONG n = ++entry->PwPokeSameSkips;
+                                    if (n <= 4 || (n % 256) == 0)
+                                        LogInfo("QGAPOKESAME hwnd=0x%x slot=%d n=%lu: damage (%d,%d,%d,%d) shows the window's own "
+                                            L"last frame - WGC is current, no poke", (DWORD)(ULONG_PTR)entry->Handle,
+                                            entry->PwBrokerSlot, n, cmpR.left, cmpR.top, cmpR.right, cmpR.bottom);
+                                    continue;   // this rect shows nothing new for this window; the next may
+                                }
+                            }
                             // M7 INSTRUMENT (docs/DESIGN-rest-zero-capture.md): a poke to a WGC session that has not
                             // delivered for a second is the case the broker's quiet test acts on - recreate, then DEAF.
                             // Say which damage it was, so a false poke can be told from a deaf session. Rate limited:

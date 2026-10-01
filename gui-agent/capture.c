@@ -799,6 +799,60 @@ BOOL CaptureFrameRegionSig(IN const CAPTURE_FRAME* frame, IN const RECT* r, OUT 
     return ok;
 }
 
+BOOL CaptureFrameCompare(IN const CAPTURE_FRAME* frame, IN const RECT* r, IN const BYTE* buf, IN INT bufPitch,
+                         IN INT bufOriginX, IN INT bufOriginY, IN INT bufW, IN INT bufH, OUT BOOL* differs)
+{
+    CAPTURE_CONTEXT* ctx = CONTAINING_RECORD(frame, CAPTURE_CONTEXT, frame);
+    BOOL ok = FALSE;
+    *differs = TRUE;
+    EnterCriticalSection(&ctx->frame.lock);
+    do
+    {
+        if (!ctx->frame.texture || !ctx->duplication || !buf || bufPitch <= 0)
+            break;
+        const BYTE* bits = NULL;
+        INT pitch = 0;
+        if (ctx->frame.mapped)
+        {
+            bits = (const BYTE*)ctx->frame.rect.pBits;
+            pitch = ctx->frame.rect.Pitch;
+        }
+        else
+        {
+            if (!ctx->frame.peek_mapped)
+            {
+                if (FAILED(IDXGIOutputDuplication_MapDesktopSurface(ctx->duplication, &ctx->frame.peek_rect)))
+                    break;
+                ctx->frame.peek_mapped = TRUE;
+            }
+            bits = (const BYTE*)ctx->frame.peek_rect.pBits;
+            pitch = ctx->frame.peek_rect.Pitch;
+        }
+        if (!bits || pitch <= 0)
+            break;
+        RECT full = { 0, 0, (LONG)ctx->width, (LONG)ctx->height };
+        const RECT bufR = { bufOriginX, bufOriginY, bufOriginX + bufW, bufOriginY + bufH };
+        RECT c;
+        ok = TRUE;
+        if (bufW <= 0 || bufH <= 0 || !IntersectRect(&c, r, &full) || !IntersectRect(&c, &c, &bufR))
+        {
+            *differs = FALSE;           // nothing on screen to compare (or outside the buffer): no evidence of change
+            break;
+        }
+        BOOL d = FALSE;
+        for (LONG y = c.top; !d && y < c.bottom; y++)
+        {
+            const UINT32* s = (const UINT32*)(bits + (SIZE_T)y * pitch + (SIZE_T)c.left * 4);
+            const UINT32* o = (const UINT32*)(buf + (SIZE_T)(y - bufOriginY) * bufPitch + (SIZE_T)(c.left - bufOriginX) * 4);
+            for (LONG x = c.left; x < c.right; x++, s++, o++)
+                if (((*s ^ *o) & 0x00FFFFFFu) != 0) { d = TRUE; break; }
+        }
+        *differs = d;
+    } while (0);
+    LeaveCriticalSection(&ctx->frame.lock);
+    return ok;
+}
+
 static BOOL StagingEnsure(void)
 {
     if (g_Staging.handle)

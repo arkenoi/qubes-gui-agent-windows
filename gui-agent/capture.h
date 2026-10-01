@@ -124,6 +124,11 @@ void CaptureDesktopImageWanted(void);
 // refined by its pixels - read, never copied, never sent. Main thread, from ProcessNewFrame only (the capture thread holds
 // the frame until the main loop sets ready_event). FALSE when no pixels can be read for this frame.
 BOOL CaptureFrameRegionSig(IN const CAPTURE_FRAME* frame, IN const RECT* r, OUT UINT64* sig);
+// Does the desktop image inside `r` (screen coords) differ, RGB only, from `buf` - a window's own pixels laid out with
+// `bufPitch` bytes per row, whose pixel (0,0) is at screen (bufOriginX, bufOriginY)? Same read-only access and rules as
+// CaptureFrameRegionSig. FALSE return = the pixels could not be read (the caller treats that as "differs").
+BOOL CaptureFrameCompare(IN const CAPTURE_FRAME* frame, IN const RECT* r, IN const BYTE* buf, IN INT bufPitch,
+                         IN INT bufOriginX, IN INT bufOriginY, IN INT bufW, IN INT bufH, OUT BOOL* differs);
 // Acquire outcomes, so a frozen content-frame counter can be told apart from a stuck thread,
 // from every acquire timing out, and from DXGI reporting nothing presented.
 void CaptureAcquireStats(OUT LONG* present, OUT LONG* noPresent, OUT LONG* timeout,
