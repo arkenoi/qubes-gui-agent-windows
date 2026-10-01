@@ -8332,7 +8332,10 @@ static int PwCollectOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
 // override-redirect windows (a menu, a tooltip, a toast); since rest-zero M7 (2026-10-01) for EVERY window above: typing
 // into Calculator over a Notepad put damage 9 px past Calculator's edge, the Notepad was poked and its WGC session
 // recreated (the window's own change was nil - Jev: margin for every window above 0.54 with the event order, 24 px 0.76).
-#define PW_POPUP_SHADOW_MARGIN 24
+// 33 px since rz9 (2026-10-01): an ACTIVE window's shadow is larger - DWM's damage for a resized 3816-px Notepad ran 32-33 px
+// past its frame (26-27 at the top) in all 21 of its damage rects, and the 9 px the 24 px margin left uncovered poked the four
+// windows beneath at every resize step (12 recreates). Jev: 32 px does not cover it 0.15, 33 px 0.86 (measured at 100% DPI).
+#define PW_POPUP_SHADOW_MARGIN 33
 
 static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
                                 OUT RECT* out, IN int maxOut, IN BOOL withPopups)
