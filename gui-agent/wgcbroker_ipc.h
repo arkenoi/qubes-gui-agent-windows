@@ -12,7 +12,9 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  21u  /* 21: AgentWake* - the agent's main-loop wakes by what woke it (rest-zero M1);
+#define WGCBRK_ABI_VERSION  22u  /* 22: DirtyPublishes/DirtyFullCopies/DirtyBytes (rest-zero S1 dirty regions, M9(b)),
+                                  *     appended: sizeof(WGCBRK_SLOT) 3424 -> 3440;
+                                  * 21: AgentWake* - the agent's main-loop wakes by what woke it (rest-zero M1);
                                   * 20: SameFrames (was BackoffMs, unused since S3) - WGC arrivals not republished
                                   *     because their card equals the published one;
                                   * 19: rest-zero S3/S4 - no heartbeats; CtlAck (the request ack the agent's
@@ -380,6 +382,13 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG     Republished;
     volatile LONGLONG ItemClosedTick;   /* GetTickCount64 of the last Closed, so it can be ordered
                                          * against CaptureTick and the poke/damage timeline */
+    /* ABI 22, rest-zero S1 (docs/DESIGN-rest-zero-capture.md A) and M9(b): a WGC session in DirtyRegionMode keeps a CPU
+     * copy of the window current from each arrival's dirty regions and writes only the regions that changed into the
+     * spare ring buffer. DirtyPublishes: frames published from regions; DirtyFullCopies: arrivals read whole (first
+     * frame, resize, no dirty-region API, the relay); DirtyBytes: bytes written into the ring, cumulative. */
+    volatile LONG     DirtyPublishes;
+    volatile LONG     DirtyFullCopies;
+    volatile LONGLONG DirtyBytes;
 } WGCBRK_SLOT;
 
 /* ABI 18: WGCBRK_HEADER.BrokerStage codes (bits 8+; the low 8 bits are the slot). */
