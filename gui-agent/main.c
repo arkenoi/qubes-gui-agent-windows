@@ -324,10 +324,22 @@ static UINT64 g_WgcNonce = 0;
 // other process can pre-create it.
 static HANDLE g_WgcAlive = NULL;
 static HANDLE g_WgcFrame = NULL;   // broker -> agent: a frame was published (auto-reset)
-static DWORD  g_WgcArenaBytes = 128u * 1024u * 1024u;
+// RESERVED, NOT COMMITTED (rest-zero S2, design c4; Jev 0.98): the section is SEC_RESERVE and each allocation is committed on
+// the agent's view when it is made (WgcArenaAlloc), so the commit charge is what windows actually use (its high-water mark -
+// committed section pages are never decommitted, and a reused region is already committed). Measured 2026-10-01: the old
+// fixed 128 MiB SEC_COMMIT arena was full with the 8-window burn scene at 5120x1440, and a Calculator launched over it was
+// refused and never shown; a maximized 5120x1440 window needs 59 MB. 1 GiB of address space in each process; c4's probe
+// showed pages committed on the SYSTEM agent's view readable and writable through the user-session broker's view, and the
+// charge growing by the committed size only.
+static DWORD  g_WgcArenaBytes = 1024u * 1024u * 1024u;
+// THE AGENT'S OWN RECORD of each slot's two arena buffers, set at registration and cleared at unregister. The slot's
+// BufOffset/BufBytes in the section are written for the broker; the agent never takes a buffer's place or size back from the
+// section: frames are read only from these regions (the ones the agent committed - an uncommitted page faults), unregister
+// frees these, and the keep test sizes against these.
+static struct { ULONGLONG Off[WGCBRK_RING]; ULONGLONG Bytes; } g_WgcSlotBufs[WGCBRK_MAX_SLOTS];
 static ULONGLONG g_WgcArenaNext = 0;   // bump frontier within the arena (offset past ArenaOffset)
 // Arena free-list: reclaim regions freed on BrokerUnregister so high-churn windows (menus open/
-// close constantly) don't exhaust the 128 MB arena. Agent-thread-only (register/unregister/supervise
+// close constantly) don't grow the committed arena. Agent-thread-only (register/unregister/supervise
 // all run on the main loop) so no locking. Offsets are ABSOLUTE section offsets, matching the slot's
 // BufOffset and the agent's own bounds-checks (reused regions stay inside the arena, so the checks
 // hold). Frees are DEFERRED (see g_WgcPending): the user-session broker can still write a slot's
@@ -2632,10 +2644,16 @@ static BOOL WgcCreateSection(void)
     }
 
     ULONGLONG total = (ULONGLONG)WGCBRK_HEADER_BYTES + g_WgcArenaBytes;
-    g_WgcMap = CreateFileMapping(INVALID_HANDLE_VALUE, &saS, PAGE_READWRITE,
+    g_WgcMap = CreateFileMapping(INVALID_HANDLE_VALUE, &saS, PAGE_READWRITE | SEC_RESERVE,
         (DWORD)(total >> 32), (DWORD)(total & 0xFFFFFFFF), nmShm);
     if (g_WgcMap && GetLastError() == ERROR_ALREADY_EXISTS) { CloseHandle(g_WgcMap); g_WgcMap = NULL; }
     if (g_WgcMap) g_WgcBase = (BYTE*)MapViewOfFile(g_WgcMap, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+    // The header (and the slot table in it) is the one part committed up front; the arena is committed per allocation.
+    if (g_WgcBase && !VirtualAlloc(g_WgcBase, WGCBRK_HEADER_BYTES, MEM_COMMIT, PAGE_READWRITE))
+    {
+        LogError("WGCBROKER section header commit failed (%lu)", GetLastError());
+        UnmapViewOfFile(g_WgcBase); g_WgcBase = NULL;
+    }
     g_WgcCtl = CreateEvent(&saE, FALSE, FALSE, nmCtl);
     g_WgcFrame = CreateEvent(&saE, FALSE, FALSE, nmFrm);
     LocalFree(sdS); LocalFree(sdE);
@@ -2647,7 +2665,7 @@ static BOOL WgcCreateSection(void)
     h->AgentPid = (LONG)GetCurrentProcessId();
     MemoryBarrier();
     _InterlockedExchange(&h->Magic, (LONG)WGCBRK_MAGIC);   // publish readiness LAST
-    LogInfo("WGCBROKER section created (%llu bytes, arena %lu)", total, g_WgcArenaBytes);
+    LogInfo("WGCBROKER section created (%llu bytes reserved, arena %lu, committed per allocation)", total, g_WgcArenaBytes);
     return TRUE;
 }
 
@@ -3722,10 +3740,14 @@ static ULONGLONG BrokerGraceEnd(void)
     return anchor + BROKER_LAUNCH_GRACE_MS;
 }
 
-static ULONGLONG WgcArenaAlloc(ULONGLONG bytes)   // best-fit free-list, else 64-aligned bump; 0 == full
+static DWORD g_WgcArenaCommitErr = 0;   // the last failed arena commit's error (0 = the arena was simply full); for the log
+
+static ULONGLONG WgcArenaAlloc(ULONGLONG bytes)   // best-fit free-list, else 64-aligned bump; 0 == full or not committable
 {
     bytes = (bytes + 63) & ~(ULONGLONG)63;
-    // Best-fit reuse of a reclaimed region (minimizes fragmentation vs first-fit).
+    g_WgcArenaCommitErr = 0;
+    // Best-fit reuse of a reclaimed region (minimizes fragmentation vs first-fit). A reclaimed region was committed when it
+    // was first handed out, and committed section pages stay committed.
     int best = -1;
     for (int i = 0; i < g_WgcFreeCount; i++)
         if (g_WgcFree[i].size >= bytes && (best < 0 || g_WgcFree[i].size < g_WgcFree[best].size))
@@ -3738,11 +3760,17 @@ static ULONGLONG WgcArenaAlloc(ULONGLONG bytes)   // best-fit free-list, else 64
         else { g_WgcFree[best].off += bytes; g_WgcFree[best].size -= bytes; }  // split
         return off;
     }
-    // Bump the frontier.
+    // Bump the frontier - and commit the new region on this view before anyone is told about it (the arena is SEC_RESERVE).
     ULONGLONG off = (g_WgcArenaNext + 63) & ~(ULONGLONG)63;
     if (off + bytes > (ULONGLONG)g_WgcArenaBytes) return 0;
+    const ULONGLONG abs = (ULONGLONG)WGCBRK_HEADER_BYTES + off;   // absolute offset from section base
+    if (!VirtualAlloc(g_WgcBase + abs, (SIZE_T)bytes, MEM_COMMIT, PAGE_READWRITE))
+    {
+        g_WgcArenaCommitErr = GetLastError();   // the commit limit, most likely: refuse like a full arena, and say why
+        return 0;
+    }
     g_WgcArenaNext = off + bytes;
-    return (ULONGLONG)WGCBRK_HEADER_BYTES + off;   // absolute offset from section base
+    return abs;
 }
 
 // Return a region to the free-list, coalescing with any adjacent free block (bounded n, cheap).
@@ -3846,7 +3874,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     // which closes and recreates the WGC capture session (see BrokerCanKeepSlot). A Win11 menu
     // oscillates BOTH ways while opening (measured: 313x387 -> 313x324 -> 293x304, and
     // 289x297 -> 293x304), so an exact fit defeats slot-keeping on every grow. Rounding to a
-    // class lets the whole oscillation live in one allocation. The arena is 128 MB and a menu
+    // class lets the whole oscillation live in one allocation. The arena reserves 1 GiB and a menu
     // costs 2 x 512 KB, so the headroom is cheap; it also keeps the free list to a few sizes,
     // which is friendlier to the best-fit reuse above.
     const ULONGLONG WGC_BUF_CLASS = 256u * 1024u;
@@ -3863,10 +3891,11 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
         if (!entry->PwRegFailLogged)
         {
             entry->PwRegFailLogged = TRUE;
-            LogError("QGABROKERREGFAIL hwnd 0x%x (class %s, %ux%u): the broker arena (%lu bytes) has no room for two "
-                     L"%llu-byte buffers - the window is withheld until space frees",
+            LogError("QGABROKERREGFAIL hwnd 0x%x (class %s, %ux%u): the broker arena (%lu bytes, %llu committed) has no room "
+                     L"for two %llu-byte buffers (commit error %lu) - the window is withheld until space frees",
                      (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height,
-                     (unsigned long)g_WgcArenaBytes, (unsigned long long)one);
+                     (unsigned long)g_WgcArenaBytes, (unsigned long long)g_WgcArenaNext, (unsigned long long)one,
+                     (unsigned long)g_WgcArenaCommitErr);
         }
         return FALSE;
     }
@@ -3875,6 +3904,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     WGCBRK_SLOT* s = &slots[slot];
     s->BufOffset[0] = (LONGLONG)off0; s->BufOffset[1] = (LONGLONG)off1;
     s->BufBytes = (LONGLONG)one;
+    g_WgcSlotBufs[slot].Off[0] = off0; g_WgcSlotBufs[slot].Off[1] = off1; g_WgcSlotBufs[slot].Bytes = one;
     s->ReqWidth = (LONG)entry->Width; s->ReqHeight = (LONG)entry->Height;
     // ReqWidth/Height are the CROPPED (card) size; ReqCropX/Y tell the broker WHERE that card
     // sits inside the full window, so PrintWindow lifts out the card sub-rect instead of the
@@ -3920,8 +3950,8 @@ BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG 
     // the new frame still fits both of them; otherwise a full re-registration is the only way to
     // get bigger buffers.
     const ULONGLONG need = ((ULONGLONG)newWidth * newHeight * 4 + 63) & ~(ULONGLONG)63;
-    if ((ULONGLONG)s->BufBytes < need) return FALSE;
-    if (s->BufOffset[0] <= 0 || s->BufOffset[1] <= 0) return FALSE;
+    if (g_WgcSlotBufs[entry->PwBrokerSlot].Bytes < need) return FALSE;
+    if (!g_WgcSlotBufs[entry->PwBrokerSlot].Off[0] || !g_WgcSlotBufs[entry->PwBrokerSlot].Off[1]) return FALSE;
     return TRUE;
 }
 
@@ -4056,9 +4086,11 @@ void BrokerUnregister(IN OUT WINDOW_DATA* entry)
 {
     if (!g_WgcBase || entry->PwBrokerSlot < 0) { entry->PwBrokerSourced = FALSE; return; }
     WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
-    ULONGLONG off0 = (ULONGLONG)s->BufOffset[0];   // capture the arena regions before freeing the slot
-    ULONGLONG off1 = (ULONGLONG)s->BufOffset[1];
-    ULONGLONG bsz  = (ULONGLONG)s->BufBytes;
+    // The regions this slot was given, from the agent's own record (never read back from the shared slot), then forgotten.
+    ULONGLONG off0 = g_WgcSlotBufs[entry->PwBrokerSlot].Off[0];
+    ULONGLONG off1 = g_WgcSlotBufs[entry->PwBrokerSlot].Off[1];
+    ULONGLONG bsz  = g_WgcSlotBufs[entry->PwBrokerSlot].Bytes;
+    ZeroMemory(&g_WgcSlotBufs[entry->PwBrokerSlot], sizeof(g_WgcSlotBufs[0]));
     s->ReqState = WGCBRK_FREE;
     s->Hwnd = 0;                         // free the slot immediately (broker closes on reconcile)
     _InterlockedIncrement(&s->ControlSeq);
@@ -4110,7 +4142,9 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
         UINT64 fid = (UINT64)s->FrameId;
         LONGLONG tick = s->CaptureTick, boff;
         if (b < 0 || b >= WGCBRK_RING) return FALSE;
-        boff = s->BufOffset[b];
+        // The broker picks WHICH of the slot's two buffers is current; WHERE they are and how big is the agent's own record.
+        boff = (LONGLONG)g_WgcSlotBufs[e->PwBrokerSlot].Off[b];
+        if (!boff) return FALSE;
         // dims must EXACTLY match the slab (so the dest-bounds check covers the source too).
         // A mismatch is transient while a resize is in flight (the slot's request and the slab
         // are updated a pass apart) and PERMANENT if the two ever disagree at rest - and a
@@ -4145,10 +4179,9 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
             return FALSE;
         }
         e->PwDimsSince = 0;   // dims agree: any outstanding mismatch run is over
-        // arena residency: [boff, boff + fh*stride) fully within [ArenaOffset, ArenaOffset+ArenaBytes)
+        // the frame fits the buffer the agent committed for it (its own record, not the section's fields)
         ULONGLONG need = (ULONGLONG)fh * (ULONGLONG)stride;
-        if (boff < h->ArenaOffset ||
-            (ULONGLONG)boff + need > (ULONGLONG)h->ArenaOffset + (ULONGLONG)h->ArenaBytes)
+        if (need > g_WgcSlotBufs[e->PwBrokerSlot].Bytes)
             return FALSE;
         // never present a frame captured before the last secure-desktop exit
         if ((ULONGLONG)tick < g_SecureDesktopLeftTick) return FALSE;
