@@ -10939,6 +10939,23 @@ static BOOL DrainVchanInput(IN OUT struct _CAPTURE_CONTEXT* capture, OUT BOOL* e
     return TRUE;
 }
 
+#if QGA_FAULT_INJECTION
+// rest-zero M8's pump-stall probe: an event's signal state, read WITHOUT consuming it (NtQueryEvent, EventBasicInformation),
+// so the wait that follows sees exactly what it would have. 1 signalled, 0 not, -1 the query failed (never read as 0).
+static int FiEventSignalled(IN HANDLE h)
+{
+    typedef struct { ULONG EventType; LONG EventState; } FI_EVENT_BASIC_INFORMATION;
+    typedef LONG (NTAPI *PFN_NTQUERYEVENT)(HANDLE, ULONG, PVOID, ULONG, PULONG);
+    static PFN_NTQUERYEVENT pNtQueryEvent = NULL;
+    if (!pNtQueryEvent)
+        pNtQueryEvent = (PFN_NTQUERYEVENT)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryEvent");
+    FI_EVENT_BASIC_INFORMATION bi;
+    if (!h || !pNtQueryEvent || pNtQueryEvent(h, 0 /* EventBasicInformation */, &bi, sizeof(bi), NULL) != 0)
+        return -1;
+    return bi.EventState != 0;
+}
+#endif
+
 static ULONG WINAPI WatchForEvents(void)
 {
     LogInfo("QGATHREAD role=main tid=%lu", GetCurrentThreadId());   // M1 instrument (restwatch's per-thread join)
@@ -11078,7 +11095,31 @@ static ULONG WINAPI WatchForEvents(void)
         {
             DWORD fiStallMs = FiPumpStallMs();
             if (fiStallMs != 0)
+            {
+#if QGA_FAULT_INJECTION
+                // rest-zero M8 (docs/DESIGN-rest-zero-capture.md): what was signalled while this loop was NOT waiting must
+                // still be signalled when it waits again. The broker's publishes are counted across the stall (each one
+                // advances its slot's FrameId and sets g_WgcFrame), then the state of this loop's own events is READ
+                // (FiEventSignalled: nothing consumed, so the wait below sees exactly what it would have). "Work done"
+                // alone cannot show this: the desktop frame path also copies broker frames, so it would mask a lost one.
+                // FaultPumpStallLose consumes the broker's event first: an injected lost wakeup, the check seen to fail.
+                LONGLONG fiPub0 = 0, fiPub1 = 0;
+                if (g_WgcBase)
+                    for (int k = 0; k < WGCBRK_MAX_SLOTS; k++) fiPub0 += (LONGLONG)WGCBRK_SLOTS(g_WgcBase)[k].FrameId;
                 Sleep(fiStallMs);
+                if (g_WgcBase)
+                    for (int k = 0; k < WGCBRK_MAX_SLOTS; k++) fiPub1 += (LONGLONG)WGCBRK_SLOTS(g_WgcBase)[k].FrameId;
+                const BOOL fiLose = FiPumpStallLose();
+                if (fiLose && g_WgcFrame)
+                    (void)WaitForSingleObject(g_WgcFrame, 0);
+                LogWarning("QGAFAULT FI_PUMP_STALL ended: the broker published %lld frame(s) during it%s; still signalled: "
+                    L"desktopFrame=%d windowEvent=%d brokerFrame=%d", fiPub1 - fiPub0,
+                    fiLose ? L" (FaultPumpStallLose: its event consumed on purpose)" : L"",
+                    FiEventSignalled(newFrameEvent), FiEventSignalled(g_WindowEventSignal), FiEventSignalled(g_WgcFrame));
+#else
+                Sleep(fiStallMs);
+#endif
+            }
         }
 
         vchanIoInProgress = TRUE;

@@ -172,6 +172,10 @@ BOOL FiRingStallActive(void);
 // One-shot: reproduces H2, where the pump stops draining the vchan for seconds.
 DWORD FiPumpStallMs(void);
 
+// [FI_PUMP_LOSE] TRUE: the stall ends by consuming the broker's frame event WITHOUT setting it again - an injected lost
+// wakeup, so rest-zero M8's signal check (QGAFAULT FI_PUMP_STALL ended ...) is seen to fail.
+BOOL FiPumpStallLose(void);
+
 // [FI_DAMAGE_DELAY] Milliseconds every damage message waits before it is traced and sent, 0 for none. A mode, armed after
 // the arming delay: validates the M5 typing-latency instrument (docs/DESIGN-rest-zero-capture.md) - it must see the delay.
 DWORD FiDamageDelayMs(void);
@@ -219,6 +223,7 @@ static __forceinline BOOL  FiShouldNegCreate(IN HWND window) { UNREFERENCED_PARA
 static __forceinline BOOL  FiRawCreate(void) { return FALSE; }
 static __forceinline BOOL  FiRingStallActive(void) { return FALSE; }
 static __forceinline DWORD FiPumpStallMs(void) { return 0; }
+static __forceinline BOOL  FiPumpStallLose(void) { return FALSE; }
 static __forceinline DWORD FiDamageDelayMs(void) { return 0; }
 static __forceinline BOOL  FiShouldCaptureExit(void) { return FALSE; }
 static __forceinline BOOL  FiShouldDupCreate(IN HWND window) { UNREFERENCED_PARAMETER(window); return FALSE; }

@@ -51,6 +51,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define REG_CONFIG_FAULT_SLAB_BIND_VALUE    L"FaultSlabDoubleBind"
 #define REG_CONFIG_FAULT_GATE_OFF_VALUE     L"FaultGateOff"
 #define REG_CONFIG_FAULT_DAMAGE_DELAY_VALUE L"FaultDamageDelayMs"
+#define REG_CONFIG_FAULT_PUMP_LOSE_VALUE   L"FaultPumpStallLose"
 
 #define FAULT_DELAY_ENV_VALUE        L"QUBES_GUI_FAULT_DELAY"
 #define FAULT_NEG_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_NEG_CREATE"
@@ -65,6 +66,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define FAULT_SLAB_BIND_ENV_VALUE    L"QUBES_GUI_FAULT_SLAB_DOUBLE_BIND"
 #define FAULT_GATE_OFF_ENV_VALUE     L"QUBES_GUI_FAULT_GATE_OFF"
 #define FAULT_DAMAGE_DELAY_ENV_VALUE L"QUBES_GUI_FAULT_DAMAGE_DELAY"
+#define FAULT_PUMP_LOSE_ENV_VALUE    L"QUBES_GUI_FAULT_PUMP_LOSE"
 
 // Seconds between FiInit() and the first fault that may fire. See faultinject.h: every
 // failure being reproduced is a failure of a CONNECTED agent, so a fault landing during
@@ -112,6 +114,9 @@ static DWORD g_FiRawCreate     = 0;
 
 // One-shot payload: how long the single stalled pump iteration sleeps. Written once.
 static DWORD g_FiPumpStallMs = 0;
+// [FI_PUMP_LOSE] with the stall: the broker's frame event is consumed at its end without being set again - an injected
+// lost wakeup, so the stall's signal check (rest-zero M8) is seen to fail. Written once.
+static DWORD g_FiPumpStallLose = 0;
 
 // [FI_DAMAGE_DELAY] a MODE, not a shot: every damage message waits this long before it is traced and sent. Written once.
 static DWORD g_FiDamageDelayMs = 0;
@@ -200,6 +205,7 @@ void FiInit(void)
     g_FiSlabDoubleBind  = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_SLAB_BIND_VALUE, FAULT_SLAB_BIND_ENV_VALUE, 0);
     g_FiGateOff         = FiReadDword(moduleName, REG_CONFIG_FAULT_GATE_OFF_VALUE, FAULT_GATE_OFF_ENV_VALUE, 0);
     g_FiDamageDelayMs   = FiReadDword(moduleName, REG_CONFIG_FAULT_DAMAGE_DELAY_VALUE, FAULT_DAMAGE_DELAY_ENV_VALUE, 0);
+    g_FiPumpStallLose   = FiReadDword(moduleName, REG_CONFIG_FAULT_PUMP_LOSE_VALUE, FAULT_PUMP_LOSE_ENV_VALUE, 0);
 
     g_FiArmAt = GetTickCount64() + (ULONGLONG)delaySec * 1000ULL;
 
@@ -219,12 +225,12 @@ void FiInit(void)
     // cause is a measurement run attributed to the wrong build, so every log file from a
     // fault-capable binary has to say so on its first page whether or not anything is armed.
     LogWarning("QGAFAULT-INIT build=%S armdelay=%us negcreate=%d(hwnd=0x%x) ringstall=%us "
-        L"pumpstall=%us captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d gateoff=0x%x damagedelay=%ums",
+        L"pumpstall=%us pumplose=%u captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d gateoff=0x%x damagedelay=%ums",
         g_FaultInjectionMarker,
         delaySec,
         g_FiNegCreate, g_FiNegCreateHwnd,
         ringStallSec,
-        pumpStallSec,
+        pumpStallSec, g_FiPumpStallLose,
         g_FiCaptureExit, g_FiDupCreate, g_FiLegacySend, g_FiRawCreate, g_FiPrintWindowFail,
         g_FiGateOff, g_FiDamageDelayMs);
 
@@ -361,6 +367,12 @@ BOOL FiRingStallActive(void)
     }
 
     return TRUE;
+}
+
+// [FI_PUMP_LOSE] TRUE when the stall must end with an injected lost wakeup (see g_FiPumpStallLose).
+BOOL FiPumpStallLose(void)
+{
+    return g_FiPumpStallLose != 0;
 }
 
 DWORD FiPumpStallMs(void)
