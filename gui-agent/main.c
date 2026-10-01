@@ -2799,16 +2799,28 @@ static void BrokerRequestSent(int slot)
     g_SlotCtlSince[slot] = GetTickCount64();
 }
 
-// Is a request older than WGCBRK_ACK_DEADLINE_MS still unanswered? Answered ones are disarmed on the way. CtlAck is
-// broker-written in a user-writable section: a forged value can only hide that broker's own hang or get it relaunched.
+// Is a request older than WGCBRK_ACK_DEADLINE_MS still unanswered WHILE the broker made no progress for as long?
+// Answered ones are disarmed on the way. A BUSY broker is not a hung one: measured 2026-10-01, a fresh broker opening
+// eight WGC sessions in one pass acknowledged the last after > 2 s and was reaped (QGABROKERHUNG, QGABROKERDIED) - so
+// the deadline also runs from the broker's last progress (BrokerProgress, bumped at every call it starts or finishes).
+// CtlAck/BrokerProgress are broker-written in a user-writable section: a forged value can only hide that broker's own
+// hang or get it relaunched.
+static LONG      g_BrokerProgressSeen = 0;
+static ULONGLONG g_BrokerProgressAt = 0;
+static void BrokerNoteProgress(IN ULONGLONG now)
+{
+    const LONG p = WGCBRK_HDR(g_WgcBase)->BrokerProgress;
+    if (p != g_BrokerProgressSeen || g_BrokerProgressAt == 0) { g_BrokerProgressSeen = p; g_BrokerProgressAt = now; }
+}
 static BOOL BrokerAckOverdue(IN ULONGLONG now, OUT int* slotOut, OUT ULONGLONG* ageOut)
 {
     const WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
+    BrokerNoteProgress(now);
     for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
     {
         if (!g_SlotCtlSince[i]) continue;
         if ((LONG)((ULONG)slots[i].CtlAck - (ULONG)g_SlotCtlWant[i]) >= 0) { g_SlotCtlSince[i] = 0; continue; }
-        if (now - g_SlotCtlSince[i] >= WGCBRK_ACK_DEADLINE_MS)
+        if (now - g_SlotCtlSince[i] >= WGCBRK_ACK_DEADLINE_MS && now - g_BrokerProgressAt >= WGCBRK_ACK_DEADLINE_MS)
         {
             *slotOut = i; *ageOut = now - g_SlotCtlSince[i];
             return TRUE;
@@ -2829,10 +2841,12 @@ static ULONGLONG BrokerNextDue(void)
     ULONGLONG due = 0;
     if (g_BrokerReady)
     {
+        // The later of the request's deadline and the broker's last progress + the deadline (see BrokerAckOverdue).
         for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
             if (g_SlotCtlSince[i])
             {
-                const ULONGLONG d = g_SlotCtlSince[i] + WGCBRK_ACK_DEADLINE_MS;
+                ULONGLONG d = g_SlotCtlSince[i] + WGCBRK_ACK_DEADLINE_MS;
+                if (g_BrokerProgressAt + WGCBRK_ACK_DEADLINE_MS > d) d = g_BrokerProgressAt + WGCBRK_ACK_DEADLINE_MS;
                 if (!due || d < due) due = d;
             }
         return due;

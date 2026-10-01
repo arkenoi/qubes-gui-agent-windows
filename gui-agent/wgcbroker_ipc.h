@@ -118,7 +118,12 @@ typedef struct _WGCBRK_HEADER {          /* 128 bytes */
     volatile LONG      AgentFrameWakes;
     volatile LONG      AgentStalls;
     volatile LONGLONG  AgentStallTick;
-    BYTE               _pad2[32];
+    /* ABI 19, R1: bumped by the broker's main loop every time it starts or finishes a call (StageScope) and every slot
+     * Reconcile handles. A request unacknowledged for WGCBRK_ACK_DEADLINE_MS is a HANG only if this did not move in that
+     * time either: measured 2026-10-01, a fresh broker opening eight WGC sessions in one pass acknowledged the last one
+     * after > 2 s while busy the whole time, and was reaped as hung. Was _pad2[0..3]. */
+    volatile LONG      BrokerProgress;
+    BYTE               _pad2[28];
 } WGCBRK_HEADER;
 
 typedef struct _WGCBRK_SLOT {
