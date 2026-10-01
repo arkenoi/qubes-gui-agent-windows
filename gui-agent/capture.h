@@ -53,6 +53,9 @@ typedef struct _CAPTURE_FRAME
 	// This frame's staging copy was a FULL refill: the frame loop delivers it even with no dirty rects, so a window 0
 	// shown again repaints from the refilled buffer instead of waiting for the next present.
 	BOOL full_copied;
+	// CaptureFrameRegionSig mapped the desktop surface for READING this frame (released with the frame).
+	BOOL peek_mapped;
+	DXGI_MAPPED_RECT peek_rect;
 } CAPTURE_FRAME;
 
 // A6: a superseded screen grant awaiting revocation. dom0 releases its mapping of the
@@ -117,6 +120,10 @@ BOOL CaptureScreenGrantLive(void);
 BOOL CaptureStagingGrantNow(void);
 // Window 0 is about to show the desktop image: if the staging copy went stale (rest-zero S2), ask for a present.
 void CaptureDesktopImageWanted(void);
+// A signature (geometry + pixels) of the desktop image inside `r` for the frame being processed: DDA as a damage signal
+// refined by its pixels - read, never copied, never sent. Main thread, from ProcessNewFrame only (the capture thread holds
+// the frame until the main loop sets ready_event). FALSE when no pixels can be read for this frame.
+BOOL CaptureFrameRegionSig(IN const CAPTURE_FRAME* frame, IN const RECT* r, OUT UINT64* sig);
 // Acquire outcomes, so a frozen content-frame counter can be told apart from a stuck thread,
 // from every acquire timing out, and from DXGI reporting nothing presented.
 void CaptureAcquireStats(OUT LONG* present, OUT LONG* noPresent, OUT LONG* timeout,

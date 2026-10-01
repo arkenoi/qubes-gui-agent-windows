@@ -3788,6 +3788,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     entry->PwDimsStuck = FALSE;
     entry->PwDirectSuppressed = FALSE;
     entry->PwBrokerFrames = 0;
+    entry->PwPixSigValid = FALSE;   // a new slot renders its first frame on its own; the next damage pokes
     if (!WgcBrokerActive() || !entry->PwSliceFed) return FALSE;
     if (entry->Width == 0 || entry->Height == 0) return FALSE;
 
@@ -9635,6 +9636,35 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                         frame->dirty_rects[ddi].right, frame->dirty_rects[ddi].bottom,
                                         pwHit.left, pwHit.top, pwHit.right, pwHit.bottom, nOcc,
                                         (ULONGLONG)GetTickCount64() - (ULONGLONG)ps->CaptureTick);
+                            }
+                            // A PRINTWINDOW SLOT'S OWN RENDER IS NOT A CHANGE (owner: "if you repaint the same pixels it is
+                            // not a change"). Rendering a window makes Windows present it again, pixels unchanged - a
+                            // desktop dirty rect, the next poke, the next render: measured 2026-10-01 on w11-ds with a held
+                            // system menu, 463 desktop frames and ~11 renders a second at rest, and with the broker merely
+                            // suspended 0 frames; PrintWindow's WM_PRINT path echoes as well (1 frame per render, probe).
+                            // So the damage pokes only when the window's on-screen pixels differ from those at its last
+                            // poke - DDA stays a damage signal, read for this window's rect, never copied, never sent. The
+                            // input path pokes unconditionally, as before. Pixels unreadable: poke (and it is said, once).
+                            if (ps->Route == WGCBRK_ROUTE_PW)
+                            {
+                                RECT pixRect;
+                                const RECT screenR = { 0, 0, (LONG)fbWidth, (LONG)fbHeight };
+                                UINT64 psig = 0;
+                                if (IntersectRect(&pixRect, &pwRect, &screenR) &&
+                                    CaptureFrameRegionSig(frame, &pixRect, &psig))
+                                {
+                                    if (entry->PwPixSigValid && entry->PwPixSig == psig)
+                                    {
+                                        const ULONG n = ++entry->PwEchoSkips;
+                                        if (n <= 4 || (n % 256) == 0)
+                                            LogInfo("QGAPWECHO hwnd=0x%x slot=%d n=%lu: damage with unchanged pixels - no poke "
+                                                L"(the echo of a render)", (DWORD)(ULONG_PTR)entry->Handle,
+                                                entry->PwBrokerSlot, n);
+                                        break;
+                                    }
+                                    entry->PwPixSig = psig;
+                                    entry->PwPixSigValid = TRUE;
+                                }
                             }
                             BrokerPokeDamage(entry);
                             break;      // one poke per pass; the broker coalesces

@@ -154,6 +154,11 @@ typedef struct _WINDOW_DATA
     BOOL PwVisSigValid;
     // QGAPOKEWGC diagnostic: how many unanswered-looking damage pokes this window's WGC slot has been sent (rate limit).
     ULONG PwPokeWgcLogged;
+    // Rest-zero, the held-menu echo: the desktop pixels inside this PrintWindow slot's rect at its last damage poke. A
+    // render makes Windows present the window again with the same pixels; damage whose pixels did not change pokes nothing.
+    UINT64 PwPixSig;
+    BOOL PwPixSigValid;
+    ULONG PwEchoSkips;      // damage pokes withheld because the pixels had not changed (QGAPWECHO)
     // QGACOMPOSITECOPY said for this window (M4: a composite copy on a DirectRequired guest is an error, said once).
     BOOL PwCompositeLogged;
 
