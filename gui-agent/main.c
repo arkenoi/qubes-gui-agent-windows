@@ -3990,6 +3990,32 @@ void BrokerPokeWindow(IN HWND window)
     LeaveCriticalSection(&g_csWatchedWindows);
 }
 
+// Poke for POINTER MOTION - only a slot the broker RENDERS on request. On the PrintWindow route (WGCBRK_ROUTE_PW: menus
+// and the other classes WGC cannot capture) the poke is the render trigger - motion over a menu moves its highlight and
+// that render is the only way the change is captured - so it stays. A WGC or relay slot delivers its own changes as
+// arrivals; there the poke only asks a LIVENESS question ("a change is coming - did the session see it?"), and pointer
+// motion makes no such promise: over a window with no hover effect nothing changes, the poke goes unanswered, and the
+// broker's quiet test recreates a healthy session. Measured 2026-10-01 on w11r-ds: the owner hovered over a focused
+// Notepad - its slot took +2555 pokes and 3 QGAWGCRECREATE in ~75 s while the damage path's pixel compare refused all
+// 2304 pointer damages (QGAPOKESAME); Paint, whose status bar follows the pointer, answered every poke and was not
+// recreated (Jev: chain established 0.64). Under motion a WGC slot's liveness stays with that pixel-checked damage path;
+// keys and buttons still poke every slot (BrokerPokeWindow).
+void BrokerPokeWindowMotion(IN HWND window)
+{
+    if (!g_WgcBase || !window)
+        return;
+    if (!TryEnterCriticalSection(&g_csWatchedWindows))   // never wait on the vchan thread - see BrokerPokeWindow
+    {
+        _InterlockedIncrement(&WGCBRK_HDR(g_WgcBase)->PokeLockMiss);
+        return;
+    }
+    const WINDOW_DATA* entry = FindWindowByHandle(window);
+    if (entry && entry->PwBrokerSourced && entry->PwBrokerSlot >= 0 && entry->PwBrokerSlot < WGCBRK_MAX_SLOTS &&
+        WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot].Route == (LONG)WGCBRK_ROUTE_PW)
+        BrokerPokeDamage(entry);
+    LeaveCriticalSection(&g_csWatchedWindows);
+}
+
 BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
 {
     if (!BrokerCanKeepSlot(entry, entry->Width, entry->Height))

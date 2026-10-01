@@ -758,10 +758,10 @@ static DWORD HandleCrossing(IN HWND window)
 static DWORD HandleMotion(IN HWND window)
 {
     _InterlockedIncrement(&g_InMotion);
-    // Input for this window: its pixels are about to change, and the broker's PrintWindow
-    // path renders only when told. Desktop-duplication damage does not cover this class of
-    // window (measured), so input is the signal that keeps interaction responsive.
-    BrokerPokeWindow(window);
+    // Pointer motion pokes only a slot the broker renders on request (the PrintWindow route): a menu's highlight follows
+    // the pointer and that render is how it is captured. A WGC slot is NOT poked on motion - motion promises no change,
+    // and an unanswered poke made the broker recreate healthy sessions (BrokerPokeWindowMotion, measured 2026-10-01).
+    BrokerPokeWindowMotion(window);
     struct msg_motion motionMsg;
 
     LogVerbose("0x%x", window);
