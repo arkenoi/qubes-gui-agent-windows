@@ -1464,6 +1464,26 @@ static DWORD HandleFocus(IN HWND window)
             // and the call is permitted. Attach only on failure, and always detach - a leaked
             // attachment couples our input queue to another process's for good, so a hang there
             // would become our hang.
+            //
+            // A REFUSED CALL IS NOT A NO-OP (measured 2026-10-01, w11-ds): Windows then activates the
+            // window inside its OWN thread's input queue while the foreground stays where it was.
+            // Windows Terminal follows that activation - its cursor blinks for ever, and with nothing
+            // ever deactivating it, a window nobody is using repaints ~2 times a second (rest-zero
+            // acceptance: ~2% of a core for our capture, 2% for Terminal, 3.5% for DWM, both Terminals,
+            // after dom0 focused each window as a restarted agent mapped it). Replayed guest-side: a
+            // refused SetForegroundWindow alone does it; AttachThreadInput alone does not; neither
+            // FLASHW_STOP nor a posted deactivation undoes it. So make the request ALLOWED instead:
+            // one zero-distance relative mouse move first - the agent already injects all of dom0's
+            // input with SendInput, and input from this process is what the foreground lock asks for.
+            // Measured: the call then succeeds, and the window that loses the foreground goes quiet.
+            // Only when the window is not already the foreground (Jev 0.60 over always).
+            if (GetForegroundWindow() != window)
+            {
+                INPUT nudge = { 0 };
+                nudge.type = INPUT_MOUSE;
+                nudge.mi.dwFlags = MOUSEEVENTF_MOVE;   // dx = dy = 0: the cursor does not move
+                (void)InjectInput(&nudge, "SendInput(focus nudge)");
+            }
             if (!SetForegroundWindow(window))
             {
                 HWND fg = GetForegroundWindow();
