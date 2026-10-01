@@ -11284,6 +11284,20 @@ static ULONG WINAPI WatchForEvents(void)
 
         // Wait for events.
         signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, waitTimeout);
+        // M1 attribution (ABI 21): what woke the loop, counted where the peek can read it.
+        if (g_WgcBase)
+        {
+            WGCBRK_HEADER* wh = WGCBRK_HDR(g_WgcBase);
+            volatile LONG* wc;
+            if (signaledEvent == WAIT_TIMEOUT)                 wc = &wh->AgentWakeDeadline;
+            else if (signaledEvent == 1)                       wc = &wh->AgentWakeFrame;
+            else if (signaledEvent == 4)                       wc = &wh->AgentWakeVchan;
+            else if (signaledEvent == 6)                       wc = &wh->AgentWakeWinEvent;
+            else if ((int)signaledEvent == frameEventIdx)      wc = &wh->AgentWakeBroker;
+            else if (signaledEvent >= 7 && signaledEvent < eventCount) wc = &wh->AgentWakeHelper;
+            else                                               wc = &wh->AgentWakeOther;
+            _InterlockedIncrement(wc);
+        }
         if (signaledEvent != WAIT_TIMEOUT && signaledEvent >= MAXIMUM_WAIT_OBJECTS)
         {
             // KEEP-FATAL: the wait itself failing means our own handle table is

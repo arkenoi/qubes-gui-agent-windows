@@ -12,7 +12,8 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  20u  /* 20: SameFrames (was BackoffMs, unused since S3) - WGC arrivals not republished
+#define WGCBRK_ABI_VERSION  21u  /* 21: AgentWake* - the agent's main-loop wakes by what woke it (rest-zero M1);
+                                  * 20: SameFrames (was BackoffMs, unused since S3) - WGC arrivals not republished
                                   *     because their card equals the published one;
                                   * 19: rest-zero S3/S4 - no heartbeats; CtlAck (the request ack the agent's
                                   *     deadlines key on), DeafHolds + WGCBRK_E_DEAF, AgentFrameWakes/AgentStalls (R5);
@@ -125,7 +126,15 @@ typedef struct _WGCBRK_HEADER {          /* 128 bytes */
      * time either: measured 2026-10-01, a fresh broker opening eight WGC sessions in one pass acknowledged the last one
      * after > 2 s while busy the whole time, and was reaped as hung. Was _pad2[0..3]. */
     volatile LONG      BrokerProgress;
-    BYTE               _pad2[28];
+    /* ABI 21, rest-zero M1 attribution (was _pad2[28]): the agent's main-loop wakes, by what woke it. At rest the loop
+     * waits on events alone; these say which of them fired - a deadline that keeps firing at rest would be ours. */
+    volatile LONG      AgentWakeFrame;     /* a desktop-duplication frame (the capture thread) */
+    volatile LONG      AgentWakeVchan;     /* dom0 traffic */
+    volatile LONG      AgentWakeWinEvent;  /* window events the hook thread queued */
+    volatile LONG      AgentWakeBroker;    /* the broker's frame event */
+    volatile LONG      AgentWakeDeadline;  /* the wait timed out: a deadline this loop armed */
+    volatile LONG      AgentWakeHelper;    /* a helper's process handle, the bridge's ready event, the capture thread's exit */
+    volatile LONG      AgentWakeOther;     /* shutdown, fullscreen on/off, capture error */
 } WGCBRK_HEADER;
 
 typedef struct _WGCBRK_SLOT {
