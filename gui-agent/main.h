@@ -154,6 +154,8 @@ typedef struct _WINDOW_DATA
     BOOL PwVisSigValid;
     // QGAPOKEWGC diagnostic: how many unanswered-looking damage pokes this window's WGC slot has been sent (rate limit).
     ULONG PwPokeWgcLogged;
+    // QGACOMPOSITECOPY said for this window (M4: a composite copy on a DirectRequired guest is an error, said once).
+    BOOL PwCompositeLogged;
 
     // Position as of the frame currently being processed. Dirty rects come from a frame
     // captured BEFORE this frame's tracking update ran, so converting them to

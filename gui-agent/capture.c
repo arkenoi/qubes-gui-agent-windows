@@ -1427,6 +1427,8 @@ static DWORD WINAPI CaptureThread(void* param)
     DWORD status = ERROR_SUCCESS;
     CAPTURE_CONTEXT* capture = (CAPTURE_CONTEXT*)param;
     LogDebug("starting, resolution %ux%u", capture->width, capture->height);
+    // M1 instrument (docs/DESIGN-rest-zero-capture.md S0): which thread is which, for tools/restwatch.ps1's per-thread counts.
+    LogInfo("QGATHREAD role=capture tid=%lu", GetCurrentThreadId());
 
     while (TRUE)
     {

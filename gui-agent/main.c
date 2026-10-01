@@ -1018,6 +1018,7 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
 
     UNREFERENCED_PARAMETER(param);
     LogDebug("start");
+    LogInfo("QGATHREAD role=hooks tid=%lu", GetCurrentThreadId());   // M1 instrument (restwatch's per-thread join)
 
     waitFor[0] = g_WindowEventStop;
     waitFor[1] = g_WindowEventRearm;
@@ -7841,12 +7842,26 @@ static BOOL PwSliceCopyAndDamageSrc(IN OUT WINDOW_DATA* entry, IN const BYTE* sr
     return TRUE;
 }
 
+// M4 INSTRUMENT (docs/DESIGN-rest-zero-capture.md): on a DirectRequired guest no window pixel may come from the
+// composited desktop (owner 2026-09-30: "desktop-copy is slicing in disguise"). Every composite copy site reports here;
+// on such a guest each is an ERROR, once per window, and acceptance asserts there are none.
+static void PwNoteCompositeCopy(IN OUT WINDOW_DATA* entry, IN const WCHAR* site)
+{
+    if (!DirectRequired() || !entry || entry->PwCompositeLogged)
+        return;
+    entry->PwCompositeLogged = TRUE;
+    LogError("QGACOMPOSITECOPY hwnd 0x%x (class %s): window pixels copied from the composited desktop (%s) on a guest where "
+        L"every window is broker-fed - a slicing path that must be unreachable here", (DWORD)(ULONG_PTR)entry->Handle,
+        entry->Class, site);
+}
+
 // Legacy wrapper: copy from the persistently-granted composited desktop image (screen-relative).
 // fb is ctx->framebuffer, constant for the life of the duplication (daemon reads it live) - do
 // NOT gate on frame->mapped, which is only TRUE on the very first frame.
 static BOOL PwSliceCopyAndDamage(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRAME* frame,
                                  IN const BYTE* fb, IN const RECT* area)
 {
+    if (fb) PwNoteCompositeCopy(entry, L"slice");
     return PwSliceCopyAndDamageSrc(entry, fb, frame ? frame->rect.Pitch : 0, 0, 0, area);
 }
 
@@ -7981,6 +7996,7 @@ static BOOL PwDragSliceRefresh(IN OUT WINDOW_DATA* entry, IN const CAPTURE_FRAME
 {
     if (!fb || frame->rect.Pitch <= 0 || !entry->PwBuffer)
         return FALSE;
+    PwNoteCompositeCopy(entry, L"drag slice");
 
     RECT screenR = { 0, 0, (LONG)min(g_ScreenWidth, g_FbWidth), (LONG)min(g_ScreenHeight, g_FbHeight) };
     RECT winR = { entry->X, entry->Y,
@@ -10139,6 +10155,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             (g_ZOrderValid ? !RectInRegion(rgnCovered, &pwRect) : TRUE) &&
                             PwDdaEligible(entry, &pwRect, fbWidth, fbHeight, pwForeground))
                         {
+                            PwNoteCompositeCopy(entry, L"DDA mode");
                             if (!entry->PwDdaActive)
                             {
                                 // Entering DDA mode: establish the buffer from the
@@ -10830,6 +10847,7 @@ static BOOL DrainVchanInput(IN OUT struct _CAPTURE_CONTEXT* capture, OUT BOOL* e
 
 static ULONG WINAPI WatchForEvents(void)
 {
+    LogInfo("QGATHREAD role=main tid=%lu", GetCurrentThreadId());   // M1 instrument (restwatch's per-thread join)
     ULONG eventCount;
     DWORD signaledEvent;
     BOOL vchanIoInProgress;
