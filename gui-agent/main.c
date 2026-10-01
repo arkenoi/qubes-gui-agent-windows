@@ -7889,7 +7889,11 @@ static BOOL PwBrokerCopyDiff(IN OUT WINDOW_DATA* entry, IN const BYTE* srcBase, 
     if (entry) entry->PwLedgerCopies++;
     if (!srcBase || srcPitch <= 0 || !entry->PwBuffer)
         return FALSE;
-    RECT screenR = { 0, 0, (LONG)min(g_ScreenWidth, g_FbWidth), (LONG)min(g_ScreenHeight, g_FbHeight) };
+    // The SCREEN, not the published desktop image (g_FbWidth/g_FbHeight): this source is the window's own frame, and on
+    // 26100+ in seamless no desktop image is published at all (rest-zero S2), so those read 0 and clipped every copy to
+    // nothing - every window held black, then declared (QGADIRECTSUPPRESS 8 of 8, rz3 on w11-ds, 2026-10-01). While a
+    // desktop image was published it was screen-sized, so this is the same clip.
+    RECT screenR = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
     RECT winR = { entry->X, entry->Y, entry->X + (int)entry->PwWidth, entry->Y + (int)entry->PwHeight };
     RECT r;
     if (!IntersectRect(&r, area, &winR) || !IntersectRect(&r, &r, &screenR))
