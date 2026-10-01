@@ -963,6 +963,13 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
         return ERROR_SUCCESS; // dropped on purpose; not an error the caller can act on
     }
 
+    // FAULT INJECTION (test builds only): M5's instrument must be seen to fail - the delay precedes the trace line it times.
+    {
+        const DWORD fiDelay = FiDamageDelayMs();
+        if (fiDelay != 0)
+            Sleep(fiDelay);
+    }
+
     if (g_ProtoTrace)
     {
         // Wobble is a desync between the geometry dom0 believes and where the window actually

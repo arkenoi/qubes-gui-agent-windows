@@ -172,6 +172,10 @@ BOOL FiRingStallActive(void);
 // One-shot: reproduces H2, where the pump stops draining the vchan for seconds.
 DWORD FiPumpStallMs(void);
 
+// [FI_DAMAGE_DELAY] Milliseconds every damage message waits before it is traced and sent, 0 for none. A mode, armed after
+// the arming delay: validates the M5 typing-latency instrument (docs/DESIGN-rest-zero-capture.md) - it must see the delay.
+DWORD FiDamageDelayMs(void);
+
 // [FI_CAPTURE_EXIT] TRUE once: the capture thread must return WITHOUT setting its error
 // event, reproducing the silent death the main loop currently never learns about.
 BOOL FiShouldCaptureExit(void);
@@ -215,6 +219,7 @@ static __forceinline BOOL  FiShouldNegCreate(IN HWND window) { UNREFERENCED_PARA
 static __forceinline BOOL  FiRawCreate(void) { return FALSE; }
 static __forceinline BOOL  FiRingStallActive(void) { return FALSE; }
 static __forceinline DWORD FiPumpStallMs(void) { return 0; }
+static __forceinline DWORD FiDamageDelayMs(void) { return 0; }
 static __forceinline BOOL  FiShouldCaptureExit(void) { return FALSE; }
 static __forceinline BOOL  FiShouldDupCreate(IN HWND window) { UNREFERENCED_PARAMETER(window); return FALSE; }
 static __forceinline BOOL  FiShouldLegacySend(void) { return FALSE; }

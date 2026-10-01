@@ -50,6 +50,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define REG_CONFIG_FAULT_PW_FAIL_VALUE      L"FaultPrintWindowFail"
 #define REG_CONFIG_FAULT_SLAB_BIND_VALUE    L"FaultSlabDoubleBind"
 #define REG_CONFIG_FAULT_GATE_OFF_VALUE     L"FaultGateOff"
+#define REG_CONFIG_FAULT_DAMAGE_DELAY_VALUE L"FaultDamageDelayMs"
 
 #define FAULT_DELAY_ENV_VALUE        L"QUBES_GUI_FAULT_DELAY"
 #define FAULT_NEG_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_NEG_CREATE"
@@ -63,6 +64,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define FAULT_PW_FAIL_ENV_VALUE      L"QUBES_GUI_FAULT_PRINTWINDOW_FAIL"
 #define FAULT_SLAB_BIND_ENV_VALUE    L"QUBES_GUI_FAULT_SLAB_DOUBLE_BIND"
 #define FAULT_GATE_OFF_ENV_VALUE     L"QUBES_GUI_FAULT_GATE_OFF"
+#define FAULT_DAMAGE_DELAY_ENV_VALUE L"QUBES_GUI_FAULT_DAMAGE_DELAY"
 
 // Seconds between FiInit() and the first fault that may fire. See faultinject.h: every
 // failure being reproduced is a failure of a CONNECTED agent, so a fault landing during
@@ -110,6 +112,10 @@ static DWORD g_FiRawCreate     = 0;
 
 // One-shot payload: how long the single stalled pump iteration sleeps. Written once.
 static DWORD g_FiPumpStallMs = 0;
+
+// [FI_DAMAGE_DELAY] a MODE, not a shot: every damage message waits this long before it is traced and sent. Written once.
+static DWORD g_FiDamageDelayMs = 0;
+static volatile LONG g_FiDamageDelayLogged = 0;
 
 // FI_RING_STALL is a time WINDOW, not a one-shot, because the H2 wedge is defined by its
 // duration: the daemon stopped draining for ~6.5 s and the agent had to survive that.
@@ -193,6 +199,7 @@ void FiInit(void)
     g_FiPrintWindowFail = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_PW_FAIL_VALUE, FAULT_PW_FAIL_ENV_VALUE, 0);
     g_FiSlabDoubleBind  = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_SLAB_BIND_VALUE, FAULT_SLAB_BIND_ENV_VALUE, 0);
     g_FiGateOff         = FiReadDword(moduleName, REG_CONFIG_FAULT_GATE_OFF_VALUE, FAULT_GATE_OFF_ENV_VALUE, 0);
+    g_FiDamageDelayMs   = FiReadDword(moduleName, REG_CONFIG_FAULT_DAMAGE_DELAY_VALUE, FAULT_DAMAGE_DELAY_ENV_VALUE, 0);
 
     g_FiArmAt = GetTickCount64() + (ULONGLONG)delaySec * 1000ULL;
 
@@ -212,18 +219,18 @@ void FiInit(void)
     // cause is a measurement run attributed to the wrong build, so every log file from a
     // fault-capable binary has to say so on its first page whether or not anything is armed.
     LogWarning("QGAFAULT-INIT build=%S armdelay=%us negcreate=%d(hwnd=0x%x) ringstall=%us "
-        L"pumpstall=%us captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d gateoff=0x%x",
+        L"pumpstall=%us captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d gateoff=0x%x damagedelay=%ums",
         g_FaultInjectionMarker,
         delaySec,
         g_FiNegCreate, g_FiNegCreateHwnd,
         ringStallSec,
         pumpStallSec,
         g_FiCaptureExit, g_FiDupCreate, g_FiLegacySend, g_FiRawCreate, g_FiPrintWindowFail,
-        g_FiGateOff);
+        g_FiGateOff, g_FiDamageDelayMs);
 
     if (g_FiNegCreate > 0 || g_FiDupCreate > 0 || g_FiLegacySend > 0 ||
         g_FiCaptureExit > 0 || g_FiPumpStall > 0 || g_FiRingStallArmed || g_FiRawCreate ||
-        g_FiPrintWindowFail > 0 || g_FiSlabDoubleBind > 0 || g_FiGateOff != 0)
+        g_FiPrintWindowFail > 0 || g_FiSlabDoubleBind > 0 || g_FiGateOff != 0 || g_FiDamageDelayMs != 0)
     {
         LogWarning("QGAFAULT-INIT FAULTS ARE ARMED - this agent will break itself on purpose "
             L"in %u s; results from this run describe the INJECTED defect, not the build", delaySec);
@@ -364,6 +371,18 @@ DWORD FiPumpStallMs(void)
     LogWarning("QGAFAULT FI_PUMP_STALL firing: this WatchForEvents iteration sleeps %u ms; "
         L"the vchan is NOT serviced for that long (H2 signature)", g_FiPumpStallMs);
     return g_FiPumpStallMs;
+}
+
+// docs/DESIGN-rest-zero-capture.md S0/M5: the typing-latency instrument (key -> the agent's first damage for that window)
+// must be SEEN TO FAIL before its numbers count - this delays every damage message by a known amount.
+DWORD FiDamageDelayMs(void)
+{
+    if (g_FiDamageDelayMs == 0 || GetTickCount64() < g_FiArmAt)
+        return 0;
+    if (InterlockedExchange(&g_FiDamageDelayLogged, 1) == 0)
+        LogWarning("QGAFAULT FI_DAMAGE_DELAY firing: every damage message now waits %u ms before it is traced and sent",
+            g_FiDamageDelayMs);
+    return g_FiDamageDelayMs;
 }
 
 BOOL FiShouldCaptureExit(void)
