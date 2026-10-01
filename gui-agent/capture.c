@@ -119,6 +119,13 @@ typedef struct _STAGING_GRANT
 
 static STAGING_GRANT g_Staging;
 
+// rest-zero S2 (docs/DESIGN-rest-zero-capture.md): frames went by without being copied into the buffer above, so its
+// content is stale. A property of the BUFFER, which outlives every capture generation - hence here, not in the context.
+// Written by the capture thread; read by the main thread (CaptureDesktopImageWanted) racily, which costs at most one
+// unneeded present request.
+static volatile BOOL g_StagingStale = FALSE;
+static volatile BOOL g_StagingPresentAsked = FALSE;   // CaptureDesktopImageWanted asked once for this stale episode
+
 // ACQUIRE OUTCOMES. A counter at the top of ProcessNewFrame counts frames WITH CONTENT, and its
 // being frozen is consistent with three different states of this thread: stuck, every acquire
 // timing out, or acquires succeeding while DXGI reports nothing presented. Reporting that counter
@@ -129,6 +136,8 @@ static volatile LONG g_AcqNoPresent = 0;   // acquired, LastPresentTime == 0 (me
 static volatile LONG g_AcqTimeout   = 0;   // DXGI_ERROR_WAIT_TIMEOUT (deliberately never logged)
 static volatile LONG g_AcqError     = 0;   // any other failure
 static volatile LONG g_AcqLastHr    = 0;   // the most recent failing HRESULT
+static volatile LONG g_DeskCopied   = 0;   // rest-zero S2: frames whose pixels were copied into the staging buffer
+static volatile LONG g_DeskSkipped  = 0;   // ...and frames that copied nothing (nobody shows the desktop image)
 // Separating "blocked inside AcquireNextFrame" from "the thread is gone". The outcome counters
 // above freeze identically in both cases, and Jev refused to choose between them on those alone
 // (insufficient-evidence 0.60) - a loop counter decides it in one run (0.87), and a watchdog
@@ -706,6 +715,28 @@ BOOL CaptureStagingGrantNow(void)
     return TRUE;
 }
 
+// rest-zero S2: window 0 is about to be shown (non-seamless entry). If frames went by uncopied, the staging buffer is
+// stale and the capture thread refills it whole on its next frame - but on a desktop at rest no frame may come for a
+// long time (the acquire waits without a timeout), and the usual entry's resolution change that would raise one is not
+// guaranteed. So ask Windows to present: invalidate every window once. Asynchronous (no RDW_UPDATENOW/ERASENOW), so a
+// hung application cannot stall the caller; the cost is one repaint of the desktop per entry into non-seamless mode.
+void CaptureDesktopImageWanted(void)
+{
+    // The caller has just made DesktopImageWanted() TRUE. Against the capture thread marking the buffer stale on a frame
+    // it judged unwanted a moment earlier, each side writes its flag, fences, then reads the other's (Dekker): at least
+    // one of them sees the other - either this request sees the stale flag, or that frame sees the image wanted and is
+    // copied after all (GetFrame).
+    MemoryBarrier();
+    // Once per stale episode: a switch that stays pending re-applies the mode on later passes, and the first request
+    // already produces the frame that ends the episode.
+    if (!g_StagingStale || g_StagingPresentAsked)
+        return;
+    g_StagingPresentAsked = TRUE;
+    const BOOL ok = RedrawWindow(NULL, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+    LogInfo("QGADESKCOPY window 0 wants the desktop image and the staging copy is stale: asked every window to "
+        L"repaint so the next frame refills it (RedrawWindow %s)", ok ? L"ok" : L"FAILED");
+}
+
 static BOOL StagingEnsure(void)
 {
     if (g_Staging.handle)
@@ -1174,6 +1205,7 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
     EnterCriticalSection(&ctx->frame.lock);
     assert(!ctx->frame.texture);
 
+    ctx->frame.full_copied = FALSE;
     LONGLONG perf_t0 = PerfNow();
     g_AcqEnterTick = (LONGLONG)GetTickCount64();
     _InterlockedExchange(&g_AcqInside, 1);
@@ -1212,9 +1244,11 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
 
     // STAGING: a pending full copy must not take this early-out - after a geometry
     // change the staging content is laid out at the old pitch and must be refilled
-    // from the current desktop image even if nothing new was presented.
-    if (ctx->frame.info.LastPresentTime.QuadPart == 0 && ctx->grant_refs &&
-        !(ctx->uses_staging && ctx->staging_full_copy))
+    // from the current desktop image even if nothing new was presented. Nor may a stale
+    // buffer (rest-zero S2: frames went by uncopied) whose image is wanted again.
+    const BOOL refillDue = ctx->uses_staging &&
+        (ctx->staging_full_copy || (g_StagingStale && DesktopImageWanted()));
+    if (ctx->frame.info.LastPresentTime.QuadPart == 0 && ctx->grant_refs && !refillDue)
     {
         // only skip here after we shared the framebuffer
         LogVerbose("framebuffer unchanged");
@@ -1326,14 +1360,52 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
     // STAGING: copy this frame's changes into the persistently granted buffer. Needs
     // the dirty rects, so it runs after their retrieval; the DXGI surface is mapped
     // and unmapped inside (frame.mapped stays FALSE - see the fail3 note below).
+    //
+    // rest-zero S2 (docs/DESIGN-rest-zero-capture.md): ONLY while somebody shows the desktop image. On a direct-
+    // required guest in seamless mode every window is broker-fed, so the frame is a damage signal and nothing is
+    // copied out of the desktop at all; the buffer goes stale and is refilled whole when window 0 wants it again.
     if (ctx->uses_staging)
     {
-        status = StagingCopyFrame(ctx);
-        if (FAILED(status))
-            goto fail4;
+        BOOL wanted = DesktopImageWanted();
+        if (!wanted)
+        {
+            if (!g_StagingStale)
+            {
+                g_StagingPresentAsked = FALSE;   // a new stale episode begins
+                LogInfo("QGADESKCOPY off: nothing is copied out of the desktop image - every window is broker-fed "
+                    L"(26100+, seamless), desktop frames are a damage signal only (frames copied %ld, skipped %ld)",
+                    g_DeskCopied, g_DeskSkipped);
+            }
+            g_StagingStale = TRUE;
+            // The other half of CaptureDesktopImageWanted's fence: a non-seamless entry that began while this frame was
+            // being judged either saw the stale flag (and asked for a present) or is seen here - copy this frame then.
+            MemoryBarrier();
+            wanted = DesktopImageWanted();
+        }
+        if (wanted)
+        {
+            if (g_StagingStale)
+            {
+                ctx->staging_full_copy = TRUE;
+                g_StagingStale = FALSE;
+                LogInfo("QGADESKCOPY on: the desktop image is wanted again (window 0) - refilling it whole "
+                    L"(frames copied %ld, skipped %ld)", g_DeskCopied, g_DeskSkipped);
+            }
+            ctx->frame.full_copied = ctx->staging_full_copy;
+            status = StagingCopyFrame(ctx);
+            if (FAILED(status))
+                goto fail4;
+            _InterlockedIncrement(&g_DeskCopied);
+        }
+        else
+        {
+            ctx->staging_full_copy = FALSE;   // folded into g_StagingStale: the refill is whole either way
+            _InterlockedIncrement(&g_DeskSkipped);
+        }
     }
 
 end:
+    ctx->frame.pixels_skipped = ctx->uses_staging && g_StagingStale;
     LeaveCriticalSection(&ctx->frame.lock);
     LogVerbose("end");
     return 0;
@@ -1539,7 +1611,9 @@ static DWORD WINAPI CaptureThread(void* param)
         // sends nothing (the per-window repaint in the grants_changed handler has
         // already covered it). Held-frame masking is untouched and still runs first
         // in ProcessNewFrame, so a transitional geometry still sends nothing at all.
-        if (capture->frame.dirty_rects_count == 0 && !capture->grants_changed)
+        // ...nor a FULL refill (rest-zero S2: the first copy after frames went by uncopied, possibly on a frame that
+        // only moved the pointer): window 0 must repaint from the refilled buffer now, not at the next present.
+        if (capture->frame.dirty_rects_count == 0 && !capture->grants_changed && !capture->frame.full_copied)
         {
             PerfNoteSkippedFrame();
             goto end_frame; // framebuffer contents not changed

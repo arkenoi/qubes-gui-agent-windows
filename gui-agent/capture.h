@@ -46,6 +46,13 @@ typedef struct _CAPTURE_FRAME
 	RECT* dirty_rects;
 	CRITICAL_SECTION lock;
 	PERF_CAPTURE perf; // instrumentation, see perf.h (inert unless enabled)
+	// rest-zero S2 (docs/DESIGN-rest-zero-capture.md): this frame's pixels were NOT copied into the staging buffer -
+	// nobody shows the desktop image (DesktopImageWanted), so the frame is a damage signal only and the frame loop
+	// hands ProcessNewFrame no framebuffer.
+	BOOL pixels_skipped;
+	// This frame's staging copy was a FULL refill: the frame loop delivers it even with no dirty rects, so a window 0
+	// shown again repaints from the refilled buffer instead of waiting for the next present.
+	BOOL full_copied;
 } CAPTURE_FRAME;
 
 // A6: a superseded screen grant awaiting revocation. dom0 releases its mapping of the
@@ -108,6 +115,8 @@ CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event);
 BOOL CaptureScreenGrantLive(void);
 // Grant the already-allocated staging buffer in place, without tearing capture down.
 BOOL CaptureStagingGrantNow(void);
+// Window 0 is about to show the desktop image: if the staging copy went stale (rest-zero S2), ask for a present.
+void CaptureDesktopImageWanted(void);
 // Acquire outcomes, so a frozen content-frame counter can be told apart from a stuck thread,
 // from every acquire timing out, and from DXGI reporting nothing presented.
 void CaptureAcquireStats(OUT LONG* present, OUT LONG* noPresent, OUT LONG* timeout,

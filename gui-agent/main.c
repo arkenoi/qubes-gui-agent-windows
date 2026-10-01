@@ -3675,6 +3675,15 @@ BOOL DirectRequired(void)
     return g_WgcBroker && g_OsBuild >= 26100 && PwEnabled();
 }
 
+// rest-zero S2 (docs/DESIGN-rest-zero-capture.md): on a direct-required guest in seamless mode no window takes pixels
+// from the desktop image - each is broker-fed, held when it has no frame - so copying the desktop into the staging
+// buffer on every DDA frame fed nothing (QGACOMPOSITECOPY 0 over the rz1 run). Window 0 is the one reader: non-seamless,
+// or on its way there (g_DesktopGrantWanted is set at the top of the switch, before the shrink that precedes it).
+BOOL DesktopImageWanted(void)
+{
+    return !DirectRequired() || !g_SeamlessMode || g_DesktopGrantWanted;
+}
+
 // When BrokerState() stops answering BRK_STARTING; 0 = it does not answer it now. The held-window sweep arms the
 // declaration of a frameless window at the later of this and the window's own grace (rest-zero S4).
 static ULONGLONG BrokerGraceEnd(void)
@@ -6059,6 +6068,9 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     if (!seamlessMode)
     {
         g_DesktopGrantWanted = TRUE;
+        // rest-zero S2: from here the capture thread copies the desktop again (DesktopImageWanted); if it skipped
+        // frames meanwhile, make sure one comes to refill the buffer whole.
+        CaptureDesktopImageWanted();
         // The grant being live is NOT sufficient - dom0 also needs the window-0 dump, and it
         // has none after an earlier unplug destroyed window 0. So the entry waits for the dump,
         // not merely for the grant, and asks for the replug that produces it either way.
@@ -9299,6 +9311,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         g_FbWidth = fbWidth;
         g_FbHeight = fbHeight;
     }
+    // rest-zero S2: a frame whose pixels were not copied (DesktopImageWanted FALSE) publishes NO image - not the stale
+    // buffer of an earlier copy, which a reader would take for the current desktop.
+    else if (g_FbBits)
+        PwInvalidateFramebuffer();
 
     // The redundant-frame check does NOT belong here, and putting it here produced a BLACK
     // guest window. Returning early from the top of this function skips:
@@ -9364,7 +9380,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             return ERROR_SUCCESS;
         }
 
-        if (frame->dirty_rects_count == 0)
+        // ...and a frame that REFILLED the whole buffer (rest-zero S2: the desktop image was not copied while seamless):
+        // dom0 may already show the stale buffer outside this frame's dirty rects, so all of it is damage.
+        if (frame->dirty_rects_count == 0 || frame->full_copied)
         {
             // normally we don't get frames with 0 dirty rects unless it's the 1st one
             // then refresh everything (at the size the dump was actually granted at,
@@ -11471,7 +11489,8 @@ static ULONG WINAPI WatchForEvents(void)
                     }
                 }
 
-                ProcessNewFrame(&capture->frame, (const BYTE*)capture->framebuffer,
+                ProcessNewFrame(&capture->frame,
+                    capture->frame.pixels_skipped ? NULL : (const BYTE*)capture->framebuffer,
                     capture->width, capture->height);
 
                 // Work-area drift check (frame path; ProcessWindowEvents has the

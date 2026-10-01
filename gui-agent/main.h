@@ -591,6 +591,9 @@ BOOL WgcBrokerActive(void);
 // Eligibility (not availability) for the per-window broker path: on a guest where it is TRUE
 // the whole-desktop composite is NOT an allowed source for a per-window window. See main.c.
 BOOL DirectRequired(void);
+// Is the whole-desktop image anyone's to show? FALSE on a direct-required guest in seamless mode, where every window
+// is broker-fed: the capture thread then copies nothing out of the desktop (rest-zero S2). Read racily by that thread.
+BOOL DesktopImageWanted(void);
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry);
 // Tell the broker a window's pixels are likely to have changed. Called from the input path:
 // desktop-duplication damage is measured not to cover cross-process-content windows.
