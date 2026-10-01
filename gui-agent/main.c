@@ -266,10 +266,10 @@ volatile LONG g_BrokerReady = 0;
 static HANDLE g_WgcMap = NULL, g_WgcCtl = NULL, g_WgcBrokerProc = NULL;
 static BYTE*  g_WgcBase = NULL;
 static DWORD  g_WgcSession = 0xFFFFFFFF;
-static ULONGLONG g_WgcNextPoll = 0;
 // The broker is launched via the Task Scheduler (see WgcLaunch), so there is no child process
 // HANDLE at launch. g_WgcBrokerProc is opened from the pid the broker publishes, validated
-// (WgcOpenBrokerProcess), once its heartbeat is live; the heartbeat then backstops a HUNG broker.
+// (WgcOpenBrokerProcess), on the wake the broker gives once it has published it; a HUNG broker is
+// an unanswered request (R1, BrokerAckOverdue), not a stale heartbeat - there is none any more.
 static LONG      g_WgcBrokerPidRejected = 0;   // last BrokerPid that failed validation (log once)
 // The pid whose process handle VALIDATED as a running wgcbroker.exe from the install dir in this
 // session. Kept separately from the shared section's BrokerPid because that field is USER-WRITABLE:
@@ -277,8 +277,16 @@ static LONG      g_WgcBrokerPidRejected = 0;   // last BrokerPid that failed val
 // publishing its own pid. Written only where the validation succeeds, cleared where the handle is
 // closed.
 static volatile LONG g_WgcBrokerPidValidated = 0;
-static LONGLONG  g_WgcBrokerHbLast = 0;    // last BrokerHeartbeat value observed
-static ULONGLONG g_WgcBrokerHbSeenAt = 0;  // wall time we last saw it ADVANCE
+// R1/R4 (docs/DESIGN-rest-zero-capture.md D): per slot, the ControlSeq this agent last wrote and when, until the
+// broker's CtlAck catches up (0 = nothing outstanding). Unanswered for WGCBRK_ACK_DEADLINE_MS = a hung broker.
+static LONG      g_SlotCtlWant[WGCBRK_MAX_SLOTS];
+static ULONGLONG g_SlotCtlSince[WGCBRK_MAX_SLOTS];
+// QGAWGCDEAF is said once per request: the ControlSeq it was said for, per slot (0 = not said).
+static LONG      g_SlotDeafSaid[WGCBRK_MAX_SLOTS];
+// Count of WGC sessions the broker declared DEAF (FAILED + WGCBRK_E_DEAF), published like DirectSuppressed: acceptance
+// asserts 0 (M7).
+#define REG_CONFIG_WGC_DEAF_VALUE L"WgcDeaf"
+static DWORD     g_WgcDeafCount = 0;
 static ULONGLONG g_WgcLastLaunch = 0;      // throttle: don't relaunch while one is starting
 static ULONGLONG g_AgentStartTick = 0;     // set at Init; bounds BRK_STARTING (see BrokerState)
 static ULONGLONG g_BrokerDownSince = 0;    // wall time the broker went (or started) DOWN while eligible; 0 = up/ok
@@ -317,11 +325,12 @@ static ULONGLONG g_WgcArenaNext = 0;   // bump frontier within the arena (offset
 typedef struct { ULONGLONG off, size; } WGC_FREEBLK;
 static WGC_FREEBLK g_WgcFree[WGCBRK_MAX_SLOTS * WGCBRK_RING + 4];
 static int g_WgcFreeCount = 0;
-typedef struct { ULONGLONG off0, off1, size, freeAtTick; } WGC_PENDINGFREE;
+// R4: a region is reusable once the broker has ACKNOWLEDGED the unregister that freed it (the slot's CtlAck reached
+// `seq`): CloseChannel ran under the slot lock before that ack, so no publish can still be writing it. No timer.
+typedef struct { ULONGLONG off0, off1, size; int slot; LONG seq; } WGC_PENDINGFREE;
 static WGC_PENDINGFREE g_WgcPending[WGCBRK_MAX_SLOTS * 2];
 static int g_WgcPendingCount = 0;
-#define WGC_ARENA_FREE_DELAY_MS 2000   // >> broker Reconcile (<=250 ms) + in-flight FrameArrived
-static void WgcArenaReapPending(void);      // defined with the arena allocator; called from BrokerSupervise
+static void WgcArenaReapPending(BOOL all);  // defined with the arena allocator; called from BrokerSupervise/BrokerRegister
 static BOOL BrokerOpaqueInsets(IN HWND window, OUT RECT* insets);  // defined after BrokerFreshFrame; used by the crop in GetWindowData
 
 // minimal acceptable window dimensions
@@ -858,6 +867,17 @@ void PokeWindowTracking(void)
 {
     if (g_WindowEventSignal)
         SetEvent(g_WindowEventSignal);
+}
+
+// Re-examine ONE window on the next tracking pass. A bare PokeWindowTracking runs a pass with nothing queued unless a
+// resync is due, so a held window whose crop just resolved stayed held until something else queued it - on a
+// DirectRequired guest that is its ceiling deadline, since nothing re-checks a held window on a tick (rest-zero S4).
+void PokeWindowTrackingFor(IN HWND window)
+{
+    if (window)
+        QueueWindowEvent(window, EVENT_OBJECT_SHOW, FALSE);
+    else
+        PokeWindowTracking();
 }
 
 // Hand the queued window handles to the caller and tell it whether a full
@@ -2597,7 +2617,6 @@ static BOOL WgcCreateSection(void)
     h->AbiVersion = WGCBRK_ABI_VERSION; h->SlotCount = WGCBRK_MAX_SLOTS;
     h->ArenaOffset = WGCBRK_HEADER_BYTES; h->ArenaBytes = g_WgcArenaBytes;
     h->AgentPid = (LONG)GetCurrentProcessId();
-    h->AgentHeartbeat = (LONGLONG)GetTickCount64();
     MemoryBarrier();
     _InterlockedExchange(&h->Magic, (LONG)WGCBRK_MAGIC);   // publish readiness LAST
     LogInfo("WGCBROKER section created (%llu bytes, arena %lu)", total, g_WgcArenaBytes);
@@ -2619,19 +2638,10 @@ static BOOL WgcRunSchtasks(const WCHAR* argtail)
     if (!CreateProcess(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
     { win_perror("CreateProcess(schtasks)"); return FALSE; }
     CloseHandle(pi.hThread);
-    // Wait in 1 s slices and keep the broker's AgentHeartbeat fresh meanwhile. This runs on the
-    // main-loop thread: a relaunch is THREE schtasks calls, each capped at 15 s, while the broker
-    // exits once AgentHeartbeat is >10 s stale (wgcbroker.cpp). One slow schtasks on a loaded first
-    // boot therefore made the agent starve a HEALTHY broker to death and then report QGABROKERDIED
-    // (+BrokerDeaths) for a death it caused (audit 2026-09-08). Bumping from THIS thread inside the
-    // bounded wait keeps the backstop's meaning - a hung agent still stops bumping; only "busy in
-    // schtasks" is excused.
-    ULONGLONG t0 = GetTickCount64(); DWORD w;
-    do
-    {
-        w = WaitForSingleObject(pi.hProcess, 1000);
-        if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->AgentHeartbeat = (LONGLONG)GetTickCount64();
-    } while (w == WAIT_TIMEOUT && GetTickCount64() - t0 < 15000);
+    // One bounded wait. It used to be taken in 1 s slices to keep the broker's AgentHeartbeat fresh
+    // (a slow schtasks once starved a healthy broker to death, audit 2026-09-08); there is no
+    // heartbeat since rest-zero S4, so nothing here can starve the broker.
+    const DWORD w = WaitForSingleObject(pi.hProcess, 15000);
     if (w == WAIT_TIMEOUT)
         LogWarning("schtasks did not finish within 15 s (%s) - treated as failed", argtail);
     DWORD ec = 1; GetExitCodeProcess(pi.hProcess, &ec);
@@ -2753,69 +2763,160 @@ static HANDLE WgcOpenBrokerProcess(DWORD pid, DWORD consoleSid)
     return OpenHelperProcess(pid, consoleSid, L"wgcbroker.exe");
 }
 
-// ~1 Hz supervisor. Creates the section on first eligible pass, keeps the heartbeat fresh,
-// (re)launches the broker when it is absent/dead or the console session changed, and marks it
-// ready once its heartbeat advances. Called from the frame path and the idle sweep. Cannot
-// affect rendering in stage 2a - nothing consumes broker frames yet.
+// ---- R1/R4: requests the broker must acknowledge (docs/DESIGN-rest-zero-capture.md D) ----------------------------------
+// Called right after the agent bumps a slot's ControlSeq (register, retarget, unregister) and signals the broker: the
+// broker writes CtlAck = that ControlSeq once its main loop has handled the slot. This replaces the heartbeat on both
+// sides - a heartbeat is a timer that wakes both processes forever and detects only a HUNG peer; a request deadline is
+// armed only while a request is outstanding, which at rest is never.
+static void BrokerRequestSent(int slot)
+{
+    if (!g_WgcBase || slot < 0 || slot >= WGCBRK_MAX_SLOTS) return;
+    g_SlotCtlWant[slot] = WGCBRK_SLOTS(g_WgcBase)[slot].ControlSeq;
+    g_SlotCtlSince[slot] = GetTickCount64();
+}
+
+// Is a request older than WGCBRK_ACK_DEADLINE_MS still unanswered? Answered ones are disarmed on the way. CtlAck is
+// broker-written in a user-writable section: a forged value can only hide that broker's own hang or get it relaunched.
+static BOOL BrokerAckOverdue(IN ULONGLONG now, OUT int* slotOut, OUT ULONGLONG* ageOut)
+{
+    const WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
+    for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
+    {
+        if (!g_SlotCtlSince[i]) continue;
+        if ((LONG)((ULONG)slots[i].CtlAck - (ULONG)g_SlotCtlWant[i]) >= 0) { g_SlotCtlSince[i] = 0; continue; }
+        if (now - g_SlotCtlSince[i] >= WGCBRK_ACK_DEADLINE_MS)
+        {
+            *slotOut = i; *ageOut = now - g_SlotCtlSince[i];
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+// The earliest moment the broker's supervision needs the main loop awake; 0 = nothing armed, which is the rest state.
+// While the broker is up: an outstanding request's ack deadline (R1/R4). While it is DOWN or STARTING - a failure state,
+// which keeps its bounded timers (design C, "Cost") - the relaunch throttle and the next QGADESLICEDOWN. Never a past
+// deadline: a relaunch that is due but cannot happen (no console session, no shell yet) waits for the window event
+// that brings the shell, not for a spin.
+static ULONGLONG BrokerNextDue(void)
+{
+    if (!g_WgcBroker || g_OsBuild < 26100 || !PwEnabled() || !g_WgcBase) return 0;
+    const ULONGLONG now = GetTickCount64();
+    ULONGLONG due = 0;
+    if (g_BrokerReady)
+    {
+        for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
+            if (g_SlotCtlSince[i])
+            {
+                const ULONGLONG d = g_SlotCtlSince[i] + WGCBRK_ACK_DEADLINE_MS;
+                if (!due || d < due) due = d;
+            }
+        return due;
+    }
+    // g_WgcLastLaunch == 0 included: BrokerSupervise's throttle (now - g_WgcLastLaunch < 8000) also holds back the FIRST
+    // launch during the first 8 s of uptime, and nothing else would wake the loop for it.
+    if (g_WgcLastLaunch + 8000 > now) due = g_WgcLastLaunch + 8000;
+    if (g_BrokerNextWarn > now && (!due || g_BrokerNextWarn < due)) due = g_BrokerNextWarn;
+    return due;
+}
+
+// QGAWGCDEAF (rest-zero E): the broker declared a slot's WGC session deaf - silent through a first frame or an own-change
+// poke, recreated once, silent again - and holds it FAILED with WGCBRK_E_DEAF until it is asked again. Said once per
+// request, published as WgcDeaf for the harness. The window keeps its last content (or stays withheld): there is no
+// PrintWindow route under it any more (c2: 0.05).
+static void BrokerReportDeaf(void)
+{
+    const WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
+    for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
+    {
+        const WGCBRK_SLOT* s = &slots[i];
+        if (s->ReqState != WGCBRK_REQUESTED || s->AckState != WGCBRK_FAILED || s->FailHr != WGCBRK_E_DEAF)
+            continue;
+        const LONG seq = s->ControlSeq;
+        if (g_SlotDeafSaid[i] == seq)
+            continue;
+        g_SlotDeafSaid[i] = seq;
+        (void)CfgWriteDword(NULL, REG_CONFIG_WGC_DEAF_VALUE, ++g_WgcDeafCount, NULL);
+        LogError("QGAWGCDEAF hwnd 0x%llx slot %d: its WGC session delivered nothing for a first frame or an own-change "
+            L"poke within %u ms, was recreated once and was silent again. The broker holds it FAILED (deaf holds %ld); "
+            L"the window keeps its last content until it is registered again - there is no PrintWindow fallback. "
+            L"WgcDeaf=%lu published under the Qubes Tools config key.",
+            (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, s->DeafHolds, g_WgcDeafCount);
+    }
+}
+
+// This instance missed an ack deadline (QGABROKERHUNG): it is not ready again until it is replaced - its handle is closed
+// on exit or by the reap before the relaunch. Without the latch the next pass would find it "alive" (process running,
+// readiness no longer checking acks) and report a recovery that never happened.
+static BOOL g_WgcBrokerHung = FALSE;
+
+// The broker supervisor - EVENT-DRIVEN since rest-zero S4: it runs on every main-loop wake, waits for nothing, and arms
+// no timer while the broker is up and its requests are answered. Creates the section on the first eligible pass;
+// (re)launches the broker when it is absent, dead, hung or in another console session; marks it ready when the pid it
+// publishes validates. EXIT is the broker's process handle (in the main loop's wait array); READY is the pid the broker
+// publishes and then signals the frame event for; a HANG is a request it has not acknowledged within
+// WGCBRK_ACK_DEADLINE_MS (R1/R4). No heartbeat is read or written.
 static void BrokerSupervise(void)
 {
     if (!g_WgcBroker || g_OsBuild < 26100 || !PwEnabled()) return;
     if (!g_WgcBase && !WgcCreateSection()) return;
+    // R5 (rest-zero D): this loop is alive - the broker's deadline on a published frame is answered by any wake of it
+    // (its frame event is one). Replaced the agent heartbeat the broker used to exit on.
+    _InterlockedIncrement(&WGCBRK_HDR(g_WgcBase)->AgentFrameWakes);
     ULONGLONG now = GetTickCount64();
-    // Bump the agent heartbeat on EVERY call (not gated by the 1 Hz launch throttle) so the
-    // broker's staleness backstop never trips while the main loop is merely idle. The main
-    // loop caps its wait to ~1 s while the broker is active, so this runs at least ~1/s.
-    WGCBRK_HDR(g_WgcBase)->AgentHeartbeat = (LONGLONG)now;
-    // PROCESS EXIT IS THE PRIMARY DEATH SIGNAL; the heartbeat is the backstop for a HUNG broker.
-    // Heartbeat-only liveness noticed a death only after the 1 Hz poll + 6 s staleness window (~7 s
-    // of withheld toasts/menus per death, audit 2026-09-08). The validated handle (opened below on
-    // ready) sits in the main loop's wait array, so an exit wakes the loop and lands here at once -
-    // and bypasses the 1 Hz throttle.
+    const LONG pidBefore = g_WgcBrokerPidValidated;   // for the death report: an exit clears it below
+    // PROCESS EXIT IS THE DEATH SIGNAL. The validated handle (opened below on ready) sits in the main loop's wait array,
+    // so an exit wakes the loop and lands here at once.
     BOOL brokerExited = FALSE; DWORD brokerExitCode = 0;
     if (g_WgcBrokerProc && WaitForSingleObject(g_WgcBrokerProc, 0) == WAIT_OBJECT_0)
     {
         brokerExited = TRUE;
         GetExitCodeProcess(g_WgcBrokerProc, &brokerExitCode);
         CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
+        g_WgcBrokerHung = FALSE;
         _InterlockedExchange(&g_WgcBrokerPidValidated, 0);   // a dead broker must not keep suppressing windows
+        // Its pid stays in the section: zero it, or the next pass would try to validate a dead process and report a
+        // forged pid (QGABROKERPID) for an ordinary exit.
+        WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
     }
-    if (!brokerExited && now < g_WgcNextPoll) return;
-    g_WgcNextPoll = now + 1000;
-
-    WgcArenaReapPending();   // return deferred-free arena regions once the broker can no longer touch them
 
     DWORD sid = WTSGetActiveConsoleSessionId();
-    // Task-Scheduler-launched broker: no child HANDLE at launch. Liveness = the process (once its
-    // handle is held) has not exited AND the shared-memory heartbeat has ADVANCED within the last
-    // ~6 s (and the console session is unchanged).
-    LONGLONG hb = WGCBRK_HDR(g_WgcBase)->BrokerHeartbeat;
-    if (hb != 0 && hb != g_WgcBrokerHbLast) { g_WgcBrokerHbLast = hb; g_WgcBrokerHbSeenAt = now; }
-    BOOL alive = !brokerExited && (g_WgcSession == sid) && g_WgcBrokerHbSeenAt &&
-                 (now - g_WgcBrokerHbSeenAt < 6000);
-    if (alive)
+    // READY = the pid this launch's broker published, VALIDATED (WgcOpenBrokerProcess). The broker publishes it and then
+    // signals the frame event, so this runs on that wake. The pid field is user-writable, so a pid that does not
+    // validate is one loud line per pid; without a handle a broker's exit cannot be waited on.
+    if (!brokerExited && !g_WgcBrokerProc && g_WgcSession == sid)
     {
-        // Take the process handle from the published pid, validated (WgcOpenBrokerProcess). Only
-        // while the heartbeat advances, so a dead broker's stale pid is never tried. A live
-        // heartbeat whose pid does not validate is an anomaly worth one loud line per pid: the
-        // pid field is user-writable, and without a handle a hung broker cannot be reaped.
         LONG pid = WGCBRK_HDR(g_WgcBase)->BrokerPid;
-        if (!g_WgcBrokerProc && pid != 0 && pid != g_WgcBrokerPidRejected)
+        if (pid != 0 && pid != g_WgcBrokerPidRejected)
         {
             g_WgcBrokerProc = WgcOpenBrokerProcess((DWORD)pid, sid);
             if (g_WgcBrokerProc)
                 _InterlockedExchange(&g_WgcBrokerPidValidated, pid);
-            if (!g_WgcBrokerProc)
+            else
             {
                 g_WgcBrokerPidRejected = pid;
                 LogWarning("QGABROKERPID BrokerPid %ld published in the shared section is not a "
                     L"running wgcbroker.exe from the install dir in session %lu - ignored (the field "
-                    L"is user-writable). Only the heartbeat can detect this broker's death, and a "
-                    L"hung instance cannot be reaped before a relaunch.", pid, sid);
+                    L"is user-writable). The broker is not treated as ready until a pid validates.", pid, sid);
             }
         }
+    }
+    // HUNG = a request this READY instance has not acknowledged within WGCBRK_ACK_DEADLINE_MS. Checked only once ready:
+    // requests outstanding across a relaunch get a fresh clock at the ready transition below.
+    int hungSlot = -1; ULONGLONG hungMs = 0;
+    const BOOL hung = (!g_WgcBrokerHung && g_WgcBrokerProc && g_BrokerReady) ?
+                      BrokerAckOverdue(now, &hungSlot, &hungMs) : FALSE;
+    if (hung) g_WgcBrokerHung = TRUE;
+    const BOOL alive = !brokerExited && g_WgcBrokerProc && (g_WgcSession == sid) && !g_WgcBrokerHung;
+    if (alive)
+    {
         if (!g_BrokerReady)
         {
             _InterlockedExchange(&g_BrokerReady, 1);
+            // A fresh instance answers every slot on its first pass: requests left outstanding by the previous one get
+            // a fresh clock rather than being charged to this one.
+            for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
+                if (g_SlotCtlSince[i]) g_SlotCtlSince[i] = now;
             // RECOVERY FROM A DEATH IS ITSELF REPORTABLE. A broker that crashed and came back is
             // not a non-event just because the pixels resumed: something killed it, and the only
             // record that it happened is this line plus BrokerDeaths.
@@ -2829,7 +2930,7 @@ static void BrokerSupervise(void)
             }
             else
             {
-                LogInfo("WGCBROKER ready (heartbeat live)");
+                LogInfo("WGCBROKER ready (pid %ld validated)", (long)g_WgcBrokerPidValidated);
             }
         }
         // Recovered (or first-ever ready): clear the hard-fail state + its machine-readable flag.
@@ -2838,6 +2939,8 @@ static void BrokerSupervise(void)
             g_BrokerDownSince = 0; g_BrokerNextWarn = 0;
             (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
         }
+        WgcArenaReapPending(FALSE);   // regions whose unregister the broker has acknowledged (R4)
+        BrokerReportDeaf();
         return;
     }
     // THE DEATH TRANSITION IS THE LOUD MOMENT, not the 30 s mark. Before this, a broker that
@@ -2850,12 +2953,12 @@ static void BrokerSupervise(void)
         g_BrokerDiedAt = now;
         (void)CfgWriteDword(NULL, REG_CONFIG_BROKER_DEATHS_VALUE, ++g_BrokerDeaths, NULL);
         // Say WHICH signal fired: an exit (with the broker's own exit code - the broker has no log
-        // of its own) is a crash/self-exit; a stale heartbeat with the process still running is a
+        // of its own) is a crash/self-exit; an unanswered request with the process still running is a
         // HANG, reaped below before the relaunch.
         if (brokerExited)
             LogError("QGABROKEREXIT de-slice broker process EXITED (exit code %lu) - detected by "
-                L"process wait, not by heartbeat staleness.", brokerExitCode);
-        else if (g_WgcBrokerProc && now - g_WgcBrokerHbSeenAt >= 6000)
+                L"process wait.", brokerExitCode);
+        else if (hung)
         {
             // ABI 18: the broker publishes which call its main loop is in (WGCBRK_STG_* << 8 | slot), so a
             // hang names its call instead of leaving it to be guessed - "most likely PrintWindow" was a
@@ -2863,27 +2966,28 @@ static void BrokerSupervise(void)
             static const wchar_t* const stgName[] = { L"loop", L"reconcile", L"open-channel",
                 L"close-channel", L"relay-dwm", L"probe", L"source-printwindow", L"polled-printwindow",
                 L"republish", L"sign", L"close-lock", L"close-reap" };
-            const LONG stg = g_WgcBase ? WGCBRK_HDR(g_WgcBase)->BrokerStage : -1;
+            const LONG stg = WGCBRK_HDR(g_WgcBase)->BrokerStage;
             const LONG code = stg >= 0 ? (stg >> 8) : -1;
-            LogError("QGABROKERHUNG de-slice broker process is still RUNNING but its heartbeat has "
-                L"not advanced for %I64u ms - a hang, not a crash; it is blocked in stage=%s (%ld) "
-                L"slot=%ld.", now - g_WgcBrokerHbSeenAt,
+            LogError("QGABROKERHUNG de-slice broker process is still RUNNING but has not acknowledged the "
+                L"request on slot %d for %I64u ms (CtlAck %ld, wanted %ld) - a hang, not a crash; it is "
+                L"blocked in stage=%s (%ld) slot=%ld.", hungSlot, hungMs,
+                (long)WGCBRK_SLOTS(g_WgcBase)[hungSlot].CtlAck, (long)g_SlotCtlWant[hungSlot],
                 (code >= 0 && code < (LONG)(sizeof(stgName) / sizeof(stgName[0]))) ? stgName[code] : L"unknown",
                 code, stg >= 0 ? (stg & 0xFF) : -1L);
         }
-        LogError("QGABROKERDIED de-slice broker STOPPED HEARTBEATING after being ready (death #%lu, "
+        LogError("QGABROKERDIED de-slice broker STOPPED SERVING after being ready (death #%lu, "
             L"pid was %ld). This is a MAJOR FAILURE, not a hiccup: while it is gone there is NO "
             L"composite fallback on an eligible guest, so toasts, menus and WinUI surfaces are "
             L"WITHHELD rather than drawn. A relaunch follows within ~8 s and may well succeed - "
             L"that recovery does NOT make this benign, and it is reported here precisely so it "
             L"cannot pass silently. BrokerDeaths=%lu is published under the Qubes Tools config key.",
-            g_BrokerDeaths, (long)WGCBRK_HDR(g_WgcBase)->BrokerPid, g_BrokerDeaths);
+            g_BrokerDeaths, (long)pidBefore, g_BrokerDeaths);
         // Secondary route, DEGRADED - deliberately BELOW the route's ACTION threshold, so this is
         // rejected and stays in the log: a relaunch follows within ~8 s, and if it does not take,
         // QGADESLICEDOWN below escalates to ACTION 30 s later. Wired so the threshold is exercised
         // by a real site and a future promotion is a one-word change, not new plumbing.
         QerrReport("gui-agent", "broker-died", QERR_SEV_DEGRADED,
-            "the de-slice broker stopped heartbeating; a relaunch follows",
+            "the de-slice broker stopped serving; a relaunch follows",
             "gui-agent log in Qubes Logs, line QGABROKERDIED");
     }
 
@@ -2903,7 +3007,7 @@ static void BrokerSupervise(void)
     {
         g_BrokerNextWarn = now + DESLICE_REWARN_MS;
         // Name the cause: a MISSING binary is the packaging gap (wgcbroker.exe not shipped);
-        // a present binary that never heartbeats is a launch/capture failure. The distinction is
+        // a present binary that never becomes ready is a launch/capture failure. The distinction is
         // the difference between "the release is broken" and "this guest cannot capture".
         WCHAR exe[MAX_PATH] = { 0 };
         BOOL binPresent = FALSE;
@@ -2940,15 +3044,16 @@ static void BrokerSupervise(void)
             "gui-agent log in Qubes Logs, line QGADESLICEDOWN");
     }
 
-    // Throttle relaunch: a freshly launched broker needs a few seconds to attach and heartbeat;
-    // don't re-fire schtasks every second in the meantime.
+    // Throttle relaunch: a freshly launched broker needs a few seconds to attach and publish its pid;
+    // don't re-fire schtasks in the meantime. The throttle's end is a deadline (BrokerNextDue) - a
+    // failure state's bounded timer, armed only while the broker is down.
     if (now - g_WgcLastLaunch < 8000) return;
     if (sid != 0xFFFFFFFF && GetShellWindow())
     {
         g_WgcLastLaunch = now;
         // REAP A HUNG INSTANCE BEFORE RELAUNCHING. The broker holds Global\QubesWgcBrokerSingleton;
         // a second instance exits 0, silently, on it (wgcbroker.cpp wmain). So when the old broker
-        // is HUNG (heartbeat stale, process alive - e.g. blocked in PrintWindow on a hung target)
+        // is HUNG (a request unanswered, process alive - e.g. blocked in PrintWindow on a hung target)
         // every relaunch here was refused without a trace and the outage lasted until the hung app
         // died or the guest rebooted, while QGADESLICEDOWN pointed at a wgcbroker log that does not
         // exist (audit 2026-09-08). The handle was validated when taken (WgcOpenBrokerProcess), so
@@ -2968,27 +3073,26 @@ static void BrokerSupervise(void)
                         L"most likely be refused by the singleton mutex", GetLastError());
             }
             CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
-        _InterlockedExchange(&g_WgcBrokerPidValidated, 0);   // a dead broker must not keep suppressing windows
+            g_WgcBrokerHung = FALSE;
+            _InterlockedExchange(&g_WgcBrokerPidValidated, 0);   // a dead broker must not keep suppressing windows
         }
-        // ZERO THE SHARED FIELD, not just our local copy. ROOT CAUSE of "broker death is never
-        // detected", measured 2026-09-08: a dead broker's LAST heartbeat stays in shared memory,
-        // non-zero, for ever. Resetting only g_WgcBrokerHbLast to 0 meant the very next supervise
-        // pass compared that stale value against 0, found them different, and read it as "the
-        // heartbeat ADVANCED" - refreshing g_WgcBrokerHbSeenAt and re-certifying a corpse as alive.
-        // Since this ran on every relaunch attempt (~8 s), a dead broker was declared healthy
-        // indefinitely: no QGABROKERDIED, no QGADESLICEDOWN, brokerState stuck at READY, and the
-        // recovery machinery was thereby SUPPRESSING the failure detection it exists to support.
-        // Zeroing the shared field makes "no heartbeat yet" representable: the `hb != 0` guard then
-        // holds until a NEW broker writes a genuinely fresh value.
-        if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->BrokerHeartbeat = 0;
-        g_WgcBrokerHbLast = 0; g_WgcBrokerHbSeenAt = 0;   // await a fresh heartbeat from the new broker
+        // The old instance is gone (exited, or terminated just above): nothing can write the arena regions
+        // it was asked to release any more, so all of them are reusable now (R4 without the ack).
+        WgcArenaReapPending(TRUE);
+        // ZERO THE SHARED PID, so "ready" can only mean the NEW instance published one. A dead broker's
+        // last value stays in the section for ever - the same trap that made a stale heartbeat certify a
+        // corpse as alive (measured 2026-09-08) - and every request clock restarts for the new instance.
+        WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
+        for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
+            if (g_SlotCtlSince[i]) g_SlotCtlSince[i] = now;
         if (WgcLaunch()) g_WgcSession = sid;
     }
 }
 
 static void BrokerShutdown(void)
 {
-    if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->Shutdown = 1;   // broker self-exits on this flag
+    if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->Shutdown = 1;   // broker self-exits on this flag...
+    if (g_WgcCtl) SetEvent(g_WgcCtl);                      // ...read when it wakes: it has no timer any more
     WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
     if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
                            _InterlockedExchange(&g_WgcBrokerPidValidated, 0); }
@@ -3538,6 +3642,15 @@ BOOL DirectRequired(void)
     return g_WgcBroker && g_OsBuild >= 26100 && PwEnabled();
 }
 
+// When BrokerState() stops answering BRK_STARTING; 0 = it does not answer it now. The held-window sweep arms the
+// declaration of a frameless window at the later of this and the window's own grace (rest-zero S4).
+static ULONGLONG BrokerGraceEnd(void)
+{
+    if (BrokerState() != BRK_STARTING) return 0;
+    const ULONGLONG anchor = g_BrokerDownSince ? g_BrokerDownSince : g_AgentStartTick;
+    return anchor + BROKER_LAUNCH_GRACE_MS;
+}
+
 static ULONGLONG WgcArenaAlloc(ULONGLONG bytes)   // best-fit free-list, else 64-aligned bump; 0 == full
 {
     bytes = (bytes + 63) & ~(ULONGLONG)63;
@@ -3585,24 +3698,30 @@ static void WgcArenaFree(ULONGLONG off, ULONGLONG size)
     }
 }
 
-// Queue a slot's two buffers for DEFERRED reclaim - not reusable until the broker has certainly
-// stopped writing them (past its Reconcile interval). Reaped in BrokerSupervise.
-static void WgcArenaFreeDeferred(ULONGLONG off0, ULONGLONG off1, ULONGLONG size)
+// Queue a slot's two buffers for DEFERRED reclaim - not reusable until the broker has ACKNOWLEDGED the unregister
+// that released them (R4: the slot's CtlAck reached `seq`; CloseChannel ran under the slot lock before that ack, so no
+// publish can still be writing them). Reaped by WgcArenaReapPending - on the next supervise pass or allocation, never
+// on a timer (the 2 s delay this replaced needed the 1 Hz supervisor to run it).
+static void WgcArenaFreeDeferred(ULONGLONG off0, ULONGLONG off1, ULONGLONG size, int slot, LONG seq)
 {
     if (g_WgcPendingCount >= (int)RTL_NUMBER_OF(g_WgcPending))
     { WgcArenaFree(off0, size); WgcArenaFree(off1, size); return; }   // overflow: accept the small race over a leak
     g_WgcPending[g_WgcPendingCount].off0 = off0;
     g_WgcPending[g_WgcPendingCount].off1 = off1;
     g_WgcPending[g_WgcPendingCount].size = size;
-    g_WgcPending[g_WgcPendingCount].freeAtTick = GetTickCount64() + WGC_ARENA_FREE_DELAY_MS;
+    g_WgcPending[g_WgcPendingCount].slot = slot;
+    g_WgcPending[g_WgcPendingCount].seq = seq;
     g_WgcPendingCount++;
 }
 
-static void WgcArenaReapPending(void)
+// all = TRUE when no broker instance can write any region (the old one exited or was terminated before a relaunch).
+static void WgcArenaReapPending(BOOL all)
 {
-    ULONGLONG now = GetTickCount64();
+    if (!g_WgcBase) return;
+    const WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
     for (int i = 0; i < g_WgcPendingCount; )
-        if (now >= g_WgcPending[i].freeAtTick)
+        if (all || g_WgcPending[i].slot < 0 || g_WgcPending[i].slot >= WGCBRK_MAX_SLOTS ||
+            (LONG)((ULONG)slots[g_WgcPending[i].slot].CtlAck - (ULONG)g_WgcPending[i].seq) >= 0)
         {
             WgcArenaFree(g_WgcPending[i].off0, g_WgcPending[i].size);
             WgcArenaFree(g_WgcPending[i].off1, g_WgcPending[i].size);
@@ -3632,6 +3751,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
 
     WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
     WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
+    WgcArenaReapPending(FALSE);   // regions the broker has released since the last supervise pass (R4)
     int slot = -1;
     for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
         if (slots[i].Hwnd == 0 && slots[i].ReqState == WGCBRK_FREE) { slot = i; break; }
@@ -3699,6 +3819,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&h->ControlGen);
     entry->PwBrokerSlot = slot; entry->PwBrokerSourced = TRUE; entry->PwBrokerArenaOff = off0;
+    BrokerRequestSent(slot);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
     // At Info, with a tick: the gap from here to QGASLICECONTENT is the broker's first-frame
     // latency, which is what menu latency reduces to once nothing maps unpainted (2026-09-11).
@@ -3812,6 +3933,7 @@ BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
     MemoryBarrier();
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&WGCBRK_HDR(g_WgcBase)->ControlGen);
+    BrokerRequestSent(entry->PwBrokerSlot);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
 
     // PwBrokerLastId and PwBrokerFrames are PRESERVED. The window's own buffer is a fresh zeroed
@@ -3842,10 +3964,11 @@ void BrokerUnregister(IN OUT WINDOW_DATA* entry)
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&WGCBRK_HDR(g_WgcBase)->ControlGen);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
+    BrokerRequestSent(entry->PwBrokerSlot);
     // Reclaim the two arena buffers so high-churn windows (menus) don't exhaust the arena - but
-    // DEFERRED: the broker may still publish to this slot until its next Reconcile, so the regions
-    // must not become reusable until well past that (WgcArenaReapPending, called from supervise).
-    WgcArenaFreeDeferred(off0, off1, bsz);
+    // DEFERRED: the broker may still publish to this slot until it has handled this unregister, so
+    // the regions become reusable on its acknowledgement (R4, WgcArenaReapPending).
+    WgcArenaFreeDeferred(off0, off1, bsz, entry->PwBrokerSlot, s->ControlSeq);
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1; entry->PwBrokerArenaOff = 0;
 }
 
@@ -4057,6 +4180,15 @@ static void PwNoteSliceFedMap(IN OUT WINDOW_DATA* entry)
 
 static ULONGLONG g_MapDeferWake = 0;   // earliest MapDeferred deadline (tick), 0 = none armed
 
+// The first deadline of a newly held window. On a DirectRequired guest it is the crop CEILING itself (rest-zero S4): the
+// window is released before it by its own events - its first painted broker frame (PwConsumeBrokerFrame queues it), its
+// crop result, its show - so the 32 ms re-check tick below 26100 has no work to do there.
+static ULONGLONG MapDeferFirstDue(IN const WINDOW_DATA* entry)
+{
+    return DirectRequired() ? entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10
+                            : entry->MapDeferSince + MAP_DEFER_RECHECK_MS;
+}
+
 static void MapDeferWakeSweep(void)
 {
     if (g_MapDeferWake == 0)
@@ -4072,6 +4204,33 @@ static void MapDeferWakeSweep(void)
         if (!entry->MapDeferred || entry->DeletePending)
             continue;
         const ULONGLONG ceiling = entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10;
+        if (DirectRequired())
+        {
+            // ONE DEADLINE PER HELD WINDOW, NEVER A RE-CHECK TICK (rest-zero S4). The crop ceiling (the tracking pass maps
+            // the window, or keeps holding one with no pixels), then - for a window still held with nothing painted - the
+            // moment its registration grace and the broker's have both run out, when the pass DECLARES it
+            // (QGADIRECTSUPPRESS). Past both nothing is armed for it: a withheld window costs no wakes, and its first
+            // painted frame still releases it at once. The 100 ms re-arm this replaced woke the loop ten times a second
+            // for every window that never got a frame, for as long as it existed.
+            if (entry->MapDeferDue == 0)
+                entry->MapDeferDue = ceiling;
+            if (entry->MapDeferDue != MAXULONGLONG && now >= entry->MapDeferDue)
+            {
+                QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
+                ULONGLONG nd = MAXULONGLONG;
+                if (entry->MapDeferDue <= ceiling && !entry->PwDirectSuppressed && entry->PwDirectSince != 0)
+                {
+                    ULONGLONG decl = entry->PwDirectSince + DIRECT_WINDOW_GRACE_MS + 10;
+                    const ULONGLONG bEnd = BrokerGraceEnd() + 10;
+                    if (decl < bEnd) decl = bEnd;
+                    if (decl > now) nd = decl;
+                }
+                entry->MapDeferDue = nd;
+            }
+            if (entry->MapDeferDue != MAXULONGLONG && (next == 0 || entry->MapDeferDue < next))
+                next = entry->MapDeferDue;
+            continue;
+        }
         // Poke the tracking pass on EVERY tick, not only at the ceiling. The pass is the only
         // legal release site, so a hold whose crop is already resolved stays held until one
         // runs; waking only at the ceiling made every menu pay the full bound even when its
@@ -4599,7 +4758,8 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             // Wake guarantee: arm the main loop so the CROP_BEFORE_SHOW_TIMEOUT_MS bound
             // fires even if no frame/event ever wakes it again (see MapDeferWakeSweep).
             {
-                ULONGLONG due = entry->MapDeferSince + MAP_DEFER_RECHECK_MS;
+                ULONGLONG due = MapDeferFirstDue(entry);
+                entry->MapDeferDue = due;
                 if (g_MapDeferWake == 0 || due < g_MapDeferWake)
                     g_MapDeferWake = due;
             }
@@ -4614,7 +4774,8 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             entry->MapDeferred = TRUE;
             entry->MapDeferSince = GetTickCount64();
             {
-                ULONGLONG due = entry->MapDeferSince + MAP_DEFER_RECHECK_MS;
+                ULONGLONG due = MapDeferFirstDue(entry);
+                entry->MapDeferDue = due;
                 if (g_MapDeferWake == 0 || due < g_MapDeferWake)
                     g_MapDeferWake = due;
             }
@@ -8096,6 +8257,40 @@ static int PwCollectOpaqueOccluders(IN const WINDOW_DATA* self, IN const RECT* r
     return n;
 }
 
+// Does any part of r lie outside every rect of occ[0..n)? Rectangle subtraction, bounded: past the budget it answers TRUE
+// (for a PrintWindow slot the poke is the render trigger, so the conservative answer is "visible"; for a WGC slot it
+// costs at most one extra liveness hint).
+static BOOL PwRectVisibleBeyond(IN const RECT* r, IN const RECT* occ, IN int n, IN OUT int* budget)
+{
+    RECT o, parts[4];
+    int k = 0;
+    if (IsRectEmpty(r)) return FALSE;
+    if (n <= 0) return TRUE;
+    if (--(*budget) < 0) return TRUE;
+    if (!IntersectRect(&o, r, &occ[0])) return PwRectVisibleBeyond(r, occ + 1, n - 1, budget);
+    if (o.top > r->top)       SetRect(&parts[k++], r->left, r->top, r->right, o.top);
+    if (o.bottom < r->bottom) SetRect(&parts[k++], r->left, o.bottom, r->right, r->bottom);
+    if (o.left > r->left)     SetRect(&parts[k++], r->left, o.top, o.left, o.bottom);
+    if (o.right < r->right)   SetRect(&parts[k++], o.right, o.top, r->right, o.bottom);
+    for (int i = 0; i < k; i++)
+        if (PwRectVisibleBeyond(&parts[i], occ + 1, n - 1, budget)) return TRUE;
+    return FALSE;
+}
+
+// What decides a window's visible region on this pass: its rect and the opaque rects above it, in list order.
+static UINT64 PwVisibleSig(IN const RECT* w, IN const RECT* occ, IN int n)
+{
+    UINT64 h = 1469598103934665603ull;
+#define PWVS_MIX(v) do { h ^= (UINT64)(UINT32)(v); h *= 1099511628211ull; } while (0)
+    PWVS_MIX(w->left); PWVS_MIX(w->top); PWVS_MIX(w->right); PWVS_MIX(w->bottom); PWVS_MIX(n);
+    for (int i = 0; i < n; i++)
+    {
+        PWVS_MIX(occ[i].left); PWVS_MIX(occ[i].top); PWVS_MIX(occ[i].right); PWVS_MIX(occ[i].bottom);
+    }
+#undef PWVS_MIX
+    return h;
+}
+
 // ABI 5 reads the broker's first-frame stage ticks as QPC counts; this is the matching agent-side
 // read for "now". Independent of g_PerfEnabled - BROKERCHAIN must measure whether or not the perf
 // sink is on, and PerfNow() returns 0 when it is off.
@@ -8858,10 +9053,12 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
     // else: no new broker frame this pass -> nothing changed, skip
 
     // Crop-before-show: a per-window broker frame is available, so the crop is now
-    // measurable; if this window's MAP is still held, poke the tracking pass to map
-    // it promptly rather than waiting for the 2 s resync.
+    // measurable; if this window's MAP is still held, queue THIS window for the tracking
+    // pass, which maps it (the pass is the only legal release site). Queued by handle, not a
+    // bare poke: a poke runs a pass with nothing in it unless a resync is due, and on a
+    // DirectRequired guest nothing re-checks a held window on a timer any more (rest-zero S4).
     if (entry->MapDeferred)
-        PokeWindowTracking();
+        QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
     return TRUE;
 }
 
@@ -9316,19 +9513,29 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // or too many occluders to describe (-1), nothing is excluded - the behaviour before this. For a WGC
                     // slot the poke is only a liveness hint, so a skipped poke cannot hide content.
                     RECT occ[PW_MAX_OCCLUDERS];
-                    const int nOcc = g_ZOrderCaptureValid
+                    int nOcc = g_ZOrderCaptureValid
                         ? PwCollectOpaqueOccluders(entry, &pokeRect, occ, PW_MAX_OCCLUDERS) : 0;
-                    for (UINT ddi = 0; ddi < frame->dirty_rects_count; ddi++)
+                    if (nOcc < 0)
+                        nOcc = 0;   // too many to describe: nothing excluded, as before
+                    // ONLY THE WINDOW'S OWN CHANGE POKES IT (docs/DESIGN-rest-zero-capture.md E). Two refinements of the
+                    // occluder rule above, because on 26100+ an unanswered poke now ends in a DEAF hold (FAILED, no
+                    // PrintWindow rung) rather than in a polled render:
+                    //   * the damage must reach a part of the window that NO opaque window above covers - the union of
+                    //     the occluders, not one at a time (damage straddling two windows above it is theirs, not ours);
+                    //   * the window's visible region must be the one it had on the previous damaged frame: damage while
+                    //     it changes - this window or one above it moved, appeared, vanished or resized - is a reveal or
+                    //     an occlusion, not this window's content. Such a pass pokes nothing; a real change of its own
+                    //     shows again on the next frame (for WGC the poke is only a liveness hint anyway).
+                    const UINT64 vsig = PwVisibleSig(&pwRect, occ, nOcc);
+                    const BOOL visStable = entry->PwVisSigValid && entry->PwVisSig == vsig;
+                    entry->PwVisSig = vsig;
+                    entry->PwVisSigValid = TRUE;
+                    for (UINT ddi = 0; visStable && ddi < frame->dirty_rects_count; ddi++)
                     {
                         if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pokeRect))
                         {
-                            BOOL above = FALSE;
-                            for (int oi = 0; oi < nOcc && !above; oi++)
-                            {
-                                RECT under;
-                                above = IntersectRect(&under, &pwHit, &occ[oi]) && EqualRect(&under, &pwHit);
-                            }
-                            if (above)
+                            int budget = 256;
+                            if (!PwRectVisibleBeyond(&pwHit, occ, nOcc, &budget))
                                 continue;
                             BrokerPokeDamage(entry);
                             break;      // one poke per pass; the broker coalesces
@@ -10678,6 +10885,9 @@ static ULONG WINAPI WatchForEvents(void)
     BOOL capDeadReported = FALSE;   // QGACAPDEAD fires once per departure, not once per pass
     ULONGLONG degradedLogLast = 0;
 
+    // The broker's first launch must not wait for an unrelated wake: the loop below no longer caps its wait for it.
+    BrokerSupervise();
+
     while (TRUE)
     {
         status = ERROR_SUCCESS;
@@ -10703,17 +10913,32 @@ static ULONG WINAPI WatchForEvents(void)
             waitTimeout = (captureRetryDue > now64) ? (DWORD)(captureRetryDue - now64) : 0;
         }
 
-        // While the WGC broker OR the notification bridge is active, wake the loop ~1/s even when
-        // idle so BrokerSupervise/NotifBridgeSupervise keep heartbeats fresh and relaunch a dead
-        // helper promptly. Without the g_NotifBridge clause the bridge had NO idle wakeup on a
-        // win10 guest (WgcBroker floors at build 26100), so a crashed bridge stayed down until the
-        // next frame/vchan event - fail-closed while its ShowBanner suppression stood. The
-        // g_NotifRestorePending clause is the gate-OFF mirror of that lesson: the crash-leftover
-        // banner restore sweep must not wait on an unrelated wakeup either. Only tightens an
-        // otherwise-INFINITE (or longer) idle wait; never lengthens a shorter one.
-        if (((g_WgcBroker && g_WgcBase) || g_NotifBridge || g_NotifRestorePending) &&
+        // While the notification bridge is active, wake the loop ~1/s even when idle so
+        // NotifBridgeSupervise keeps reading its heartbeat and relaunches a dead bridge promptly.
+        // Without the g_NotifBridge clause the bridge had NO idle wakeup on a win10 guest (WgcBroker
+        // floors at build 26100), so a crashed bridge stayed down until the next frame/vchan event -
+        // fail-closed while its ShowBanner suppression stood. The g_NotifRestorePending clause is the
+        // gate-OFF mirror of that lesson: the crash-leftover banner restore sweep must not wait on an
+        // unrelated wakeup either. Only tightens an otherwise-INFINITE (or longer) idle wait; never
+        // lengthens a shorter one.
+        // THE BROKER IS NO LONGER IN THIS CLAUSE (docs/DESIGN-rest-zero-capture.md S4): its exit is a
+        // handle in the wait array, its readiness the frame-event wake it gives after publishing its
+        // pid, and its hang an unanswered request - BrokerNextDue arms the one deadline that is
+        // pending, if any, and nothing at all at rest.
+        if ((g_NotifBridge || g_NotifRestorePending) &&
             (waitTimeout == INFINITE || waitTimeout > 1000))
             waitTimeout = 1000;
+        {
+            const ULONGLONG due = BrokerNextDue();
+            if (due != 0)
+            {
+                const ULONGLONG now64 = GetTickCount64();
+                const ULONGLONG left = (due > now64) ? (due - now64) : 0;
+                const DWORD toDue = (left < 0x7FFFFFFFull) ? (DWORD)left : 0x7FFFFFFFu;
+                if (waitTimeout == INFINITE || toDue < (DWORD)waitTimeout)
+                    waitTimeout = toDue;
+            }
+        }
 
         // [CaptureGateFaultInject bit 4] Raise one capture error, once, to open the gate.
         if ((captureGateFault & 4) && !captureGateFaultFired &&
@@ -10745,6 +10970,18 @@ static ULONG WINAPI WatchForEvents(void)
         // dictated move, and release held damage.
         if (waitTimeout == INFINITE && g_VchanClientConnected && DaemonSettleWorkPending())
             waitTimeout = 100;
+
+        // A DEFERRED NON-SEAMLESS SWITCH reports itself every 3 s while it is stuck (QGAFSSTALL, below the switch). That
+        // report rode the 1 s cap; it is a failure state, so it keeps a bounded deadline of its own - armed only while
+        // the switch is pending (rest-zero S4).
+        if (g_NonSeamlessPending)
+        {
+            const ULONGLONG now64 = GetTickCount64();
+            const ULONGLONG at = fsStallLast + 3000;
+            const DWORD toStall = (at > now64) ? (DWORD)(at - now64) : 0;
+            if (waitTimeout == INFINITE || toStall < (DWORD)waitTimeout)
+                waitTimeout = toStall;
+        }
 
         // SLICE-MAP-HOLD WAKE GUARANTEE (see MapDeferWakeSweep): release any expired
         // map-hold NOW (queues the window for the tracking pass that maps it), then cap
@@ -10883,6 +11120,15 @@ static ULONG WINAPI WatchForEvents(void)
             frameEventIdx = (int)eventCount;
             watchedEvents[eventCount++] = g_WgcFrame;
         }
+        // THE CAPTURE THREAD'S EXIT WAKES THE LOOP (rest-zero S4). QGACAPDEAD below is evaluated on a wake; it used to
+        // ride the 1 s cap, and the capture thread now blocks in its acquire with no timeout on a direct guest, so a
+        // thread that leaves would otherwise go unnoticed until something unrelated happened. Only while the context is
+        // live and the thread still running - a signalled thread handle stays signalled, so a thread that has left is
+        // never put back (one wake per departure, whatever the thread's own flags say). Like the helper handles, it has
+        // no case in the switch below.
+        if (capture && capture->thread && !capDeadReported && eventCount < MAXIMUM_WAIT_OBJECTS &&
+            WaitForSingleObject(capture->thread, 0) == WAIT_TIMEOUT)
+            watchedEvents[eventCount++] = capture->thread;
 
         // Wait for events.
         signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, waitTimeout);
@@ -10927,7 +11173,7 @@ static ULONG WINAPI WatchForEvents(void)
         if (WAIT_TIMEOUT == signaledEvent && g_VchanClientConnected)
             DaemonSettleSweep();
 
-        BrokerSupervise();   // ~1 Hz self-throttled; no-op unless the WgcBroker gate is on
+        BrokerSupervise();   // every wake, waits for nothing; no-op unless the WgcBroker gate is on
         NotifBridgeSupervise();   // ~0.2 Hz; no-op unless the NotifyBridge gate is on
         EtwProxyPoke();   // launch-precondition only (console session / user change); proxy
                           // DEATH is detected by its exit-wait, not here (etwproxy.c)

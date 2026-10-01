@@ -12,7 +12,9 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  18u  /* 18: BrokerStage + HungSkips - which call a broker hang is in, and
+#define WGCBRK_ABI_VERSION  19u  /* 19: rest-zero S3/S4 - no heartbeats; CtlAck (the request ack the agent's
+                                  *     deadlines key on), DeafHolds + WGCBRK_E_DEAF, AgentFrameWakes/AgentStalls (R5);
+                                  * 18: BrokerStage + HungSkips - which call a broker hang is in, and
                                   *     PrintWindows skipped for an unresponsive target; 17: Republished */
 #define WGCBRK_MAX_SLOTS    32
 /* ABI 13: the delivered frame reduced to a fixed WGCBRK_TILES x WGCBRK_TILES grid of per-tile MEAN
@@ -48,6 +50,15 @@
  * and re-route to PrintWindow. Keyed on the symptom rather than on window structure. Liberal on
  * purpose: a wrong re-route now costs a single render before the adaptive backoff decays it. */
 #define WGCBRK_WGC_QUIET_MS 2000
+/* ABI 19 (docs/DESIGN-rest-zero-capture.md E): FailHr of a slot whose WGC session was quiet through a poke or a missing
+ * first frame, recreated once and quiet again. The broker holds it FAILED until the agent asks again (a new ControlSeq)
+ * - never a PrintWindow route and never a timed retry. The agent withholds the window and logs QGAWGCDEAF. A
+ * customer-bit HRESULT, so it can never collide with one the system returns. */
+#define WGCBRK_E_DEAF       ((LONG)0xA057DEAFu)
+/* ABI 19 (D, R1/R4): how long a request may go unacknowledged (CtlAck behind ControlSeq) before the broker is HUNG. */
+#define WGCBRK_ACK_DEADLINE_MS 2000
+/* ABI 19 (D, R5): how long a published frame may wait for the agent to wake on it (AgentFrameWakes unchanged). */
+#define WGCBRK_AGENT_DEADLINE_MS 5000
 /* After a quiet re-route turns out to have been wrong - the window was merely static - do not
  * re-test it for this long. Without the hysteresis a static window is re-tested every quiet
  * period for ever, which is a churn loop costing a render every couple of seconds. */
@@ -77,8 +88,11 @@ typedef struct _WGCBRK_HEADER {          /* 128 bytes */
     volatile LONG      BrokerStage;
     volatile LONGLONG  ArenaOffset;      /* bytes from base to the pixel arena */
     volatile LONGLONG  ArenaBytes;       /* total arena budget */
-    volatile LONGLONG  AgentHeartbeat;   /* GetTickCount64, bumped each supervise pass */
-    volatile LONGLONG  BrokerHeartbeat;  /* GetTickCount64, bumped each broker pass */
+    /* RETIRED at ABI 19 (rest-zero S4): neither side writes or reads a heartbeat any more - a heartbeat is a timer on
+     * both sides and detects only a HUNG peer. Exits are process handles; hangs are request deadlines (CtlAck, R5).
+     * The fields keep their place so no offset moves. */
+    volatile LONGLONG  AgentHeartbeat;
+    volatile LONGLONG  BrokerHeartbeat;
     volatile LONG      AgentPid;         /* the launcher agent's pid; broker exits if it changes */
     volatile LONG      BrokerPid;
     volatile LONG      ControlGen;       /* agent bumps on ANY capture-list change */
@@ -97,7 +111,14 @@ typedef struct _WGCBRK_HEADER {          /* 128 bytes */
      * relayFail=0. Taken from the reserved padding so the header size stays 128. */
     volatile LONG      RelayCapable;   /* 1 = the broker latched the relay ON at startup */
     volatile LONG      RelayOsBuild;   /* the build it decided from, via RtlGetVersion */
-    BYTE               _pad2[48];
+    /* ABI 19, R5 (docs/DESIGN-rest-zero-capture.md D): the agent bumps AgentFrameWakes on every main-loop wake (the
+     * broker's frame event is one); a frame the broker published that has not moved it within WGCBRK_AGENT_DEADLINE_MS
+     * is a HUNG agent,
+     * counted here (a medium-IL broker cannot reap a SYSTEM agent; the remedy is the watchdog's). Was _pad2[0..15]. */
+    volatile LONG      AgentFrameWakes;
+    volatile LONG      AgentStalls;
+    volatile LONGLONG  AgentStallTick;
+    BYTE               _pad2[32];
 } WGCBRK_HEADER;
 
 typedef struct _WGCBRK_SLOT {
@@ -166,7 +187,12 @@ typedef struct _WGCBRK_SLOT {
     volatile LONGLONG FirstArrivedTick;  /* WGC: first FrameArrived.           PW: first PrintWindow returned */
     volatile LONGLONG FirstPublishTick;  /* first publish completed (both paths) */
     volatile LONG     PollCount;         /* PW: polls entered for this open; WGC: 0 */
-    volatile LONG     _padTick2;
+    /* ABI 19 (was _padTick2), R1/R4: the ControlSeq the broker's main loop last HANDLED for this slot - written at the
+     * end of each Reconcile pass over it, after any open or close. The agent arms a deadline when it bumps ControlSeq
+     * and disarms it when this catches up: unanswered for WGCBRK_ACK_DEADLINE_MS = a hung broker (QGABROKERHUNG). For
+     * an unregister it is also the moment the broker can no longer write the slot's buffers (CloseChannel ran under the
+     * slot lock), so the arena regions are reclaimed on it instead of on a timer. */
+    volatile LONG     CtlAck;
     /* ABI 6. WGC FRAME ACCOUNTING. Why: a window can sit with AckState==ACTIVE, a clean open
      * (every stage tick populated) and a healthy broker, and still publish nothing ever again -
      * measured 2026-09-25 on Settings, which published exactly 2 frames and then stopped for
@@ -186,7 +212,7 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG     LastContentH;
     volatile LONG     PoolW;             /* the pool size it was compared against */
     volatile LONG     PoolH;
-    volatile LONG     _padAbi6;
+    volatile LONG     DeafHolds;         /* ABI 19 (was _padAbi6): times this slot went FAILED with WGCBRK_E_DEAF */
     /* ABI 7. DAMAGE-DRIVEN POLLING for the PrintWindow path.
      *
      * WHY. A window whose content is rendered by a CROSS-PROCESS CHILD has an empty surface of its

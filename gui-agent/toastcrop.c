@@ -995,7 +995,14 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
     // ~attempts x measurement-time and releases (mapped cropped, or uncropped once the defer
     // budget is spent) instead of stalling for seconds.
     if (attemptDone)
-        PokeWindowTracking();
+    {
+        // DirectRequired: queue THIS window - nothing re-checks a held window on a tick there any more, and a bare poke
+        // re-examines nothing unless a resync is due (rest-zero S4). Below 26100 unchanged (design I).
+        if (DirectRequired())
+            PokeWindowTrackingFor(req->Window);
+        else
+            PokeWindowTracking();
+    }
 }
 
 static DWORD WINAPI TcWorkerThread(IN void* param)

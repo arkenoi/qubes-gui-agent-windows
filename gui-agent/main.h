@@ -145,6 +145,13 @@ typedef struct _WINDOW_DATA
     // the reverted reject-in-ShouldAcceptWindow attempt). MapDeferSince is GetTickCount64 at defer.
     BOOL MapDeferred;
     ULONGLONG MapDeferSince;
+    // Rest-zero S4 (DirectRequired guests): the ONE deadline armed for this held window - its crop ceiling, then the
+    // declaration of a window that never got a frame; MAXULONGLONG = nothing more is armed for it (see MapDeferWakeSweep).
+    ULONGLONG MapDeferDue;
+    // Rest-zero E: the signature of this window's VISIBLE region (its rect + the opaque rects above it) on the last frame
+    // that carried damage. A damage poke needs it unchanged: damage while it changes is reveal/occlusion, not W's own.
+    UINT64 PwVisSig;
+    BOOL PwVisSigValid;
 
     // Position as of the frame currently being processed. Dirty rects come from a frame
     // captured BEFORE this frame's tracking update ran, so converting them to
@@ -631,3 +638,4 @@ void PwInvalidateFramebuffer(void);
 // Wake the main loop's window-tracking pass (thread-safe; used by the toastcrop worker
 // when an async crop measurement resolves).
 void PokeWindowTracking(void);
+void PokeWindowTrackingFor(IN HWND window);
