@@ -161,6 +161,7 @@ typedef struct _WINDOW_DATA
     ULONG PwEchoSkips;      // damage pokes withheld because the pixels had not changed (QGAPWECHO)
     ULONG PwPokeSameSkips;  // WGC liveness pokes withheld: the damaged screen showed the window's own last frame (QGAPOKESAME)
     ULONG PwPokeLiveSkips;  // WGC liveness pokes withheld: the damage lay under a LIVE window above this one (QGAPOKELIVE)
+    ULONG PwPokeDeskSkips;  // WGC liveness pokes withheld: the damage rect also covered uncovered desktop (QGAPOKEDESK)
     // QGACOMPOSITECOPY said for this window (M4: a composite copy on a DirectRequired guest is an error, said once).
     BOOL PwCompositeLogged;
 

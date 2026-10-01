@@ -8512,6 +8512,80 @@ static BOOL PwHitCoveredLive(IN HWND self, IN const RECT* hit, OUT HWND* covered
     return n > 0 && !PwRectVisibleBeyond(hit, occ, n, &budget);
 }
 
+// THE DESKTOP SHOWS THROUGH (rest-zero M7, ADR-capture section 26). A dirty rect that also covers uncovered DESKTOP - screen
+// area no tracked window (inflated by the shadow margin) covers, i.e. the wallpaper - is a desktop change, a reveal or an
+// occlusion, never solely a window's own change, so no liveness poke comes from it. Measured 2026-10-01: a wallpaper change
+// (Windows Spotlight rotates it; it also loads after login) gave DDA's coarse rects over the desktop's uncovered top band and
+// left strip; the windows whose backdrop is tinted from the wallpaper differed on screen from their WGC frames, were poked and
+// recreated - 3 per change - and the recreated sessions' first frames were IDENTICAL to the old ones (32x32 tiles, title and
+// centre 0.0): the backdrop is not in a WGC frame at all, so the recreate bought nothing (Jev: false 1.00; this rule 0.85 over
+// recording the residual 0.15 and a time window after the wallpaper broadcast 0.00). Classified once per dirty rect per frame,
+// lazily, only for rects that reach a liveness candidate; a window list too long to describe answers "not desktop" (pokes as
+// before). The caller holds g_csWatchedWindows. Only a real piece of desktop counts - at least 32x32 px of the rect uncovered
+// (a sliver from rounding or a window's own change merged with a desktop edge is not one) - and every case that cannot be
+// decided (a window list or a subtraction too long to describe) answers "not desktop", i.e. the poke goes out as before
+// (Jev review: one direction for every fallback, slivers not counted).
+#define PW_DESK_CACHE 64
+#define PW_DESK_MIN_AREA (32 * 32)
+static signed char g_PwDeskClass[PW_DESK_CACHE];   // per dirty rect of the current frame: -1 unknown, 0 windows only, 1 desktop
+
+// The area of r that no rect of occ[0..n) covers; -1 when the subtraction outgrew its budget (undecided).
+static LONGLONG PwRectUncoveredArea(IN const RECT* r, IN const RECT* occ, IN int n, IN OUT int* budget)
+{
+    RECT o, parts[4];
+    int k = 0;
+    if (IsRectEmpty(r)) return 0;
+    if (n <= 0) return (LONGLONG)(r->right - r->left) * (LONGLONG)(r->bottom - r->top);
+    if (--(*budget) < 0) return -1;
+    if (!IntersectRect(&o, r, &occ[0])) return PwRectUncoveredArea(r, occ + 1, n - 1, budget);
+    if (o.top > r->top)       SetRect(&parts[k++], r->left, r->top, r->right, o.top);
+    if (o.bottom < r->bottom) SetRect(&parts[k++], r->left, o.bottom, r->right, r->bottom);
+    if (o.left > r->left)     SetRect(&parts[k++], r->left, o.top, o.left, o.bottom);
+    if (o.right < r->right)   SetRect(&parts[k++], o.right, o.top, r->right, o.bottom);
+    LONGLONG sum = 0;
+    for (int i = 0; i < k; i++)
+    {
+        const LONGLONG a = PwRectUncoveredArea(&parts[i], occ + 1, n - 1, budget);
+        if (a < 0) return -1;
+        sum += a;
+    }
+    return sum;
+}
+
+static BOOL PwDirtyTouchesDesktop(IN const RECT* r)
+{
+    RECT occ[PW_MAX_OCCLUDERS * 4];
+    RECT x;
+    int n = 0;
+    WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
+    {
+        e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (e->IsVisible && !e->IsIconic && !e->DeletePending && e->Width > 0 && e->Height > 0)
+        {
+            RECT w = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
+            InflateRect(&w, PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
+            if (IntersectRect(&x, &w, r))
+            {
+                if (n >= (int)RTL_NUMBER_OF(occ))
+                    return FALSE;   // too many to describe: not desktop, the poke goes out as before
+                occ[n++] = w;
+            }
+        }
+        e = (WINDOW_DATA*)e->ListEntry.Flink;
+    }
+    int budget = 512;
+    return PwRectUncoveredArea(r, occ, n, &budget) >= PW_DESK_MIN_AREA;   // -1 (undecided) is below it: not desktop
+}
+static BOOL PwDirtyIsDesktop(IN const CAPTURE_FRAME* frame, IN UINT i)
+{
+    if (i >= PW_DESK_CACHE)
+        return PwDirtyTouchesDesktop(&frame->dirty_rects[i]);
+    if (g_PwDeskClass[i] < 0)
+        g_PwDeskClass[i] = PwDirtyTouchesDesktop(&frame->dirty_rects[i]) ? 1 : 0;
+    return g_PwDeskClass[i] == 1;
+}
+
 // What decides a window's visible region on this pass: its rect and the opaque rects above it, in list order.
 static UINT64 PwVisibleSig(IN const RECT* w, IN const RECT* occ, IN int n)
 {
@@ -9325,6 +9399,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
     IN UINT fbWidth, IN UINT fbHeight)
 {
     g_FrameCount++;   // QGAFSSTALL only; nothing is logged on the frame path
+    memset(g_PwDeskClass, 0xFF, sizeof(g_PwDeskClass));   // this frame's dirty rects are not classified yet (-1)
     // Complete a deferred non-seamless switch as soon as frames flow again at the smaller
     // size. This lives on the FRAME path deliberately: a resolution change can take the
     // capture down with 0x887a0026 (keyed mutex abandoned) and recover via
@@ -9785,6 +9860,18 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             int budget = 256;
                             if (!PwRectVisibleBeyond(&pwHit, occ, nOcc, &budget))
                                 continue;
+                            // M7 class 4: a rect that also covers uncovered desktop is not this window's own change
+                            // (PwDirtyIsDesktop). Liveness slots only, like the live check below.
+                            if (livenessOnly && PwDirtyIsDesktop(frame, ddi))
+                            {
+                                const ULONG n = ++entry->PwPokeDeskSkips;
+                                if (n <= 4 || (n % 256) == 0)
+                                    LogInfo("QGAPOKEDESK hwnd=0x%x slot=%d n=%lu: damage (%d,%d,%d,%d) also covers uncovered "
+                                        L"desktop - a desktop change, reveal or occlusion, no poke", (DWORD)(ULONG_PTR)entry->Handle,
+                                        entry->PwBrokerSlot, n, frame->dirty_rects[ddi].left, frame->dirty_rects[ddi].top,
+                                        frame->dirty_rects[ddi].right, frame->dirty_rects[ddi].bottom);
+                                continue;
+                            }
                             // M7: the tracked rects say this damage reached the window; the LIVE windows above may say
                             // otherwise (PwHitCoveredLive). Liveness slots only - a PrintWindow slot's poke is its render
                             // trigger and keeps the opaque-only rule above. Before the pixel compare: the walk is cheaper.
