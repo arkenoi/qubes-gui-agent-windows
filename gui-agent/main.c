@@ -8312,8 +8312,11 @@ static int PwCollectOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
 // PwCollectOccluders restricted to windows that are LIKELY OPAQUE: not WS_EX_LAYERED (a layered window may be translucent)
 // and not override-redirect (menus, tooltips and popups carry translucent shadows and acrylic). Used by the broker damage
 // poke, where excluding damage under a translucent window would hide a visible change of the window beneath it.
-// Margin around a layered / override-redirect window above (a menu, a tooltip, a toast) that counts as its own when it
-// is an occluder for a LIVENESS poke: its drop shadow is drawn outside its rect, over the window beneath.
+// Margin around a window above that counts as its own when it is an occluder for a LIVENESS poke: its drop shadow, and
+// whatever it draws just past its edge, lands outside its rect, over the window beneath. First for layered and
+// override-redirect windows (a menu, a tooltip, a toast); since rest-zero M7 (2026-10-01) for EVERY window above: typing
+// into Calculator over a Notepad put damage 9 px past Calculator's edge, the Notepad was poked and its WGC session
+// recreated (the window's own change was nil - Jev: margin for every window above 0.54 with the event order, 24 px 0.76).
 #define PW_POPUP_SHADOW_MARGIN 24
 
 static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
@@ -8331,7 +8334,9 @@ static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
             (withPopups || !popup))
         {
             RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
-            if (popup)
+            // withPopups is the LIVENESS mode (a WGC slot's poke): every window above takes the margin. The render-trigger
+            // mode (a PrintWindow slot) keeps bare rects of opaque windows - a change beside one must still render.
+            if (withPopups)
                 InflateRect(&other, PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
             if (IntersectRect(&hit, &other, rect))
             {
@@ -11459,6 +11464,15 @@ static ULONG WINAPI WatchForEvents(void)
                 if (!DrainVchanInput(capture, &exitLoop))
                     break;
             }
+
+            // WINDOW EVENTS BEFORE THE FRAME, for the same reason (rest-zero M7). A desktop frame showing a NEW window's first
+            // pixels was attributed before that window's queued events (index 6) were applied: it was not yet tracked, so not
+            // an occluder (occ=0), and the windows beneath took its pixels for their own change - a false liveness poke and a
+            // WGC session recreate 2 s later (measured 2026-10-01: Calculator opening over a Notepad, 6 pokes, recreated).
+            // Nothing is added: these events are applied on the next pass anyway, under case 6's own conditions.
+            if (g_VchanClientConnected && g_SeamlessMode && !g_LocalScreenDestroyed &&
+                WaitForSingleObject(g_WindowEventSignal, 0) == WAIT_OBJECT_0)
+                ProcessWindowEvents();
 
             // NEVEREXIT: capture can legitimately be NULL here - in the A7 degraded
             // state a stale frame event set by the torn-down capture generation can
