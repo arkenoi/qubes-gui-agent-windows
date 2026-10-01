@@ -1019,6 +1019,7 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
     UNREFERENCED_PARAMETER(param);
     LogDebug("start");
     LogInfo("QGATHREAD role=hooks tid=%lu", GetCurrentThreadId());   // M1 instrument (restwatch's per-thread join)
+    QgaNameThread(L"gui-agent: hooks");
 
     waitFor[0] = g_WindowEventStop;
     waitFor[1] = g_WindowEventRearm;
@@ -3668,6 +3669,20 @@ static BROKER_STATE BrokerState(void)
     ULONGLONG anchor = g_BrokerDownSince ? g_BrokerDownSince : g_AgentStartTick;
     ULONGLONG since = (now > anchor) ? (now - anchor) : 0;
     return (since < BROKER_LAUNCH_GRACE_MS) ? BRK_STARTING : BRK_DOWN;
+}
+
+void QgaNameThread(IN const WCHAR* name)
+{
+    typedef HRESULT (WINAPI *PFN_STD)(HANDLE, PCWSTR);
+    static PFN_STD p = NULL;
+    static BOOL looked = FALSE;
+    if (!looked)
+    {
+        p = (PFN_STD)GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription");
+        looked = TRUE;
+    }
+    if (p)
+        p(GetCurrentThread(), name);
 }
 
 BOOL DirectRequired(void)
@@ -10900,6 +10915,7 @@ static BOOL DrainVchanInput(IN OUT struct _CAPTURE_CONTEXT* capture, OUT BOOL* e
 static ULONG WINAPI WatchForEvents(void)
 {
     LogInfo("QGATHREAD role=main tid=%lu", GetCurrentThreadId());   // M1 instrument (restwatch's per-thread join)
+    QgaNameThread(L"gui-agent: main");
     ULONG eventCount;
     DWORD signaledEvent;
     BOOL vchanIoInProgress;

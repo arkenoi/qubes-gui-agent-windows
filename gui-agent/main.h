@@ -596,6 +596,9 @@ BOOL WgcBrokerActive(void);
 // Eligibility (not availability) for the per-window broker path: on a guest where it is TRUE
 // the whole-desktop composite is NOT an allowed source for a per-window window. See main.c.
 BOOL DirectRequired(void);
+// rest-zero M1 attribution: name the calling thread (SetThreadDescription, looked up at run time - Windows 10 1607+), so
+// a per-thread wake count can be read against a name instead of a start address; logged as QGATHREAD as well.
+void QgaNameThread(IN const WCHAR* name);
 // Is the whole-desktop image anyone's to show? FALSE on a direct-required guest in seamless mode, where every window
 // is broker-fed: the capture thread then copies nothing out of the desktop (rest-zero S2). Read racily by that thread.
 BOOL DesktopImageWanted(void);

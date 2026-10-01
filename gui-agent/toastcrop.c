@@ -1009,6 +1009,7 @@ static DWORD WINAPI TcWorkerThread(IN void* param)
 {
     UNREFERENCED_PARAMETER(param);
     LogInfo("QGATHREAD role=toastcrop tid=%lu", GetCurrentThreadId());   // M1 instrument (restwatch's per-thread join)
+    QgaNameThread(L"gui-agent: toastcrop");
 
     if (!TcEnsureCom())
         return 0;

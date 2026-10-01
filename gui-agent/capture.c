@@ -1571,6 +1571,7 @@ static DWORD WINAPI CaptureThread(void* param)
     LogDebug("starting, resolution %ux%u", capture->width, capture->height);
     // M1 instrument (docs/DESIGN-rest-zero-capture.md S0): which thread is which, for tools/restwatch.ps1's per-thread counts.
     LogInfo("QGATHREAD role=capture tid=%lu", GetCurrentThreadId());
+    QgaNameThread(L"gui-agent: capture");
 
     while (TRUE)
     {
