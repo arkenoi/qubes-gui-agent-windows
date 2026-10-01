@@ -8361,7 +8361,11 @@ static int PwCollectOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
 // 33 px since rz9 (2026-10-01): an ACTIVE window's shadow is larger - DWM's damage for a resized 3816-px Notepad ran 32-33 px
 // past its frame (26-27 at the top) in all 21 of its damage rects, and the 9 px the 24 px margin left uncovered poked the four
 // windows beneath at every resize step (12 recreates). Jev: 32 px does not cover it 0.15, 33 px 0.86 (measured at 100% DPI).
-#define PW_POPUP_SHADOW_MARGIN 33
+// 34 px since 2026-10-01 (rz18): a launched Calculator's damage ran 34 px past its DWM frame on the left, right and bottom (27
+// at the top) in both launches measured, so 33 px left a 1-px sliver and the windows beneath were poked and recreated even with
+// the live check (ADR-capture section 24). Jev: 34 px 0.50 over 40 px 0.45. Not scaled by DPI: this agent is DPI-unaware (no
+// manifest entry), so every rect it compares is in 96-DPI units already.
+#define PW_POPUP_SHADOW_MARGIN 34
 
 static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
                                 OUT RECT* out, IN int maxOut, IN BOOL withPopups)
