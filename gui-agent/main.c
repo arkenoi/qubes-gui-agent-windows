@@ -8414,6 +8414,58 @@ static BOOL PwRectVisibleBeyond(IN const RECT* r, IN const RECT* occ, IN int n, 
     return FALSE;
 }
 
+// THE LIVE WINDOWS ABOVE (rest-zero M7, ADR-capture §24). The occluders PwCollectOccludersEx returns are TRACKED rects, and
+// those lag the screen: growing a 3816-px Notepad moved its live rect 39 ms into SetWindowPos, the damage of its new area was
+// attributed 4 ms later, and its LOCATIONCHANGE reached a hook thread only after the call returned, >= 90 ms on (measured
+// 2026-10-01: 6 of 6 false pokes had their damage inside the live rect + margin; 6 session recreates per four-step resize). A
+// window held for its first frame, or refused by the arena, is no occluder in the tracked model at all (a Calculator 0.7 s
+// after its UNCLOAK: 3 recreates). So before a LIVENESS poke goes out its hit is checked against the windows above this one
+// as they are NOW: the windows the agent TRACKS (mapped, held for a first frame, or refused) that sit above it in the live
+// z-order, at their live rects, if visible, uncloaked and non-empty, with the same shadow margin as the tracked rule. The
+// membership is the tracked rule's on purpose: a window the agent rejected (layered chrome, a transparent overlay) hides
+// nothing beneath it from the tracked rule either, so this cannot suppress a poke the tracked rule would have sent for a
+// reason other than stale geometry or a stale z-order (Jev review: counting every visible window above over-suppresses,
+// 0.59). Covered -> the damage is theirs. Runs only where a liveness poke is about to be sent (damage that reached this
+// window beyond its tracked occluders), never at rest. A walk that cannot finish - too many windows above to describe, or
+// the chain cut by a window destroyed mid-walk - answers "not covered": the poke goes out, as before this. The caller holds
+// g_csWatchedWindows (FindWindowByHandle). *coveredBy names the first live window above that touches the hit (the log line).
+static BOOL PwHitCoveredLive(IN HWND self, IN const RECT* hit, OUT HWND* coveredBy)
+{
+    RECT occ[PW_MAX_OCCLUDERS * 2];
+    int n = 0;
+    int steps = 0;
+    HWND h;
+
+    *coveredBy = NULL;
+    for (h = GetWindow(self, GW_HWNDPREV); h && steps < 4096; h = GetWindow(h, GW_HWNDPREV), steps++)
+    {
+        RECT r, x;
+        DWORD cloaked = 0;
+        const WINDOW_DATA* above = FindWindowByHandle(h);
+        // Tracked, and not on its way out (the tracked rule's DeletePending exclusion). The same measure as the tracked rect
+        // (GetRealWindowRect: DWM's extended frame bounds), or GetWindowRect's invisible resize borders (~7 px a side) would
+        // hide this window's own damage next to the window above. No valid bounds: not an occluder (the poke goes out).
+        if (!above || above->DeletePending || !IsWindowVisible(h) ||
+            DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)) != S_OK ||
+            r.right <= r.left || r.bottom <= r.top)
+            continue;
+        InflateRect(&r, PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
+        if (!IntersectRect(&x, &r, hit))
+            continue;
+        if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
+            continue;
+        if (n >= (int)RTL_NUMBER_OF(occ))
+            return FALSE;   // too many to describe: not covered, the poke goes out
+        if (!*coveredBy)
+            *coveredBy = h;
+        occ[n++] = r;
+    }
+    if (steps >= 4096)
+        return FALSE;       // a chain that does not end is not an answer
+    int budget = 256;
+    return n > 0 && !PwRectVisibleBeyond(hit, occ, n, &budget);
+}
+
 // What decides a window's visible region on this pass: its rect and the opaque rects above it, in list order.
 static UINT64 PwVisibleSig(IN const RECT* w, IN const RECT* occ, IN int n)
 {
@@ -9687,6 +9739,23 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             int budget = 256;
                             if (!PwRectVisibleBeyond(&pwHit, occ, nOcc, &budget))
                                 continue;
+                            // M7: the tracked rects say this damage reached the window; the LIVE windows above may say
+                            // otherwise (PwHitCoveredLive). Liveness slots only - a PrintWindow slot's poke is its render
+                            // trigger and keeps the opaque-only rule above. Before the pixel compare: the walk is cheaper.
+                            if (livenessOnly)
+                            {
+                                HWND liveBy = NULL;
+                                if (PwHitCoveredLive(entry->Handle, &pwHit, &liveBy))
+                                {
+                                    const ULONG n = ++entry->PwPokeLiveSkips;
+                                    if (n <= 4 || (n % 256) == 0)
+                                        LogInfo("QGAPOKELIVE hwnd=0x%x slot=%d n=%lu: damage (%d,%d,%d,%d) is under the live "
+                                            L"window 0x%x above it (tracked occ=%d) - no poke", (DWORD)(ULONG_PTR)entry->Handle,
+                                            entry->PwBrokerSlot, n, pwHit.left, pwHit.top, pwHit.right, pwHit.bottom,
+                                            (DWORD)(ULONG_PTR)liveBy, nOcc);
+                                    continue;   // this rect is another window's; the next may be this one's own
+                                }
+                            }
                             // M7, A WGC SLOT IS POKED ONLY IF THE SCREEN SHOWS SOMETHING ITS LAST FRAME DOES NOT (Jev
                             // 0.91 over per-tile hashes 0.02 and accepting 0.07). DDA's damage is coarser than a window's
                             // own change: at focus changes and window appearances one band crosses many windows, WGC
