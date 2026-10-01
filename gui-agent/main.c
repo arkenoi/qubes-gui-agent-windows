@@ -285,6 +285,8 @@ static ULONGLONG g_SlotCtlSince[WGCBRK_MAX_SLOTS];
 static LONG      g_SlotDeafSaid[WGCBRK_MAX_SLOTS];
 // QGAWGCRECREATE: the broker's QuietReroutes per slot as last reported (a recreate is reported when it moves).
 static LONG      g_SlotQuietSeen[WGCBRK_MAX_SLOTS];
+// QGAWGCITEMCLOSED: the broker's ItemClosed per slot as last reported (baseline at each registration, like the above).
+static LONG      g_SlotClosedSeen[WGCBRK_MAX_SLOTS];
 // Count of WGC sessions the broker declared DEAF (FAILED + WGCBRK_E_DEAF), published like DirectSuppressed: acceptance
 // asserts 0 (M7).
 #define REG_CONFIG_WGC_DEAF_VALUE L"WgcDeaf"
@@ -2885,6 +2887,18 @@ static void BrokerReportDeaf(void)
                     (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, qr, s->ChanOpens);
             g_SlotQuietSeen[i] = qr;
         }
+        // WINDOWS CLOSED THE WINDOW'S CAPTURE ITEM - said, because the broker now repairs it on its own initiative: it
+        // reopens the session at once (a UWP app's first item is closed as it launches on 26100.1742 - Calculator stayed on
+        // its splash in dom0 until poked, 2026-10-01). A second closure before the reopened item delivered goes DEAF.
+        const LONG ic = s->ItemClosed;
+        if (ic != g_SlotClosedSeen[i])
+        {
+            if (s->Hwnd != 0 && ic > g_SlotClosedSeen[i])
+                LogWarning("QGAWGCITEMCLOSED hwnd 0x%llx slot %d: Windows closed the window's capture item (closures %ld); "
+                    L"the broker reopens its session at once (sessions opened %ld).",
+                    (ULONGLONG)s->Hwnd, i, ic, s->ChanOpens);
+            g_SlotClosedSeen[i] = ic;
+        }
         if (s->ReqState != WGCBRK_REQUESTED || s->AckState != WGCBRK_FAILED || s->FailHr != WGCBRK_E_DEAF)
             continue;
         const LONG seq = s->ControlSeq;
@@ -3878,6 +3892,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     _InterlockedIncrement(&h->ControlGen);
     entry->PwBrokerSlot = slot; entry->PwBrokerSourced = TRUE; entry->PwBrokerArenaOff = off0;
     g_SlotQuietSeen[slot] = s->QuietReroutes;   // QGAWGCRECREATE baseline for this window
+    g_SlotClosedSeen[slot] = s->ItemClosed;     // QGAWGCITEMCLOSED baseline for this window
     BrokerRequestSent(slot);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
     // At Info, with a tick: the gap from here to QGASLICECONTENT is the broker's first-frame
