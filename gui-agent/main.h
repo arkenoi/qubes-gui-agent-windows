@@ -152,6 +152,8 @@ typedef struct _WINDOW_DATA
     // that carried damage. A damage poke needs it unchanged: damage while it changes is reveal/occlusion, not W's own.
     UINT64 PwVisSig;
     BOOL PwVisSigValid;
+    // QGAPOKEWGC diagnostic: how many unanswered-looking damage pokes this window's WGC slot has been sent (rate limit).
+    ULONG PwPokeWgcLogged;
 
     // Position as of the frame currently being processed. Dirty rects come from a frame
     // captured BEFORE this frame's tracking update ran, so converting them to

@@ -283,6 +283,8 @@ static LONG      g_SlotCtlWant[WGCBRK_MAX_SLOTS];
 static ULONGLONG g_SlotCtlSince[WGCBRK_MAX_SLOTS];
 // QGAWGCDEAF is said once per request: the ControlSeq it was said for, per slot (0 = not said).
 static LONG      g_SlotDeafSaid[WGCBRK_MAX_SLOTS];
+// QGAWGCRECREATE: the broker's QuietReroutes per slot as last reported (a recreate is reported when it moves).
+static LONG      g_SlotQuietSeen[WGCBRK_MAX_SLOTS];
 // Count of WGC sessions the broker declared DEAF (FAILED + WGCBRK_E_DEAF), published like DirectSuppressed: acceptance
 // asserts 0 (M7).
 #define REG_CONFIG_WGC_DEAF_VALUE L"WgcDeaf"
@@ -2852,6 +2854,21 @@ static void BrokerReportDeaf(void)
     for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
     {
         const WGCBRK_SLOT* s = &slots[i];
+        // A RECREATE IS A FALLBACK FIRING, SO IT IS SAID (fallbacks-are-anomalies): the broker closed a session that
+        // left an own-change poke unanswered for WGCBRK_WGC_QUIET_MS and opened a fresh one. Either the poke was false
+        // (QGAPOKEWGC names its damage) or the session had stopped delivering. The broker counts cumulatively per slot;
+        // the baseline is taken at each registration (BrokerRegister), so a reused slot's earlier count is not
+        // reported against the new window.
+        const LONG qr = s->QuietReroutes;
+        if (qr != g_SlotQuietSeen[i])
+        {
+            if (s->Hwnd != 0 && qr > g_SlotQuietSeen[i])
+                LogWarning("QGAWGCRECREATE hwnd 0x%llx slot %d: the broker recreated its WGC session after an own-change "
+                    L"poke went unanswered for %u ms (quiet reroutes %ld, sessions opened %ld). A false poke or a session "
+                    L"that stopped delivering - QGAPOKEWGC lines name the damage.",
+                    (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, qr, s->ChanOpens);
+            g_SlotQuietSeen[i] = qr;
+        }
         if (s->ReqState != WGCBRK_REQUESTED || s->AckState != WGCBRK_FAILED || s->FailHr != WGCBRK_E_DEAF)
             continue;
         const LONG seq = s->ControlSeq;
@@ -3820,6 +3837,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&h->ControlGen);
     entry->PwBrokerSlot = slot; entry->PwBrokerSourced = TRUE; entry->PwBrokerArenaOff = off0;
+    g_SlotQuietSeen[slot] = s->QuietReroutes;   // QGAWGCRECREATE baseline for this window
     BrokerRequestSent(slot);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
     // At Info, with a tick: the gap from here to QGASLICECONTENT is the broker's first-frame
@@ -8232,8 +8250,12 @@ static int PwCollectOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
 // PwCollectOccluders restricted to windows that are LIKELY OPAQUE: not WS_EX_LAYERED (a layered window may be translucent)
 // and not override-redirect (menus, tooltips and popups carry translucent shadows and acrylic). Used by the broker damage
 // poke, where excluding damage under a translucent window would hide a visible change of the window beneath it.
-static int PwCollectOpaqueOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
-                                    OUT RECT* out, IN int maxOut)
+// Margin around a layered / override-redirect window above (a menu, a tooltip, a toast) that counts as its own when it
+// is an occluder for a LIVENESS poke: its drop shadow is drawn outside its rect, over the window beneath.
+#define PW_POPUP_SHADOW_MARGIN 24
+
+static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
+                                OUT RECT* out, IN int maxOut, IN BOOL withPopups)
 {
     int n = 0;
     RECT hit;
@@ -8241,11 +8263,14 @@ static int PwCollectOpaqueOccluders(IN const WINDOW_DATA* self, IN const RECT* r
     while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
     {
         e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        const BOOL popup = (e->ExStyle & WS_EX_LAYERED) || e->IsOverrideRedirect;
         if (e != self && e->IsVisible && !e->IsIconic && !e->DeletePending &&
             e->Width > 0 && e->Height > 0 && e->ZOrder < self->ZOrder &&
-            !(e->ExStyle & WS_EX_LAYERED) && !e->IsOverrideRedirect)
+            (withPopups || !popup))
         {
             RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
+            if (popup)
+                InflateRect(&other, PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
             if (IntersectRect(&hit, &other, rect))
             {
                 if (n >= maxOut)
@@ -9509,13 +9534,20 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // Calculator sits over part of Microsoft Store; typing into Calculator poked Store's slot, Store's
                     // WGC session correctly delivered nothing, and the broker's quiet test demoted the healthy session
                     // twice, onto polled PrintWindow. Uses the same capture-grade z-order as the screen-hash decision,
-                    // counting only windows likely to be OPAQUE (PwCollectOpaqueOccluders: a layered or override-redirect
+                    // counting only windows likely to be OPAQUE (PwCollectOccludersEx: a layered or override-redirect
                     // window above may be translucent, and a change beneath it would be visible); with no valid ordering,
                     // or too many occluders to describe (-1), nothing is excluded - the behaviour before this. For a WGC
                     // slot the poke is only a liveness hint, so a skipped poke cannot hide content.
+                    // WHICH WINDOWS ABOVE COUNT. For a PrintWindow slot the poke is the RENDER trigger, so only windows
+                    // likely to be OPAQUE hide damage (a change beneath a translucent popup is visible and must render).
+                    // For a WGC slot the poke is only a LIVENESS hint, and a false one now costs a session recreate
+                    // (2026-10-01, w11-ds: a system menu opened over a focused Notepad - its drawing, its appearance and
+                    // its shadow - poked Notepad 273 times and the design-E ladder froze a healthy window): there every
+                    // window above counts, a popup with a margin for its drop shadow (Jev: both fixes 0.64).
+                    const BOOL livenessOnly = (ps->Route != WGCBRK_ROUTE_PW);
                     RECT occ[PW_MAX_OCCLUDERS];
                     int nOcc = g_ZOrderCaptureValid
-                        ? PwCollectOpaqueOccluders(entry, &pokeRect, occ, PW_MAX_OCCLUDERS) : 0;
+                        ? PwCollectOccludersEx(entry, &pokeRect, occ, PW_MAX_OCCLUDERS, livenessOnly) : 0;
                     if (nOcc < 0)
                         nOcc = 0;   // too many to describe: nothing excluded, as before
                     // ONLY THE WINDOW'S OWN CHANGE POKES IT (docs/DESIGN-rest-zero-capture.md E). Two refinements of the
@@ -9538,6 +9570,24 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             int budget = 256;
                             if (!PwRectVisibleBeyond(&pwHit, occ, nOcc, &budget))
                                 continue;
+                            // M7 INSTRUMENT (docs/DESIGN-rest-zero-capture.md): a poke to a WGC session that has not
+                            // delivered for a second is the case the broker's quiet test acts on - recreate, then DEAF.
+                            // Say which damage it was, so a false poke can be told from a deaf session. Rate limited:
+                            // the first 8 per window, then every 64th.
+                            if (ps->Route == WGCBRK_ROUTE_WGC && ps->CaptureTick != 0 &&
+                                (ULONGLONG)GetTickCount64() - (ULONGLONG)ps->CaptureTick > 1000)
+                            {
+                                const ULONG n = ++entry->PwPokeWgcLogged;
+                                if (n <= 8 || (n % 64) == 0)
+                                    LogInfo("QGAPOKEWGC hwnd=0x%x slot=%d n=%lu win=(%d,%d,%d,%d) dirty=(%d,%d,%d,%d) "
+                                        L"hit=(%d,%d,%d,%d) occ=%d frameAge=%I64u ms",
+                                        (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot, n,
+                                        pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
+                                        frame->dirty_rects[ddi].left, frame->dirty_rects[ddi].top,
+                                        frame->dirty_rects[ddi].right, frame->dirty_rects[ddi].bottom,
+                                        pwHit.left, pwHit.top, pwHit.right, pwHit.bottom, nOcc,
+                                        (ULONGLONG)GetTickCount64() - (ULONGLONG)ps->CaptureTick);
+                            }
                             BrokerPokeDamage(entry);
                             break;      // one poke per pass; the broker coalesces
                         }
