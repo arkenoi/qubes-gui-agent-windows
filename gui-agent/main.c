@@ -7419,6 +7419,10 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             ULONG ms = SendWindowMap(windowData);
             if (ms == ERROR_SUCCESS)
             {
+                // Restart placement (ADR-gui 1): dom0's WM places a window when it is MAPPED, and a held window is mapped
+                // only now - so its 2 s window for the placement configure starts here, not at its create.
+                if (windowData->RestartPlacementTick != 0)
+                    windowData->RestartPlacementTick = GetTickCount64();
                 // Timing instrumentation (always on): held-map release. For a slice-fed
                 // window QGASLICEMAP's lead_ms tells whether content beat the map (hold
                 // worked) or the bounded timeout expired with the buffer still unfed
