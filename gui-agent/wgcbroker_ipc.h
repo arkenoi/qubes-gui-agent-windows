@@ -12,7 +12,9 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  19u  /* 19: rest-zero S3/S4 - no heartbeats; CtlAck (the request ack the agent's
+#define WGCBRK_ABI_VERSION  20u  /* 20: SameFrames (was BackoffMs, unused since S3) - WGC arrivals not republished
+                                  *     because their card equals the published one;
+                                  * 19: rest-zero S3/S4 - no heartbeats; CtlAck (the request ack the agent's
                                   *     deadlines key on), DeafHolds + WGCBRK_E_DEAF, AgentFrameWakes/AgentStalls (R5);
                                   * 18: BrokerStage + HungSkips - which call a broker hang is in, and
                                   *     PrintWindows skipped for an unresponsive target; 17: Republished */
@@ -249,9 +251,10 @@ typedef struct _WGCBRK_SLOT {
      * window stays on a session that will never deliver. A previous attempt at this fix failed
      * for exactly that reason, so the recovery is counted rather than silent. */
     volatile LONG     Reroutes;
-    /* Current adaptive interval, ms. Visible so the gate can be judged from the rig instead of
-     * assumed: an idle window should climb to the ceiling, and a self-updating one should not. */
-    volatile LONG     BackoffMs;
+    /* ABI 20 (was BackoffMs, the adaptive poll interval S3 removed): WGC arrivals whose card was byte-identical to the
+     * published one and were therefore NOT republished - the agent was not woken for them. The owner's rule: the same
+     * pixels repainted are not a change. Only in steady state; an arrival that answers a registration is published. */
+    volatile LONG     SameFrames;
     /* Re-routes triggered by the BEHAVIOURAL test (a visible window whose WGC feed never spoke),
      * as opposed to the structural fast path. Separated so the two can be told apart on the rig:
      * if QuietReroutes carries the load, the structural test is not earning its place. */
