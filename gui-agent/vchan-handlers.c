@@ -1066,6 +1066,7 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
         // daemon-drive machinery: holding damage for a window whose configures we ignore
         // buys nothing and costs full-window settle repaints (review finding).
         BOOL geometryDriven = FALSE;
+        BOOL reassertPlacement = FALSE;   // restart placement: answer dom0's placement with the guest position after the ACK
         EnterCriticalSection(&g_csWatchedWindows);
         WINDOW_DATA* data = FindWindowByHandle(window);
         if (data && data->Synthesized)
@@ -1189,6 +1190,38 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
             {
                 BOOL noMove = (data->X == configureMsg.x && data->Y == configureMsg.y);
                 BOOL noSize = (data->Width == configureMsg.width && data->Height == configureMsg.height);
+                // RESTART PLACEMENT (P3; owner 2026-10-01: "try a cheap fix and drop it if it is complicated"; Jev 0.84). A
+                // window a bulk pass re-created (agent restart, seamless re-entry) already sat where the previous agent had
+                // synced it with dom0; dom0's WM put its FRAME at that position and so the client one frame-size down-right
+                // (+5,+25 measured, every restart, every window). Obeying that walked every window by the frame on every
+                // restart. So the first pure move within 2 s of such a create is answered with the guest's own position
+                // instead of being applied; everything else - an echo, a resize, a later move - is handled as before, and a
+                // dom0 that does not take the answer sends another configure, which is obeyed (the behaviour before this).
+                if (data->RestartPlacementTick != 0)
+                {
+                    const BOOL fresh = (GetTickCount64() - data->RestartPlacementTick) < 2000;
+                    if (!fresh || !noSize || !noMove)
+                        data->RestartPlacementTick = 0;   // decided: this configure answers it (or the window outlived it)
+                    if (fresh && noSize && !noMove && replyToMessages)
+                    {
+                        // The answer goes out AFTER the ACK below: while the daemon awaits the ACK of its own configure it
+                        // ignores any other geometry and re-sends its own (xside.c handle_configure_from_vm,
+                        // have_queued_configure); once acked, an agent configure is applied with the frame extents
+                        // subtracted (moveresize_vm_window), i.e. the CLIENT lands where the guest says. The create itself
+                        // carries no frame compensation (mkwindow: PSize only), which is where the offset came from.
+                        LogInfo("QGAPLACEKEEP hwnd=0x%x: dom0 placed the re-created window at (%d,%d); the guest keeps (%d,%d) "
+                            L"and says so after the ack", (uint32_t)(ULONG_PTR)window, configureMsg.x, configureMsg.y,
+                            data->X, data->Y);
+                        reassertPlacement = TRUE;
+                        data->CfgSentValid = TRUE;
+                        data->LastCfgX = data->X;
+                        data->LastCfgY = data->Y;
+                        data->LastCfgW = (int)data->Width;
+                        data->LastCfgH = (int)data->Height;
+                        data->LastCfgOvr = data->IsOverrideRedirect;
+                        noMove = TRUE;   // nothing below moves the guest window for this configure
+                    }
+                }
 
                 if (noMove && noSize)
                 {
@@ -1314,6 +1347,10 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
             ULONG ackStatus = SendWindowConfigure(window,
                 configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height,
                 configureMsg.override_redirect);
+            // Restart placement: the ack cleared the daemon's queued configure, so this one is applied (see above).
+            if (ackStatus == ERROR_SUCCESS && reassertPlacement)
+                ackStatus = SendWindowConfigure(window, data->X, data->Y, (int)data->Width, (int)data->Height,
+                    data->IsOverrideRedirect);
             LeaveCriticalSection(&g_csWatchedWindows);
             return ackStatus;
         }

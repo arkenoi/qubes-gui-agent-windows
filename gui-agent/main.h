@@ -288,6 +288,9 @@ typedef struct _WINDOW_DATA
     // HandleButton/HandleMotion translate dom0's window-RELATIVE coords against the
     // tracked anchor, which is where the surface really is.
     BOOL  DaemonOwnsPos;
+    // Restart placement (P3, owner 2026-10-01): when the window was re-created in dom0 by a bulk enumeration (agent start,
+    // seamless re-entry), the GetTickCount64() of that create; 0 = none pending. See HandleConfigure.
+    ULONGLONG RestartPlacementTick;
 
     // Card size the dom0 size-lock hint was last sent for (WM-managed shell surfaces only).
     // -1 = never sent; re-sent when the announced card size changes.

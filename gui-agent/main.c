@@ -5890,12 +5890,21 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
 
     // Announce the collected windows BOTTOM-FIRST (see AddWindowsProc for why). A failure
     // stops the pass exactly as the inline version did.
+    // A BULK pass (nothing tracked yet: agent start, seamless re-entry) re-creates windows dom0 already knew at their synced
+    // positions; each is marked so its first dom0 placement is not obeyed (restart placement, HandleConfigure).
+    const BOOL bulk = IsListEmpty(&g_WatchedWindowsList);
     for (UINT i = context.PendingCount; i > 0 && status == ERROR_SUCCESS; i--)
     {
         HWND w = context.Pending[i - 1];
         if (FindWindowByHandle(w)) // examined meanwhile (taskbar path, event races)
             continue;
         status = ExamineWindow(w, &context.Interrogated);
+        if (bulk)
+        {
+            WINDOW_DATA* added = FindWindowByHandle(w);
+            if (added)
+                added->RestartPlacementTick = GetTickCount64();
+        }
     }
 
     // Keep dom0's stacking in step with the guest's by re-mapping whatever is foreground.
