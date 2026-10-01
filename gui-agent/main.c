@@ -4981,6 +4981,35 @@ end:
 // e.g. a guest-side snap; without the timeout one lost move would wedge the drive).
 #define DAEMON_MOVE_INFLIGHT_MS 200
 
+// Is a dom0-dictated SetWindowPos still on its way into the window? Posted less than DAEMON_MOVE_INFLIGHT_MS ago, and the window
+// neither sits on the post's target (its origin if it moved the window, its size if it resized it) nor has moved away from
+// where it was when the post was made (ADR-gui 2). The second test is what says the window's thread has TAKEN the post: a
+// window that snaps or clamps the size (a minimum width) never reaches the exact target, and waiting for the timeout on every
+// step would make it follow a drag at 5 Hz. A window busy re-laying out after the previous step changes its rect only when it
+// takes the next post, so at most one post waits behind its layout - never the replayed queue. Live GetWindowRect, never the
+// tracked rect, which trails the window by a tracking pass.
+static BOOL DaemonPostInFlight(IN const WINDOW_DATA* entry)
+{
+    RECT wr;
+    if (!entry->DaemonPostedValid || (GetTickCount() - entry->DaemonPostedTick) >= DAEMON_MOVE_INFLIGHT_MS)
+        return FALSE;
+    if (!GetWindowRect(entry->Handle, &wr))
+        return FALSE;
+    if (!EqualRect(&wr, &entry->DaemonPostedFrom))
+        return FALSE;   // taken (landed, snapped or clamped)
+    const BOOL atTarget =
+        (!entry->DaemonPostedMoved || (wr.left == entry->DaemonPostedX && wr.top == entry->DaemonPostedY)) &&
+        (!entry->DaemonPostedSized || (wr.right - wr.left == entry->DaemonPostedW && wr.bottom - wr.top == entry->DaemonPostedH));
+    return !atTarget;
+}
+
+// dom0's newest geometry is not in the window yet: it waits to be posted, or the last post is still landing. The window's own
+// rect is then an intermediate one dom0 never asked for, and announcing it moves dom0's border by itself (ADR-gui 2).
+static BOOL DaemonGeometryUnsettled(IN const WINDOW_DATA* entry)
+{
+    return entry->DaemonMovePending || DaemonPostInFlight(entry);
+}
+
 // Minimum spacing between refreshes of the announce-space/SetWindowPos-space delta
 // (one DwmGetWindowAttribute + GetMonitorInfo + EnumDisplaySettings per refresh).
 #define DAEMON_OFF_TTL_MS 500
@@ -4998,6 +5027,11 @@ static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
     // place below (or nothing, if the window landed exactly where the daemon put it).
     if (entry->DaemonStreamTick != 0 &&
         GetTickCount() - entry->DaemonStreamTick < DAEMON_DRIVE_ACTIVE_MS)
+        return;
+    // ...and until dom0's last dictated geometry has landed (ADR-gui 2): the resting geometry is not known before that, and a
+    // flush now would announce an intermediate one. Bounded: a pending geometry is posted within an in-flight window, and a post
+    // stops counting as in flight after DAEMON_MOVE_INFLIGHT_MS.
+    if (DaemonGeometryUnsettled(entry))
         return;
     // Mirror hold for a guest-native drag (D1 drag wobble): a withheld position that
     // leaks mid-drag moves dom0's applied origin and re-opens the feedback loop the
@@ -5124,9 +5158,17 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         // 2026-08-12 with a 1:1 trace). dom0 knows where its own window is; say nothing
         // about position until the drive ends. The withheld-coords slot keeps the flush
         // path armed so the resting position is verified (and only announced if it differs
-        // from what the daemon itself dictated). Size/override changes still go through.
-        if (posOnly && entry->DaemonStreamTick != 0 &&
-            (now - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS)
+        // from what the daemon itself dictated).
+        // SIZE TOO (ADR-gui 2, 2026-10-02). This used to hold positions only ("size changes still go through"), so an EDGE
+        // drag announced every lagging size: ~400 in one traced Settings drag, each applied by the daemon as a real resize
+        // under the user's hand, then 45 more replayed for 3.6 s after release. Any GEOMETRY change is now held while the
+        // drive is on or while dom0's last geometry is still landing (DaemonGeometryUnsettled); the flush then announces the
+        // resting geometry once, and only if it differs from dom0's - a size the window refused. Override-redirect changes
+        // still go out at once.
+        const BOOL geomOnly = entry->CfgSentValid && entry->LastCfgOvr == entry->IsOverrideRedirect;
+        if (geomOnly &&
+            ((entry->DaemonStreamTick != 0 && (now - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS) ||
+             DaemonGeometryUnsettled(entry)))
         {
             entry->CfgPendingPos = TRUE;
             entry->CfgPendingX = entry->X;
@@ -5209,17 +5251,15 @@ void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry)
     DWORD now = GetTickCount();
 
     // Is the previously posted async move still in flight? Compare the window's actual
-    // GetWindowRect origin (SetWindowPos space) to the last posted target. A move-less
-    // post (size-only) never gates. Timeout so a target the window can never reach (guest
-    // WM snap, clamped coordinates) cannot wedge the drive.
-    if (entry->DaemonPostedValid &&
-        (now - entry->DaemonPostedTick) < DAEMON_MOVE_INFLIGHT_MS)
-    {
-        RECT wr;
-        if (GetWindowRect(entry->Handle, &wr) &&
-            (wr.left != entry->DaemonPostedX || wr.top != entry->DaemonPostedY))
-            return; // still traveling; keep only the newest pending geometry
-    }
+    // GetWindowRect (SetWindowPos space) to the last posted target - its origin if it moved
+    // the window, its size if it resized it. SIZE-ONLY POSTS GATE TOO (ADR-gui 2): they used
+    // not to, so an edge drag posted one resize per configure - 519 for one traced Settings
+    // drag - and a window slow to re-lay out (Settings ~90 ms a step) replayed the queue for
+    // up to 10 s, the drag replay of 2026-08-12 for sizes. Timeout so a target the window can
+    // never reach (guest WM snap, clamped coordinates, a size below its minimum) cannot wedge
+    // the drive.
+    if (DaemonPostInFlight(entry))
+        return; // still traveling; keep only the newest pending geometry
 
     // Refresh the announce-space -> SetWindowPos-space delta if stale. GetRealWindowRect
     // is the expensive trio (DWM + monitor + display settings); the TTL keeps it off the
@@ -5232,6 +5272,11 @@ void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry)
         {
             entry->DaemonOffX = real.left - wr.left;
             entry->DaemonOffY = real.top - wr.top;
+            // ADR-gui 2: the size delta too, kept only when plausible (0..64 px each way); otherwise sizes pass through as before.
+            const int offW = (wr.right - wr.left) - (real.right - real.left);
+            const int offH = (wr.bottom - wr.top) - (real.bottom - real.top);
+            entry->DaemonOffW = (offW >= 0 && offW <= 64) ? offW : 0;
+            entry->DaemonOffH = (offH >= 0 && offH <= 64) ? offH : 0;
             entry->DaemonOffValid = TRUE;
         }
         // On failure keep whatever we had (0/0 initially = the old behavior).
@@ -5258,6 +5303,10 @@ void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry)
     // insets are zero for every other window, so this is a no-op on the normal path.
     int tx = entry->DaemonMoveX - entry->CropLeft - entry->DaemonOffX;
     int ty = entry->DaemonMoveY - entry->CropTop - entry->DaemonOffY;
+    // The SIZE converts the same way (ADR-gui 2): announce space is the visible frame, SetWindowPos sizes include the invisible
+    // borders. Never applied to a cropped surface (DaemonMoveNoSize is always set for those).
+    int cx = entry->DaemonMoveW + entry->DaemonOffW;
+    int cy = entry->DaemonMoveH + entry->DaemonOffH;
 
     entry->DaemonMovePending = FALSE;
 
@@ -5265,28 +5314,31 @@ void ApplyPendingDaemonMove(IN OUT WINDOW_DATA* entry)
     // dragging by hand inside the guest is a window yanked out from under the cursor, and
     // nothing in any log said whether it was happening. `drag=1` here during a guest-native
     // drag is the defect, not a diagnostic detail. `cur` is where the window was BEFORE the
-    // move, so the size of the yank is readable directly.
+    // move, so the size of the yank is readable directly. It is also what the in-flight test compares against.
+    RECT cur = { 0 };
+    (void)GetWindowRect(entry->Handle, &cur);
     if (ProtoDragOn())
     {
-        RECT cur = { 0 };
-        (void)GetWindowRect(entry->Handle, &cur);
         LogInfo("QGAPROTO,msg=DAEMONMOVE,hwnd=0x%x,tx=%d,ty=%d,curx=%d,cury=%d,drag=%d,"
-            L"nomove=%d,nosize=%d",
+            L"nomove=%d,nosize=%d,cw=%d,ch=%d,curw=%d,curh=%d",
             (uint32_t)(ULONG_PTR)entry->Handle, tx, ty, cur.left, cur.top,
             (entry->Handle == g_InputDragWindow && g_InputDragOriginValid) ? 1 : 0,
-            (flags & SWP_NOMOVE) ? 1 : 0, (flags & SWP_NOSIZE) ? 1 : 0);
+            (flags & SWP_NOMOVE) ? 1 : 0, (flags & SWP_NOSIZE) ? 1 : 0,
+            cx, cy, cur.right - cur.left, cur.bottom - cur.top);
     }
 
-    if (SetWindowPos(entry->Handle, NULL, tx, ty,
-            entry->DaemonMoveW, entry->DaemonMoveH, flags))
+    if (SetWindowPos(entry->Handle, NULL, tx, ty, cx, cy, flags))
     {
-        if (!(flags & SWP_NOMOVE))
-        {
-            entry->DaemonPostedValid = TRUE;
-            entry->DaemonPostedX = tx;
-            entry->DaemonPostedY = ty;
-            entry->DaemonPostedTick = now;
-        }
+        // In flight until the window takes it (DaemonPostInFlight): it moves away from `cur`, or already sits on the target.
+        entry->DaemonPostedValid = TRUE;
+        entry->DaemonPostedMoved = !(flags & SWP_NOMOVE);
+        entry->DaemonPostedSized = !(flags & SWP_NOSIZE);
+        entry->DaemonPostedX = tx;
+        entry->DaemonPostedY = ty;
+        entry->DaemonPostedW = cx;
+        entry->DaemonPostedH = cy;
+        entry->DaemonPostedFrom = cur;
+        entry->DaemonPostedTick = now;
     }
     else
     {

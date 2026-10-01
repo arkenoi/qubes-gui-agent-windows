@@ -249,6 +249,13 @@ typedef struct _WINDOW_DATA
     int   DaemonPostedX;       // its target, SetWindowPos (GetWindowRect) space
     int   DaemonPostedY;
     DWORD DaemonPostedTick;
+    // ...whether that post moved and/or resized the window, the size it asked for, and the window's rect when it was made (all
+    // GetWindowRect space). A RESIZE is in flight too (ADR-gui 2): an edge drag used to post one resize per configure, ungated.
+    BOOL  DaemonPostedMoved;
+    BOOL  DaemonPostedSized;
+    int   DaemonPostedW;
+    int   DaemonPostedH;
+    RECT  DaemonPostedFrom;
     // Announce space (GetRealWindowRect: DWM extended frame bounds) minus SetWindowPos space
     // (GetWindowRect): the invisible-border delta, +7px for a themed Win11 window. The old
     // code passed daemon coords (announce space) straight to SetWindowPos, so every applied
@@ -260,6 +267,11 @@ typedef struct _WINDOW_DATA
     BOOL  DaemonOffValid;
     int   DaemonOffX;
     int   DaemonOffY;
+    // ...and the SIZE delta, GetWindowRect size minus announce size (ADR-gui 2): the invisible borders a dictated size must be
+    // given back, 14x7 on a themed Win11 frame. Without it every dom0 resize left the window that much smaller than dom0's
+    // frame, the agent announced the smaller size and dom0's border stepped in by itself. 0 when the measurement is implausible.
+    int   DaemonOffW;
+    int   DaemonOffH;
     DWORD DaemonOffTick;
     // Tick of the last daemon MSG_CONFIGURE for this window (DriveTick), and of the last
     // one that had a predecessor within DAEMON_DRIVE_ACTIVE_MS (StreamTick - i.e. a dom0
