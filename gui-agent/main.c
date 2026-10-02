@@ -10006,6 +10006,30 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             // last delivered frame; where the damaged screen equals it, WGC is already current - no poke.
                             // Where it differs, WGC has not delivered that yet (lag or deaf): poke, as before. RGB only,
                             // corners excluded (8 px: DWM's rounding is not in WGC's frame). Unreadable pixels poke.
+                            // M7: DAMAGE ONLY IN THE WINDOW'S OUTER 8 px IS DWM'S CHROME (ADR-capture 28, 2026-10-02) - the 1 px
+                            // border that changes colour with activation and the rounded corners that show what lies behind;
+                            // neither is in a WGC frame (the pixel compare below excludes the same 8 px for that reason), so no
+                            // frame can answer such damage and a poke only recreates the session for nothing. Measured on rz21:
+                            // Settings' top-left edge band (54,59)-(101,63) at focus flips, 4 recreates in 25 s; Paint's 1x1 px
+                            // 7 px above its bottom edge, 2 recreates (m7-phases). Liveness only - WGC still delivers any real
+                            // change there. Jev: verify-first 0.79 - verified by the code path (such a hit never reached the
+                            // compare, so it always poked) and by the hit coordinates. Accepted cost (review, 0.86): a window's
+                            // own change confined to its outer 8 px loses that change's liveness check, never its content.
+                            if (ps->Route == WGCBRK_ROUTE_WGC)
+                            {
+                                const RECT inner8 = { pwRect.left + 8, pwRect.top + 8, pwRect.right - 8, pwRect.bottom - 8 };
+                                RECT inHit;
+                                if (!IntersectRect(&inHit, &pwHit, &inner8))
+                                {
+                                    const ULONG n = ++entry->PwPokeEdgeSkips;
+                                    if (n <= 4 || (n % 256) == 0)
+                                        LogInfo("QGAPOKEEDGE hwnd=0x%x slot=%d n=%lu: damage (%d,%d,%d,%d) lies only in the window's "
+                                            L"8 px edge - DWM's border/corners, not in a WGC frame - no poke",
+                                            (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot, n,
+                                            pwHit.left, pwHit.top, pwHit.right, pwHit.bottom);
+                                    continue;   // this rect is chrome; the next may be the window's own
+                                }
+                            }
                             if (ps->Route == WGCBRK_ROUTE_WGC && entry->PwBuffer && entry->PwBrokerFrames > 0)
                             {
                                 const RECT inner = { pwRect.left + 8, pwRect.top + 8, pwRect.right - 8, pwRect.bottom - 8 };
