@@ -163,6 +163,16 @@ typedef struct _WINDOW_DATA
     ULONG PwPokeLiveSkips;  // WGC liveness pokes withheld: the damage lay under a LIVE window above this one (QGAPOKELIVE)
     ULONG PwPokeDeskSkips;  // WGC liveness pokes withheld: the damage rect also covered uncovered desktop (QGAPOKEDESK)
     ULONG PwPokeEdgeSkips;  // WGC liveness pokes withheld: the damage lay only in the 8 px DWM edge (QGAPOKEEDGE)
+    // Rest-zero M7, ADR-capture 29: regions of this window LEARNED to be invisible to WGC - a liveness poke there went unanswered,
+    // the broker recreated the session, and the new session's first frame showed the region unchanged. Window-relative, each with
+    // the frame size it was learned at (a resize retires it). PwLastPokeHit is the hit of the last poke sent (window-relative).
+    RECT  PwLastPokeHit;
+    BOOL  PwLastPokeHitValid;
+    RECT  PwInvisRect[4];
+    UINT  PwInvisW[4];
+    UINT  PwInvisH[4];
+    UINT  PwInvisCount;     // regions learned so far; the ring slot is PwInvisCount % 4
+    ULONG PwPokeInvisSkips; // WGC liveness pokes withheld: the hit lay in a learned WGC-invisible region (QGAPOKEINVIS)
     // QGACOMPOSITECOPY said for this window (M4: a composite copy on a DirectRequired guest is an error, said once).
     BOOL PwCompositeLogged;
 

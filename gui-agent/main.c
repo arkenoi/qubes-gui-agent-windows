@@ -285,6 +285,9 @@ static ULONGLONG g_SlotCtlSince[WGCBRK_MAX_SLOTS];
 static LONG      g_SlotDeafSaid[WGCBRK_MAX_SLOTS];
 // QGAWGCRECREATE: the broker's QuietReroutes per slot as last reported (a recreate is reported when it moves).
 static LONG      g_SlotQuietSeen[WGCBRK_MAX_SLOTS];
+// ADR-capture 29: set when a QGAWGCRECREATE is reported for the slot; the next frame consumed for its window compares the region
+// of the last poke between the old frame and the new session's first frame (PwRecreateCheck), then clears it.
+static volatile LONG g_SlotRecreateCheck[WGCBRK_MAX_SLOTS];
 // QGAWGCITEMCLOSED: the broker's ItemClosed per slot as last reported (baseline at each registration, like the above).
 static LONG      g_SlotClosedSeen[WGCBRK_MAX_SLOTS];
 // Count of WGC sessions the broker declared DEAF (FAILED + WGCBRK_E_DEAF), published like DirectSuppressed: acceptance
@@ -2903,6 +2906,8 @@ static void BrokerReportDeaf(void)
                     L"poke went unanswered for %u ms (quiet reroutes %ld, sessions opened %ld). A false poke or a session "
                     L"that stopped delivering - QGAPOKEWGC lines name the damage.",
                     (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, qr, s->ChanOpens);
+            if (s->Hwnd != 0 && qr > g_SlotQuietSeen[i])
+                InterlockedExchange(&g_SlotRecreateCheck[i], 1);   // the new session's first frame is checked (ADR-capture 29)
             g_SlotQuietSeen[i] = qr;
         }
         // WINDOWS CLOSED THE WINDOW'S CAPTURE ITEM - said, because the broker now repairs it on its own initiative: it
@@ -3922,6 +3927,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     _InterlockedIncrement(&h->ControlGen);
     entry->PwBrokerSlot = slot; entry->PwBrokerSourced = TRUE; entry->PwBrokerArenaOff = off0;
     g_SlotQuietSeen[slot] = s->QuietReroutes;   // QGAWGCRECREATE baseline for this window
+    InterlockedExchange(&g_SlotRecreateCheck[slot], 0);   // a pending recreate check belonged to the slot's previous window
     g_SlotClosedSeen[slot] = s->ItemClosed;     // QGAWGCITEMCLOSED baseline for this window
     BrokerRequestSent(slot);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
@@ -9325,6 +9331,69 @@ void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason)
 // FALSE when there is none, leaving the hold and slice arms to the caller. Shared by the desktop frame loop and the
 // broker's frame-published event (BrokerConsumePass), so a window whose own content changes while nothing else on the
 // desktop does - a covered one - is copied when ITS frame lands, not at the next unrelated desktop change.
+// WGC-INVISIBLE REGIONS, LEARNED (rest-zero M7, ADR-capture 29, 2026-10-02). Some windows show changes on screen that no WGC frame
+// carries: the new (WinUI) Paint's maximize-glyph at an activation change (4560,276)-(4573,288) and a 10x12 px toolbar spot
+// (940,349)-(950,361) were poked, left unanswered and recreated on rz21 and rz24 (4 of the 4 false recreates outside the activity
+// cell's own PrintWindow span on rz24). So after a recreate the new session's first frame is compared with the old one over the
+// region of the poke that caused it: unchanged means WGC cannot see that region - it is learned, and later pokes whose hit lies
+// inside it are withheld; changed means the session had really stopped and the recreate delivered (nothing learned). Both are
+// logged (QGARECREATECHECK), which also answers whether WGC sees such pixels at all (Jev: measure first 0.68, learn 0.92). A
+// deafened session never delivers a new first frame, so the deaf ladder learns nothing and is unaffected. Up to four regions per
+// window, retired when the frame size changes; cropped windows (toasts) do not learn. Caller holds g_csWatchedWindows.
+static void PwRecreateCheck(IN OUT WINDOW_DATA* entry, IN const BYTE* bsrc, IN int bpitch, IN UINT64 bid)
+{
+    const int slot = entry->PwBrokerSlot;
+    if (slot < 0 || slot >= WGCBRK_MAX_SLOTS || !InterlockedExchange(&g_SlotRecreateCheck[slot], 0))
+        return;
+    if (!entry->PwLastPokeHitValid || !entry->PwBuffer || entry->CropLeft || entry->CropTop ||
+        bpitch != (int)entry->PwWidth * 4)
+    {
+        LogInfo("QGARECREATECHECK hwnd=0x%x slot=%d: not compared (no poke region, no buffer, cropped or resized)",
+            (DWORD)(ULONG_PTR)entry->Handle, slot);
+        return;
+    }
+    RECT r = entry->PwLastPokeHit, all = { 0, 0, (LONG)entry->PwWidth, (LONG)entry->PwHeight };
+    if (!IntersectRect(&r, &r, &all))
+        return;
+    BOOL same = TRUE;
+    for (LONG y = r.top; same && y < r.bottom; y++)
+        same = (memcmp((const BYTE*)entry->PwBuffer + (size_t)y * entry->PwWidth * 4 + (size_t)r.left * 4,
+                       bsrc + (size_t)y * (size_t)bpitch + (size_t)r.left * 4, (size_t)(r.right - r.left) * 4) == 0);
+    // Only glyph-sized regions are learned (Jev review: a poke false for ANOTHER reason - a race strip - would otherwise teach a
+    // region of real content; those are wide, Paint's were 10x12 and 13x12).
+    const BOOL small = (r.right - r.left) <= 64 && (r.bottom - r.top) <= 64;
+    if (same && small)
+    {
+        const UINT k = (UINT)(entry->PwInvisCount % RTL_NUMBER_OF(entry->PwInvisRect));
+        entry->PwInvisRect[k] = r;
+        entry->PwInvisW[k] = entry->PwWidth;
+        entry->PwInvisH[k] = entry->PwHeight;
+        entry->PwInvisCount++;
+    }
+    LogInfo("QGARECREATECHECK hwnd=0x%x slot=%d frame=%I64u: the recreated session's first frame shows the poked region "
+        L"(%ld,%ld,%ld,%ld) %s", (DWORD)(ULONG_PTR)entry->Handle, slot, bid, r.left, r.top, r.right, r.bottom,
+        !same ? L"CHANGED - the session had stopped; nothing learned" :
+        small ? L"UNCHANGED - WGC cannot see it; learned, no further pokes there" :
+                L"UNCHANGED - but larger than 64x64 px; not learned");
+}
+
+// Does the hit (window-relative) lie inside a region learned for this frame size (2 px of slack)?
+static BOOL PwHitLearnedInvisible(IN const WINDOW_DATA* entry, IN const RECT* hitRel)
+{
+    const UINT n = entry->PwInvisCount < RTL_NUMBER_OF(entry->PwInvisRect) ? entry->PwInvisCount
+                                                                            : (UINT)RTL_NUMBER_OF(entry->PwInvisRect);
+    for (UINT k = 0; k < n; k++)
+    {
+        if (entry->PwInvisW[k] != entry->PwWidth || entry->PwInvisH[k] != entry->PwHeight)
+            continue;
+        RECT g = entry->PwInvisRect[k], u;
+        InflateRect(&g, 2, 2);
+        if (UnionRect(&u, &g, hitRel) && EqualRect(&u, &g))
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRectIn)
 {
     const RECT pwRect = *pwRectIn;
@@ -9338,6 +9407,7 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
         entry->PwSliceNeedsFull = FALSE;
         entry->PwBrokerLastId = bid;
         if (entry->PwBrokerFrames < 0xFFFFFFFFu) entry->PwBrokerFrames++;
+        PwRecreateCheck(entry, bsrc, bpitch, bid);   // before the copy overwrites the old frame (ADR-capture 29)
         PwBrokerCopyDiff(entry, bsrc, bpitch, &pwRect);
         // Buffer is complete for this window: square off DWM's black rounded
         // corners before the content check judges it.
@@ -10029,6 +10099,18 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                             pwHit.left, pwHit.top, pwHit.right, pwHit.bottom);
                                     continue;   // this rect is chrome; the next may be the window's own
                                 }
+                                // ...or in a region this window has been seen to change invisibly to WGC (ADR-capture 29).
+                                RECT hitRel = pwHit;
+                                OffsetRect(&hitRel, -pwRect.left, -pwRect.top);
+                                if (PwHitLearnedInvisible(entry, &hitRel))
+                                {
+                                    const ULONG n = ++entry->PwPokeInvisSkips;
+                                    if (n <= 4 || (n % 256) == 0)
+                                        LogInfo("QGAPOKEINVIS hwnd=0x%x slot=%d n=%lu: damage (%d,%d,%d,%d) lies in a region learned to "
+                                            L"be invisible to WGC - no poke", (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot, n,
+                                            pwHit.left, pwHit.top, pwHit.right, pwHit.bottom);
+                                    continue;
+                                }
                             }
                             if (ps->Route == WGCBRK_ROUTE_WGC && entry->PwBuffer && entry->PwBrokerFrames > 0)
                             {
@@ -10098,6 +10180,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                     entry->PwPixSigValid = TRUE;
                                 }
                             }
+                            // The region a recreate check compares, if this poke goes unanswered (ADR-capture 29).
+                            entry->PwLastPokeHit = pwHit;
+                            OffsetRect(&entry->PwLastPokeHit, -pwRect.left, -pwRect.top);
+                            entry->PwLastPokeHitValid = TRUE;
                             BrokerPokeDamage(entry);
                             break;      // one poke per pass; the broker coalesces
                         }
