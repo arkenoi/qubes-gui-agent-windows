@@ -286,7 +286,8 @@ static LONG      g_SlotDeafSaid[WGCBRK_MAX_SLOTS];
 // QGAWGCRECREATE: the broker's QuietReroutes per slot as last reported (a recreate is reported when it moves).
 static LONG      g_SlotQuietSeen[WGCBRK_MAX_SLOTS];
 // ADR-capture 29: set when a QGAWGCRECREATE is reported for the slot; the next frame consumed for its window compares the region
-// of the last poke between the old frame and the new session's first frame (PwRecreateCheck), then clears it.
+// its unanswered pokes covered (PwPokeRegion, frozen from the report on) between the old frame and the new session's first frame
+// (PwRecreateCheck), then clears it.
 static volatile LONG g_SlotRecreateCheck[WGCBRK_MAX_SLOTS];
 // QGAWGCITEMCLOSED: the broker's ItemClosed per slot as last reported (baseline at each registration, like the above).
 static LONG      g_SlotClosedSeen[WGCBRK_MAX_SLOTS];
@@ -3928,6 +3929,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     entry->PwBrokerSlot = slot; entry->PwBrokerSourced = TRUE; entry->PwBrokerArenaOff = off0;
     g_SlotQuietSeen[slot] = s->QuietReroutes;   // QGAWGCRECREATE baseline for this window
     InterlockedExchange(&g_SlotRecreateCheck[slot], 0);   // a pending recreate check belonged to the slot's previous window
+    entry->PwPokeRegionValid = FALSE;                    // ...and so did any poke region (ADR-capture 29)
     g_SlotClosedSeen[slot] = s->ItemClosed;     // QGAWGCITEMCLOSED baseline for this window
     BrokerRequestSent(slot);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
@@ -9335,7 +9337,7 @@ void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason)
 // carries: the new (WinUI) Paint's maximize-glyph at an activation change (4560,276)-(4573,288) and a 10x12 px toolbar spot
 // (940,349)-(950,361) were poked, left unanswered and recreated on rz21 and rz24 (4 of the 4 false recreates outside the activity
 // cell's own PrintWindow span on rz24). So after a recreate the new session's first frame is compared with the old one over the
-// region of the poke that caused it: unchanged means WGC cannot see that region - it is learned, and later pokes whose hit lies
+// region of the pokes that went unanswered (PwPokeRegion): unchanged means WGC cannot see that region - it is learned, and later pokes whose hit lies
 // inside it are withheld; changed means the session had really stopped and the recreate delivered (nothing learned). Both are
 // logged (QGARECREATECHECK), which also answers whether WGC sees such pixels at all (Jev: measure first 0.68, learn 0.92). A
 // deafened session never delivers a new first frame, so the deaf ladder learns nothing and is unaffected. Up to four regions per
@@ -9345,14 +9347,14 @@ static void PwRecreateCheck(IN OUT WINDOW_DATA* entry, IN const BYTE* bsrc, IN i
     const int slot = entry->PwBrokerSlot;
     if (slot < 0 || slot >= WGCBRK_MAX_SLOTS || !InterlockedExchange(&g_SlotRecreateCheck[slot], 0))
         return;
-    if (!entry->PwLastPokeHitValid || !entry->PwBuffer || entry->CropLeft || entry->CropTop ||
+    if (!entry->PwPokeRegionValid || !entry->PwBuffer || entry->CropLeft || entry->CropTop ||
         bpitch != (int)entry->PwWidth * 4)
     {
         LogInfo("QGARECREATECHECK hwnd=0x%x slot=%d: not compared (no poke region, no buffer, cropped or resized)",
             (DWORD)(ULONG_PTR)entry->Handle, slot);
         return;
     }
-    RECT r = entry->PwLastPokeHit, all = { 0, 0, (LONG)entry->PwWidth, (LONG)entry->PwHeight };
+    RECT r = entry->PwPokeRegion, all = { 0, 0, (LONG)entry->PwWidth, (LONG)entry->PwHeight };
     if (!IntersectRect(&r, &r, &all))
         return;
     BOOL same = TRUE;
@@ -9404,10 +9406,17 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
     if (bid != entry->PwBrokerLastId || entry->PwSliceNeedsFull)
     {
         BOOL firstBrokerFrame = (entry->PwBrokerLastId == 0);
+        // Only a NEW frame id is a frame the broker published since the last one: a full re-copy (PwSliceNeedsFull) of the same id
+        // is not the recreated session's first frame (comparing it with itself would learn the region "unchanged") and answers no poke.
+        const BOOL newFrame = (bid != entry->PwBrokerLastId);
         entry->PwSliceNeedsFull = FALSE;
         entry->PwBrokerLastId = bid;
         if (entry->PwBrokerFrames < 0xFFFFFFFFu) entry->PwBrokerFrames++;
-        PwRecreateCheck(entry, bsrc, bpitch, bid);   // before the copy overwrites the old frame (ADR-capture 29)
+        if (newFrame)
+        {
+            PwRecreateCheck(entry, bsrc, bpitch, bid);   // before the copy overwrites the old frame (ADR-capture 29)
+            entry->PwPokeRegionValid = FALSE;            // a frame answers every poke sent before it
+        }
         PwBrokerCopyDiff(entry, bsrc, bpitch, &pwRect);
         // Buffer is complete for this window: square off DWM's black rounded
         // corners before the content check judges it.
@@ -10180,10 +10189,24 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                     entry->PwPixSigValid = TRUE;
                                 }
                             }
-                            // The region a recreate check compares, if this poke goes unanswered (ADR-capture 29).
-                            entry->PwLastPokeHit = pwHit;
-                            OffsetRect(&entry->PwLastPokeHit, -pwRect.left, -pwRect.top);
-                            entry->PwLastPokeHitValid = TRUE;
+                            // The region a recreate check compares, if this poke goes unanswered (ADR-capture 29): the union
+                            // of the pokes since the last frame. Frozen once a recreate is reported for the slot - a poke sent
+                            // between the report and the new session's first frame did not cause the recreate (measured rz24
+                            // and rz25: Calculator's new session drew a whole-window damage 8-12 ms after the report, which
+                            // replaced the 6x12 px region that went unanswered, so the check compared the whole window).
+                            {
+                                const int ps2 = entry->PwBrokerSlot;
+                                if (ps2 < 0 || ps2 >= WGCBRK_MAX_SLOTS || !g_SlotRecreateCheck[ps2])
+                                {
+                                    RECT hr = pwHit;
+                                    OffsetRect(&hr, -pwRect.left, -pwRect.top);
+                                    if (entry->PwPokeRegionValid)
+                                        UnionRect(&entry->PwPokeRegion, &entry->PwPokeRegion, &hr);
+                                    else
+                                        entry->PwPokeRegion = hr;
+                                    entry->PwPokeRegionValid = TRUE;
+                                }
+                            }
                             BrokerPokeDamage(entry);
                             break;      // one poke per pass; the broker coalesces
                         }

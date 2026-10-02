@@ -165,9 +165,10 @@ typedef struct _WINDOW_DATA
     ULONG PwPokeEdgeSkips;  // WGC liveness pokes withheld: the damage lay only in the 8 px DWM edge (QGAPOKEEDGE)
     // Rest-zero M7, ADR-capture 29: regions of this window LEARNED to be invisible to WGC - a liveness poke there went unanswered,
     // the broker recreated the session, and the new session's first frame showed the region unchanged. Window-relative, each with
-    // the frame size it was learned at (a resize retires it). PwLastPokeHit is the hit of the last poke sent (window-relative).
-    RECT  PwLastPokeHit;
-    BOOL  PwLastPokeHitValid;
+    // the frame size it was learned at (a resize retires it). PwPokeRegion is the union of the hits of the pokes sent since the last
+    // broker frame was consumed (window-relative) - the pokes a recreate left unanswered; frozen while a recreate check is pending.
+    RECT  PwPokeRegion;
+    BOOL  PwPokeRegionValid;
     RECT  PwInvisRect[4];
     UINT  PwInvisW[4];
     UINT  PwInvisH[4];
