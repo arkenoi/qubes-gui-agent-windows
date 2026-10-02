@@ -2888,6 +2888,66 @@ static ULONGLONG BrokerNextDue(void)
 // poke, recreated once, silent again - and holds it FAILED with WGCBRK_E_DEAF until it is asked again. Said once per
 // request, published as WgcDeaf for the harness. The window keeps its last content (or stays withheld): there is no
 // PrintWindow route under it any more (c2: 0.05).
+// The user-facing half of QGAWGCDEAF (ADR-capture 32). The id carries the app's image name reduced to [a-z0-9-] (the route's
+// name rule), so each deaf app is reported once per boot; the text is templated - the image name, one sentence, the log line.
+static void DeafNotifyUser(IN HWND window)
+{
+    char image[64] = "an app";
+    char id[QERR_MAX_ID + 1] = "capture-deaf";
+    DWORD pid = 0;
+    if (window && GetWindowThreadProcessId(window, &pid) && pid)
+    {
+        HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        if (p)
+        {
+            WCHAR path[MAX_PATH];
+            DWORD n = RTL_NUMBER_OF(path);
+            if (QueryFullProcessImageNameW(p, 0, path, &n))
+            {
+                const WCHAR* base = wcsrchr(path, L'\\');
+                base = base ? base + 1 : path;
+                size_t k = 0;
+                // ASCII letters, digits and . - _ only, at most 32 characters: the error route refuses text carrying a run of
+                // 40 or more base64-class characters (it reads as a key), and a refused notification would be a silent one.
+                for (const WCHAR* c = base; *c && k < 32; c++)
+                {
+                    const WCHAR w = *c;
+                    const BOOL ok = (w >= L'a' && w <= L'z') || (w >= L'A' && w <= L'Z') || (w >= L'0' && w <= L'9') ||
+                                    w == L'.' || w == L'-' || w == L'_';
+                    image[k++] = (char)(ok ? w : L'_');
+                }
+                image[k] = 0;
+                // the id: "capture-deaf-" + the image name lowercased, every other character a '-'
+                size_t j = strlen(id);
+                id[j++] = '-';
+                for (size_t m = 0; image[m] && j < QERR_MAX_ID; m++)
+                {
+                    const char ch = image[m];
+                    id[j++] = (char)((ch >= 'A' && ch <= 'Z') ? (ch - 'A' + 'a') :
+                                     ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) ? ch : '-');
+                }
+                id[j] = 0;
+            }
+            CloseHandle(p);
+        }
+    }
+    char summary[300];
+    (void)StringCchPrintfA(summary, RTL_NUMBER_OF(summary),
+        "a window of %s stopped updating: Windows delivers no new pictures of it, so dom0 keeps showing its last content; "
+        "close and reopen that window", image);
+    QerrDecision d = QerrReport("gui-agent", id, QERR_SEV_ACTION, summary, "gui-agent log in Qubes Logs, line QGAWGCDEAF");
+    LogInfo("QGAWGCDEAF user notification for %S: %S", id, QerrDecisionName(d));
+    // An image name the route's redaction refuses (one containing "token", say) must not make the report silent: say it
+    // without the name, under the generic id.
+    if (d == QERR_REJECT_REDACT || d == QERR_REJECT_NAME)
+    {
+        d = QerrReport("gui-agent", "capture-deaf", QERR_SEV_ACTION,
+            "a window stopped updating: Windows delivers no new pictures of it, so dom0 keeps showing its last content; "
+            "close and reopen that window", "gui-agent log in Qubes Logs, line QGAWGCDEAF");
+        LogInfo("QGAWGCDEAF user notification (generic) for capture-deaf: %S", QerrDecisionName(d));
+    }
+}
+
 static void BrokerReportDeaf(void)
 {
     const WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
@@ -2935,6 +2995,11 @@ static void BrokerReportDeaf(void)
             L"the window keeps its last content until it is registered again - there is no PrintWindow fallback. "
             L"WgcDeaf=%lu published under the Qubes Tools config key.",
             (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, s->DeafHolds, g_WgcDeafCount);
+        // NO SILENT REGRESSIONS (owner 2026-10-02: "fail loudly (including user facing message) if capture really goes
+        // deaf someday"). A deaf hold is the product not delivering a window, and nothing here recovers it: the user is told
+        // in dom0 through the agent's error route (notifyerr: ACTION, one notification per app per boot, at most
+        // QERR_CAP_PER_BOOT per boot), naming the app by its image name - never a window title.
+        DeafNotifyUser((HWND)(ULONG_PTR)s->Hwnd);
     }
 }
 
@@ -10052,7 +10117,15 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // frame followed; silence with no poke just means nothing changed.
                 // Jev picked this discriminator at 0.63 over "has never delivered" at 0.25 - the
                 // latter would never re-route the founding case, which had FramesArrived frozen at 3.
-                if (ps->Hwnd == (UINT64)(ULONG_PTR)entry->Handle)
+                // ADR-capture 32 (owner 2026-10-02, "go on"): DESKTOP DAMAGE POKES ONLY THE PRINTWINDOW ROUTE, where the poke is
+                // the render trigger (menus). A WGC or relay slot delivers its own changes as arrivals; there the damage poke only
+                // asked a liveness question by comparing what changed on the composed screen with what changed in the window's
+                // capture - two views that legitimately differ (other windows' pixels over it: key-tip badges, the relay's
+                // invisible window, neighbours' shadows; DWM-drawn parts no capture holds: border, corners, backdrop, title-bar
+                // activation visuals). On the target (retail 26300) it caught no real stop in four acceptance chains and caused
+                // dozens of false recreates (Jev: justified 0.19; input + Windows' events only 0.84). Liveness for those slots now
+                // comes from keys and clicks into the window (BrokerPokeWindow) and from Windows closing the capture item.
+                if (ps->Hwnd == (UINT64)(ULONG_PTR)entry->Handle && ps->Route == (LONG)WGCBRK_ROUTE_PW)
                 {
                     // NOT THE BORDER. A damage rect that only reaches this window's outermost pixels is the
                     // NEIGHBOUR's damage: Windows 11 draws a translucent one-pixel border, the window beneath
