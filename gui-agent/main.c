@@ -6880,6 +6880,13 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     return TRUE;
 }
 
+// Remember where a window was before its tracked rect changes (rest-zero M7, ADR-capture 27; read by PwHitCoveredLive).
+static void NotePrevRect(IN OUT WINDOW_DATA* e)
+{
+    SetRect(&e->PrevRect, e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height);
+    e->PrevRectTick = GetTickCount64();
+}
+
 // Refresh data about a window, send notifications to gui daemon if needed.
 // Marks the window for removal from the list if the new state makes it no longer eligible.
 // Watched windows critical section must be entered.
@@ -7139,6 +7146,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             windowData->Handle, windowData->X, windowData->Y, windowData->Width, windowData->Height,
             data.X, data.Y, data.Width, data.Height);
 
+        NotePrevRect(windowData);
         windowData->X = data.X;
         windowData->Y = data.Y;
         windowData->Width = data.Width;
@@ -8531,9 +8539,17 @@ static BOOL PwRectVisibleBeyond(IN const RECT* r, IN const RECT* occ, IN int n, 
 // window beyond its tracked occluders), never at rest. A walk that cannot finish - too many windows above to describe, or
 // the chain cut by a window destroyed mid-walk - answers "not covered": the poke goes out, as before this. The caller holds
 // g_csWatchedWindows (FindWindowByHandle). *coveredBy names the first live window above that touches the hit (the log line).
+// ...and WHERE THEY JUST WERE (ADR-capture 27, 2026-10-02). The frame being read can show a window above one step behind its
+// live rect: a Calculator moved back over a Notepad in steps left damage (1913,363)-(2487,1037) - its previous step plus shadow -
+// while its live rect was already 100 px on; the strip it had just uncovered counted as the Notepad's own change, the Notepad was
+// poked and its session recreated (m7-phases B, rz21: 1 poke, 1 recreate; Jev: fix now 0.98). So each tracked window above also
+// covers with its TRACKED rect (the live rect can lead it) and, for PW_PREV_RECT_MS after its tracked rect changed, with the rect
+// it had before (NotePrevRect), all with the same shadow margin. What a moving window uncovers is the window beneath's own,
+// unchanged content - already in its last WGC frame - so withholding the liveness poke there loses nothing.
+#define PW_PREV_RECT_MS 250
 static BOOL PwHitCoveredLive(IN HWND self, IN const RECT* hit, OUT HWND* coveredBy)
 {
-    RECT occ[PW_MAX_OCCLUDERS * 2];
+    RECT occ[PW_MAX_OCCLUDERS * 6];
     int n = 0;
     int steps = 0;
     HWND h;
@@ -8547,20 +8563,39 @@ static BOOL PwHitCoveredLive(IN HWND self, IN const RECT* hit, OUT HWND* covered
         // Tracked, and not on its way out (the tracked rule's DeletePending exclusion). The same measure as the tracked rect
         // (GetRealWindowRect: DWM's extended frame bounds), or GetWindowRect's invisible resize borders (~7 px a side) would
         // hide this window's own damage next to the window above. No valid bounds: not an occluder (the poke goes out).
-        if (!above || above->DeletePending || !IsWindowVisible(h) ||
+        // A minimized window covers nothing, whatever rect it was last tracked at (Jev review: a stale tracked rect is the
+        // over-suppression risk; otherwise the tracked rect follows every LOCATIONCHANGE and the 2 s resync).
+        if (!above || above->DeletePending || !IsWindowVisible(h) || IsIconic(h) ||
             DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)) != S_OK ||
             r.right <= r.left || r.bottom <= r.top)
             continue;
-        InflateRect(&r, PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
-        if (!IntersectRect(&x, &r, hit))
+        // Live, tracked, and - just after a move - previous (see above), each with the shadow margin.
+        RECT cand[3];
+        int nc = 0;
+        BOOL touches = FALSE;
+        cand[nc++] = r;
+        SetRect(&cand[nc], above->X, above->Y, above->X + (int)above->Width, above->Y + (int)above->Height);
+        if (!IsRectEmpty(&cand[nc]))
+            nc++;
+        if (above->PrevRectTick != 0 && GetTickCount64() - above->PrevRectTick < PW_PREV_RECT_MS &&
+            !IsRectEmpty(&above->PrevRect))
+            cand[nc++] = above->PrevRect;
+        for (int c = 0; c < nc; c++)
+        {
+            InflateRect(&cand[c], PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
+            if (IntersectRect(&x, &cand[c], hit))
+                touches = TRUE;
+        }
+        if (!touches)
             continue;
         if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
             continue;
-        if (n >= (int)RTL_NUMBER_OF(occ))
+        if (n + nc > (int)RTL_NUMBER_OF(occ))
             return FALSE;   // too many to describe: not covered, the poke goes out
         if (!*coveredBy)
             *coveredBy = h;
-        occ[n++] = r;
+        for (int c = 0; c < nc; c++)
+            occ[n++] = cand[c];
     }
     if (steps >= 4096)
         return FALSE;       // a chain that does not end is not an answer
@@ -10762,6 +10797,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                      freshW != (int)entry->Width || freshH != (int)entry->Height) &&
                     freshW > 0 && freshH > 0)
                 {
+                    NotePrevRect(entry);
                     entry->X = fresh.left;
                     entry->Y = fresh.top;
                     entry->Width = freshW;

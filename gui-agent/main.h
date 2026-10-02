@@ -304,6 +304,10 @@ typedef struct _WINDOW_DATA
     // Restart placement (P3, owner 2026-10-01): when the window was re-created in dom0 by a bulk enumeration (agent start,
     // seamless re-entry), the GetTickCount64() of that create; 0 = none pending. See HandleConfigure.
     ULONGLONG RestartPlacementTick;
+    // The tracked rect this window had before its last move or resize, and when it changed (rest-zero M7, ADR-capture 27): a
+    // window moving over others leaves damage where it WAS, which the live check must still count as its own. 0 = never moved.
+    RECT  PrevRect;
+    ULONGLONG PrevRectTick;
 
     // Card size the dom0 size-lock hint was last sent for (WM-managed shell surfaces only).
     // -1 = never sent; re-sent when the announced card size changes.
