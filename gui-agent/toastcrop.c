@@ -1263,6 +1263,20 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
     if (!IsShellToastWindow(data) && !IsMenuPopupWindow(data))
         return FALSE;
 
+    // A WINDOW SMALLER THAN THE CROP FLOOR CAN NEVER YIELD A CARD: a card lies inside its window and TcValidateInsets
+    // refuses any crop below the floor (the same floor, computed the same way). So no measurement is queued for it. These
+    // are the Win11 Alt-nav key-tip badges (~35-48 x 46 px, Xaml_WindowedPopupClass / PopupWindowSiteBridge): each took up
+    // to 6 cross-process UIA card searches ~2 s apart, all "below the floor", and AddWindow then drops it anyway (Paint
+    // shows 27 at once). Owner 2026-10-02: the badges are dropped fully - not shown in dom0, and nothing spent on them
+    // (Jev: painting them would slow the menu Alt+letter opens 0.80, drop fully 0.93). Result unchanged: uncropped.
+    {
+        LONG floorW = (LONG)g_MinWindowWidth, floorH = (LONG)g_MinWindowHeight;
+        if (floorW < TOAST_CROP_FLOOR_WIDTH)  floorW = TOAST_CROP_FLOOR_WIDTH;
+        if (floorH < TOAST_CROP_FLOOR_HEIGHT) floorH = TOAST_CROP_FLOOR_HEIGHT;
+        if ((LONG)data->Width < floorW || (LONG)data->Height < floorH)
+            return FALSE;
+    }
+
     EnterCriticalSection(&g_TcLock);
 
     TOAST_CROP_ENTRY* slot = TcGetSlot(TcCacheKey(data), data->Width, data->Height);
