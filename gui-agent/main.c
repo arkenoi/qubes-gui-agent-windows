@@ -8512,6 +8512,55 @@ static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
     return n;
 }
 
+// A WINDOW'S OWN POPUP THAT THE AGENT DOES NOT TRACK (ADR-capture 30, 2026-10-02). The agent drops Alt-nav key-tip badges
+// (Xaml_WindowedPopupClass / Microsoft.UI.Content.PopupWindowSiteBridge, ~35-48 x 46 px, OWNED by the app window) as sub-floor
+// popups with no synthesis owner, so no occluder rule ever counted them: their cards and glyphs, drawn over the app, were taken
+// for the app's own change, poked, WGC (the app's capture, which never holds another window's pixels) delivered nothing, and
+// the session was recreated. Every Calculator and Paint region ADR 29 "learned" as WGC-invisible on rz24/rz25 lay inside such a
+// badge (calc-popup-2, 2026-10-02: focus by an Alt tap - the harness's way - 2/2 Calculator recreates and 3 on Paint, focus
+// without a key 0/2 and 0; Jev: root cause 0.99, this rule 0.78). Narrow on purpose (Jev 0.59 against counting every window
+// above): only a WS_POPUP window whose GW_OWNER is this one, visible, not minimized, not DWM-cloaked, neither click-through nor layered
+// (Office's alpha-0 shadow strips are layered owned windows), with valid DWM bounds. Its live bounds; no tracked or previous rect.
+static BOOL PwOwnedPopupRect(IN HWND h, IN HWND self, OUT RECT* r)
+{
+    DWORD cloaked = 0;
+    if (GetWindow(h, GW_OWNER) != self || !IsWindowVisible(h) || IsIconic(h) ||
+        !(GetWindowLongW(h, GWL_STYLE) & WS_POPUP) ||
+        (GetWindowLongW(h, GWL_EXSTYLE) & (WS_EX_TRANSPARENT | WS_EX_LAYERED)) ||
+        DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, r, sizeof(*r)) != S_OK ||
+        r->right <= r->left || r->bottom <= r->top)
+        return FALSE;
+    if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
+        return FALSE;
+    return TRUE;
+}
+
+// Append this window's untracked owned popups that intersect `rect` (each with PW_OWNED_POPUP_MARGIN) to out[n..maxOut): the new
+// count, or -1 when they do not fit. Owned windows always sit above their owner, so the live chain above it is walked, whatever
+// the captured z-order. The caller holds g_csWatchedWindows (FindWindowByHandle).
+// THE MARGIN IS NOT THE DWM SHADOW'S: a XAML windowed popup (WS_EX_NOREDIRECTIONBITMAP) draws its own shadow INSIDE its window
+// (a 46 px badge holds a 26 px card) and DWM adds none; its damage ran 1 px past its bounds (652,278 vs 653,279, calc-popup-2).
+// 34 px would inflate a 40x46 badge to 108x114 over the app's own content and withhold that content's liveness pokes too.
+#define PW_MAX_OWNED_POPUPS 48
+#define PW_OWNED_POPUP_MARGIN 4
+static int PwAddOwnedPopups(IN HWND self, IN const RECT* rect, IN OUT RECT* out, IN int n, IN int maxOut)
+{
+    int steps = 0;
+    for (HWND h = GetWindow(self, GW_HWNDPREV); h && steps < 4096; h = GetWindow(h, GW_HWNDPREV), steps++)
+    {
+        RECT r, hit;
+        if (GetWindow(h, GW_OWNER) != self || FindWindowByHandle(h) || !PwOwnedPopupRect(h, self, &r))
+            continue;
+        InflateRect(&r, PW_OWNED_POPUP_MARGIN, PW_OWNED_POPUP_MARGIN);
+        if (!IntersectRect(&hit, &r, rect))
+            continue;
+        if (n >= maxOut)
+            return -1;
+        out[n++] = hit;
+    }
+    return steps >= 4096 ? -1 : n;
+}
+
 // Does any part of r lie outside every rect of occ[0..n)? Rectangle subtraction, bounded: past the budget it answers TRUE
 // (for a PrintWindow slot the poke is the render trigger, so the conservative answer is "visible"; for a WGC slot it
 // costs at most one extra liveness hint).
@@ -8573,24 +8622,31 @@ static BOOL PwHitCoveredLive(IN HWND self, IN const RECT* hit, OUT HWND* covered
         // hide this window's own damage next to the window above. No valid bounds: not an occluder (the poke goes out).
         // A minimized window covers nothing, whatever rect it was last tracked at (Jev review: a stale tracked rect is the
         // over-suppression risk; otherwise the tracked rect follows every LOCATIONCHANGE and the 2 s resync).
-        if (!above || above->DeletePending || !IsWindowVisible(h) || IsIconic(h) ||
-            DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)) != S_OK ||
-            r.right <= r.left || r.bottom <= r.top)
+        // ...or this window's own popup that the agent does not track (ADR-capture 30, PwOwnedPopupRect): its live rect only.
+        const BOOL ownedPopup = !above && PwOwnedPopupRect(h, self, &r);
+        if (!ownedPopup &&
+            (!above || above->DeletePending || !IsWindowVisible(h) || IsIconic(h) ||
+             DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)) != S_OK ||
+             r.right <= r.left || r.bottom <= r.top))
             continue;
         // Live, tracked, and - just after a move - previous (see above), each with the shadow margin.
         RECT cand[3];
         int nc = 0;
         BOOL touches = FALSE;
         cand[nc++] = r;
-        SetRect(&cand[nc], above->X, above->Y, above->X + (int)above->Width, above->Y + (int)above->Height);
-        if (!IsRectEmpty(&cand[nc]))
-            nc++;
-        if (above->PrevRectTick != 0 && GetTickCount64() - above->PrevRectTick < PW_PREV_RECT_MS &&
-            !IsRectEmpty(&above->PrevRect))
-            cand[nc++] = above->PrevRect;
+        if (!ownedPopup)
+        {
+            SetRect(&cand[nc], above->X, above->Y, above->X + (int)above->Width, above->Y + (int)above->Height);
+            if (!IsRectEmpty(&cand[nc]))
+                nc++;
+            if (above->PrevRectTick != 0 && GetTickCount64() - above->PrevRectTick < PW_PREV_RECT_MS &&
+                !IsRectEmpty(&above->PrevRect))
+                cand[nc++] = above->PrevRect;
+        }
         for (int c = 0; c < nc; c++)
         {
-            InflateRect(&cand[c], PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
+            const int m = ownedPopup ? PW_OWNED_POPUP_MARGIN : PW_POPUP_SHADOW_MARGIN;
+            InflateRect(&cand[c], m, m);
             if (IntersectRect(&x, &cand[c], hit))
                 touches = TRUE;
         }
@@ -10023,11 +10079,22 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // its shadow - poked Notepad 273 times and the design-E ladder froze a healthy window): there every
                     // window above counts, a popup with a margin for its drop shadow (Jev: both fixes 0.64).
                     const BOOL livenessOnly = (ps->Route != WGCBRK_ROUTE_PW);
-                    RECT occ[PW_MAX_OCCLUDERS];
+                    RECT occ[PW_MAX_OCCLUDERS + PW_MAX_OWNED_POPUPS];
                     int nOcc = g_ZOrderCaptureValid
                         ? PwCollectOccludersEx(entry, &pokeRect, occ, PW_MAX_OCCLUDERS, livenessOnly) : 0;
                     if (nOcc < 0)
                         nOcc = 0;   // too many to describe: nothing excluded, as before
+                    // ...and, for a liveness poke, the window's own untracked popups (ADR-capture 30): the damage under a key-tip
+                    // badge is the badge's, and a badge appearing or vanishing changes the visible region, so that pass is an
+                    // occlusion, not this window's change (the visible-region rule below). They do not fit: the tracked set only.
+                    // No valid z-order capture: nothing excluded, as before (the owned popups would not need it, but that case
+                    // keeps the behaviour it had).
+                    else if (livenessOnly && g_ZOrderCaptureValid)
+                    {
+                        const int withOwned = PwAddOwnedPopups(entry->Handle, &pokeRect, occ, nOcc, (int)RTL_NUMBER_OF(occ));
+                        if (withOwned >= 0)
+                            nOcc = withOwned;
+                    }
                     // ONLY THE WINDOW'S OWN CHANGE POKES IT (docs/DESIGN-rest-zero-capture.md E). Two refinements of the
                     // occluder rule above, because on 26100+ an unanswered poke now ends in a DEAF hold (FAILED, no
                     // PrintWindow rung) rather than in a polled render:
