@@ -8614,7 +8614,7 @@ static BOOL PwHitCoveredLive(IN HWND self, IN const RECT* hit, OUT HWND* covered
     *coveredBy = NULL;
     for (h = GetWindow(self, GW_HWNDPREV); h && steps < 4096; h = GetWindow(h, GW_HWNDPREV), steps++)
     {
-        RECT r, x;
+        RECT r = { 0, 0, 0, 0 }, x;   // filled by PwOwnedPopupRect or DwmGetWindowAttribute below (C4701 cannot see it)
         DWORD cloaked = 0;
         const WINDOW_DATA* above = FindWindowByHandle(h);
         // Tracked, and not on its way out (the tracked rule's DeletePending exclusion). The same measure as the tracked rect
