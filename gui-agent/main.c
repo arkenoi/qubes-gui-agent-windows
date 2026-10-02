@@ -9361,8 +9361,8 @@ static void PwRecreateCheck(IN OUT WINDOW_DATA* entry, IN const BYTE* bsrc, IN i
                        bsrc + (size_t)y * (size_t)bpitch + (size_t)r.left * 4, (size_t)(r.right - r.left) * 4) == 0);
     // Only glyph-sized regions are learned (Jev review: a poke false for ANOTHER reason - a race strip - would otherwise teach a
     // region of real content; those are wide, Paint's were 10x12 and 13x12).
-    const BOOL small = (r.right - r.left) <= 64 && (r.bottom - r.top) <= 64;
-    if (same && small)
+    const BOOL glyphSized = (r.right - r.left) <= 64 && (r.bottom - r.top) <= 64;   // not "small": rpcndr.h #defines it
+    if (same && glyphSized)
     {
         const UINT k = (UINT)(entry->PwInvisCount % RTL_NUMBER_OF(entry->PwInvisRect));
         entry->PwInvisRect[k] = r;
@@ -9373,7 +9373,7 @@ static void PwRecreateCheck(IN OUT WINDOW_DATA* entry, IN const BYTE* bsrc, IN i
     LogInfo("QGARECREATECHECK hwnd=0x%x slot=%d frame=%I64u: the recreated session's first frame shows the poked region "
         L"(%ld,%ld,%ld,%ld) %s", (DWORD)(ULONG_PTR)entry->Handle, slot, bid, r.left, r.top, r.right, r.bottom,
         !same ? L"CHANGED - the session had stopped; nothing learned" :
-        small ? L"UNCHANGED - WGC cannot see it; learned, no further pokes there" :
+        glyphSized ? L"UNCHANGED - WGC cannot see it; learned, no further pokes there" :
                 L"UNCHANGED - but larger than 64x64 px; not learned");
 }
 
