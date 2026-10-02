@@ -36,6 +36,8 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #include <log.h>
 #include <config.h>
 
+#include "main.h"   // BrokerPokeWindow - the call a dom0 key makes first (FI_GUEST_KEY_POKE)
+
 // Registry values (module key: HKLM\Software\Invisible Things Lab\Qubes Tools\gui-agent)
 // and the environment overrides that win over them, exactly as perf.c does it.
 #define REG_CONFIG_FAULT_DELAY_VALUE        L"FaultArmDelaySec"
@@ -52,6 +54,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define REG_CONFIG_FAULT_GATE_OFF_VALUE     L"FaultGateOff"
 #define REG_CONFIG_FAULT_DAMAGE_DELAY_VALUE L"FaultDamageDelayMs"
 #define REG_CONFIG_FAULT_PUMP_LOSE_VALUE   L"FaultPumpStallLose"
+#define REG_CONFIG_FAULT_GUEST_KEY_VALUE   L"FaultGuestKeyPoke"
 
 #define FAULT_DELAY_ENV_VALUE        L"QUBES_GUI_FAULT_DELAY"
 #define FAULT_NEG_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_NEG_CREATE"
@@ -67,6 +70,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define FAULT_GATE_OFF_ENV_VALUE     L"QUBES_GUI_FAULT_GATE_OFF"
 #define FAULT_DAMAGE_DELAY_ENV_VALUE L"QUBES_GUI_FAULT_DAMAGE_DELAY"
 #define FAULT_PUMP_LOSE_ENV_VALUE    L"QUBES_GUI_FAULT_PUMP_LOSE"
+#define FAULT_GUEST_KEY_ENV_VALUE    L"QUBES_GUI_FAULT_GUEST_KEY_POKE"
 
 // Seconds between FiInit() and the first fault that may fire. See faultinject.h: every
 // failure being reproduced is a failure of a CONNECTED agent, so a fault landing during
@@ -129,6 +133,66 @@ static volatile LONG g_FiDamageDelayLogged = 0;
 static volatile LONG g_FiRingStallArmed = 0;
 static ULONGLONG     g_FiRingStallUntil = 0;    // written once by FiInit
 static volatile LONG g_FiRingStallHits  = 0;
+
+// [FI_GUEST_KEY_POKE] A key typed INSIDE the guest pokes the foreground window's liveness exactly as a key from dom0 does.
+//
+// WHY. Since ADR-capture 32 a window's capture is checked for liveness only when dom0 delivers a key or a click to it
+// (HandleKeypress / HandleButton -> BrokerPokeWindow). The rest-zero acceptance's deaf cell types from a script INSIDE the
+// guest session, so its keys never pass this agent and the deaf ladder could not be reached at all (rz29, 2026-10-02:
+// 0 pokes, 0 reopens, 0 DEAF, no notification - in the control and the armed run alike). The real hop is dom0 ->
+// gui-daemon -> vchan; driving it from the dev qube needs a dom0 input service, which the owner declined ("better skip more
+// dom0 complications"). So this makes the SAME BrokerPokeWindow call the dom0 key path makes first, for the foreground
+// window, on every key-down a low-level keyboard hook sees: it exercises everything after the vchan input handler, and
+// NOT the dom0 -> vchan hop - a deaf-cell result from it must say so.
+//
+// A MODE, not a shot, and not delayed (it injects no defect: it only carries a stimulus the build otherwise cannot see).
+// Keys this agent injects for dom0 are seen as well and poke twice - harmless, the broker compares PokeSeq with the value
+// it last serviced and does not count pokes. Each poke is logged (QGAFIKEYPOKE) so the cell can show its stimulus arrived.
+// TEMPORARY: owner 2026-10-02, "dont forget to strip it afterwards" - REMOVE this knob, the hook and the main.h include
+// once the rz29 acceptance is graded (tracked in findings/issues.md).
+static DWORD g_FiGuestKeyPoke = 0;
+static volatile LONG g_FiGuestKeyPokes = 0;
+
+static LRESULT CALLBACK FiGuestKeyProc(IN int code, IN WPARAM wParam, IN LPARAM lParam)
+{
+    if (code == HC_ACTION && (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN))
+    {
+        // Low-level hooks must return quickly (LowLevelHooksTimeout); BrokerPokeWindow never waits - it TRIES the lock.
+        HWND fg = GetForegroundWindow();
+        HWND root = fg ? GetAncestor(fg, GA_ROOT) : NULL;
+        if (root)
+        {
+            BrokerPokeWindow(root);
+            LogInfo("QGAFIKEYPOKE hwnd 0x%x n=%ld", (ULONG)(ULONG_PTR)root, InterlockedIncrement(&g_FiGuestKeyPokes));
+        }
+    }
+    return CallNextHookEx(NULL, code, wParam, lParam);
+}
+
+static DWORD WINAPI FiGuestKeyThread(IN void* unused)
+{
+    HHOOK hook;
+    MSG msg;
+
+    UNREFERENCED_PARAMETER(unused);
+    hook = SetWindowsHookExW(WH_KEYBOARD_LL, FiGuestKeyProc, GetModuleHandleW(NULL), 0);
+    if (!hook)
+    {
+        LogWarning("QGAFAULT FI_GUEST_KEY_POKE: SetWindowsHookEx failed (0x%x) - guest keys will NOT reach the liveness "
+            L"check, so a deaf cell on this run measures nothing", GetLastError());
+        return 1;
+    }
+    LogWarning("QGAFAULT FI_GUEST_KEY_POKE on: every key typed in the guest pokes the foreground window's liveness, "
+        L"as a key from dom0 does (the dom0 -> vchan hop itself is NOT exercised)");
+    // A low-level hook is called through the installing thread's message queue: this thread only has to pump.
+    while (GetMessageW(&msg, NULL, 0, 0) > 0)
+    {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+    UnhookWindowsHookEx(hook);
+    return 0;
+}
 
 // Registry first, environment second (env wins) - the same precedence PerfInit uses, so
 // a fault can be armed for one qrexec-launched run without touching HKLM.
@@ -206,6 +270,7 @@ void FiInit(void)
     g_FiGateOff         = FiReadDword(moduleName, REG_CONFIG_FAULT_GATE_OFF_VALUE, FAULT_GATE_OFF_ENV_VALUE, 0);
     g_FiDamageDelayMs   = FiReadDword(moduleName, REG_CONFIG_FAULT_DAMAGE_DELAY_VALUE, FAULT_DAMAGE_DELAY_ENV_VALUE, 0);
     g_FiPumpStallLose   = FiReadDword(moduleName, REG_CONFIG_FAULT_PUMP_LOSE_VALUE, FAULT_PUMP_LOSE_ENV_VALUE, 0);
+    g_FiGuestKeyPoke    = FiReadDword(moduleName, REG_CONFIG_FAULT_GUEST_KEY_VALUE, FAULT_GUEST_KEY_ENV_VALUE, 0);
 
     g_FiArmAt = GetTickCount64() + (ULONGLONG)delaySec * 1000ULL;
 
@@ -225,14 +290,25 @@ void FiInit(void)
     // cause is a measurement run attributed to the wrong build, so every log file from a
     // fault-capable binary has to say so on its first page whether or not anything is armed.
     LogWarning("QGAFAULT-INIT build=%S armdelay=%us negcreate=%d(hwnd=0x%x) ringstall=%us "
-        L"pumpstall=%us pumplose=%u captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d gateoff=0x%x damagedelay=%ums",
+        L"pumpstall=%us pumplose=%u captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d gateoff=0x%x damagedelay=%ums "
+        L"guestkeypoke=%u",
         g_FaultInjectionMarker,
         delaySec,
         g_FiNegCreate, g_FiNegCreateHwnd,
         ringStallSec,
         pumpStallSec, g_FiPumpStallLose,
         g_FiCaptureExit, g_FiDupCreate, g_FiLegacySend, g_FiRawCreate, g_FiPrintWindowFail,
-        g_FiGateOff, g_FiDamageDelayMs);
+        g_FiGateOff, g_FiDamageDelayMs, g_FiGuestKeyPoke);
+
+    if (g_FiGuestKeyPoke)
+    {
+        HANDLE thread = CreateThread(NULL, 0, FiGuestKeyThread, NULL, 0, NULL);
+        if (thread)
+            CloseHandle(thread);
+        else
+            LogWarning("QGAFAULT FI_GUEST_KEY_POKE: CreateThread failed (0x%x) - guest keys will NOT reach the liveness check",
+                GetLastError());
+    }
 
     if (g_FiNegCreate > 0 || g_FiDupCreate > 0 || g_FiLegacySend > 0 ||
         g_FiCaptureExit > 0 || g_FiPumpStall > 0 || g_FiRingStallArmed || g_FiRawCreate ||
