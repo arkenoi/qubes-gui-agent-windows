@@ -152,28 +152,11 @@ typedef struct _WINDOW_DATA
     // that carried damage. A damage poke needs it unchanged: damage while it changes is reveal/occlusion, not W's own.
     UINT64 PwVisSig;
     BOOL PwVisSigValid;
-    // QGAPOKEWGC diagnostic: how many unanswered-looking damage pokes this window's WGC slot has been sent (rate limit).
-    ULONG PwPokeWgcLogged;
     // Rest-zero, the held-menu echo: the desktop pixels inside this PrintWindow slot's rect at its last damage poke. A
     // render makes Windows present the window again with the same pixels; damage whose pixels did not change pokes nothing.
     UINT64 PwPixSig;
     BOOL PwPixSigValid;
     ULONG PwEchoSkips;      // damage pokes withheld because the pixels had not changed (QGAPWECHO)
-    ULONG PwPokeSameSkips;  // WGC liveness pokes withheld: the damaged screen showed the window's own last frame (QGAPOKESAME)
-    ULONG PwPokeLiveSkips;  // WGC liveness pokes withheld: the damage lay under a LIVE window above this one (QGAPOKELIVE)
-    ULONG PwPokeDeskSkips;  // WGC liveness pokes withheld: the damage rect also covered uncovered desktop (QGAPOKEDESK)
-    ULONG PwPokeEdgeSkips;  // WGC liveness pokes withheld: the damage lay only in the 8 px DWM edge (QGAPOKEEDGE)
-    // Rest-zero M7, ADR-capture 29: regions of this window LEARNED to be invisible to WGC - a liveness poke there went unanswered,
-    // the broker recreated the session, and the new session's first frame showed the region unchanged. Window-relative, each with
-    // the frame size it was learned at (a resize retires it). PwPokeRegion is the union of the hits of the pokes sent since the last
-    // broker frame was consumed (window-relative) - the pokes a recreate left unanswered; frozen while a recreate check is pending.
-    RECT  PwPokeRegion;
-    BOOL  PwPokeRegionValid;
-    RECT  PwInvisRect[4];
-    UINT  PwInvisW[4];
-    UINT  PwInvisH[4];
-    UINT  PwInvisCount;     // regions learned so far; the ring slot is PwInvisCount % 4
-    ULONG PwPokeInvisSkips; // WGC liveness pokes withheld: the hit lay in a learned WGC-invisible region (QGAPOKEINVIS)
     // QGACOMPOSITECOPY said for this window (M4: a composite copy on a DirectRequired guest is an error, said once).
     BOOL PwCompositeLogged;
 
@@ -316,10 +299,6 @@ typedef struct _WINDOW_DATA
     // Restart placement (P3, owner 2026-10-01): when the window was re-created in dom0 by a bulk enumeration (agent start,
     // seamless re-entry), the GetTickCount64() of that create; 0 = none pending. See HandleConfigure.
     ULONGLONG RestartPlacementTick;
-    // The tracked rect this window had before its last move or resize, and when it changed (rest-zero M7, ADR-capture 27): a
-    // window moving over others leaves damage where it WAS, which the live check must still count as its own. 0 = never moved.
-    RECT  PrevRect;
-    ULONGLONG PrevRectTick;
 
     // Card size the dom0 size-lock hint was last sent for (WM-managed shell surfaces only).
     // -1 = never sent; re-sent when the announced card size changes.

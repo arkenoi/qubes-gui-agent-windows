@@ -285,10 +285,6 @@ static ULONGLONG g_SlotCtlSince[WGCBRK_MAX_SLOTS];
 static LONG      g_SlotDeafSaid[WGCBRK_MAX_SLOTS];
 // QGAWGCRECREATE: the broker's QuietReroutes per slot as last reported (a recreate is reported when it moves).
 static LONG      g_SlotQuietSeen[WGCBRK_MAX_SLOTS];
-// ADR-capture 29: set when a QGAWGCRECREATE is reported for the slot; the next frame consumed for its window compares the region
-// its unanswered pokes covered (PwPokeRegion, frozen from the report on) between the old frame and the new session's first frame
-// (PwRecreateCheck), then clears it.
-static volatile LONG g_SlotRecreateCheck[WGCBRK_MAX_SLOTS];
 // QGAWGCITEMCLOSED: the broker's ItemClosed per slot as last reported (baseline at each registration, like the above).
 static LONG      g_SlotClosedSeen[WGCBRK_MAX_SLOTS];
 // Count of WGC sessions the broker declared DEAF (FAILED + WGCBRK_E_DEAF), published like DirectSuppressed: acceptance
@@ -2955,20 +2951,18 @@ static void BrokerReportDeaf(void)
     {
         const WGCBRK_SLOT* s = &slots[i];
         // A RECREATE IS A FALLBACK FIRING, SO IT IS SAID (fallbacks-are-anomalies): the broker closed a session that
-        // left an own-change poke unanswered for WGCBRK_WGC_QUIET_MS and opened a fresh one. Either the poke was false
-        // (QGAPOKEWGC names its damage) or the session had stopped delivering. The broker counts cumulatively per slot;
-        // the baseline is taken at each registration (BrokerRegister), so a reused slot's earlier count is not
-        // reported against the new window.
+        // left a poke unanswered for WGCBRK_WGC_QUIET_MS and opened a fresh one. Since ADR-capture 32 the poke comes from
+        // a key or click into the window (BrokerPokeWindow): either that key's change was one WGC did not deliver, or the
+        // session had stopped delivering. The broker counts cumulatively per slot; the baseline is taken at each
+        // registration (BrokerRegister), so a reused slot's earlier count is not reported against the new window.
         const LONG qr = s->QuietReroutes;
         if (qr != g_SlotQuietSeen[i])
         {
             if (s->Hwnd != 0 && qr > g_SlotQuietSeen[i])
-                LogWarning("QGAWGCRECREATE hwnd 0x%llx slot %d: the broker recreated its WGC session after an own-change "
-                    L"poke went unanswered for %u ms (quiet reroutes %ld, sessions opened %ld). A false poke or a session "
-                    L"that stopped delivering - QGAPOKEWGC lines name the damage.",
+                LogWarning("QGAWGCRECREATE hwnd 0x%llx slot %d: the broker recreated its WGC session after a poke from a "
+                    L"key or click went unanswered for %u ms (quiet reroutes %ld, sessions opened %ld). A key whose change "
+                    L"WGC did not deliver, or a session that stopped delivering.",
                     (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, qr, s->ChanOpens);
-            if (s->Hwnd != 0 && qr > g_SlotQuietSeen[i])
-                InterlockedExchange(&g_SlotRecreateCheck[i], 1);   // the new session's first frame is checked (ADR-capture 29)
             g_SlotQuietSeen[i] = qr;
         }
         // WINDOWS CLOSED THE WINDOW'S CAPTURE ITEM - said, because the broker now repairs it on its own initiative: it
@@ -3993,8 +3987,6 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     _InterlockedIncrement(&h->ControlGen);
     entry->PwBrokerSlot = slot; entry->PwBrokerSourced = TRUE; entry->PwBrokerArenaOff = off0;
     g_SlotQuietSeen[slot] = s->QuietReroutes;   // QGAWGCRECREATE baseline for this window
-    InterlockedExchange(&g_SlotRecreateCheck[slot], 0);   // a pending recreate check belonged to the slot's previous window
-    entry->PwPokeRegionValid = FALSE;                    // ...and so did any poke region (ADR-capture 29)
     g_SlotClosedSeen[slot] = s->ItemClosed;     // QGAWGCITEMCLOSED baseline for this window
     BrokerRequestSent(slot);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
@@ -4099,9 +4091,9 @@ void BrokerPokeWindow(IN HWND window)
 // arrivals; there the poke only asks a LIVENESS question ("a change is coming - did the session see it?"), and pointer
 // motion makes no such promise: over a window with no hover effect nothing changes, the poke goes unanswered, and the
 // broker's quiet test recreates a healthy session. Measured 2026-10-01 on w11r-ds: the owner hovered over a focused
-// Notepad - its slot took +2555 pokes and 3 QGAWGCRECREATE in ~75 s while the damage path's pixel compare refused all
-// 2304 pointer damages (QGAPOKESAME); Paint, whose status bar follows the pointer, answered every poke and was not
-// recreated (Jev: chain established 0.64). Under motion a WGC slot's liveness stays with that pixel-checked damage path;
+// Notepad - its slot took +2555 pokes and 3 QGAWGCRECREATE in ~75 s while the damage path's pixel compare (since removed,
+// ADR-capture 32) refused all 2304 pointer damages; Paint, whose status bar follows the pointer, answered every poke and was
+// not recreated (Jev: chain established 0.64). Since ADR-capture 32 no desktop damage pokes a WGC or relay slot either;
 // keys and buttons still poke every slot (BrokerPokeWindow).
 void BrokerPokeWindowMotion(IN HWND window)
 {
@@ -6953,13 +6945,6 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     return TRUE;
 }
 
-// Remember where a window was before its tracked rect changes (rest-zero M7, ADR-capture 27; read by PwHitCoveredLive).
-static void NotePrevRect(IN OUT WINDOW_DATA* e)
-{
-    SetRect(&e->PrevRect, e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height);
-    e->PrevRectTick = GetTickCount64();
-}
-
 // Refresh data about a window, send notifications to gui daemon if needed.
 // Marks the window for removal from the list if the new state makes it no longer eligible.
 // Watched windows critical section must be entered.
@@ -7219,7 +7204,6 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             windowData->Handle, windowData->X, windowData->Y, windowData->Width, windowData->Height,
             data.X, data.Y, data.Width, data.Height);
 
-        NotePrevRect(windowData);
         windowData->X = data.X;
         windowData->Y = data.Y;
         windowData->Width = data.Width;
@@ -8532,22 +8516,8 @@ static int PwCollectOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
 // PwCollectOccluders restricted to windows that are LIKELY OPAQUE: not WS_EX_LAYERED (a layered window may be translucent)
 // and not override-redirect (menus, tooltips and popups carry translucent shadows and acrylic). Used by the broker damage
 // poke, where excluding damage under a translucent window would hide a visible change of the window beneath it.
-// Margin around a window above that counts as its own when it is an occluder for a LIVENESS poke: its drop shadow, and
-// whatever it draws just past its edge, lands outside its rect, over the window beneath. First for layered and
-// override-redirect windows (a menu, a tooltip, a toast); since rest-zero M7 (2026-10-01) for EVERY window above: typing
-// into Calculator over a Notepad put damage 9 px past Calculator's edge, the Notepad was poked and its WGC session
-// recreated (the window's own change was nil - Jev: margin for every window above 0.54 with the event order, 24 px 0.76).
-// 33 px since rz9 (2026-10-01): an ACTIVE window's shadow is larger - DWM's damage for a resized 3816-px Notepad ran 32-33 px
-// past its frame (26-27 at the top) in all 21 of its damage rects, and the 9 px the 24 px margin left uncovered poked the four
-// windows beneath at every resize step (12 recreates). Jev: 32 px does not cover it 0.15, 33 px 0.86 (measured at 100% DPI).
-// 34 px since 2026-10-01 (rz18): a launched Calculator's damage ran 34 px past its DWM frame on the left, right and bottom (27
-// at the top) in both launches measured, so 33 px left a 1-px sliver and the windows beneath were poked and recreated even with
-// the live check (ADR-capture section 24). Jev: 34 px 0.50 over 40 px 0.45. Not scaled by DPI: this agent is DPI-unaware (no
-// manifest entry), so every rect it compares is in 96-DPI units already.
-#define PW_POPUP_SHADOW_MARGIN 34
-
 static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
-                                OUT RECT* out, IN int maxOut, IN BOOL withPopups)
+                                OUT RECT* out, IN int maxOut)
 {
     int n = 0;
     RECT hit;
@@ -8558,13 +8528,9 @@ static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
         const BOOL popup = (e->ExStyle & WS_EX_LAYERED) || e->IsOverrideRedirect;
         if (e != self && e->IsVisible && !e->IsIconic && !e->DeletePending &&
             e->Width > 0 && e->Height > 0 && e->ZOrder < self->ZOrder &&
-            (withPopups || !popup))
+            !popup)
         {
             RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
-            // withPopups is the LIVENESS mode (a WGC slot's poke): every window above takes the margin. The render-trigger
-            // mode (a PrintWindow slot) keeps bare rects of opaque windows - a change beside one must still render.
-            if (withPopups)
-                InflateRect(&other, PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
             if (IntersectRect(&hit, &other, rect))
             {
                 if (n >= maxOut)
@@ -8577,58 +8543,8 @@ static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
     return n;
 }
 
-// A WINDOW'S OWN POPUP THAT THE AGENT DOES NOT TRACK (ADR-capture 30, 2026-10-02). The agent drops Alt-nav key-tip badges
-// (Xaml_WindowedPopupClass / Microsoft.UI.Content.PopupWindowSiteBridge, ~35-48 x 46 px, OWNED by the app window) as sub-floor
-// popups with no synthesis owner, so no occluder rule ever counted them: their cards and glyphs, drawn over the app, were taken
-// for the app's own change, poked, WGC (the app's capture, which never holds another window's pixels) delivered nothing, and
-// the session was recreated. Every Calculator and Paint region ADR 29 "learned" as WGC-invisible on rz24/rz25 lay inside such a
-// badge (calc-popup-2, 2026-10-02: focus by an Alt tap - the harness's way - 2/2 Calculator recreates and 3 on Paint, focus
-// without a key 0/2 and 0; Jev: root cause 0.99, this rule 0.78). Narrow on purpose (Jev 0.59 against counting every window
-// above): only a WS_POPUP window whose GW_OWNER is this one, visible, not minimized, not DWM-cloaked, neither click-through nor layered
-// (Office's alpha-0 shadow strips are layered owned windows), with valid DWM bounds. Its live bounds; no tracked or previous rect.
-static BOOL PwOwnedPopupRect(IN HWND h, IN HWND self, OUT RECT* r)
-{
-    DWORD cloaked = 0;
-    if (GetWindow(h, GW_OWNER) != self || !IsWindowVisible(h) || IsIconic(h) ||
-        !(GetWindowLongW(h, GWL_STYLE) & WS_POPUP) ||
-        (GetWindowLongW(h, GWL_EXSTYLE) & (WS_EX_TRANSPARENT | WS_EX_LAYERED)) ||
-        DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, r, sizeof(*r)) != S_OK ||
-        r->right <= r->left || r->bottom <= r->top)
-        return FALSE;
-    if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
-        return FALSE;
-    return TRUE;
-}
-
-// Append this window's untracked owned popups that intersect `rect` (each with PW_OWNED_POPUP_MARGIN) to out[n..maxOut): the new
-// count, or -1 when they do not fit. Owned windows always sit above their owner, so the live chain above it is walked, whatever
-// the captured z-order. The caller holds g_csWatchedWindows (FindWindowByHandle).
-// THE MARGIN IS NOT THE DWM SHADOW'S: a XAML windowed popup (WS_EX_NOREDIRECTIONBITMAP) draws its own shadow INSIDE its window
-// (a 46 px badge holds a 26 px card) and DWM adds none; its damage ran 1 px past its bounds (652,278 vs 653,279, calc-popup-2).
-// 34 px would inflate a 40x46 badge to 108x114 over the app's own content and withhold that content's liveness pokes too.
-#define PW_MAX_OWNED_POPUPS 48
-#define PW_OWNED_POPUP_MARGIN 4
-static int PwAddOwnedPopups(IN HWND self, IN const RECT* rect, IN OUT RECT* out, IN int n, IN int maxOut)
-{
-    int steps = 0;
-    for (HWND h = GetWindow(self, GW_HWNDPREV); h && steps < 4096; h = GetWindow(h, GW_HWNDPREV), steps++)
-    {
-        RECT r, hit;
-        if (GetWindow(h, GW_OWNER) != self || FindWindowByHandle(h) || !PwOwnedPopupRect(h, self, &r))
-            continue;
-        InflateRect(&r, PW_OWNED_POPUP_MARGIN, PW_OWNED_POPUP_MARGIN);
-        if (!IntersectRect(&hit, &r, rect))
-            continue;
-        if (n >= maxOut)
-            return -1;
-        out[n++] = hit;
-    }
-    return steps >= 4096 ? -1 : n;
-}
-
 // Does any part of r lie outside every rect of occ[0..n)? Rectangle subtraction, bounded: past the budget it answers TRUE
-// (for a PrintWindow slot the poke is the render trigger, so the conservative answer is "visible"; for a WGC slot it
-// costs at most one extra liveness hint).
+// (for a PrintWindow slot the poke is the render trigger, so the conservative answer is "visible").
 static BOOL PwRectVisibleBeyond(IN const RECT* r, IN const RECT* occ, IN int n, IN OUT int* budget)
 {
     RECT o, parts[4];
@@ -8644,184 +8560,6 @@ static BOOL PwRectVisibleBeyond(IN const RECT* r, IN const RECT* occ, IN int n, 
     for (int i = 0; i < k; i++)
         if (PwRectVisibleBeyond(&parts[i], occ + 1, n - 1, budget)) return TRUE;
     return FALSE;
-}
-
-// THE LIVE WINDOWS ABOVE (rest-zero M7, ADR-capture §24). The occluders PwCollectOccludersEx returns are TRACKED rects, and
-// those lag the screen: growing a 3816-px Notepad moved its live rect 39 ms into SetWindowPos, the damage of its new area was
-// attributed 4 ms later, and its LOCATIONCHANGE reached a hook thread only after the call returned, >= 90 ms on (measured
-// 2026-10-01: 6 of 6 false pokes had their damage inside the live rect + margin; 6 session recreates per four-step resize). A
-// window held for its first frame, or refused by the arena, is no occluder in the tracked model at all (a Calculator 0.7 s
-// after its UNCLOAK: 3 recreates). So before a LIVENESS poke goes out its hit is checked against the windows above this one
-// as they are NOW: the windows the agent TRACKS (mapped, held for a first frame, or refused) that sit above it in the live
-// z-order, at their live rects, if visible, uncloaked and non-empty, with the same shadow margin as the tracked rule. The
-// membership is the tracked rule's on purpose: a window the agent rejected (layered chrome, a transparent overlay) hides
-// nothing beneath it from the tracked rule either, so this cannot suppress a poke the tracked rule would have sent for a
-// reason other than stale geometry or a stale z-order (Jev review: counting every visible window above over-suppresses,
-// 0.59). Covered -> the damage is theirs. Runs only where a liveness poke is about to be sent (damage that reached this
-// window beyond its tracked occluders), never at rest. A walk that cannot finish - too many windows above to describe, or
-// the chain cut by a window destroyed mid-walk - answers "not covered": the poke goes out, as before this. The caller holds
-// g_csWatchedWindows (FindWindowByHandle). *coveredBy names the first live window above that touches the hit (the log line).
-// ...and WHERE THEY JUST WERE (ADR-capture 27, 2026-10-02). The frame being read can show a window above one step behind its
-// live rect: a Calculator moved back over a Notepad in steps left damage (1913,363)-(2487,1037) - its previous step plus shadow -
-// while its live rect was already 100 px on; the strip it had just uncovered counted as the Notepad's own change, the Notepad was
-// poked and its session recreated (m7-phases B, rz21: 1 poke, 1 recreate; Jev: fix now 0.98). So each tracked window above also
-// covers with its TRACKED rect (the live rect can lead it) and, for PW_PREV_RECT_MS after its tracked rect changed, with the rect
-// it had before (NotePrevRect), all with the same shadow margin. What a moving window uncovers is the window beneath's own,
-// unchanged content - already in its last WGC frame - so withholding the liveness poke there loses nothing.
-#define PW_PREV_RECT_MS 250
-static BOOL PwHitCoveredLive(IN HWND self, IN const RECT* hit, OUT HWND* coveredBy)
-{
-    RECT occ[PW_MAX_OCCLUDERS * 6];
-    int n = 0;
-    int steps = 0;
-    HWND h;
-
-    *coveredBy = NULL;
-    for (h = GetWindow(self, GW_HWNDPREV); h && steps < 4096; h = GetWindow(h, GW_HWNDPREV), steps++)
-    {
-        RECT r = { 0, 0, 0, 0 }, x;   // filled by PwOwnedPopupRect or DwmGetWindowAttribute below (C4701 cannot see it)
-        DWORD cloaked = 0;
-        const WINDOW_DATA* above = FindWindowByHandle(h);
-        // Tracked, and not on its way out (the tracked rule's DeletePending exclusion). The same measure as the tracked rect
-        // (GetRealWindowRect: DWM's extended frame bounds), or GetWindowRect's invisible resize borders (~7 px a side) would
-        // hide this window's own damage next to the window above. No valid bounds: not an occluder (the poke goes out).
-        // A minimized window covers nothing, whatever rect it was last tracked at (Jev review: a stale tracked rect is the
-        // over-suppression risk; otherwise the tracked rect follows every LOCATIONCHANGE and the 2 s resync).
-        // ...or this window's own popup that the agent does not track (ADR-capture 30, PwOwnedPopupRect): its live rect only.
-        const BOOL ownedPopup = !above && PwOwnedPopupRect(h, self, &r);
-        if (!ownedPopup &&
-            (!above || above->DeletePending || !IsWindowVisible(h) || IsIconic(h) ||
-             DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &r, sizeof(r)) != S_OK ||
-             r.right <= r.left || r.bottom <= r.top))
-            continue;
-        // Live, tracked, and - just after a move - previous (see above), each with the shadow margin.
-        RECT cand[3];
-        int nc = 0;
-        BOOL touches = FALSE;
-        cand[nc++] = r;
-        if (!ownedPopup)
-        {
-            SetRect(&cand[nc], above->X, above->Y, above->X + (int)above->Width, above->Y + (int)above->Height);
-            if (!IsRectEmpty(&cand[nc]))
-                nc++;
-            if (above->PrevRectTick != 0 && GetTickCount64() - above->PrevRectTick < PW_PREV_RECT_MS &&
-                !IsRectEmpty(&above->PrevRect))
-                cand[nc++] = above->PrevRect;
-        }
-        for (int c = 0; c < nc; c++)
-        {
-            const int m = ownedPopup ? PW_OWNED_POPUP_MARGIN : PW_POPUP_SHADOW_MARGIN;
-            InflateRect(&cand[c], m, m);
-            if (IntersectRect(&x, &cand[c], hit))
-                touches = TRUE;
-        }
-        if (!touches)
-            continue;
-        if (SUCCEEDED(DwmGetWindowAttribute(h, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked)
-            continue;
-        if (n + nc > (int)RTL_NUMBER_OF(occ))
-            return FALSE;   // too many to describe: not covered, the poke goes out
-        if (!*coveredBy)
-            *coveredBy = h;
-        for (int c = 0; c < nc; c++)
-            occ[n++] = cand[c];
-    }
-    if (steps >= 4096)
-        return FALSE;       // a chain that does not end is not an answer
-    int budget = 256;
-    return n > 0 && !PwRectVisibleBeyond(hit, occ, n, &budget);
-}
-
-// THE DESKTOP SHOWS THROUGH (rest-zero M7, ADR-capture section 26). A dirty rect that also covers uncovered DESKTOP - screen
-// area no tracked window's bare frame covers (PwDesktopUncoveredArea; the shadow margin was dropped here 2026-10-02 - a
-// window's shadow over the wallpaper is desktop content), i.e. the wallpaper - is a desktop change, a reveal or an
-// occlusion, never solely a window's own change, so no liveness poke comes from it. Measured 2026-10-01: a wallpaper change
-// (Windows Spotlight rotates it; it also loads after login) gave DDA's coarse rects over the desktop's uncovered top band and
-// left strip; the windows whose backdrop is tinted from the wallpaper differed on screen from their WGC frames, were poked and
-// recreated - 3 per change - and the recreated sessions' first frames were IDENTICAL to the old ones (32x32 tiles, title and
-// centre 0.0): the backdrop is not in a WGC frame at all, so the recreate bought nothing (Jev: false 1.00; this rule 0.85 over
-// recording the residual 0.15 and a time window after the wallpaper broadcast 0.00). Classified once per dirty rect per frame,
-// lazily, only for rects that reach a liveness candidate; a window list too long to describe answers "not desktop" (pokes as
-// before). The caller holds g_csWatchedWindows. Only a real piece of desktop counts - at least 32x32 px of the rect uncovered
-// (a sliver from rounding or a window's own change merged with a desktop edge is not one) - and every case that cannot be
-// decided (a window list or a subtraction too long to describe) answers "not desktop", i.e. the poke goes out as before
-// (Jev review: one direction for every fallback, slivers not counted).
-#define PW_DESK_CACHE 64
-#define PW_DESK_MIN_AREA (32 * 32)
-static signed char g_PwDeskClass[PW_DESK_CACHE];   // per dirty rect of the current frame: -1 unknown, 0 windows only, 1 desktop
-
-// The area of r that no rect of occ[0..n) covers; -1 when the subtraction outgrew its budget (undecided).
-static LONGLONG PwRectUncoveredArea(IN const RECT* r, IN const RECT* occ, IN int n, IN OUT int* budget)
-{
-    RECT o, parts[4];
-    int k = 0;
-    if (IsRectEmpty(r)) return 0;
-    if (n <= 0) return (LONGLONG)(r->right - r->left) * (LONGLONG)(r->bottom - r->top);
-    if (--(*budget) < 0) return -1;
-    if (!IntersectRect(&o, r, &occ[0])) return PwRectUncoveredArea(r, occ + 1, n - 1, budget);
-    if (o.top > r->top)       SetRect(&parts[k++], r->left, r->top, r->right, o.top);
-    if (o.bottom < r->bottom) SetRect(&parts[k++], r->left, o.bottom, r->right, r->bottom);
-    if (o.left > r->left)     SetRect(&parts[k++], r->left, o.top, o.left, o.bottom);
-    if (o.right < r->right)   SetRect(&parts[k++], o.right, o.top, r->right, o.bottom);
-    LONGLONG sum = 0;
-    for (int i = 0; i < k; i++)
-    {
-        const LONGLONG a = PwRectUncoveredArea(&parts[i], occ + 1, n - 1, budget);
-        if (a < 0) return -1;
-        sum += a;
-    }
-    return sum;
-}
-
-// The area of r that no tracked window covers - its bare frame, or (inflate) its frame plus the shadow margin; -1 undecided.
-// BARE FRAMES DECIDE since 2026-10-02 (ADR-capture 26, amended): a window's shadow over the wallpaper re-composes when the
-// wallpaper changes, so it is desktop content, not the window's. With the margin, the band check's wallpaper change left damage
-// (552,873)-(668,967) straddling Paint's left edge - the outside part the 16 px strip of its shadow - counted 0 px2 of desktop,
-// Paint was poked and its session recreated (rz21: QGAPOKEDESK never fired). The margin stays where it belongs: the live and
-// tracked OCCLUDER tests, which ask whether a window above owns damage that spilled onto the window beneath. The inflated
-// measure is kept for the QGAPOKEWGC line, so a run shows both numbers for every poke that still goes out.
-// THE COST, accepted (Jev review 2026-10-02: the likely regression, 0.87): a window's OWN change whose damage also spills
-// >= 32x32 px onto its shadow over the desktop (an activation change, a resize) skips its liveness poke - no content is lost
-// (WGC delivers what changed), only that change's deafness check; a deaf session still shows at its next interior change, which
-// is what the deaf ladder's cell drives.
-static LONGLONG PwDesktopUncoveredArea(IN const RECT* r, IN BOOL inflate)
-{
-    RECT occ[PW_MAX_OCCLUDERS * 4];
-    RECT x;
-    int n = 0;
-    WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
-    while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
-    {
-        e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
-        if (e->IsVisible && !e->IsIconic && !e->DeletePending && e->Width > 0 && e->Height > 0)
-        {
-            RECT w = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
-            if (inflate)
-                InflateRect(&w, PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
-            if (IntersectRect(&x, &w, r))
-            {
-                if (n >= (int)RTL_NUMBER_OF(occ))
-                    return -1;      // too many to describe: undecided
-                occ[n++] = w;
-            }
-        }
-        e = (WINDOW_DATA*)e->ListEntry.Flink;
-    }
-    int budget = 512;
-    return PwRectUncoveredArea(r, occ, n, &budget);
-}
-
-static BOOL PwDirtyTouchesDesktop(IN const RECT* r)
-{
-    return PwDesktopUncoveredArea(r, FALSE) >= PW_DESK_MIN_AREA;   // -1 (undecided) is below it: not desktop, the poke goes out
-}
-static BOOL PwDirtyIsDesktop(IN const CAPTURE_FRAME* frame, IN UINT i)
-{
-    if (i >= PW_DESK_CACHE)
-        return PwDirtyTouchesDesktop(&frame->dirty_rects[i]);
-    if (g_PwDeskClass[i] < 0)
-        g_PwDeskClass[i] = PwDirtyTouchesDesktop(&frame->dirty_rects[i]) ? 1 : 0;
-    return g_PwDeskClass[i] == 1;
 }
 
 // What decides a window's visible region on this pass: its rect and the opaque rects above it, in list order.
@@ -9454,69 +9192,6 @@ void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason)
 // FALSE when there is none, leaving the hold and slice arms to the caller. Shared by the desktop frame loop and the
 // broker's frame-published event (BrokerConsumePass), so a window whose own content changes while nothing else on the
 // desktop does - a covered one - is copied when ITS frame lands, not at the next unrelated desktop change.
-// WGC-INVISIBLE REGIONS, LEARNED (rest-zero M7, ADR-capture 29, 2026-10-02). Some windows show changes on screen that no WGC frame
-// carries: the new (WinUI) Paint's maximize-glyph at an activation change (4560,276)-(4573,288) and a 10x12 px toolbar spot
-// (940,349)-(950,361) were poked, left unanswered and recreated on rz21 and rz24 (4 of the 4 false recreates outside the activity
-// cell's own PrintWindow span on rz24). So after a recreate the new session's first frame is compared with the old one over the
-// region of the pokes that went unanswered (PwPokeRegion): unchanged means WGC cannot see that region - it is learned, and later pokes whose hit lies
-// inside it are withheld; changed means the session had really stopped and the recreate delivered (nothing learned). Both are
-// logged (QGARECREATECHECK), which also answers whether WGC sees such pixels at all (Jev: measure first 0.68, learn 0.92). A
-// deafened session never delivers a new first frame, so the deaf ladder learns nothing and is unaffected. Up to four regions per
-// window, retired when the frame size changes; cropped windows (toasts) do not learn. Caller holds g_csWatchedWindows.
-static void PwRecreateCheck(IN OUT WINDOW_DATA* entry, IN const BYTE* bsrc, IN int bpitch, IN UINT64 bid)
-{
-    const int slot = entry->PwBrokerSlot;
-    if (slot < 0 || slot >= WGCBRK_MAX_SLOTS || !InterlockedExchange(&g_SlotRecreateCheck[slot], 0))
-        return;
-    if (!entry->PwPokeRegionValid || !entry->PwBuffer || entry->CropLeft || entry->CropTop ||
-        bpitch != (int)entry->PwWidth * 4)
-    {
-        LogInfo("QGARECREATECHECK hwnd=0x%x slot=%d: not compared (no poke region, no buffer, cropped or resized)",
-            (DWORD)(ULONG_PTR)entry->Handle, slot);
-        return;
-    }
-    RECT r = entry->PwPokeRegion, all = { 0, 0, (LONG)entry->PwWidth, (LONG)entry->PwHeight };
-    if (!IntersectRect(&r, &r, &all))
-        return;
-    BOOL same = TRUE;
-    for (LONG y = r.top; same && y < r.bottom; y++)
-        same = (memcmp((const BYTE*)entry->PwBuffer + (size_t)y * entry->PwWidth * 4 + (size_t)r.left * 4,
-                       bsrc + (size_t)y * (size_t)bpitch + (size_t)r.left * 4, (size_t)(r.right - r.left) * 4) == 0);
-    // Only glyph-sized regions are learned (Jev review: a poke false for ANOTHER reason - a race strip - would otherwise teach a
-    // region of real content; those are wide, Paint's were 10x12 and 13x12).
-    const BOOL glyphSized = (r.right - r.left) <= 64 && (r.bottom - r.top) <= 64;   // not "small": rpcndr.h #defines it
-    if (same && glyphSized)
-    {
-        const UINT k = (UINT)(entry->PwInvisCount % RTL_NUMBER_OF(entry->PwInvisRect));
-        entry->PwInvisRect[k] = r;
-        entry->PwInvisW[k] = entry->PwWidth;
-        entry->PwInvisH[k] = entry->PwHeight;
-        entry->PwInvisCount++;
-    }
-    LogInfo("QGARECREATECHECK hwnd=0x%x slot=%d frame=%I64u: the recreated session's first frame shows the poked region "
-        L"(%ld,%ld,%ld,%ld) %s", (DWORD)(ULONG_PTR)entry->Handle, slot, bid, r.left, r.top, r.right, r.bottom,
-        !same ? L"CHANGED - the session had stopped; nothing learned" :
-        glyphSized ? L"UNCHANGED - WGC cannot see it; learned, no further pokes there" :
-                L"UNCHANGED - but larger than 64x64 px; not learned");
-}
-
-// Does the hit (window-relative) lie inside a region learned for this frame size (2 px of slack)?
-static BOOL PwHitLearnedInvisible(IN const WINDOW_DATA* entry, IN const RECT* hitRel)
-{
-    const UINT n = entry->PwInvisCount < RTL_NUMBER_OF(entry->PwInvisRect) ? entry->PwInvisCount
-                                                                            : (UINT)RTL_NUMBER_OF(entry->PwInvisRect);
-    for (UINT k = 0; k < n; k++)
-    {
-        if (entry->PwInvisW[k] != entry->PwWidth || entry->PwInvisH[k] != entry->PwHeight)
-            continue;
-        RECT g = entry->PwInvisRect[k], u;
-        InflateRect(&g, 2, 2);
-        if (UnionRect(&u, &g, hitRel) && EqualRect(&u, &g))
-            return TRUE;
-    }
-    return FALSE;
-}
-
 static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRectIn)
 {
     const RECT pwRect = *pwRectIn;
@@ -9527,17 +9202,9 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
     if (bid != entry->PwBrokerLastId || entry->PwSliceNeedsFull)
     {
         BOOL firstBrokerFrame = (entry->PwBrokerLastId == 0);
-        // Only a NEW frame id is a frame the broker published since the last one: a full re-copy (PwSliceNeedsFull) of the same id
-        // is not the recreated session's first frame (comparing it with itself would learn the region "unchanged") and answers no poke.
-        const BOOL newFrame = (bid != entry->PwBrokerLastId);
         entry->PwSliceNeedsFull = FALSE;
         entry->PwBrokerLastId = bid;
         if (entry->PwBrokerFrames < 0xFFFFFFFFu) entry->PwBrokerFrames++;
-        if (newFrame)
-        {
-            PwRecreateCheck(entry, bsrc, bpitch, bid);   // before the copy overwrites the old frame (ADR-capture 29)
-            entry->PwPokeRegionValid = FALSE;            // a frame answers every poke sent before it
-        }
         PwBrokerCopyDiff(entry, bsrc, bpitch, &pwRect);
         // Buffer is complete for this window: square off DWM's black rounded
         // corners before the content check judges it.
@@ -9708,7 +9375,6 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
     IN UINT fbWidth, IN UINT fbHeight)
 {
     g_FrameCount++;   // QGAFSSTALL only; nothing is logged on the frame path
-    memset(g_PwDeskClass, 0xFF, sizeof(g_PwDeskClass));   // this frame's dirty rects are not classified yet (-1)
     // Complete a deferred non-seamless switch as soon as frames flow again at the smaller
     // size. This lives on the FRAME path deliberately: a resolution change can take the
     // capture down with 0x887a0026 (keyed mutex abandoned) and recover via
@@ -10125,6 +9791,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // activation visuals). On the target (retail 26300) it caught no real stop in four acceptance chains and caused
                 // dozens of false recreates (Jev: justified 0.19; input + Windows' events only 0.84). Liveness for those slots now
                 // comes from keys and clicks into the window (BrokerPokeWindow) and from Windows closing the capture item.
+                // The WGC liveness filters of ADR-capture sections 21, 24 and 26-30 were removed with it (2026-10-02).
                 if (ps->Hwnd == (UINT64)(ULONG_PTR)entry->Handle && ps->Route == (LONG)WGCBRK_ROUTE_PW)
                 {
                     // NOT THE BORDER. A damage rect that only reaches this window's outermost pixels is the
@@ -10143,31 +9810,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // twice, onto polled PrintWindow. Uses the same capture-grade z-order as the screen-hash decision,
                     // counting only windows likely to be OPAQUE (PwCollectOccludersEx: a layered or override-redirect
                     // window above may be translucent, and a change beneath it would be visible); with no valid ordering,
-                    // or too many occluders to describe (-1), nothing is excluded - the behaviour before this. For a WGC
-                    // slot the poke is only a liveness hint, so a skipped poke cannot hide content.
+                    // or too many occluders to describe (-1), nothing is excluded - the behaviour before this.
                     // WHICH WINDOWS ABOVE COUNT. For a PrintWindow slot the poke is the RENDER trigger, so only windows
                     // likely to be OPAQUE hide damage (a change beneath a translucent popup is visible and must render).
-                    // For a WGC slot the poke is only a LIVENESS hint, and a false one now costs a session recreate
-                    // (2026-10-01, w11-ds: a system menu opened over a focused Notepad - its drawing, its appearance and
-                    // its shadow - poked Notepad 273 times and the design-E ladder froze a healthy window): there every
-                    // window above counts, a popup with a margin for its drop shadow (Jev: both fixes 0.64).
-                    const BOOL livenessOnly = (ps->Route != WGCBRK_ROUTE_PW);
-                    RECT occ[PW_MAX_OCCLUDERS + PW_MAX_OWNED_POPUPS];
+                    RECT occ[PW_MAX_OCCLUDERS];
                     int nOcc = g_ZOrderCaptureValid
-                        ? PwCollectOccludersEx(entry, &pokeRect, occ, PW_MAX_OCCLUDERS, livenessOnly) : 0;
+                        ? PwCollectOccludersEx(entry, &pokeRect, occ, PW_MAX_OCCLUDERS) : 0;
                     if (nOcc < 0)
                         nOcc = 0;   // too many to describe: nothing excluded, as before
-                    // ...and, for a liveness poke, the window's own untracked popups (ADR-capture 30): the damage under a key-tip
-                    // badge is the badge's, and a badge appearing or vanishing changes the visible region, so that pass is an
-                    // occlusion, not this window's change (the visible-region rule below). They do not fit: the tracked set only.
-                    // No valid z-order capture: nothing excluded, as before (the owned popups would not need it, but that case
-                    // keeps the behaviour it had).
-                    else if (livenessOnly && g_ZOrderCaptureValid)
-                    {
-                        const int withOwned = PwAddOwnedPopups(entry->Handle, &pokeRect, occ, nOcc, (int)RTL_NUMBER_OF(occ));
-                        if (withOwned >= 0)
-                            nOcc = withOwned;
-                    }
                     // ONLY THE WINDOW'S OWN CHANGE POKES IT (docs/DESIGN-rest-zero-capture.md E). Two refinements of the
                     // occluder rule above, because on 26100+ an unanswered poke now ends in a DEAF hold (FAILED, no
                     // PrintWindow rung) rather than in a polled render:
@@ -10176,7 +9826,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     //   * the window's visible region must be the one it had on the previous damaged frame: damage while
                     //     it changes - this window or one above it moved, appeared, vanished or resized - is a reveal or
                     //     an occlusion, not this window's content. Such a pass pokes nothing; a real change of its own
-                    //     shows again on the next frame (for WGC the poke is only a liveness hint anyway).
+                    //     shows again on the next frame.
                     const UINT64 vsig = PwVisibleSig(&pwRect, occ, nOcc);
                     const BOOL visStable = entry->PwVisSigValid && entry->PwVisSig == vsig;
                     entry->PwVisSig = vsig;
@@ -10188,118 +9838,6 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             int budget = 256;
                             if (!PwRectVisibleBeyond(&pwHit, occ, nOcc, &budget))
                                 continue;
-                            // M7 class 4: a rect that also covers uncovered desktop is not this window's own change
-                            // (PwDirtyIsDesktop). Liveness slots only, like the live check below.
-                            if (livenessOnly && PwDirtyIsDesktop(frame, ddi))
-                            {
-                                const ULONG n = ++entry->PwPokeDeskSkips;
-                                if (n <= 4 || (n % 256) == 0)
-                                    LogInfo("QGAPOKEDESK hwnd=0x%x slot=%d n=%lu: damage (%d,%d,%d,%d) also covers uncovered "
-                                        L"desktop - a desktop change, reveal or occlusion, no poke", (DWORD)(ULONG_PTR)entry->Handle,
-                                        entry->PwBrokerSlot, n, frame->dirty_rects[ddi].left, frame->dirty_rects[ddi].top,
-                                        frame->dirty_rects[ddi].right, frame->dirty_rects[ddi].bottom);
-                                continue;
-                            }
-                            // M7: the tracked rects say this damage reached the window; the LIVE windows above may say
-                            // otherwise (PwHitCoveredLive). Liveness slots only - a PrintWindow slot's poke is its render
-                            // trigger and keeps the opaque-only rule above. Before the pixel compare: the walk is cheaper.
-                            if (livenessOnly)
-                            {
-                                HWND liveBy = NULL;
-                                if (PwHitCoveredLive(entry->Handle, &pwHit, &liveBy))
-                                {
-                                    const ULONG n = ++entry->PwPokeLiveSkips;
-                                    if (n <= 4 || (n % 256) == 0)
-                                        LogInfo("QGAPOKELIVE hwnd=0x%x slot=%d n=%lu: damage (%d,%d,%d,%d) is under the live "
-                                            L"window 0x%x above it (tracked occ=%d) - no poke", (DWORD)(ULONG_PTR)entry->Handle,
-                                            entry->PwBrokerSlot, n, pwHit.left, pwHit.top, pwHit.right, pwHit.bottom,
-                                            (DWORD)(ULONG_PTR)liveBy, nOcc);
-                                    continue;   // this rect is another window's; the next may be this one's own
-                                }
-                            }
-                            // M7, A WGC SLOT IS POKED ONLY IF THE SCREEN SHOWS SOMETHING ITS LAST FRAME DOES NOT (Jev
-                            // 0.91 over per-tile hashes 0.02 and accepting 0.07). DDA's damage is coarser than a window's
-                            // own change: at focus changes and window appearances one band crosses many windows, WGC
-                            // rightly delivers nothing for the unchanged ones, and each became a session recreate 2 s later
-                            // (9-12 per acceptance pass, all in activity, rz3b-rz5 on w11-ds). The window's buffer holds its
-                            // last delivered frame; where the damaged screen equals it, WGC is already current - no poke.
-                            // Where it differs, WGC has not delivered that yet (lag or deaf): poke, as before. RGB only,
-                            // corners excluded (8 px: DWM's rounding is not in WGC's frame). Unreadable pixels poke.
-                            // M7: DAMAGE ONLY IN THE WINDOW'S OUTER 8 px IS DWM'S CHROME (ADR-capture 28, 2026-10-02) - the 1 px
-                            // border that changes colour with activation and the rounded corners that show what lies behind;
-                            // neither is in a WGC frame (the pixel compare below excludes the same 8 px for that reason), so no
-                            // frame can answer such damage and a poke only recreates the session for nothing. Measured on rz21:
-                            // Settings' top-left edge band (54,59)-(101,63) at focus flips, 4 recreates in 25 s; Paint's 1x1 px
-                            // 7 px above its bottom edge, 2 recreates (m7-phases). Liveness only - WGC still delivers any real
-                            // change there. Jev: verify-first 0.79 - verified by the code path (such a hit never reached the
-                            // compare, so it always poked) and by the hit coordinates. Accepted cost (review, 0.86): a window's
-                            // own change confined to its outer 8 px loses that change's liveness check, never its content.
-                            if (ps->Route == WGCBRK_ROUTE_WGC)
-                            {
-                                const RECT inner8 = { pwRect.left + 8, pwRect.top + 8, pwRect.right - 8, pwRect.bottom - 8 };
-                                RECT inHit;
-                                if (!IntersectRect(&inHit, &pwHit, &inner8))
-                                {
-                                    const ULONG n = ++entry->PwPokeEdgeSkips;
-                                    if (n <= 4 || (n % 256) == 0)
-                                        LogInfo("QGAPOKEEDGE hwnd=0x%x slot=%d n=%lu: damage (%d,%d,%d,%d) lies only in the window's "
-                                            L"8 px edge - DWM's border/corners, not in a WGC frame - no poke",
-                                            (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot, n,
-                                            pwHit.left, pwHit.top, pwHit.right, pwHit.bottom);
-                                    continue;   // this rect is chrome; the next may be the window's own
-                                }
-                                // ...or in a region this window has been seen to change invisibly to WGC (ADR-capture 29).
-                                RECT hitRel = pwHit;
-                                OffsetRect(&hitRel, -pwRect.left, -pwRect.top);
-                                if (PwHitLearnedInvisible(entry, &hitRel))
-                                {
-                                    const ULONG n = ++entry->PwPokeInvisSkips;
-                                    if (n <= 4 || (n % 256) == 0)
-                                        LogInfo("QGAPOKEINVIS hwnd=0x%x slot=%d n=%lu: damage (%d,%d,%d,%d) lies in a region learned to "
-                                            L"be invisible to WGC - no poke", (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot, n,
-                                            pwHit.left, pwHit.top, pwHit.right, pwHit.bottom);
-                                    continue;
-                                }
-                            }
-                            if (ps->Route == WGCBRK_ROUTE_WGC && entry->PwBuffer && entry->PwBrokerFrames > 0)
-                            {
-                                const RECT inner = { pwRect.left + 8, pwRect.top + 8, pwRect.right - 8, pwRect.bottom - 8 };
-                                RECT cmpR;
-                                BOOL differs = TRUE;
-                                if (IntersectRect(&cmpR, &pwHit, &inner) &&
-                                    CaptureFrameCompare(frame, &cmpR, (const BYTE*)entry->PwBuffer, (INT)entry->PwWidth * 4,
-                                                        entry->X, entry->Y, (INT)entry->PwWidth, (INT)entry->PwHeight,
-                                                        &differs) &&
-                                    !differs)
-                                {
-                                    const ULONG n = ++entry->PwPokeSameSkips;
-                                    if (n <= 4 || (n % 256) == 0)
-                                        LogInfo("QGAPOKESAME hwnd=0x%x slot=%d n=%lu: damage (%d,%d,%d,%d) shows the window's own "
-                                            L"last frame - WGC is current, no poke", (DWORD)(ULONG_PTR)entry->Handle,
-                                            entry->PwBrokerSlot, n, cmpR.left, cmpR.top, cmpR.right, cmpR.bottom);
-                                    continue;   // this rect shows nothing new for this window; the next may
-                                }
-                            }
-                            // M7 INSTRUMENT (docs/DESIGN-rest-zero-capture.md): a poke to a WGC session that has not
-                            // delivered for a second is the case the broker's quiet test acts on - recreate, then DEAF.
-                            // Say which damage it was, so a false poke can be told from a deaf session. Rate limited:
-                            // the first 8 per window, then every 64th.
-                            if (ps->Route == WGCBRK_ROUTE_WGC && ps->CaptureTick != 0 &&
-                                (ULONGLONG)GetTickCount64() - (ULONGLONG)ps->CaptureTick > 1000)
-                            {
-                                const ULONG n = ++entry->PwPokeWgcLogged;
-                                if (n <= 8 || (n % 64) == 0)
-                                    LogInfo("QGAPOKEWGC hwnd=0x%x slot=%d n=%lu win=(%d,%d,%d,%d) dirty=(%d,%d,%d,%d) "
-                                        L"hit=(%d,%d,%d,%d) occ=%d frameAge=%I64u ms desk=%I64d/%I64d",
-                                        (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot, n,
-                                        pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
-                                        frame->dirty_rects[ddi].left, frame->dirty_rects[ddi].top,
-                                        frame->dirty_rects[ddi].right, frame->dirty_rects[ddi].bottom,
-                                        pwHit.left, pwHit.top, pwHit.right, pwHit.bottom, nOcc,
-                                        (ULONGLONG)GetTickCount64() - (ULONGLONG)ps->CaptureTick,
-                                        PwDesktopUncoveredArea(&frame->dirty_rects[ddi], FALSE),
-                                        PwDesktopUncoveredArea(&frame->dirty_rects[ddi], TRUE));
-                            }
                             // A PRINTWINDOW SLOT'S OWN RENDER IS NOT A CHANGE (owner: "if you repaint the same pixels it is
                             // not a change"). Rendering a window makes Windows present it again, pixels unchanged - a
                             // desktop dirty rect, the next poke, the next render: measured 2026-10-01 on w11-ds with a held
@@ -10327,24 +9865,6 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                     }
                                     entry->PwPixSig = psig;
                                     entry->PwPixSigValid = TRUE;
-                                }
-                            }
-                            // The region a recreate check compares, if this poke goes unanswered (ADR-capture 29): the union
-                            // of the pokes since the last frame. Frozen once a recreate is reported for the slot - a poke sent
-                            // between the report and the new session's first frame did not cause the recreate (measured rz24
-                            // and rz25: Calculator's new session drew a whole-window damage 8-12 ms after the report, which
-                            // replaced the 6x12 px region that went unanswered, so the check compared the whole window).
-                            {
-                                const int ps2 = entry->PwBrokerSlot;
-                                if (ps2 < 0 || ps2 >= WGCBRK_MAX_SLOTS || !g_SlotRecreateCheck[ps2])
-                                {
-                                    RECT hr = pwHit;
-                                    OffsetRect(&hr, -pwRect.left, -pwRect.top);
-                                    if (entry->PwPokeRegionValid)
-                                        UnionRect(&entry->PwPokeRegion, &entry->PwPokeRegion, &hr);
-                                    else
-                                        entry->PwPokeRegion = hr;
-                                    entry->PwPokeRegionValid = TRUE;
                                 }
                             }
                             BrokerPokeDamage(entry);
@@ -11090,7 +10610,6 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                      freshW != (int)entry->Width || freshH != (int)entry->Height) &&
                     freshW > 0 && freshH > 0)
                 {
-                    NotePrevRect(entry);
                     entry->X = fresh.left;
                     entry->Y = fresh.top;
                     entry->Width = freshW;
