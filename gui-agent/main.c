@@ -8604,7 +8604,8 @@ static BOOL PwHitCoveredLive(IN HWND self, IN const RECT* hit, OUT HWND* covered
 }
 
 // THE DESKTOP SHOWS THROUGH (rest-zero M7, ADR-capture section 26). A dirty rect that also covers uncovered DESKTOP - screen
-// area no tracked window (inflated by the shadow margin) covers, i.e. the wallpaper - is a desktop change, a reveal or an
+// area no tracked window's bare frame covers (PwDesktopUncoveredArea; the shadow margin was dropped here 2026-10-02 - a
+// window's shadow over the wallpaper is desktop content), i.e. the wallpaper - is a desktop change, a reveal or an
 // occlusion, never solely a window's own change, so no liveness poke comes from it. Measured 2026-10-01: a wallpaper change
 // (Windows Spotlight rotates it; it also loads after login) gave DDA's coarse rects over the desktop's uncovered top band and
 // left strip; the windows whose backdrop is tinted from the wallpaper differed on screen from their WGC frames, were poked and
@@ -8643,7 +8644,18 @@ static LONGLONG PwRectUncoveredArea(IN const RECT* r, IN const RECT* occ, IN int
     return sum;
 }
 
-static BOOL PwDirtyTouchesDesktop(IN const RECT* r)
+// The area of r that no tracked window covers - its bare frame, or (inflate) its frame plus the shadow margin; -1 undecided.
+// BARE FRAMES DECIDE since 2026-10-02 (ADR-capture 26, amended): a window's shadow over the wallpaper re-composes when the
+// wallpaper changes, so it is desktop content, not the window's. With the margin, the band check's wallpaper change left damage
+// (552,873)-(668,967) straddling Paint's left edge - the outside part the 16 px strip of its shadow - counted 0 px2 of desktop,
+// Paint was poked and its session recreated (rz21: QGAPOKEDESK never fired). The margin stays where it belongs: the live and
+// tracked OCCLUDER tests, which ask whether a window above owns damage that spilled onto the window beneath. The inflated
+// measure is kept for the QGAPOKEWGC line, so a run shows both numbers for every poke that still goes out.
+// THE COST, accepted (Jev review 2026-10-02: the likely regression, 0.87): a window's OWN change whose damage also spills
+// >= 32x32 px onto its shadow over the desktop (an activation change, a resize) skips its liveness poke - no content is lost
+// (WGC delivers what changed), only that change's deafness check; a deaf session still shows at its next interior change, which
+// is what the deaf ladder's cell drives.
+static LONGLONG PwDesktopUncoveredArea(IN const RECT* r, IN BOOL inflate)
 {
     RECT occ[PW_MAX_OCCLUDERS * 4];
     RECT x;
@@ -8655,18 +8667,24 @@ static BOOL PwDirtyTouchesDesktop(IN const RECT* r)
         if (e->IsVisible && !e->IsIconic && !e->DeletePending && e->Width > 0 && e->Height > 0)
         {
             RECT w = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
-            InflateRect(&w, PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
+            if (inflate)
+                InflateRect(&w, PW_POPUP_SHADOW_MARGIN, PW_POPUP_SHADOW_MARGIN);
             if (IntersectRect(&x, &w, r))
             {
                 if (n >= (int)RTL_NUMBER_OF(occ))
-                    return FALSE;   // too many to describe: not desktop, the poke goes out as before
+                    return -1;      // too many to describe: undecided
                 occ[n++] = w;
             }
         }
         e = (WINDOW_DATA*)e->ListEntry.Flink;
     }
     int budget = 512;
-    return PwRectUncoveredArea(r, occ, n, &budget) >= PW_DESK_MIN_AREA;   // -1 (undecided) is below it: not desktop
+    return PwRectUncoveredArea(r, occ, n, &budget);
+}
+
+static BOOL PwDirtyTouchesDesktop(IN const RECT* r)
+{
+    return PwDesktopUncoveredArea(r, FALSE) >= PW_DESK_MIN_AREA;   // -1 (undecided) is below it: not desktop, the poke goes out
 }
 static BOOL PwDirtyIsDesktop(IN const CAPTURE_FRAME* frame, IN UINT i)
 {
@@ -10017,13 +10035,15 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 const ULONG n = ++entry->PwPokeWgcLogged;
                                 if (n <= 8 || (n % 64) == 0)
                                     LogInfo("QGAPOKEWGC hwnd=0x%x slot=%d n=%lu win=(%d,%d,%d,%d) dirty=(%d,%d,%d,%d) "
-                                        L"hit=(%d,%d,%d,%d) occ=%d frameAge=%I64u ms",
+                                        L"hit=(%d,%d,%d,%d) occ=%d frameAge=%I64u ms desk=%I64d/%I64d",
                                         (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot, n,
                                         pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
                                         frame->dirty_rects[ddi].left, frame->dirty_rects[ddi].top,
                                         frame->dirty_rects[ddi].right, frame->dirty_rects[ddi].bottom,
                                         pwHit.left, pwHit.top, pwHit.right, pwHit.bottom, nOcc,
-                                        (ULONGLONG)GetTickCount64() - (ULONGLONG)ps->CaptureTick);
+                                        (ULONGLONG)GetTickCount64() - (ULONGLONG)ps->CaptureTick,
+                                        PwDesktopUncoveredArea(&frame->dirty_rects[ddi], FALSE),
+                                        PwDesktopUncoveredArea(&frame->dirty_rects[ddi], TRUE));
                             }
                             // A PRINTWINDOW SLOT'S OWN RENDER IS NOT A CHANGE (owner: "if you repaint the same pixels it is
                             // not a change"). Rendering a window makes Windows present it again, pixels unchanged - a
