@@ -53,6 +53,7 @@
 #include "faultinject.h"
 #include "dragsim.h"
 #include "notifyerr.h"
+#include "notifytexts.h"   // every dom0 notification this agent sends, as data (rendered offline by the render test)
 #include "qga-exitcodes.h"
 #include "deathevent.h"
 #include "qubes-io.h"
@@ -2734,11 +2735,9 @@ static BOOL WgcLaunch(void)
             L"never staged next to gui-agent.exe. It is a major failure of the install, not a "
             L"runtime condition to tolerate.", longExe);
         // Secondary route (ACTION: will not recover by itself; a reinstall is the fix). The log
-        // line above stays the record; this is the courtesy copy, once per boot.
-        QerrReport("gui-agent", "broker-missing", QERR_SEV_ACTION,
-            "wgcbroker.exe is missing from the install, so toasts, menus and WinUI surfaces are "
-            "withheld on this guest; reinstall the package",
-            "gui-agent log in Qubes Logs, line QGABROKERMISSING");
+        // line above stays the record; this is the courtesy copy, once per boot. The text is the
+        // "broker-missing" row of notifytexts.h.
+        QerrReportText(QerrTextFind("broker-missing"), NULL, NULL);
         return FALSE;
     }
     WCHAR shortExe[MAX_PATH] = { 0 };
@@ -2887,11 +2886,13 @@ static ULONGLONG BrokerNextDue(void)
 // request, published as WgcDeaf for the harness. The window keeps its last content (or stays withheld): there is no
 // PrintWindow route under it any more (c2: 0.05).
 // The user-facing half of QGAWGCDEAF (ADR-capture 32). The id carries the app's image name reduced to [a-z0-9-] (the route's
-// name rule), so each deaf app is reported once per boot; the text is templated - the image name, one sentence, the log line.
+// name rule), so each deaf app is reported once per boot; the text is the "capture-deaf" row of notifytexts.h, its header
+// naming the app (the image name without ".exe" - a human name, not a file name); the generic row when there is no name.
 static void DeafNotifyUser(IN HWND window)
 {
     char image[64] = "an app";
     char id[QERR_MAX_ID + 1] = "capture-deaf";
+    BOOL named = FALSE;
     DWORD pid = 0;
     if (window && GetWindowThreadProcessId(window, &pid) && pid)
     {
@@ -2925,23 +2926,24 @@ static void DeafNotifyUser(IN HWND window)
                                      ((ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9')) ? ch : '-');
                 }
                 id[j] = 0;
+                named = (k > 0);
+                // the header's human name: the image without its ".exe" (the header carries no file names)
+                if (k > 4 && (image[k - 4] == '.') &&
+                    (image[k - 3] == 'e' || image[k - 3] == 'E') && (image[k - 2] == 'x' || image[k - 2] == 'X') &&
+                    (image[k - 1] == 'e' || image[k - 1] == 'E'))
+                    image[k - 4] = 0;
             }
             CloseHandle(p);
         }
     }
-    char summary[300];
-    (void)StringCchPrintfA(summary, RTL_NUMBER_OF(summary),
-        "a window of %s stopped updating: Windows delivers no new pictures of it, so dom0 keeps showing its last content; "
-        "close and reopen that window", image);
-    QerrDecision d = QerrReport("gui-agent", id, QERR_SEV_ACTION, summary, "gui-agent log in Qubes Logs, line QGAWGCDEAF");
+    QerrDecision d = named ? QerrReportText(QerrTextFind("capture-deaf"), id, image)
+                           : QerrReportText(QerrTextFind("capture-deaf-generic"), NULL, NULL);
     LogInfo("QGAWGCDEAF user notification for %S: %S", id, QerrDecisionName(d));
     // An image name the route's redaction refuses (one containing "token", say) must not make the report silent: say it
     // without the name, under the generic id.
-    if (d == QERR_REJECT_REDACT || d == QERR_REJECT_NAME)
+    if (named && (d == QERR_REJECT_REDACT || d == QERR_REJECT_NAME))
     {
-        d = QerrReport("gui-agent", "capture-deaf", QERR_SEV_ACTION,
-            "a window stopped updating: Windows delivers no new pictures of it, so dom0 keeps showing its last content; "
-            "close and reopen that window", "gui-agent log in Qubes Logs, line QGAWGCDEAF");
+        d = QerrReportText(QerrTextFind("capture-deaf-generic"), NULL, NULL);
         LogInfo("QGAWGCDEAF user notification (generic) for capture-deaf: %S", QerrDecisionName(d));
     }
 }
@@ -3140,16 +3142,19 @@ static void BrokerSupervise(void)
         // rejected and stays in the log: a relaunch follows within ~8 s, and if it does not take,
         // QGADESLICEDOWN below escalates to ACTION 30 s later. Wired so the threshold is exercised
         // by a real site and a future promotion is a one-word change, not new plumbing.
-        QerrReport("gui-agent", "broker-died", QERR_SEV_DEGRADED,
-            "the de-slice broker stopped serving; a relaunch follows",
-            "gui-agent log in Qubes Logs, line QGABROKERDIED");
+        QerrReportText(QerrTextFind("broker-died"), NULL, NULL);
         // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo): a crash
         // is in Windows Error Reporting already, a clean unasked exit and a hang are visible only here.
         // ONE Event Log entry under our source, with the exit code (unknown for a hang: the agent reaps
         // it) and the run time since the launch; the dom0 notification is the event-triggered reporter's
         // job (ADR 3), which is also why the DEGRADED QerrReport above stays below the ACTION threshold.
+        // A HANG IS NOT AN EXIT: the broker that stopped answering is still running when this is
+        // written and is reaped below, so its record says "hung" (DEATHEVENT_EXIT_HUNG), never
+        // "exit code unknown" - the reporter renders a hang as a hang (rz39 defect 2). "unknown"
+        // is kept for a death that is neither an observed exit nor an observed hang (the session
+        // changed under it, the handle is gone).
         DeathEventReport(DEATHEVENT_ID_WGCBROKER, L"wgcbroker.exe", (DWORD)pidBefore,
-            brokerExited ? brokerExitCode : DEATHEVENT_EXIT_UNKNOWN,
+            brokerExited ? brokerExitCode : (hung ? DEATHEVENT_EXIT_HUNG : DEATHEVENT_EXIT_UNKNOWN),
             g_WgcLastLaunch != 0 ? now - g_WgcLastLaunch : DEATHEVENT_RAN_UNKNOWN,
             hung ? L"It was running but stopped answering (a hang): the agent reaps it and relaunches within "
                    L"~8 s. gui-agent log lines QGABROKERHUNG and QGABROKERDIED name the stage it hung in."
@@ -3200,14 +3205,9 @@ static void BrokerSupervise(void)
             binPresent ? 1u : 2u);
         // Secondary route (ACTION: windows are being withheld and nothing here recovers it). Once
         // per boot regardless of the 120 s re-warn cadence above; the text names the cause the same
-        // way the log line does, and points at the log for everything else.
-        QerrReport("gui-agent", "deslice-down", QERR_SEV_ACTION,
-            binPresent
-              ? "the de-slice broker is expected but has not been running for over 30 s, so toasts, "
-                "menus and WinUI surfaces are withheld; collect the gui-agent and wgcbroker logs"
-              : "the de-slice broker binary is missing from the install (packaging gap), so toasts, "
-                "menus and WinUI surfaces are withheld; reinstall the package",
-            "gui-agent log in Qubes Logs, line QGADESLICEDOWN");
+        // way the log line does (one row per cause in notifytexts.h), and points at the log for
+        // everything else.
+        QerrReportText(QerrTextFind(binPresent ? "deslice-down-present" : "deslice-down-missing"), NULL, NULL);
     }
 
     // Throttle relaunch: a freshly launched broker needs a few seconds to attach and publish its pid;
@@ -9519,10 +9519,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // This is the case the route is best at - a guest with zero windows and a live
                 // qrexec - so the notification is exactly what the log line cannot be: seen.
                 // The desktop name is not included: the fixed text is all a reader needs.
-                QerrReport("gui-agent", "desktop-stuck", QERR_SEV_ACTION,
-                    "the guest has been on the Windows sign-in or lock screen for over 30 s and "
-                    "shows nothing in seamless mode; arm autologon or open the windowed desktop",
-                    "gui-agent log in Qubes Logs, line QGADESKSTUCK");
+                QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
             }
 
             // Seamless: nothing may flow while this desktop is up. Non-seamless falls through

@@ -7,9 +7,11 @@
  * type, the id, the six strings and their order - not a re-implementation of it. Driven by
  * tools/tests/deathevent-selftest.sh (main repo), which also builds it with each DEATHEVENT_DEFECT_*
  * and requires the suite to FAIL on every one (a guard never seen to fail is decoration):
- *   WARNING   the record is written as a warning   (the owner: "it is not fucking warning!")
- *   SHAREDID  every death gets the agent's id       (the reporter could not tell the children apart)
- *   NOCODE    the exit code is dropped              (the one fact a crash leaves behind)
+ *   WARNING    the record is written as a warning   (the owner: "it is not fucking warning!")
+ *   SHAREDID   every death gets the agent's id      (the reporter could not tell the children apart)
+ *   NOCODE     the exit code is dropped             (the one fact a crash leaves behind)
+ *   HANGASEXIT a hang is written as an exit with no code (rz39 defect 2: "exited ... exit code unknown"
+ *              for a broker that stopped answering and was reaped)
  * Prints "ok <case>" / "FAIL <case>" lines; exit 0 iff no FAIL.
  */
 #include <stdio.h>
@@ -85,6 +87,8 @@ int main(void)
     check("compose: the record is an ERROR, never a warning", ev.Type == EVENTLOG_ERROR_TYPE);
     check("compose: the id is the caller's", ev.EventId == DEATHEVENT_ID_GUI_AGENT);
     check("compose: %1 is the rendered text", ev.Strings[0] == ev.Text);
+    check("compose: text opens with the human name, then the exe and pid in brackets (the dom0 style)",
+          wcsncmp(ev.Text, L"The GUI agent (gui-agent.exe, PID 1234) exited without being asked to - exit code 0xC0000409 - after running 0:12:34 (754000 ms). ", 120) == 0);
     check("compose: text names the exe", has(ev.Text, L"gui-agent.exe"));
     check("compose: text names the pid", has(ev.Text, L"PID 1234"));
     check("compose: text carries the exit code as 0x%08X", has(ev.Text, L"0xC0000409"));
@@ -128,6 +132,25 @@ int main(void)
     check("zero: 0 ms is a real run time, not unknown", wcscmp(ev.Strings[4], L"0") == 0);
     check("null detail: %6 is empty, not (null)", ev.Strings[5][0] == 0);
 
+    /* 3b. a hang is a hang: the child was still running and the supervisor ended it, so it has no exit
+     *     code of its own - %4 says "hung" and the text says what happened, never "exited ... unknown" */
+    DeathEventCompose(&ev, DEATHEVENT_ID_WGCBROKER, L"wgcbroker.exe", 4100, DEATHEVENT_EXIT_HUNG, 125000ULL,
+                      L"the agent reaps it and relaunches within ~8 s");
+    check("hang: %4 is the word hung", wcscmp(ev.Strings[3], L"hung") == 0);
+    check("hang: text says it stopped answering and was ended by the GUI agent",
+          has(ev.Text, L"The notification and menu capture helper (wgcbroker.exe, PID 4100) stopped answering and was ended by the GUI agent"));
+    check("hang: text says there is no exit code, and how long it ran", has(ev.Text, L"a hang, so there is no exit code - after running 0:02:05 (125000 ms)"));
+    check("hang: text does NOT say it exited", !has(ev.Text, L"exited without being asked to"));
+    check("hang: text does NOT say exit code unknown", !has(ev.Text, L"exit code unknown"));
+    check("hang: the other fields are untouched (exe, pid, run time, detail)",
+          wcscmp(ev.Strings[1], L"wgcbroker.exe") == 0 && wcscmp(ev.Strings[2], L"4100") == 0 &&
+          wcscmp(ev.Strings[4], L"125000") == 0 && has(ev.Strings[5], L"relaunches within"));
+    DeathEventCompose(&ev, DEATHEVENT_ID_GUI_AGENT, L"gui-agent.exe", 5, DEATHEVENT_EXIT_HUNG, 1, NULL);
+    check("hang: the agent's supervisor is named as the watchdog", has(ev.Text, L"was ended by the GUI agent watchdog"));
+    check("names: each child has its human name", wcscmp(DeathEventHumanName(DEATHEVENT_ID_NOTIFBRIDGE), L"The notification bridge") == 0 &&
+          wcscmp(DeathEventHumanName(DEATHEVENT_ID_ETWPROXY), L"The ETW signal proxy") == 0 &&
+          wcscmp(DeathEventHumanName(4999), L"A component") == 0);
+
     /* 4. bounded: oversize inputs are truncated, never overflow, always terminated */
     for (i = 0; i < RTL_NUMBER_OF(longDetail) - 1; i++) longDetail[i] = L'd';
     longDetail[RTL_NUMBER_OF(longDetail) - 1] = 0;
@@ -151,7 +174,7 @@ int main(void)
     check("report: category 0, no sid, no raw data", g_category == 0 && g_sid == NULL && g_dataSize == 0 && g_raw == NULL);
     check("report: id is the bridge's", g_eventId == DEATHEVENT_ID_NOTIFBRIDGE);
     check("report: six strings", g_numStrings == DEATHEVENT_STRINGS);
-    check("report: %1 renders the exe, pid and code", has(g_strings[0], L"notifhost.exe (PID 4321) exited without being asked to: exit code 0xC0000005"));
+    check("report: %1 renders the human name, exe, pid and code", has(g_strings[0], L"The notification bridge (notifhost.exe, PID 4321) exited without being asked to - exit code 0xC0000005"));
     check("report: %2..%5 structured", wcscmp(g_strings[1], L"notifhost.exe") == 0 && wcscmp(g_strings[2], L"4321") == 0 &&
           wcscmp(g_strings[3], L"0xC0000005") == 0 && wcscmp(g_strings[4], L"60000") == 0);
     check("report: no perror on success", g_perrorCalls == 0);

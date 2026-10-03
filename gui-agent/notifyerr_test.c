@@ -23,10 +23,13 @@
  *   fail-open  NOTIFYERR_DEFECT_FAILOPEN  - transport missing/failed/unwritable store: the caller
  *                                           gets a return, not a crash, and the failure is logged
  *                                           ONCE per process for repeated errors
- * Plus the gate (off -> nothing leaves the log), the notify-file text shape, and the marker
- * file contract shared with guest/qwt-notify-error.ps1.
+ * Plus the gate (off -> nothing leaves the log), the notify-file text shape (header / line 1 /
+ * cause / technical line, rz39), the row glue QerrReportText, and the marker file contract shared
+ * with guest/qwt-notify-error.ps1. The texts themselves are held to the rules by
+ * notifyrender_test.c, which renders every row of notifytexts.h.
  */
 #include "notifyerr.h"
+#include "notifytexts.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -43,6 +46,7 @@
 extern int  (*QerrTestSpawnHook)(const char* notifyPath);
 extern void (*QerrTestLogHook)(const char* line);
 extern long long QerrTestBootStamp;
+extern unsigned long QerrTestPid;
 
 static unsigned g_run = 0, g_fail = 0;
 static char g_base[256];
@@ -149,9 +153,10 @@ int main(void)
 
     /* ---- 1. pure redaction --------------------------------------------------------------- */
     {
-        const char* clean = "Qubes Windows Tools, gui-agent: de-slice broker is not running\r\n"
-                            "Error id: deslicedown. Reported once per boot; the detail is in the guest log: "
-                            "C:\\Qubes Logs\\gui-agent-20260909-101010.log";
+        const char* clean = "The notification and menu capture helper is not running\r\n"
+                            "Menus, modern app windows and notification windows do not appear in dom0 until it is back; collect the gui-agent and wgcbroker logs.\r\n"
+                            "Cause: wgcbroker.exe is installed but has not been running for over 30 s (log line QGADESLICEDOWN).\r\n"
+                            "gui-agent.exe pid 4242; reported once per boot. Evidence: C:\\Qubes Logs\\gui-agent-20260909-101010.log, line QGADESLICEDOWN.";
         Check("redact: templated text with a log path is clean", QerrRedactReason(clean) == NULL);
         Check("redact: 'password=' refused",       QerrRedactReason("agent failed: password=hunter2") != NULL);
         Check("redact: 'DefaultPassword' refused", QerrRedactReason("LSA DefaultPassword missing") != NULL);
@@ -204,10 +209,41 @@ int main(void)
               !QerrBootMatch(1000, 927) && !QerrBootMatch(1000, 5000));
     }
 
+    /* ---- 2b. the text shape: header / line 1 / cause / technical line (rz39) --------------- */
+    {
+        char buf[QERR_MAX_TEXT + 256], tech[400], hdr[200];
+        Check("compose: header, line 1, cause and the technical line, CRLF-separated",
+              QerrComposeNotifyText(buf, sizeof(buf), "H", "N", "C", "T") == 10 && strcmp(buf, "H\r\nN\r\nC\r\nT") == 0);
+        Check("compose: no cause -> three lines", QerrComposeNotifyText(buf, sizeof(buf), "H", "N", NULL, "T") == 7 && strcmp(buf, "H\r\nN\r\nT") == 0);
+        Check("compose: an empty cause is no cause", QerrComposeNotifyText(buf, sizeof(buf), "H", "N", "", "T") == 7 && strcmp(buf, "H\r\nN\r\nT") == 0);
+        Check("compose: a CR/LF inside a part is folded to a space (it cannot move text into another line)",
+              QerrComposeNotifyText(buf, sizeof(buf), "H\r\nx", "N\ny", "C\rz", "T") > 0 && strcmp(buf, "H x\r\nN y\r\nC z\r\nT") == 0);
+        Check("compose: an empty header is refused", QerrComposeNotifyText(buf, sizeof(buf), "", "N", NULL, "T") == 0 && buf[0] == 0);
+        Check("compose: an empty line 1 is refused", QerrComposeNotifyText(buf, sizeof(buf), "H", "", NULL, "T") == 0);
+        Check("compose: an empty technical line is refused", QerrComposeNotifyText(buf, sizeof(buf), "H", "N", NULL, "") == 0);
+        Check("compose: a text that does not fit is refused, not truncated", QerrComposeNotifyText(buf, 8, "Header", "N", NULL, "T") == 0 && buf[0] == 0);
+        Check("tech: every part, in order",
+              QerrFormatTechLine(tech, sizeof(tech), "gui-agent.exe", 6100, "exception 0xC0000409", "0:12:34", "death 1 this boot",
+                                 "C:\\ProgramData\\Qubes\\qwt-deaths.log; WER folder AppCrash_gui-agent.exe_*; Application log event 1000") > 0 &&
+              strcmp(tech, "gui-agent.exe pid 6100; exception 0xC0000409; ran 0:12:34; death 1 this boot. "
+                           "Evidence: C:\\ProgramData\\Qubes\\qwt-deaths.log; WER folder AppCrash_gui-agent.exe_*; Application log event 1000.") == 0);
+        Check("tech: no pid, no code, no run time -> subject, count and evidence only",
+              QerrFormatTechLine(tech, sizeof(tech), "activate-idd.ps1", 0, NULL, NULL, "reported once per boot", "C:\\qwt-idd-activate.log") > 0 &&
+              strcmp(tech, "activate-idd.ps1; reported once per boot. Evidence: C:\\qwt-idd-activate.log.") == 0);
+        Check("tech: a missing subject, count or evidence is refused",
+              QerrFormatTechLine(tech, sizeof(tech), "", 1, NULL, NULL, "x", "y") == 0 &&
+              QerrFormatTechLine(tech, sizeof(tech), "a", 1, NULL, NULL, NULL, "y") == 0 &&
+              QerrFormatTechLine(tech, sizeof(tech), "a", 1, NULL, NULL, "x", "") == 0);
+        Check("header: the one %s takes the per-instance name", QerrFormatHeader(hdr, sizeof(hdr), "A %s window stopped updating", "chrome") &&
+              strcmp(hdr, "A chrome window stopped updating") == 0);
+        Check("header: no %s -> a plain copy", QerrFormatHeader(hdr, sizeof(hdr), "The GUI agent crashed", "ignored") && strcmp(hdr, "The GUI agent crashed") == 0);
+        Check("header: a %s with no name says an app", QerrFormatHeader(hdr, sizeof(hdr), "A %s window", NULL) && strcmp(hdr, "A an app window") == 0);
+    }
+
     /* ---- 3. pure decision: severity threshold ------------------------------------------- */
     {
         unsigned nc = 0;
-        const char* t = "Qubes Windows Tools, gui-agent: x\r\nError id: y. log: z";
+        const char* t = "The GUI agent crashed\r\nx\r\ngui-agent.exe; reported once per boot. Evidence: z.";
         CheckDecision("decide: INFO rejected by severity",
             QerrDecide(QERR_SEV_INFO, "gui-agent", "y", t, 0, 0, 0, 0, 0, BOOT, &nc), QERR_REJECT_SEVERITY);
         CheckDecision("decide: DEGRADED rejected by severity",
@@ -241,68 +277,104 @@ int main(void)
     ResetStore();
     QerrTestSpawnHook = SpawnOk;
     QerrInit(0, g_dir);
-    CheckDecision("gate off: ACTION error is not sent", QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "x", NULL), QERR_REJECT_SEVERITY);
+    CheckDecision("gate off: ACTION error is not sent", QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_REJECT_SEVERITY);
     Check("gate off: nothing spawned, no marker", g_spawned == 0 && !FileExists("gui-agent.deslicedown"));
 
     /* ---- 5. glue end-to-end: sends, dedupe, cap ----------------------------------------- */
     ResetStore();
     QerrInit(1, g_dir);
     CheckDecision("send: first ACTION report sends",
-        QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "de-slice broker is not running", "C:\\Qubes Logs\\gui-agent.log"), QERR_SEND);
+        QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "The notification and menu capture helper is not running",
+                   "Menus, modern app windows and notification windows do not appear in dom0 until it is back.",
+                   "Cause: wgcbroker.exe has not been running for over 30 s (log line QGADESLICEDOWN).",
+                   "gui-agent.exe pid 4242; reported once per boot. Evidence: C:\\Qubes Logs\\gui-agent.log, line QGADESLICEDOWN."), QERR_SEND);
     Check("send: notifhost spawned once with a file", g_spawned == 1);
-    Check("send: notify text summary line names the component",
-          strncmp(g_lastNotify, "Qubes Windows Tools, gui-agent: de-slice broker is not running\r\n", 62) == 0);
-    Check("send: notify text body carries the id and the log pointer",
-          strstr(g_lastNotify, "Error id: deslicedown.") != NULL &&
-          strstr(g_lastNotify, "C:\\Qubes Logs\\gui-agent.log") != NULL);
+    Check("send: notify text line 1 is the header, alone",
+          strncmp(g_lastNotify, "The notification and menu capture helper is not running\r\n", strlen("The notification and menu capture helper is not running\r\n")) == 0);
+    Check("send: notify text body is line 1, the cause and the technical line",
+          strcmp(g_lastNotify, "The notification and menu capture helper is not running\r\n"
+                               "Menus, modern app windows and notification windows do not appear in dom0 until it is back.\r\n"
+                               "Cause: wgcbroker.exe has not been running for over 30 s (log line QGADESLICEDOWN).\r\n"
+                               "gui-agent.exe pid 4242; reported once per boot. Evidence: C:\\Qubes Logs\\gui-agent.log, line QGADESLICEDOWN.") == 0);
     Check("send: marker and count files written", FileExists("gui-agent.deslicedown") && FileExists(".count"));
     CheckDecision("dedupe: the same error again this boot is suppressed",
-        QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "de-slice broker is not running", NULL), QERR_SUPPRESS_DUP);
+        QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "The de-slice broker is not running", "y", NULL, "z"), QERR_SUPPRESS_DUP);
     Check("dedupe: no second spawn", g_spawned == 1);
     CheckDecision("dedupe: a different id still sends",
-        QerrReport("gui-agent", "deskstuck", QERR_SEV_ACTION, "secure desktop for 30 s", NULL), QERR_SEND);
+        QerrReport("gui-agent", "deskstuck", QERR_SEV_ACTION, "The guest is waiting at the sign-in screen", "y", NULL, "z"), QERR_SEND);
     CheckDecision("severity: DEGRADED report is rejected end-to-end",
-        QerrReport("gui-agent", "brokerdied", QERR_SEV_DEGRADED, "broker died, relaunching", NULL), QERR_REJECT_SEVERITY);
+        QerrReport("gui-agent", "brokerdied", QERR_SEV_DEGRADED, "The de-slice broker stopped serving", "y", NULL, "z"), QERR_REJECT_SEVERITY);
     Check("severity: rejected event left no marker and no spawn", !FileExists("gui-agent.brokerdied") && g_spawned == 2);
     /* a marker from the previous boot must not suppress */
     WriteFileRel("gui-agent.oldboot", "boot=1757300000\n");
     CheckDecision("dedupe: marker from an earlier boot does not suppress",
-        QerrReport("gui-agent", "oldboot", QERR_SEV_ACTION, "x", NULL), QERR_SEND);
+        QerrReport("gui-agent", "oldboot", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_SEND);
     /* cap: we are at 3 sends; push to the cap with distinct ids */
     {
         char id[16]; unsigned i; QerrDecision last = QERR_SEND;
         for (i = 3; i < QERR_CAP_PER_BOOT; i++) {
             snprintf(id, sizeof(id), "cap-%u", i);
-            last = QerrReport("gui-agent", id, QERR_SEV_ACTION, "x", NULL);
+            last = QerrReport("gui-agent", id, QERR_SEV_ACTION, "x", "y", NULL, "z");
         }
         CheckDecision("cap: the 8th distinct error still sends", last, QERR_SEND);
         CheckDecision("cap: the 9th distinct error is suppressed",
-            QerrReport("gui-agent", "cap-9", QERR_SEV_ACTION, "x", NULL), QERR_SUPPRESS_CAP);
+            QerrReport("gui-agent", "cap-9", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_SUPPRESS_CAP);
         Check("cap: exactly QERR_CAP_PER_BOOT spawns this boot", g_spawned == QERR_CAP_PER_BOOT);
         Check("cap: suppression was logged", LogCount("suppressed:cap") == 1);
+    }
+
+    /* ---- 5b. the row glue: QerrReportText renders a notifytexts.h row exactly as the render test does */
+    ResetStore();
+    QerrInit(1, g_dir);
+    {
+        char want[QERR_MAX_TEXT + 256];
+        const QerrText* row = QerrTextFind("deslice-down-present");
+        const QerrText* deaf = QerrTextFind("capture-deaf");
+        Check("rows: the keys the agent asks for exist", row != NULL && deaf != NULL &&
+              QerrTextFind("broker-missing") && QerrTextFind("deslice-down-missing") && QerrTextFind("desktop-stuck") &&
+              QerrTextFind("broker-died") && QerrTextFind("capture-deaf-generic"));
+        Check("rows: an unknown key is NULL", QerrTextFind("no-such-row") == NULL && QerrTextFind(NULL) == NULL);
+        CheckDecision("row send: a row sends under its own component and id", QerrReportText(row, NULL, NULL), QERR_SEND);
+        Check("row send: the marker is the row's component.id", FileExists("gui-agent.deslice-down"));
+        Check("row send: the notify text is byte-identical to the render test's rendering",
+              QerrRenderText(want, sizeof(want), row, NULL, QerrTestPid) > 0 && strcmp(g_lastNotify, want) == 0);
+        Check("row send: the technical line carries this process's pid",
+              strstr(g_lastNotify, "\r\ngui-agent.exe pid 4242; reported once per boot. Evidence: ") != NULL);
+        CheckDecision("row send: a per-instance id and header name (the deaf app) are used",
+            QerrReportText(deaf, "capture-deaf-chrome", "chrome"), QERR_SEND);
+        Check("row send: the deaf header names the app, the marker carries the per-instance id",
+              strncmp(g_lastNotify, "A chrome window stopped updating\r\n", 34) == 0 && FileExists("gui-agent.capture-deaf-chrome"));
+        g_logN = 0;
+        CheckDecision("row send: a missing row is refused, never dereferenced", QerrReportText(NULL, NULL, NULL), QERR_REJECT_NAME);
+        Check("row send: the missing row is logged as a bug of ours", LogCount("notifytexts.h") == 1);
     }
 
     /* ---- 6. glue end-to-end: redaction refuses ----------------------------------------- */
     ResetStore();
     QerrInit(1, g_dir);
-    CheckDecision("redact e2e: summary with a password is refused",
-        QerrReport("activate-idd", "reboot-refused", QERR_SEV_ACTION, "shutdown refused, password=abc", NULL), QERR_REJECT_REDACT);
+    CheckDecision("redact e2e: a cause with a password is refused",
+        QerrReport("activate-idd", "reboot-refused", QERR_SEV_ACTION, "The display driver needs a reboot that was refused", "y",
+                   "Cause: shutdown refused, password=abc", "z"), QERR_REJECT_REDACT);
     Check("redact e2e: refused text spawned nothing and left no marker",
           g_spawned == 0 && !FileExists("activate-idd.reboot-refused"));
     Check("redact e2e: refusal logged", LogCount("rejected:redact") == 1);
+    g_logN = 0;
+    CheckDecision("compose e2e: a report with no header does not compose and is refused",
+        QerrReport("activate-idd", "no-header", QERR_SEV_ACTION, "", "y", NULL, "z"), QERR_REJECT_REDACT);
+    Check("compose e2e: the refusal is logged (never a silent drop)", LogCount("did not compose") == 1 && g_spawned == 0);
 
     /* ---- 7. fail-open ------------------------------------------------------------------ */
     ResetStore();
     QerrInit(1, g_dir);
     QerrTestSpawnHook = NULL;   /* notifhost.exe missing */
     CheckDecision("fail-open: exe missing -> caller gets a return, transport failed",
-        QerrReport("gui-agent", "a", QERR_SEV_ACTION, "x", NULL), QERR_FAIL_TRANSPORT);
-    (void)QerrReport("gui-agent", "b", QERR_SEV_ACTION, "x", NULL);
-    (void)QerrReport("gui-agent", "c", QERR_SEV_ACTION, "x", NULL);
+        QerrReport("gui-agent", "a", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_FAIL_TRANSPORT);
+    (void)QerrReport("gui-agent", "b", QERR_SEV_ACTION, "x", "y", NULL, "z");
+    (void)QerrReport("gui-agent", "c", QERR_SEV_ACTION, "x", "y", NULL, "z");
     Check("fail-open: three failures, the missing exe logged ONCE", LogCount("NOT PRESENT") == 1);
     QerrTestSpawnHook = SpawnFail;
-    (void)QerrReport("gui-agent", "d", QERR_SEV_ACTION, "x", NULL);
-    (void)QerrReport("gui-agent", "e", QERR_SEV_ACTION, "x", NULL);
+    (void)QerrReport("gui-agent", "d", QERR_SEV_ACTION, "x", "y", NULL, "z");
+    (void)QerrReport("gui-agent", "e", QERR_SEV_ACTION, "x", "y", NULL, "z");
     Check("fail-open: spawn failures logged ONCE", LogCount("CreateProcess") == 1);
     Check("fail-open: caller reached this line (no crash, no exit)", 1);
     /* unwritable store: no send, one line */
@@ -314,8 +386,8 @@ int main(void)
         QerrInit(1, bad);
         QerrTestSpawnHook = SpawnOk; g_spawned = 0;
         CheckDecision("fail-open: unwritable store -> no send",
-            QerrReport("gui-agent", "f", QERR_SEV_ACTION, "x", NULL), QERR_FAIL_TRANSPORT);
-        (void)QerrReport("gui-agent", "g", QERR_SEV_ACTION, "x", NULL);
+            QerrReport("gui-agent", "f", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_FAIL_TRANSPORT);
+        (void)QerrReport("gui-agent", "g", QERR_SEV_ACTION, "x", "y", NULL, "z");
         Check("fail-open: unwritable store spawned nothing", g_spawned == 0);
         Check("fail-open: unwritable store logged ONCE", LogCount("not writable") == 1);
     }

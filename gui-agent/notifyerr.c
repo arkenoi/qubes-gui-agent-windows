@@ -61,12 +61,14 @@ static int       PlatWriteSmall(const char* path, const char* text);      /* 1 =
 static int       PlatWriteNotifyFile(const char* path, const char* utf8); /* UTF-16LE + BOM */
 static int       PlatSpawnNotify(const char* notifyPath, int* exeMissing);
 static void      PlatDefaultStateDir(char* out, size_t cap);
+static unsigned long PlatPid(void);                                       /* this process, for the technical line */
 
 #ifndef QERR_AGENT_LAYER
 /* Test hooks (notifyerr_test.c): the spawn outcome and the log sink are the test's. */
 int  (*QerrTestSpawnHook)(const char* notifyPath) = NULL;   /* NULL = "notifhost.exe missing" */
 void (*QerrTestLogHook)(const char* line) = NULL;
 long long QerrTestBootStamp = 0;                              /* 0 = wall clock (the suite always pins it) */
+unsigned long QerrTestPid = 4242;                             /* the pid the technical line shows under test */
 #endif
 
 /* --- API ---------------------------------------------------------------------------------- */
@@ -102,8 +104,8 @@ static void LogOnce(int* flag, const char* fmt, ...)
     PlatLog("%s", line);
 }
 
-QerrDecision QerrReport(const char* component, const char* id, int sev, const char* summary,
-                        const char* logHint)
+QerrDecision QerrReport(const char* component, const char* id, int sev, const char* header,
+                        const char* next, const char* cause, const char* tech)
 {
     static int s_LoggedStore = 0, s_LoggedNoExe = 0, s_LoggedSpawn = 0;
     static unsigned s_Seq = 0;
@@ -117,11 +119,17 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
 
     if (!g_QerrGate) return QERR_REJECT_SEVERITY;   /* gate off: nothing leaves the log */
 
-    /* Compose first: the text is what redaction judges, and a text that does not fit is not
-     * sent at all (QerrComposeNotifyText returns 0). */
-    if (!QerrComposeNotifyText(text, sizeof(text), component ? component : "", id ? id : "",
-                               summary ? summary : "", logHint))
+    /* Compose first: the text is what redaction judges, and a text that does not fit - or lacks
+     * its header, line 1 or technical line - is not sent at all (QerrComposeNotifyText returns 0).
+     * Logged: a notification that is never composed is otherwise a silent one. */
+    if (!QerrComposeNotifyText(text, sizeof(text), header ? header : "", next ? next : "", cause,
+                               tech ? tech : ""))
+    {
+        PlatLog("NOTIFYERR %s.%s not sent: rejected:redact (the text did not compose - empty "
+                "header, line 1 or technical line, or over %u bytes)",
+                component ? component : "-", id ? id : "-", (unsigned)sizeof(text));
         return QERR_REJECT_REDACT;
+    }
 
     /* Cheap, store-free checks come first inside QerrDecide; only a candidate for sending
      * reads the store. Read both files up front anyway - they are tiny and this keeps the
@@ -185,6 +193,28 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
     PlatLog("NOTIFYERR %s.%s sent to dom0 (#%u this boot; delivery is notifhost's to log)",
             component, id, newCount);
     return QERR_SEND;
+}
+
+/* One of the agent's own texts (notifytexts.h), rendered the way the offline render test renders
+ * it: the header's %s filled, the technical line composed from the row and this process's pid. */
+QerrDecision QerrReportText(const QerrText* t, const char* idOverride, const char* headerArg)
+{
+    char header[200], tech[400];
+    if (!t) {
+        PlatLog("QGANOTIFYERR a notification text row is missing (a bug of ours: the key a call "
+                "site asked for is not in notifytexts.h) - nothing sent");
+        return QERR_REJECT_NAME;
+    }
+    if (!QerrFormatHeader(header, sizeof(header), t->header, headerArg) ||
+        !QerrFormatTechLine(tech, sizeof(tech), t->subject, PlatPid(), t->code, NULL,
+                            t->count ? t->count : "reported once per boot", t->evidence))
+    {
+        PlatLog("NOTIFYERR %s.%s not sent: the header or the technical line did not render",
+                t->component, idOverride ? idOverride : t->id);
+        return QERR_REJECT_REDACT;
+    }
+    return QerrReport(t->component, idOverride ? idOverride : t->id, t->sev, header, t->next,
+                      t->cause, tech);
 }
 
 /* ========================================================================================= */
@@ -266,6 +296,11 @@ static void PlatDefaultStateDir(char* out, size_t cap)
     if (!GetEnvironmentVariableA("ProgramData", pd, RTL_NUMBER_OF(pd)) || !pd[0])
         StringCchCopyA(pd, RTL_NUMBER_OF(pd), "C:\\ProgramData");
     StringCchPrintfA(out, cap, "%s\\Qubes\\notify-errors", pd);
+}
+
+static unsigned long PlatPid(void)
+{
+    return (unsigned long)GetCurrentProcessId();
 }
 
 static int PlatEnsureDir(const char* dir)
@@ -366,6 +401,11 @@ static long long PlatBootStamp(void)
 static void PlatDefaultStateDir(char* out, size_t cap)
 {
     snprintf(out, cap, "%s", "qwt-notify-errors-test");
+}
+
+static unsigned long PlatPid(void)
+{
+    return QerrTestPid;   /* pinned: the suite compares rendered text byte for byte */
 }
 
 static int PlatEnsureDir(const char* dir)

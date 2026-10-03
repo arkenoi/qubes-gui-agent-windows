@@ -48,6 +48,10 @@
 //
 // The exit code is written RAW. Its meaning (0xC0000409 = fast-fail, ...) is decoded in ONE place,
 // the reporter, so the text a human reads in dom0 and the text in our own deaths log cannot drift.
+//
+// THE RENDERED TEXT (%1, what Event Viewer shows) follows the dom0 notification's style (rz39,
+// agent notifyerr.h): the component by its human name first, the executable and pid in brackets,
+// what happened in words, then the code, the run time and the supervisor's own words.
 
 #include <windows.h>
 #include <strsafe.h>
@@ -62,10 +66,33 @@
 #define DEATHEVENT_ID_NOTIFBRIDGE   4003    // gui-agent: the notification bridge exited unasked
 #define DEATHEVENT_ID_ETWPROXY      4004    // gui-agent: the ETW signal proxy exited unasked
 
-// "I do not know": a supervisor that reaped a hung child has no exit code; one that found a child
-// gone without a launch stamp has no run time. Both are written as the word "unknown", never as 0.
+// "I do not know": a supervisor that found a child gone without observing its exit has no exit
+// code; one that found it gone without a launch stamp has no run time. Both are written as the
+// word "unknown", never as 0.
 #define DEATHEVENT_EXIT_UNKNOWN     0xFFFFFFFFUL
 #define DEATHEVENT_RAN_UNKNOWN      ((ULONGLONG)-1)
+// A HANG IS NOT AN EXIT: a child that was still running but stopped answering, and that the
+// supervisor then ended itself, has no exit code of its own - the word "hung" is written in the
+// exit-code field, so the reporter renders a hang as a hang and never as "exited, code unknown".
+#define DEATHEVENT_EXIT_HUNG        0xFFFFFFFEUL
+
+// The human name of each supervised child (the dom0 notification and the deaths log use the same
+// names - guest/qwt-report-death.ps1's table), and who supervises it.
+static const WCHAR *DeathEventHumanName(IN DWORD eventId)
+{
+    switch (eventId)
+    {
+    case DEATHEVENT_ID_GUI_AGENT:   return L"The GUI agent";
+    case DEATHEVENT_ID_WGCBROKER:   return L"The notification and menu capture helper";
+    case DEATHEVENT_ID_NOTIFBRIDGE: return L"The notification bridge";
+    case DEATHEVENT_ID_ETWPROXY:    return L"The ETW signal proxy";
+    default:                        return L"A component";
+    }
+}
+static const WCHAR *DeathEventSupervisorName(IN DWORD eventId)
+{
+    return eventId == DEATHEVENT_ID_GUI_AGENT ? L"the GUI agent watchdog" : L"the GUI agent";
+}
 
 // Insertion strings: %1 renders; 2..6 are the reporter's structured fields, in this fixed order.
 #define DEATHEVENT_STRINGS          6
@@ -116,8 +143,14 @@ static WORD DeathEventCompose(
 #ifdef DEATHEVENT_DEFECT_NOCODE
     exitCode = DEATHEVENT_EXIT_UNKNOWN;          // DEFECT: the one fact a crash leaves behind is dropped
 #endif
+#ifdef DEATHEVENT_DEFECT_HANGASEXIT
+    if (exitCode == DEATHEVENT_EXIT_HUNG)
+        exitCode = DEATHEVENT_EXIT_UNKNOWN;      // DEFECT: a hang is written as an exit with no code (rz39 defect 2)
+#endif
     if (exitCode == DEATHEVENT_EXIT_UNKNOWN)
         StringCchCopyW(ev->ExitCode, RTL_NUMBER_OF(ev->ExitCode), L"unknown");
+    else if (exitCode == DEATHEVENT_EXIT_HUNG)
+        StringCchCopyW(ev->ExitCode, RTL_NUMBER_OF(ev->ExitCode), L"hung");
     else
         StringCchPrintfW(ev->ExitCode, RTL_NUMBER_OF(ev->ExitCode), L"0x%08X", (unsigned int)exitCode);
     if (ranMs == DEATHEVENT_RAN_UNKNOWN)
@@ -133,10 +166,17 @@ static WORD DeathEventCompose(
             (unsigned int)((ranMs / 1000ULL) % 60ULL), (unsigned long long)ranMs);
     }
     StringCchCopyW(ev->Detail, RTL_NUMBER_OF(ev->Detail), detail ? detail : L"");
-    StringCchPrintfW(ev->Text, RTL_NUMBER_OF(ev->Text),
-        L"%s (PID %s) exited without being asked to: exit code %s, after running %s. "
-        L"This is a death of a Qubes Windows Tools component, reported as a major error. %s",
-        ev->Exe, ev->Pid, ev->ExitCode, ran, ev->Detail);
+    if (exitCode == DEATHEVENT_EXIT_HUNG)
+        StringCchPrintfW(ev->Text, RTL_NUMBER_OF(ev->Text),
+            L"%s (%s, PID %s) stopped answering and was ended by %s - a hang, so there is no exit code - "
+            L"after running %s. A Qubes Windows Tools component died; this is a major error. %s",
+            DeathEventHumanName(ev->EventId), ev->Exe, ev->Pid, DeathEventSupervisorName(ev->EventId),
+            ran, ev->Detail);
+    else
+        StringCchPrintfW(ev->Text, RTL_NUMBER_OF(ev->Text),
+            L"%s (%s, PID %s) exited without being asked to - exit code %s - after running %s. "
+            L"A Qubes Windows Tools component died; this is a major error. %s",
+            DeathEventHumanName(ev->EventId), ev->Exe, ev->Pid, ev->ExitCode, ran, ev->Detail);
     ev->Strings[0] = ev->Text;
     ev->Strings[1] = ev->Exe;
     ev->Strings[2] = ev->Pid;

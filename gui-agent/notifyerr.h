@@ -303,21 +303,151 @@ static inline QerrDecision QerrDecide(int sev, const char* component, const char
 }
 
 /* --- the notification text ---------------------------------------------------------------- */
-/* notifhost --notify-file format: line 1 = summary, the rest = body. dom0 prefixes the qube's
- * own name and colour to the summary (origin marking is the proxy's, unforgeable), so the guest
- * does not name itself; the COMPONENT is named here because dom0 cannot know it. The body says
- * where the detail is and that this is a once-per-boot report, so a reader who sees nothing
- * further does not conclude the fault went away. Returns the byte length, or 0 if it did not
- * fit (the caller then sends nothing - a truncated pointer to a log is worse than none). */
-static inline size_t QerrComposeNotifyText(char* out, size_t cap, const char* component, const char* id,
-                                    const char* summary, const char* logHint)
+/* notifhost --notify-file format: line 1 = the HEADER, the rest = the BODY, CRLF-separated. ONE
+ * shape for every sender - this file (the agent and notifhost) and guest/qwt-notify-error.ps1 (the
+ * scripts and the death reporter) - decided 2026-10-03 (rz39):
+ *   header   WHAT happened to WHICH component, in human names: no codes, no file names, no counts,
+ *            no product prefix (dom0 shows the source qube itself); at most ~60 characters.
+ *   line 1   what it means for the user and what the system does next; what the user can do, only
+ *            when there is something.
+ *   line 2   the cause in words WITH the code (omitted when there is no cause to state).
+ *   line 3   ONE technical line, QerrFormatTechLine below: the executable, pid, code, how long it
+ *            ran, "death n this boot" or "reported once per boot", and where the evidence is.
+ * The code's MEANING comes from the table of the code's SOURCE (a process exit or exception code,
+ * a Win32 error the SCM reports, a service-specific code, a task result) - never the process table
+ * for the others. A CR or LF inside a part would move text into the wrong line unnoticed, so each
+ * part is copied with CR/LF folded to a space. Returns the byte length, or 0 if the text did not
+ * fit or the header, line 1 or the technical line is empty - the caller then sends nothing: a
+ * truncated notification is worse than none, and the log is still the record. */
+static inline int QerrPut_(char* out, size_t cap, size_t* at, const char* s, int foldNewlines)
 {
-    int n = snprintf(out, cap,
-        "Qubes Windows Tools, %s: %s\r\n"
-        "Error id: %s. Reported once per boot; the detail is in the guest log: %s",
-        component, summary, id, (logHint && *logHint) ? logHint : "see the gui-agent log directory");
-    if (n <= 0 || (size_t)n >= cap) { if (cap) out[0] = 0; return 0; }
-    return (size_t)n;
+    size_t i;
+    for (i = 0; s[i]; i++) {
+        char c = s[i];
+        if (foldNewlines && (c == '\r' || c == '\n')) {
+            if (c == '\r' && s[i + 1] == '\n') continue;   /* CRLF -> one space */
+            c = ' ';
+        }
+        if (*at + 1 >= cap) { out[0] = 0; return 0; }
+        out[(*at)++] = c;
+        out[*at] = 0;
+    }
+    return 1;
+}
+#ifdef NOTIFYERR_DEFECT_FLATBODY
+#define QERR_LINE_SEP " "        /* DEFECT (render test): the body collapses into one line */
+#else
+#define QERR_LINE_SEP "\r\n"
+#endif
+static inline size_t QerrComposeNotifyText(char* out, size_t cap, const char* header, const char* next,
+                                           const char* cause, const char* tech)
+{
+    size_t at = 0;
+    if (!out || cap == 0) return 0;
+    out[0] = 0;
+    if (!header || !*header || !next || !*next || !tech || !*tech) return 0;
+    if (!QerrPut_(out, cap, &at, header, 1) || !QerrPut_(out, cap, &at, "\r\n", 0) ||
+        !QerrPut_(out, cap, &at, next, 1) || !QerrPut_(out, cap, &at, QERR_LINE_SEP, 0))
+        return 0;
+    if (cause && *cause && (!QerrPut_(out, cap, &at, cause, 1) || !QerrPut_(out, cap, &at, QERR_LINE_SEP, 0)))
+        return 0;
+    if (!QerrPut_(out, cap, &at, tech, 1)) return 0;
+    return at;
+}
+
+/* The technical line: "<subject>[ pid <n>][; <code>][; ran <h:mm:ss>]; <count>. Evidence: <where>."
+ * subject = the executable or task; code = "exit code 2" / "exception 0xC0000409" / ... already
+ * phrased by the source's table, or NULL; ran = "0:12:34" or NULL; count = "death 3 this boot" or
+ * "reported once per boot"; evidence = the log path, WER folder prefix, event log + id. Returns the
+ * byte length, or 0 when a required part is missing or it did not fit. */
+static inline int QerrPutUl_(char* out, size_t cap, size_t* at, unsigned long v)
+{
+    char num[24];
+    snprintf(num, sizeof(num), "%lu", v);
+    return QerrPut_(out, cap, at, num, 0);
+}
+static inline size_t QerrFormatTechLine(char* out, size_t cap, const char* subject, unsigned long pid,
+                                        const char* code, const char* ran, const char* count,
+                                        const char* evidence)
+{
+    size_t at = 0;
+    if (!out || cap == 0) return 0;
+    out[0] = 0;
+    if (!subject || !*subject || !count || !*count || !evidence || !*evidence) return 0;
+    if (!QerrPut_(out, cap, &at, subject, 1)) return 0;
+    if (pid && (!QerrPut_(out, cap, &at, " pid ", 0) || !QerrPutUl_(out, cap, &at, pid))) return 0;
+    if (code && *code && (!QerrPut_(out, cap, &at, "; ", 0) || !QerrPut_(out, cap, &at, code, 1))) return 0;
+    if (ran && *ran && (!QerrPut_(out, cap, &at, "; ran ", 0) || !QerrPut_(out, cap, &at, ran, 1))) return 0;
+    if (!QerrPut_(out, cap, &at, "; ", 0) || !QerrPut_(out, cap, &at, count, 1) ||
+        !QerrPut_(out, cap, &at, ". Evidence: ", 0) || !QerrPut_(out, cap, &at, evidence, 1) ||
+        !QerrPut_(out, cap, &at, ".", 0))
+        return 0;
+    return at;
+}
+
+/* --- a sender's own texts, as data ---------------------------------------------------------- */
+/* Every notification the agent and notifhost send is one row of notifytexts.h (QerrTexts[]): the
+ * route id, the four parts and the technical line's fixed pieces. Keeping them as data is what
+ * lets the offline render test (gui-agent/notifyrender_test.c) produce every one of them and hold
+ * each to the rules above, with no agent running. A header may hold ONE "%s" for a per-instance
+ * human name (the app whose window went deaf); nothing else is formatted at run time. */
+typedef struct QerrText {
+    const char* key;         /* unique row name: what the callers and the render test refer to */
+    const char* component;   /* route component - the sender's machine id, [a-z0-9-] */
+    const char* id;          /* route id, [a-z0-9-]; a caller may pass a per-instance one */
+    int         sev;         /* QERR_SEV_* */
+    const char* subject;     /* the technical line's executable */
+    const char* code;        /* "exit code 2" (phrased by the source's table), or NULL */
+    const char* header;      /* <= 60 characters, human names only; may hold one %s */
+    const char* next;        /* line 1 */
+    const char* cause;       /* line 2, or NULL */
+    const char* evidence;    /* where to look */
+    const char* count;       /* NULL = "reported once per boot" */
+} QerrText;
+
+/* Substitutes the header's one "%s" (if any) with arg; plain copy otherwise. */
+static inline int QerrFormatHeader(char* out, size_t cap, const char* header, const char* arg)
+{
+    const char* p;
+    size_t at = 0;
+    if (!out || cap == 0) return 0;
+    out[0] = 0;
+    if (!header || !*header) return 0;
+    p = strstr(header, "%s");
+    if (!p) return QerrPut_(out, cap, &at, header, 1);
+    {
+        size_t i;
+        for (i = 0; header + i < p; i++) {
+            if (at + 1 >= cap) { out[0] = 0; return 0; }
+            out[at++] = header[i];
+            out[at] = 0;
+        }
+    }
+    if (!QerrPut_(out, cap, &at, (arg && *arg) ? arg : "an app", 1)) return 0;
+    return QerrPut_(out, cap, &at, p + 2, 1);
+}
+
+/* Pure: renders one row into the complete notify-file text. headerArg fills the header's %s;
+ * pid is the sender's own. Returns the byte length, or 0 when it could not be rendered. */
+static inline size_t QerrRenderText(char* out, size_t cap, const QerrText* t, const char* headerArg,
+                                    unsigned long pid)
+{
+    char header[200];
+    if (!t) return 0;
+    if (!QerrFormatHeader(header, sizeof(header), t->header, headerArg)) return 0;
+#ifdef NOTIFYERR_DEFECT_NOTECH
+    /* DEFECT (render test): the technical line is dropped - the cause takes its place */
+    (void)pid;
+    return QerrComposeNotifyText(out, cap, header, t->next, NULL, t->cause ? t->cause : "-");
+#else
+    {
+        char tech[400];
+        if (!QerrFormatTechLine(tech, sizeof(tech), t->subject, pid, t->code, NULL,
+                                t->count ? t->count : "reported once per boot", t->evidence))
+            return 0;
+        return QerrComposeNotifyText(out, cap, header, t->next, t->cause, tech);
+    }
+#endif
 }
 
 #ifdef __cplusplus
@@ -332,11 +462,16 @@ extern "C" {
  * /qubes-service/notify-errors - dom0 wins - exactly like the NotifyBridge gate; read by the
  * caller, passed in). stateDir NULL = %ProgramData%\Qubes\notify-errors. */
 void QerrInit(int gateOn, const char* stateDirUtf8);
-/* Report one error. component/id: [a-z0-9-]. summary: one templated ASCII/UTF-8 sentence with
- * no secrets, no file contents. logHint: the path a human should open, or NULL. Returns the
- * decision for logging/testing; the caller ignores it - nothing here can fail the caller. */
-QerrDecision QerrReport(const char* component, const char* id, int sev, const char* summary,
-                        const char* logHint);
+/* Report one error. component/id: [a-z0-9-]. header/next/cause/tech: the four parts described at
+ * QerrComposeNotifyText - templated ASCII/UTF-8, no secrets, no file contents; cause may be NULL.
+ * Returns the decision for logging/testing; the caller ignores it - nothing here can fail the
+ * caller. */
+QerrDecision QerrReport(const char* component, const char* id, int sev, const char* header,
+                        const char* next, const char* cause, const char* tech);
+/* Report one of the agent's own texts (notifytexts.h). idOverride: a per-instance id in place of
+ * the row's (NULL = the row's); headerArg: fills the header's %s (NULL when it has none). The
+ * technical line is composed here from the row and this process's pid. */
+QerrDecision QerrReportText(const QerrText* t, const char* idOverride, const char* headerArg);
 #ifdef __cplusplus
 }
 #endif

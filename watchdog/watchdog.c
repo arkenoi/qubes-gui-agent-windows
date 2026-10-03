@@ -321,6 +321,11 @@ DWORD WINAPI WatchdogThread(void *param)
     // reported as what it is; the old code folded it into the "died within 10 s" grant-table text.
     BOOL lastLaunchFailed = FALSE;
     DWORD lastLaunchError = ERROR_SUCCESS;
+    // The exit code of the last death we observed, for the quick-death line: that line used to
+    // name ONE cause for every quick death (the grant-table line) - true for the 2026-08-15
+    // incident, a fabrication for every other code (rz39 defect 5).
+    DWORD lastExitCode = 0;
+    BOOL lastExitKnown = FALSE;
     // Handle of the agent WE STARTED - the only process this service owns. While we hold one it is
     // the liveness oracle: the loop sleeps on it and wakes the moment the process exits, and the
     // stop path below ends it (StopOwnAgent). Without it the loop enumerated processes every
@@ -423,6 +428,8 @@ DWORD WINAPI WatchdogThread(void *param)
             CloseHandle(agentProcess);
             agentProcess = NULL;
             agentPid = 0;
+            lastExitCode = exitCode;
+            lastExitKnown = (exitCode != 0xFFFFFFFF);
             // Judge "quick" at the moment of death, not after the delay below (a 16 s+ delay made
             // every death look old and reset the backoff). And KEEP the delay: the handle wakes
             // us the instant the agent exits, so without it a quick death would be respawned
@@ -547,10 +554,24 @@ DWORD WINAPI WatchdogThread(void *param)
                         L"backing off to %u ms (%s). The guest has NO GUI while this lasts.",
                         exeName, lastLaunchError, quickDeaths, backoffMs, why);
                 else
-                    LogError("Process '%s' died within %u ms of starting, %u time(s) in a row - "
+                {
+                    // The cause is the exit code we saw, not a presumption. 0x5aa is
+                    // ERROR_NO_SYSTEM_RESOURCES, which on this guest has meant an exhausted Xen
+                    // grant table (measured 2026-08-15) - said only when that is the code.
+                    WCHAR codeText[48];
+                    if (lastExitKnown)
+                        StringCchPrintfW(codeText, RTL_NUMBER_OF(codeText), L"exit code 0x%x", lastExitCode);
+                    else
+                        StringCchCopyW(codeText, RTL_NUMBER_OF(codeText), L"exit code unknown");
+                    LogError("Process '%s' died within %u ms of starting (%s), %u time(s) in a row - "
                         L"backing off to %u ms (%s). The guest has NO GUI while this lasts; the agent "
-                        L"log names the failure (grant-table exhaustion, 0x5aa, needs a reboot).",
-                        exeName, QUICK_DEATH_MS, quickDeaths, backoffMs, why);
+                        L"log names the failure.%s",
+                        exeName, QUICK_DEATH_MS, codeText, quickDeaths, backoffMs, why,
+                        (lastExitKnown && lastExitCode == 0x5aa)
+                            ? L" Exit code 0x5aa is ERROR_NO_SYSTEM_RESOURCES: on this guest that has "
+                              L"meant an exhausted Xen grant table, which only a reboot clears."
+                            : L"");   // QGA_QUICKDEATH_CODE
+                }
             }
             else
             {
