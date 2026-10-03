@@ -375,9 +375,22 @@ DWORD WINAPI WatchdogThread(void *param)
         if (agentProcess && wait == WAIT_OBJECT_0 + 2)
         {
             DWORD exitCode = 0;
+            WCHAR why[128] = L"";
             if (!GetExitCodeProcess(agentProcess, &exitCode))
                 exitCode = 0xFFFFFFFF;
-            LogWarning("Process '%s' (PID %u) exited with code 0x%x", exeName, agentPid, exitCode);
+            // A DYING AGENT IS A MAJOR ERROR, not a warning (owner, 2026-10-03). This service did
+            // not ask it to exit: a stop the service asked for takes the g_StopEvent path above and
+            // StopOwnAgent, never this line. So an exit seen here is the agent going away under us -
+            // logged at ERROR with the exit code, whatever the relaunch below then does. The one
+            // exit that is not a death: the machine is going down and the session-1 agent is torn
+            // down before the SCM reaches us (the measured shutdown cluster, AgentRespawnPointless
+            // above) - that stays INFO, with the signals that said so, as the respawn path does.
+            if (AgentRespawnPointless(why, RTL_NUMBER_OF(why)))
+                LogInfo("Process '%s' (PID %u) exited with code 0x%x while the system is going down (%s)",
+                    exeName, agentPid, exitCode, why);
+            else
+                LogError("Process '%s' (PID %u) exited with code 0x%x without this service asking it to - "
+                    L"the agent DIED (%s)", exeName, agentPid, exitCode, why);
             CloseHandle(agentProcess);
             agentProcess = NULL;
             agentPid = 0;
@@ -443,7 +456,7 @@ DWORD WINAPI WatchdogThread(void *param)
                     win_perror("OpenProcess(foreign agent, SYNCHRONIZE)");
                 if (!foreignLogged)
                 {
-                    LogWarning("QGAWDFOREIGN '%s' (PID %u, session %u) is running but was NOT started by this service - "
+                    LogError("QGAWDFOREIGN '%s' (PID %u, session %u) is running but was NOT started by this service - "
                         L"not adopted, not stopped, and no second agent is started while it lives (%s)",
                         exeName, pid, sid,
                         foreignProcess ? L"waiting on its handle" : L"it cannot be opened, polling for it by name");
@@ -496,12 +509,15 @@ DWORD WINAPI WatchdogThread(void *param)
                     if (backoffMs > BACKOFF_MAX_MS)
                         backoffMs = BACKOFF_MAX_MS;
                 }
+                // ERROR, not warning (owner, 2026-10-03): a launch that fails and an agent that
+                // dies on arrival are the guest having no GUI, and the backoff only spaces the
+                // attempts out - nothing here is recovering.
                 if (lastLaunchFailed)
-                    LogWarning("Starting process '%s' failed (error 0x%x), %u time(s) in a row - "
+                    LogError("Starting process '%s' failed (error 0x%x), %u time(s) in a row - "
                         L"backing off to %u ms (%s). The guest has NO GUI while this lasts.",
                         exeName, lastLaunchError, quickDeaths, backoffMs, why);
                 else
-                    LogWarning("Process '%s' died within %u ms of starting, %u time(s) in a row - "
+                    LogError("Process '%s' died within %u ms of starting, %u time(s) in a row - "
                         L"backing off to %u ms (%s). The guest has NO GUI while this lasts; the agent "
                         L"log names the failure (grant-table exhaustion, 0x5aa, needs a reboot).",
                         exeName, QUICK_DEATH_MS, quickDeaths, backoffMs, why);
@@ -555,7 +571,7 @@ DWORD WINAPI WatchdogThread(void *param)
         StopOwnAgent(agentProcess, agentPid, exeName);
     if (foreignProcess)
     {
-        LogWarning("QGAWDFOREIGN service stopping while '%s' (PID %u), which this service did not start, is running - "
+        LogError("QGAWDFOREIGN service stopping while '%s' (PID %u), which this service did not start, is running - "
             L"left running, not ours", exeName, foreignPid);
         CloseHandle(foreignProcess);
     }
