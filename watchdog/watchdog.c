@@ -29,6 +29,7 @@
 #include <log.h>
 #include <config.h>
 #include <qubes-io.h>
+#include "deathevent.h"
 
 #define SERVICE_NAME L"QgaWatchdog"
 
@@ -389,8 +390,20 @@ DWORD WINAPI WatchdogThread(void *param)
                 LogInfo("Process '%s' (PID %u) exited with code 0x%x while the system is going down (%s)",
                     exeName, agentPid, exitCode, why);
             else
+            {
                 LogError("Process '%s' (PID %u) exited with code 0x%x without this service asking it to - "
                     L"the agent DIED (%s)", exeName, agentPid, exitCode, why);
+                // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo):
+                // a crash is in Windows Error Reporting and Application event 1000 already, but a clean,
+                // unasked exit is visible only here. ONE Event Log entry under our source, with the exit
+                // code and how long it ran; the dom0 notification is the event-triggered reporter's job
+                // (ADR 3), not this service's - nothing here waits on qrexec or on a session.
+                DeathEventReport(DEATHEVENT_ID_GUI_AGENT, exeName, agentPid, exitCode,
+                    startedAt != 0 ? GetTickCount64() - startedAt : DEATHEVENT_RAN_UNKNOWN,
+                    L"The QubesGuiWatchdog service relaunches it (backed off while it keeps dying quickly). "
+                    L"Its log and the agent's are in the Qubes Tools log directory; a crash also leaves a "
+                    L"Windows Error Reporting record (AppCrash_gui-agent.exe_*).");
+            }
             CloseHandle(agentProcess);
             agentProcess = NULL;
             agentPid = 0;

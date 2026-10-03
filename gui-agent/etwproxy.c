@@ -97,6 +97,7 @@
 #include <strsafe.h>
 
 #include "etwproxy.h"
+#include "deathevent.h"
 
 // windows-utils
 #include <log.h>
@@ -389,8 +390,10 @@ static void EtwProxyParkLocked(const char* reason, DWORD code)
 {
     EtwProxySessionStopLocked();
     g_State = EPS_PARKED;
-    LogWarning("ETWPROXYSUP parked for this boot: %S (code %lu) - ETW toast tier stays down, "
-               "bridge degrades to listener/DB (fail-open)", reason, code);
+    // ERROR, not warning (owner, 2026-10-03, docs/ADR-supervision.md 1): a tier that stops for the
+    // rest of the boot is a component that was working and stopped, reported loudly.
+    LogError("ETWPROXYSUP parked for this boot: %S (code %lu) - ETW toast tier stays down, "
+             "bridge degrades to listener/DB (fail-open)", reason, code);
 }
 
 // ---- backoff: schedule one relaunch attempt; the session is stopped meanwhile (a
@@ -899,6 +902,7 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
 
     DWORD rc = (DWORD)-1;
     GetExitCodeProcess(g_Proc, &rc);
+    DWORD pid = GetProcessId(g_Proc);
     ULONGLONG uptimeMs = GetTickCount64() - g_LaunchTick;
 
     if (g_Wait)
@@ -910,6 +914,22 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
     g_Proc = NULL;
     CloseHandle(g_Job);   // process already gone; KILL_ON_JOB_CLOSE has nothing left to kill
     g_Job = NULL;
+
+    // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo): every exit
+    // that reaches this point is one this agent did not ask for (a shutdown or a park has already
+    // left EPS_RUNNING and returned above), so each is ONE Event Log entry under our source, with the
+    // exit code and the run time, whatever this function then decides - park or relaunch. The dom0
+    // notification is the event-triggered reporter's job (ADR 3); nothing here waits on anything.
+    DeathEventReport(DEATHEVENT_ID_ETWPROXY, L"etwproxy.exe", pid, rc, uptimeMs,
+        (rc == ETWPROXY_EXIT_DENIED || rc == ETWPROXY_EXIT_BADTOKEN) ?
+            L"A rights problem a relaunch cannot fix: the agent parks the ETW toast tier for this boot. "
+            L"gui-agent log line ETWPROXYSUP; etw-proxy.log in the Qubes Tools log directory." :
+        (rc == ETWPROXY_EXIT_KILLED) ?
+            L"Exit code 1 is what TerminateProcess imposes - an external force-kill. The agent relaunches "
+            L"it on a backoff. gui-agent log line ETWPROXYSUP; etw-proxy.log in the Qubes Tools log directory." :
+            L"The agent relaunches it on a backoff (5 s to 5 min). gui-agent log line ETWPROXYSUP; "
+            L"etw-proxy.log in the Qubes Tools log directory; a crash also leaves a Windows Error "
+            L"Reporting record (AppCrash_etwproxy.exe_*).");
 
     if (rc == ETWPROXY_EXIT_DENIED)
     {
@@ -944,15 +964,17 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
 
     // The 'proxy exited rc=<n> after' prefix is a GREP CONTRACT with the p3a gate
     // (t2-proxy-exits collection + the T8c 'proxy exited rc=8 after' detector) - the
-    // decode/anomaly text goes AFTER it, never inside it.
+    // decode/anomaly text goes AFTER it, never inside it. All three are ERROR, not warning
+    // (owner, 2026-10-03, docs/ADR-supervision.md 1): an exit nobody asked for is a death,
+    // and the relaunch that follows does not make it benign.
     if (rc == 0 || rc == ETWPROXY_EXIT_CONSUME || rc == ETWPROXY_EXIT_PIPE)
     {
-        LogWarning("ETWPROXYSUP proxy exited rc=%lu after %llu ms (%S) - relaunch in %lu ms",
-                   rc, uptimeMs,
-                   rc == 0 ? "clean stop - session ended externally or console ctrl" :
-                   rc == ETWPROXY_EXIT_CONSUME ? "consumer open/thread failure" :
-                   "pipe failure: squatter or persistent connect faults",
-                   g_Backoff);
+        LogError("ETWPROXYSUP proxy exited rc=%lu after %llu ms (%S) - relaunch in %lu ms",
+                 rc, uptimeMs,
+                 rc == 0 ? "clean stop - session ended externally or console ctrl" :
+                 rc == ETWPROXY_EXIT_CONSUME ? "consumer open/thread failure" :
+                 "pipe failure: squatter or persistent connect faults",
+                 g_Backoff);
     }
     else if (rc == ETWPROXY_EXIT_KILLED)
     {
@@ -962,10 +984,10 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
         // drills). Log it quietly + machine-readably (its own token, still greppable) and
         // relaunch; do NOT raise EtwProxyUnknownExit, which stays reserved for a TRULY
         // unaccounted code (a crash) so a benign external kill cannot desensitize it.
-        LogWarning("ETWPROXYSUP proxy exited rc=%lu after %llu ms (external force-termination: "
-                   "TerminateProcess/taskkill/Stop-Process/reap - expected on a supervised "
-                   "kill, not a proxy return path) - relaunch in %lu ms",
-                   rc, uptimeMs, g_Backoff);
+        LogError("ETWPROXYSUP proxy exited rc=%lu after %llu ms (external force-termination: "
+                 "TerminateProcess/taskkill/Stop-Process/reap - expected on a supervised "
+                 "kill, not a proxy return path) - relaunch in %lu ms",
+                 rc, uptimeMs, g_Backoff);
     }
     else
     {
@@ -973,12 +995,12 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
         // uncommanded crash. A fallback firing silently is how defects hide - log the anomaly
         // loudly and machine-readably, then still relaunch (the tier is not worth wedging
         // over, but the datum must not vanish into a routine line).
-        LogWarning("ETWPROXYSUP proxy exited rc=%lu after %llu ms - ANOMALY "
-                   "EtwProxyUnknownExit (0x%lX): not an ETWPROXY_EXIT_* code (0/5/7/8/9) and "
-                   "not the force-kill code 1 - the proxy binary has no such return path, so "
-                   "it CRASHED (check etw-proxy.log for a CRASH line). Diagnose before "
-                   "trusting the tier; relaunch in %lu ms",
-                   rc, uptimeMs, rc, g_Backoff);
+        LogError("ETWPROXYSUP proxy exited rc=%lu after %llu ms - ANOMALY "
+                 "EtwProxyUnknownExit (0x%lX): not an ETWPROXY_EXIT_* code (0/5/7/8/9) and "
+                 "not the force-kill code 1 - the proxy binary has no such return path, so "
+                 "it CRASHED (check etw-proxy.log for a CRASH line). Diagnose before "
+                 "trusting the tier; relaunch in %lu ms",
+                 rc, uptimeMs, rc, g_Backoff);
     }
     EtwProxyBackoffLocked();   // stops the session; the relaunch restarts it fresh
     LeaveCriticalSection(&g_Lock);

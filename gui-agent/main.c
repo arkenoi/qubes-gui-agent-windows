@@ -53,6 +53,7 @@
 #include "faultinject.h"
 #include "dragsim.h"
 #include "notifyerr.h"
+#include "deathevent.h"
 #include "qubes-io.h"
 
 // windows-utils
@@ -3141,6 +3142,18 @@ static void BrokerSupervise(void)
         QerrReport("gui-agent", "broker-died", QERR_SEV_DEGRADED,
             "the de-slice broker stopped serving; a relaunch follows",
             "gui-agent log in Qubes Logs, line QGABROKERDIED");
+        // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo): a crash
+        // is in Windows Error Reporting already, a clean unasked exit and a hang are visible only here.
+        // ONE Event Log entry under our source, with the exit code (unknown for a hang: the agent reaps
+        // it) and the run time since the launch; the dom0 notification is the event-triggered reporter's
+        // job (ADR 3), which is also why the DEGRADED QerrReport above stays below the ACTION threshold.
+        DeathEventReport(DEATHEVENT_ID_WGCBROKER, L"wgcbroker.exe", (DWORD)pidBefore,
+            brokerExited ? brokerExitCode : DEATHEVENT_EXIT_UNKNOWN,
+            g_WgcLastLaunch != 0 ? now - g_WgcLastLaunch : DEATHEVENT_RAN_UNKNOWN,
+            hung ? L"It was running but stopped answering (a hang): the agent reaps it and relaunches within "
+                   L"~8 s. gui-agent log lines QGABROKERHUNG and QGABROKERDIED name the stage it hung in."
+                 : L"The agent relaunches it within ~8 s. gui-agent log lines QGABROKEREXIT and QGABROKERDIED; "
+                   L"a crash also leaves a Windows Error Reporting record (AppCrash_wgcbroker.exe_*).");
     }
 
     // HARD-FAIL, LOUDLY, ON AN ELIGIBLE SYSTEM (owner 2026-09-04: "I want deslicer to hard fail
@@ -3578,6 +3591,14 @@ static void NotifBridgeSupervise(void)
         LogError("QGANOTIFBRIDGEEXIT notification bridge pid %lu EXITED (exit code %lu) - detected "
             L"by process wait. Guest toasts take the window path until the relaunch (throttled to one per "
             L"60 s). bridge.log names the reason.", g_NotifBridgePid, exitCode);
+        // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo): a crash
+        // is in Windows Error Reporting already, a clean unasked exit is visible only here. ONE Event Log
+        // entry under our source; the dom0 notification is the event-triggered reporter's job (ADR 3).
+        DeathEventReport(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", g_NotifBridgePid, exitCode,
+            g_NotifLastLaunch != 0 ? now - g_NotifLastLaunch : DEATHEVENT_RAN_UNKNOWN,
+            L"The agent relaunches it, at most once per 60 s. bridge.log in ProgramData\\qubes-toast-bridge "
+            L"names the reason; gui-agent log line QGANOTIFBRIDGEEXIT; a crash also leaves a Windows Error "
+            L"Reporting record (AppCrash_notifhost.exe_*).");
         g_NotifBridgePid = 0;
     }
     if (g_NotifBridgeProc) return;            // running: nothing to do and nothing armed
