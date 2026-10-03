@@ -30,6 +30,7 @@
 #include <config.h>
 #include <qubes-io.h>
 #include "deathevent.h"
+#include "qga-exitcodes.h"
 
 #define SERVICE_NAME L"QgaWatchdog"
 
@@ -337,6 +338,9 @@ DWORD WINAPI WatchdogThread(void *param)
     DWORD foreignPid = 0;
     BOOL foreignLogged = FALSE;
     BOOL waitingForSession = FALSE;
+    // The agent reported NO GUI DOMAIN this boot (include/qga-exitcodes.h): nothing is relaunched before the next boot, and the wait
+    // below has no timeout - only a service stop or a console-session change wakes it.
+    BOOL noGuiDomain = FALSE;
 
     while (TRUE)
     {
@@ -357,7 +361,7 @@ DWORD WINAPI WatchdogThread(void *param)
         // Holding a healthy agent's handle - or a stranger's, which is only waited out - there is
         // nothing to poll for: its exit wakes us. The timeout is only the respawn backoff, plus the
         // QUICK_DEATH_MS survival check while a backoff is in force.
-        timeoutMs = ((agentProcess || foreignProcess) && quickDeaths == 0) ? INFINITE : backoffMs;
+        timeoutMs = (noGuiDomain || ((agentProcess || foreignProcess) && quickDeaths == 0)) ? INFINITE : backoffMs;   // QGA_NOGUI_WAIT
 
         wait = WaitForMultipleObjects(waitCount, waitHandles, FALSE, timeoutMs);
         if (wait == WAIT_OBJECT_0) // stop event
@@ -379,6 +383,18 @@ DWORD WINAPI WatchdogThread(void *param)
             WCHAR why[128] = L"";
             if (!GetExitCodeProcess(agentProcess, &exitCode))
                 exitCode = 0xFFFFFFFF;
+            if (exitCode == QGA_EXIT_NO_GUI_DOMAIN)
+            {
+                // A START-TIME CONDITION, NOT A DEATH (include/qga-exitcodes.h; Jev 0.94): no GUI domain for this qube this boot.
+                // Logged once, no death event, no relaunch before the next boot - a relaunch would fail the same way every time.
+                LogInfo("QGAWDNOGUIDOMAIN '%s' (PID %u) found no GUI domain for this qube (guivm is '') - not relaunching it "
+                    L"before the next boot; this is a start-time condition, not a death", exeName, agentPid);
+                noGuiDomain = TRUE;   // QGA_NOGUI_LATCH
+                CloseHandle(agentProcess);
+                agentProcess = NULL;
+                agentPid = 0;
+                continue;
+            }
             // A DYING AGENT IS A MAJOR ERROR, not a warning (owner, 2026-10-03). This service did
             // not ask it to exit: a stop the service asked for takes the g_StopEvent path above and
             // StopOwnAgent, never this line. So an exit seen here is the agent going away under us -
@@ -482,6 +498,7 @@ DWORD WINAPI WatchdogThread(void *param)
             }
         }
 
+        if (!running && noGuiDomain) continue;   // QGA_NOGUI_NORELAUNCH - nothing to start before the next boot
         if (!running)
         {
             WCHAR why[128] = L"";

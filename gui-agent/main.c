@@ -53,6 +53,7 @@
 #include "faultinject.h"
 #include "dragsim.h"
 #include "notifyerr.h"
+#include "qga-exitcodes.h"
 #include "deathevent.h"
 #include "qubes-io.h"
 
@@ -12402,8 +12403,13 @@ static DWORD GetGuiDomainId(OUT USHORT* gid)
     string_id = qdb_read(qdb, "/qubes-gui-domain-xid", NULL);
     if (!string_id)
     {
-        LogError("Failed to read GUI domain id");
-        status = ERROR_NOT_FOUND;
+        // NO GUI DOMAIN THIS BOOT - a start-time condition, not a failure (include/qga-exitcodes.h): qubesdb answered (qdb_open just
+        // succeeded) and the key dom0 writes at VM start for a qube with a GUI domain is absent (guivm is ''). The agent exits with
+        // QGA_EXIT_NO_GUI_DOMAIN and its watchdog does not relaunch it before the next boot. A qubesdb that cannot be opened stays a
+        // failure (above), with the watchdog's respawn.
+        LogInfo("QGANOGUIDOMAIN this qube has no GUI domain this boot (qubesdb /qubes-gui-domain-xid is absent: guivm is ''); "
+            L"the GUI agent does not run, and its watchdog does not relaunch it before the next boot");
+        status = QGA_EXIT_NO_GUI_DOMAIN;
         goto cleanup;
     }
 
@@ -13162,8 +13168,14 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     if (lpCmdLine && 0 == strncmp(lpCmdLine, "--set-shadows", 13))
         return SetShadowsMain(lpCmdLine);
 
-    if (ERROR_SUCCESS != Init())
-        return win_perror("Init");
+    // Init's OWN status is the exit code: win_perror() reported GetLastError(), which is 0 here, so every Init failure used to exit 0
+    // ("Init failed with error 0x0") and could not be told from a clean exit. No GUI domain is the one start-time condition
+    // (include/qga-exitcodes.h) - not logged as a failure.
+    DWORD initStatus = Init();
+    if (initStatus == QGA_EXIT_NO_GUI_DOMAIN)
+        return (int)QGA_EXIT_NO_GUI_DOMAIN;
+    if (ERROR_SUCCESS != initStatus)
+        return (int)win_perror2(initStatus, "Init");
 
     InitializeCriticalSection(&g_VchanCriticalSection);
 
