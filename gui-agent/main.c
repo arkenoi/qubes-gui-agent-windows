@@ -6618,10 +6618,17 @@ WINDOW_DATA *FindWindowByHandle(IN HWND window)
 // the foreground reached SearchHost up to 480 ms after the press, AFTER the surface's first event at 318 ms). Search opened ALONE
 // (Win+S) has the same SearchHost foreground but never shows the Start surface: 0 Start-surface examinations in 2 Win+S openings
 // against 2 per Shift+Win opening (25H2 26200, 2026-10-04), so it never reaches this.
-// State, not time: one Escape per opening, re-armed when Start/Search no longer holds the foreground; a still-open Start on a later look
-// is logged LOUDLY (clicks would still go to it); the user is told once per agent run why the menu closed. Third-party menus
+// State, not time: one Escape per opening, re-armed when Start/Search no longer holds the foreground; a Start still open on any look
+// more than START_DISMISS_SETTLE_MS after the Escape is logged LOUDLY (clicks would still go to it) - an earlier look is the menu
+// closing; the user is told once per agent run why the menu closed. Third-party menus
 // (Open-Shell's CMenuContainer) are ordinary windows and never reach this.
 static BOOL g_StartDismissSent = FALSE;        // Escape already sent in this opening (re-armed once Start/Search no longer holds the foreground)
+static ULONGLONG g_StartDismissSentAt = 0;     // GetTickCount64() when that Escape was sent
+// How long the native Start takes to CLOSE after the injected Escape - measured 90-420 ms from the Escape to the foreground leaving
+// Start/Search (5 openings, 25H2 26200, 4.3.35 RC, 2026-10-04). A look that still finds it open inside this time is the menu closing
+// (the surface emits more events in the same burst - measured: a second look 6-8 ms after the Escape), not a failure; only a look
+// after it is the evidence that the Escape did not close it. A threshold on an event that happens anyway - nothing is armed or waited.
+#define START_DISMISS_SETTLE_MS 1000
 static BOOL g_StartDismissStuckLogged = FALSE;
 static BOOL g_StartDismissNotified = FALSE;
 
@@ -6680,6 +6687,24 @@ static BOOL StartOrSearchHoldsForeground(OUT DWORD* fgPid)
     return k == ShellSurfaceStart || k == ShellSurfaceSearch;
 }
 
+// Escape already sent in this opening and Start/Search still holds the foreground: the menu is closing (a debug line) until
+// START_DISMISS_SETTLE_MS after the Escape, stuck after it (one LOUD line per opening).
+static void StartDismissCheckStuck(IN HWND start, IN DWORD fgPid)
+{
+    const ULONGLONG since = GetTickCount64() - g_StartDismissSentAt;
+    if (since < START_DISMISS_SETTLE_MS)
+    {
+        LogDebug("QGASTARTDISMISS 0x%x: Start still closing %llu ms after Escape (foreground pid %lu)", start, since, fgPid);
+        return;
+    }
+    if (!g_StartDismissStuckLogged)
+    {
+        g_StartDismissStuckLogged = TRUE;
+        LogWarning("QGASTARTDISMISS 0x%x: the hidden Start menu is STILL open %llu ms after Escape (foreground pid %lu) - clicks go to a menu the user cannot see",
+            start, since, fgPid);
+    }
+}
+
 // RE-ARM FROM ANY WINDOW EVENT (Jev review 2026-10-04: re-arming only on a later look at the Start window itself would leave the NEXT
 // opening undismissed if Windows sent no event for Start as it closed). Called at the top of ShouldAcceptWindow, i.e. on every window
 // event the agent processes: while an Escape is outstanding, the moment Start/Search no longer holds the foreground the opening is over
@@ -6693,7 +6718,13 @@ static void StartDismissMaybeRearm(void)
     {
         g_StartDismissSent = FALSE;
         g_StartDismissStuckLogged = FALSE;
+        return;
     }
+    // Still Start/Search in front: once the settle time is over, ANY window event is the evidence for a Start the Escape did not
+    // close - provided the Start surface has not been seen closed (cloaked) since, which clears g_StartSurfaceOpen.
+    HWND start = (HWND)InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, NULL);
+    if (start && GetTickCount64() - g_StartDismissSentAt >= START_DISMISS_SETTLE_MS)
+        StartDismissCheckStuck(start, fgPid);
 }
 
 static void DismissHiddenStartSurface(IN HWND start)
@@ -6708,13 +6739,7 @@ static void DismissHiddenStartSurface(IN HWND start)
     }
     if (g_StartDismissSent)
     {
-        // Escape already sent in this opening and Start/Search still holds the foreground: say so, once, LOUDLY.
-        if (!g_StartDismissStuckLogged)
-        {
-            g_StartDismissStuckLogged = TRUE;
-            LogWarning("QGASTARTDISMISS 0x%x: the hidden Start menu is STILL open after Escape (foreground pid %lu) - clicks go to a menu the user cannot see",
-                start, fgPid);
-        }
+        StartDismissCheckStuck(start, fgPid);   // closing, or - after the settle time - stuck (once, LOUDLY)
         return;
     }
     INPUT in[2];
@@ -6726,6 +6751,7 @@ static void DismissHiddenStartSurface(IN HWND start)
     in[1].ki.dwFlags = KEYEVENTF_KEYUP;
     UINT sent = SendInput(2, in, sizeof(INPUT));
     g_StartDismissSent = TRUE;
+    g_StartDismissSentAt = GetTickCount64();
     g_StartDismissStuckLogged = FALSE;
     if (sent == 2)
         LogInfo("QGASTARTDISMISS 0x%x: the Windows Start menu opened in seamless mode, where it is never shown (SeamlessStart=0) - "
