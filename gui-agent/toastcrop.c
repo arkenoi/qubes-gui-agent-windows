@@ -1090,24 +1090,15 @@ static BOOL TcEnqueueQueryLocked(IN HWND window, IN HWND cacheKey, IN const RECT
     return TRUE;
 }
 
-// g_TcLock must be held. The order of g_TcShellHostImages defines the kind mapping:
-// [0] -> Toast, [1] -> Start, [2] -> Search.
-static SHELL_SURFACE_KIND TcShellHostKind(IN DWORD processId)
+// The order of g_TcShellHostImages defines the kind mapping: [0] -> Toast, [1] -> Start, [2] -> Search.
+// Reads the process image NOW (no cache, no shared state - no lock needed).
+static SHELL_SURFACE_KIND TcShellHostKindUncached(IN DWORD processId)
 {
     static const SHELL_SURFACE_KIND kindByImage[] =
         { ShellSurfaceToast, ShellSurfaceStart, ShellSurfaceSearch };
 
     if (processId == 0)
         return ShellSurfaceNone;
-
-    for (int i = 0; i < TOAST_PID_CACHE_SIZE; i++)
-    {
-        if (g_TcPidCache[i].ProcessId == processId)
-        {
-            g_TcPidCache[i].LastUse = ++g_TcClock;
-            return g_TcPidCache[i].Kind;
-        }
-    }
 
     // MAX_PATH is enough for the shell app's own path (under %WINDIR%\SystemApps); a
     // longer one simply fails the query and the window is left uncropped.
@@ -1131,6 +1122,25 @@ static SHELL_SURFACE_KIND TcShellHostKind(IN DWORD processId)
         }
         CloseHandle(process);
     }
+    return match;
+}
+
+// g_TcLock must be held. TcShellHostKindUncached behind a small pid cache.
+static SHELL_SURFACE_KIND TcShellHostKind(IN DWORD processId)
+{
+    if (processId == 0)
+        return ShellSurfaceNone;
+
+    for (int i = 0; i < TOAST_PID_CACHE_SIZE; i++)
+    {
+        if (g_TcPidCache[i].ProcessId == processId)
+        {
+            g_TcPidCache[i].LastUse = ++g_TcClock;
+            return g_TcPidCache[i].Kind;
+        }
+    }
+
+    SHELL_SURFACE_KIND match = TcShellHostKindUncached(processId);
 
     // PIDs are recycled, so a stale hit can misclassify an unrelated process. Harmless by
     // construction: a false positive only asks UIA for a toast card that is not there.
@@ -1218,6 +1228,14 @@ SHELL_SURFACE_KIND ShellSurfaceKind(IN const WINDOW_DATA* data)
     LeaveCriticalSection(&g_TcLock);
 
     return kind;
+}
+
+// Which shell host a PROCESS is (Start / Search / toast host), by the same image check ShellSurfaceKind uses, read FRESH: the
+// cached lookup tolerates a recycled pid (a false positive there only asks UIA for a card that is not there), but this answer
+// decides whether the hidden-Start dismissal (main.c) injects an Escape, and a stale hit would send it to an unrelated app.
+SHELL_SURFACE_KIND ShellHostKindOfProcess(IN DWORD processId)
+{
+    return TcShellHostKindUncached(processId);
 }
 
 // g_TcLock must be held.

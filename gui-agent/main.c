@@ -799,7 +799,14 @@ static const struct
     { EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE }, // create/destroy/show/hide
     { EVENT_OBJECT_STATECHANGE, EVENT_OBJECT_NAMECHANGE }, // state/location/name (window moves)
     { EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED }, // DWM cloaking = invisible for us
+    { EVENT_SYSTEM_FOREGROUND, EVENT_SYSTEM_FOREGROUND }, // only re-examines an OPEN hidden Start (g_StartSurfaceOpen)
 };
+
+// The native Start surface last seen VISIBLE by ShouldAcceptWindow's hidden-Start branch (seamless, SeamlessStart=0), NULL once it is
+// seen cloaked/hidden. Main thread writes; the hook thread reads it to look at the open Start again when the foreground moves - on 25H2
+// the foreground goes to Start's search box (SearchHost) on its own schedule, possibly after the surface's last event of that opening,
+// and the dismissal decides on the foreground (see DismissHiddenStartSurface).
+static HWND volatile g_StartSurfaceOpen = NULL;
 
 // TRUE for events whose effect on eligibility is INVISIBLE to the cheap reject-cache
 // signature (pid/tid/style/exstyle/rect), so a cached rejection cannot be trusted and the
@@ -999,6 +1006,20 @@ static void CALLBACK WindowEventProc(
     if (event == EVENT_SYSTEM_DESKTOPSWITCH)
     {
         QueueWindowEvent(NULL, 0, TRUE);
+        return;
+    }
+
+    if (event == EVENT_SYSTEM_FOREGROUND)
+    {
+        // Nothing else is queued for a foreground change: only an open hidden Start is looked at again (see g_StartSurfaceOpen).
+        HWND start = (HWND)InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, NULL);
+        if (start && !IsWindow(start))
+        {
+            InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, start);
+            start = NULL;
+        }
+        if (start)
+            QueueWindowEvent(start, EVENT_OBJECT_SHOW, FALSE);   // SHOW forces the re-examination past the reject cache
         return;
     }
 
@@ -6583,10 +6604,149 @@ WINDOW_DATA *FindWindowByHandle(IN HWND window)
 
 // filters unwanted windows (not visible, too small etc)
 // assumes window state is up to date
+// THE HIDDEN START MUST NOT TAKE INPUT (field report GWeck #172; reproduced 2026-10-04 on his registered environment with 4.3.34).
+// In seamless mode the Windows Start menu is never presented (the decision just below in ShouldAcceptWindow). But when the Windows key
+// reaches the guest - service.enableWinKey 1, which is documented for third-party shells such as Open-Shell, or Shift+Win / a shell's
+// "Windows menu" item - Windows still OPENS it: invisible in dom0 and holding the foreground, so the user's next clicks land in a menu
+// they cannot see ("clicking where it should be starts Paint"). Hidden must therefore also mean closed: the moment the Start surface is
+// seen open, it gets ONE Escape. Open = this is reached from ShouldAcceptWindow's Start branch, which only sees the Start surface while
+// it is VISIBLE (GetWindowData folds DWM cloaking into IsVisible; the closed surface is cloaked), AND the foreground belongs to a Start
+// or Search shell host - measured on 25H2 26200 2026-10-04: with Start open the FOREGROUND is SearchHost's CoreWindow (Start's search
+// box), not the Start surface. A posted WM_KEYDOWN Escape to that window does NOT close Start; a real Escape keystroke does (measured),
+// so the Escape is injected - only after the foreground was read as Start/Search in the same call; a foreground change while the surface
+// is open looks again (EVENT_SYSTEM_FOREGROUND, g_StartSurfaceOpen), so a late switch to SearchHost is not missed. Search opened ALONE (Win+S) has the
+// same SearchHost foreground, so it must not uncloak the Start surface - UNMEASURED at the time of writing; the guest test checks it.
+// State, not time: one Escape per opening, re-armed when Start/Search no longer holds the foreground; a still-open Start on a later look
+// is logged LOUDLY (clicks would still go to it); the user is told once per agent run why the menu closed. Third-party menus
+// (Open-Shell's CMenuContainer) are ordinary windows and never reach this.
+static BOOL g_StartDismissSent = FALSE;        // Escape already sent in this opening (re-armed once Start/Search no longer holds the foreground)
+static BOOL g_StartDismissStuckLogged = FALSE;
+static BOOL g_StartDismissNotified = FALSE;
+
+static void StartDismissNotifyUser(void)
+{
+    // Same delivery as DirectSuppressNotifyUser (see its comment for why it is a direct CreateProcess of notifhost --notify-file).
+    WCHAR dir[MAX_PATH] = { 0 }, path[MAX_PATH] = { 0 };
+    if (!ExpandEnvironmentStrings(L"%ProgramData%\\Qubes", dir, RTL_NUMBER_OF(dir)))
+        return;
+    CreateDirectory(dir, NULL);   // ERROR_ALREADY_EXISTS is the normal case
+    StringCchPrintf(path, RTL_NUMBER_OF(path), L"%s\\gui-agent-notify-start.txt", dir);
+    static const WCHAR text[] =
+        L"Qubes: the Windows Start menu is not shown in seamless mode\r\n"
+        L"It was opened and has been closed again, so it cannot take your clicks while invisible. Use the Qubes app menu, "
+        L"or a third-party menu such as Open-Shell (Windows key). See the gui-agent log: QGASTARTDISMISS.";
+    HANDLE h = CreateFile(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        LogWarning("QGASTARTDISMISS: cannot write %s (0x%x) - the user is not told why Start closed", path, GetLastError());
+        return;
+    }
+    static const BYTE bom[2] = { 0xFF, 0xFE };
+    DWORD wr = 0;
+    WriteFile(h, bom, 2, &wr, NULL);
+    WriteFile(h, text, (DWORD)(wcslen(text) * sizeof(WCHAR)), &wr, NULL);
+    CloseHandle(h);
+    WCHAR exe[MAX_PATH] = { 0 };
+    if (GetModuleFileName(NULL, exe, RTL_NUMBER_OF(exe)))
+    {
+        WCHAR* sl = wcsrchr(exe, L'\\'); if (sl) *(sl + 1) = 0;
+        StringCchCat(exe, RTL_NUMBER_OF(exe), L"notifhost.exe");
+    }
+    WCHAR cmd[MAX_PATH * 2];
+    StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\" --notify-file \"%s\"", exe, path);
+    STARTUPINFO si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
+    PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
+    if (GetFileAttributes(exe) == INVALID_FILE_ATTRIBUTES)
+        LogError("QGASTARTDISMISS: notifhost.exe is NOT PRESENT at %s - the user cannot be told why Start closed (packaging gap)", exe);
+    else if (CreateProcess(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    {
+        CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
+        LogInfo("QGASTARTDISMISS: user notification sent (once per agent run)");
+    }
+    else
+        LogError("QGASTARTDISMISS: CreateProcess(notifhost --notify-file) failed (0x%x) - the user is not told why Start closed", GetLastError());
+}
+
+// TRUE when the foreground window belongs to StartMenuExperienceHost or SearchHost (image read fresh - see ShellHostKindOfProcess).
+static BOOL StartOrSearchHoldsForeground(OUT DWORD* fgPid)
+{
+    *fgPid = 0;
+    HWND fg = GetForegroundWindow();
+    if (fg)
+        GetWindowThreadProcessId(fg, fgPid);
+    SHELL_SURFACE_KIND k = ShellHostKindOfProcess(*fgPid);
+    return k == ShellSurfaceStart || k == ShellSurfaceSearch;
+}
+
+// RE-ARM FROM ANY WINDOW EVENT (Jev review 2026-10-04: re-arming only on a later look at the Start window itself would leave the NEXT
+// opening undismissed if Windows sent no event for Start as it closed). Called at the top of ShouldAcceptWindow, i.e. on every window
+// event the agent processes: while an Escape is outstanding, the moment Start/Search no longer holds the foreground the opening is over
+// and the next one gets its own Escape. Costs a foreground read and one image query, and only while an Escape is outstanding.
+static void StartDismissMaybeRearm(void)
+{
+    if (!g_StartDismissSent)
+        return;
+    DWORD fgPid = 0;
+    if (!StartOrSearchHoldsForeground(&fgPid))
+    {
+        g_StartDismissSent = FALSE;
+        g_StartDismissStuckLogged = FALSE;
+    }
+}
+
+static void DismissHiddenStartSurface(IN HWND start)
+{
+    DWORD fgPid = 0;
+    if (!StartOrSearchHoldsForeground(&fgPid))
+    {
+        // Start is not holding input (or not open yet - a later event of this opening looks again): nothing to close.
+        g_StartDismissSent = FALSE;
+        g_StartDismissStuckLogged = FALSE;
+        return;
+    }
+    if (g_StartDismissSent)
+    {
+        // Escape already sent in this opening and Start/Search still holds the foreground: say so, once, LOUDLY.
+        if (!g_StartDismissStuckLogged)
+        {
+            g_StartDismissStuckLogged = TRUE;
+            LogWarning("QGASTARTDISMISS 0x%x: the hidden Start menu is STILL open after Escape (foreground pid %lu) - clicks go to a menu the user cannot see",
+                start, fgPid);
+        }
+        return;
+    }
+    INPUT in[2];
+    ZeroMemory(in, sizeof(in));
+    in[0].type = INPUT_KEYBOARD;
+    in[0].ki.wVk = VK_ESCAPE;
+    in[1].type = INPUT_KEYBOARD;
+    in[1].ki.wVk = VK_ESCAPE;
+    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
+    UINT sent = SendInput(2, in, sizeof(INPUT));
+    g_StartDismissSent = TRUE;
+    g_StartDismissStuckLogged = FALSE;
+    if (sent == 2)
+        LogInfo("QGASTARTDISMISS 0x%x: the Windows Start menu opened in seamless mode, where it is never shown (SeamlessStart=0) - "
+            "closed it with Escape so no invisible window takes input (foreground pid %lu)", start, fgPid);
+    else
+        LogError("QGASTARTDISMISS 0x%x: SendInput(Escape) sent %u of 2 events (0x%x) - the hidden Start menu may stay open and take clicks",
+            start, sent, GetLastError());
+    if (!g_StartDismissNotified)
+    {
+        g_StartDismissNotified = TRUE;
+        StartDismissNotifyUser();
+    }
+}
+
 BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 {
+    StartDismissMaybeRearm();   // GUARD:startrearm
     if (!data->IsVisible)
+    {
+        if (data->Handle == g_StartSurfaceOpen)   // the hidden Start closed: foreground changes stop looking at it
+            InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, data->Handle);
         return FALSE;
+    }
 
     if (!g_ShowTaskbar && data->Handle == g_TaskbarWindow)
         return FALSE;
@@ -6700,6 +6860,8 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     {
         LogDebug("0x%x: Start surface not presented in seamless mode (SeamlessStart=0)",
             data->Handle);
+        InterlockedExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, data->Handle);   // GUARD:startfg - look again when the foreground moves
+        DismissHiddenStartSurface(data->Handle);   // GUARD:startdismiss - hidden must also mean CLOSED
         return FALSE;
     }
 

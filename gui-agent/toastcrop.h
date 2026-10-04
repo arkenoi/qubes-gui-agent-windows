@@ -97,6 +97,9 @@ SHELL_SURFACE_KIND ShellSurfaceKind(
     IN const WINDOW_DATA* data
     );
 
+// The shell host kind of a process (toastcrop.c).
+SHELL_SURFACE_KIND ShellHostKindOfProcess(IN DWORD processId);
+
 // TRUE when this window is the START surface and we do NOT know where its card is
 // (never measured, or the measurement finished finding nothing, and no sticky last-good).
 // StartMenuExperienceHost keeps a top-level surface alive while Start is CLOSED; announcing
