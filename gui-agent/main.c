@@ -6614,8 +6614,10 @@ WINDOW_DATA *FindWindowByHandle(IN HWND window)
 // or Search shell host - measured on 25H2 26200 2026-10-04: with Start open the FOREGROUND is SearchHost's CoreWindow (Start's search
 // box), not the Start surface. A posted WM_KEYDOWN Escape to that window does NOT close Start; a real Escape keystroke does (measured),
 // so the Escape is injected - only after the foreground was read as Start/Search in the same call; a foreground change while the surface
-// is open looks again (EVENT_SYSTEM_FOREGROUND, g_StartSurfaceOpen), so a late switch to SearchHost is not missed. Search opened ALONE (Win+S) has the
-// same SearchHost foreground, so it must not uncloak the Start surface - UNMEASURED at the time of writing; the guest test checks it.
+// is open looks again (EVENT_SYSTEM_FOREGROUND, g_StartSurfaceOpen), so a late switch to SearchHost is not missed (measured on 4.3.34:
+// the foreground reached SearchHost up to 480 ms after the press, AFTER the surface's first event at 318 ms). Search opened ALONE
+// (Win+S) has the same SearchHost foreground but never shows the Start surface: 0 Start-surface examinations in 2 Win+S openings
+// against 2 per Shift+Win opening (25H2 26200, 2026-10-04), so it never reaches this.
 // State, not time: one Escape per opening, re-armed when Start/Search no longer holds the foreground; a still-open Start on a later look
 // is logged LOUDLY (clicks would still go to it); the user is told once per agent run why the menu closed. Third-party menus
 // (Open-Shell's CMenuContainer) are ordinary windows and never reach this.
