@@ -13,10 +13,26 @@
 #define COBJMACROS
 #include <uiautomation.h>
 
+// Property / control-type ids as uiautomationclient.h defines them (midl emits them as macros; the
+// guards only matter for an SDK header that spells them differently). Used by TcReadCardTexts.
+#ifndef UIA_ControlTypePropertyId
+#define UIA_ControlTypePropertyId 30003
+#endif
+#ifndef UIA_NamePropertyId
+#define UIA_NamePropertyId 30005
+#endif
+#ifndef UIA_AutomationIdPropertyId
+#define UIA_AutomationIdPropertyId 30011
+#endif
+#ifndef UIA_TextControlTypeId
+#define UIA_TextControlTypeId 50020
+#endif
+
 #include "main.h"
 #include "toastcrop.h"
 #include "toastcrop-pick.h"
-#include "toasthold.h"   // ToastHoldReadIdentity: identity reads ride this module's UIA worker
+#include "toasthold.h"   // ToastHoldApplyIdentity: identity reads ride this module's UIA worker
+#include "toastident.h"  // the card's AutomationId predicates (TiIsSenderAutomationId & co.), pure, no linkage
 
 #include <log.h>
 #include <config.h>
@@ -225,7 +241,7 @@ typedef struct _TC_QUERY_REQ
     DWORD RawHeight;
     BOOL  Menu;      // IsMenuPopupWindow at enqueue time: selects the card rule (TcQueryCore)
     // An IDENTITY read for the toast hold (toasthold.c), not a crop measurement: the worker hands the
-    // window to ToastHoldReadIdentity with its UIA instance and touches no crop slot. Raw/Menu unused.
+    // read to TcReadCardTexts and the texts to ToastHoldApplyIdentity; touches no crop slot. Raw/Menu unused.
     BOOL  Identity;
     LONG  Incarnation;   // identity reads: the requester's incarnation, handed back with the reading
     BOOL  Valid;
@@ -1010,6 +1026,107 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
     }
 }
 
+// ---- the toast hold's identity read (toasthold.c owns the decision; THIS file owns every UIA call) ---
+
+// Appends `src` to a bounded WCHAR buffer with a single space before it when non-empty.
+static void TcAppendText(IN OUT WCHAR* dst, IN size_t cap, IN OUT size_t* len, IN const WCHAR* src, IN size_t srcLen)
+{
+    if (!src || srcLen == 0) return;
+    if (*len > 0 && *len + 1 < cap) dst[(*len)++] = L' ';
+    for (size_t i = 0; i < srcLen && *len + 1 < cap; i++) dst[(*len)++] = src[i];
+    dst[*len] = 0;
+}
+
+// The RAW view, as the measurement (twprobe.ps1: RawViewWalker) and this module's toast rule use: a cache
+// request whose TreeFilter is the raw-view condition drives both finds, so template-part TextBlocks that
+// the control view hides are seen. Name + AutomationId are cached: two RPC round trips for the whole read.
+// Fills the three raw texts; the hold normalizes and hashes them (toastident.h).
+static TOAST_CARD_STATUS TcReadCardTexts(IN IUIAutomation* uia, IN HWND window, OUT TOAST_CARD_TEXTS* texts)
+{
+    IUIAutomationElement* root = NULL;
+    IUIAutomationElement* card = NULL;
+    IUIAutomationCondition* condCard = NULL;
+    IUIAutomationCondition* condText = NULL;
+    IUIAutomationCondition* rawView = NULL;
+    IUIAutomationCacheRequest* cache = NULL;
+    IUIAutomationElementArray* found = NULL;
+    VARIANT v;
+    HRESULT hr;
+    TOAST_CARD_STATUS status = ToastCardUiaFailed;
+    int count = 0;
+    size_t senderLen = 0, titleLen = 0, messageLen = 0;
+
+    ZeroMemory(texts, sizeof(*texts));
+
+    hr = IUIAutomation_ElementFromHandle(uia, window, &root);
+    if (FAILED(hr) || !root) goto end;
+
+    hr = IUIAutomation_CreateCacheRequest(uia, &cache);
+    if (FAILED(hr) || !cache) goto end;
+    IUIAutomationCacheRequest_AddProperty(cache, UIA_NamePropertyId);
+    IUIAutomationCacheRequest_AddProperty(cache, UIA_AutomationIdPropertyId);
+    if (SUCCEEDED(IUIAutomation_get_RawViewCondition(uia, &rawView)) && rawView)
+        IUIAutomationCacheRequest_put_TreeFilter(cache, rawView);   // RAW view for both finds below
+
+    // The card, by AutomationId NormalToastView (Win10 and Win11 alike). ClassName is NOT used: it is
+    // FlexibleToastView on 11 only. The card's Name is a localized composite and is NOT parsed.
+    VariantInit(&v);
+    V_VT(&v) = VT_BSTR;
+    V_BSTR(&v) = SysAllocString(L"NormalToastView");
+    hr = IUIAutomation_CreatePropertyCondition(uia, UIA_AutomationIdPropertyId, v, &condCard);
+    VariantClear(&v);
+    if (FAILED(hr) || !condCard) goto end;
+    hr = IUIAutomationElement_FindFirstBuildCache(root, TreeScope_Descendants, condCard, cache, &card);
+    if (FAILED(hr)) goto end;
+    if (!card) { status = ToastCardNoCard; goto end; }
+
+    // Every Text control under the card.
+    VariantInit(&v);
+    V_VT(&v) = VT_I4;
+    V_I4(&v) = UIA_TextControlTypeId;
+    hr = IUIAutomation_CreatePropertyCondition(uia, UIA_ControlTypePropertyId, v, &condText);
+    VariantClear(&v);
+    if (FAILED(hr) || !condText) goto end;
+    hr = IUIAutomationElement_FindAllBuildCache(card, TreeScope_Descendants, condText, cache, &found);
+    if (FAILED(hr) || !found) { status = ToastCardNoTitle; goto end; }
+    if (FAILED(IUIAutomationElementArray_get_Length(found, &count))) count = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        IUIAutomationElement* el = NULL;
+        VARIANT va, vn;
+        if (FAILED(IUIAutomationElementArray_GetElement(found, i, &el)) || !el) continue;
+        VariantInit(&va); VariantInit(&vn);
+        if (SUCCEEDED(IUIAutomationElement_GetCachedPropertyValue(el, UIA_AutomationIdPropertyId, &va)) &&
+            SUCCEEDED(IUIAutomationElement_GetCachedPropertyValue(el, UIA_NamePropertyId, &vn)))
+        {
+            const WCHAR* aid = (V_VT(&va) == VT_BSTR && V_BSTR(&va)) ? V_BSTR(&va) : L"";
+            const WCHAR* name = (V_VT(&vn) == VT_BSTR && V_BSTR(&vn)) ? V_BSTR(&vn) : L"";
+            const size_t nameLen = (V_VT(&vn) == VT_BSTR && V_BSTR(&vn)) ? SysStringLen(V_BSTR(&vn)) : 0;
+            if (TiIsSenderAutomationId(aid) && senderLen == 0)
+                TcAppendText(texts->Sender, RTL_NUMBER_OF(texts->Sender), &senderLen, name, nameLen);
+            else if (TiIsTitleAutomationId(aid) && titleLen == 0)
+                TcAppendText(texts->Title, RTL_NUMBER_OF(texts->Title), &titleLen, name, nameLen);
+            else if (TiIsMessageAutomationId(aid))
+                TcAppendText(texts->Message, RTL_NUMBER_OF(texts->Message), &messageLen, name, nameLen);   // blocks joined by ' '
+        }
+        VariantClear(&va); VariantClear(&vn);
+        IUIAutomationElement_Release(el);
+    }
+
+    status = (titleLen == 0) ? ToastCardNoTitle : ToastCardOk;
+
+end:
+    if (found) IUIAutomationElementArray_Release(found);
+    if (condText) IUIAutomationCondition_Release(condText);
+    if (card) IUIAutomationElement_Release(card);
+    if (condCard) IUIAutomationCondition_Release(condCard);
+    if (rawView) IUIAutomationCondition_Release(rawView);
+    if (cache) IUIAutomationCacheRequest_Release(cache);
+    if (root) IUIAutomationElement_Release(root);
+    return status;
+}
+
 static DWORD WINAPI TcWorkerThread(IN void* param)
 {
     UNREFERENCED_PARAMETER(param);
@@ -1051,8 +1168,11 @@ static DWORD WINAPI TcWorkerThread(IN void* param)
 
             if (req.Identity)
             {
-                // The toast hold's identity read: same thread, same bounded UIA instance, no crop state.
-                ToastHoldReadIdentity(uia, req.Window, req.Incarnation);
+                // The toast hold's identity read: same thread, same bounded UIA instance, no crop state. The
+                // read happens HERE (the one UIA translation unit); the hold only applies the texts.
+                TOAST_CARD_TEXTS texts;
+                const TOAST_CARD_STATUS st = TcReadCardTexts(uia, req.Window, &texts);
+                ToastHoldApplyIdentity(req.Window, req.Incarnation, st, &texts);
                 continue;
             }
 

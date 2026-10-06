@@ -20,13 +20,13 @@
  */
 
 #include <windows.h>
-#include <objbase.h>
-#include <oleauto.h>
 #include <strsafe.h>
 
-#define COBJMACROS
-#include <uiautomation.h>
-
+// NO UI Automation header here, on purpose: in C the SDK's UIAutomationClient.h defines its UIA_*Id /
+// AnnotationType_* ids as `const long` objects with EXTERNAL linkage, so a second translation unit
+// including it duplicates hundreds of symbols at link time (LNK2005, CI run 37474444216). Every UIA
+// call of the agent lives in toastcrop.c; this module receives the card's three raw texts from the
+// worker through toastcrop.h's TOAST_CARD_TEXTS contract and applies them (ToastHoldApplyIdentity).
 #include "main.h"
 #include "toasthold.h"
 #include "toastcrop.h"
@@ -36,20 +36,6 @@
 
 #define REG_CONFIG_TOASTHOLD_DISABLE_VALUE L"ToastHoldDisable"
 
-// Property / control-type ids as uiautomationclient.h defines them (midl emits them as macros; the
-// guards only matter for an SDK header that spells them differently).
-#ifndef UIA_ControlTypePropertyId
-#define UIA_ControlTypePropertyId 30003
-#endif
-#ifndef UIA_NamePropertyId
-#define UIA_NamePropertyId 30005
-#endif
-#ifndef UIA_AutomationIdPropertyId
-#define UIA_AutomationIdPropertyId 30011
-#endif
-#ifndef UIA_TextControlTypeId
-#define UIA_TextControlTypeId 50020
-#endif
 
 // How many banner windows can be tracked at once. There is ONE banner window per session (measured);
 // the slack covers a shell restart (a new HWND) and the ShellExperienceHost flyouts that pass the
@@ -644,115 +630,28 @@ void ToastHoldSweep(void)
         PokeWindowTrackingFor(wake[i]);
 }
 
-// ---- the identity read (worker thread) -----------------------------------------------------------
+// ---- the identity read: applied here, performed in toastcrop.c (the one UIA translation unit) -------
 
-// Appends `src` to a bounded WCHAR buffer with a single space before it when non-empty.
-static void ThAppend(IN OUT WCHAR* dst, IN size_t cap, IN OUT size_t* len, IN const WCHAR* src, IN size_t srcLen)
-{
-    if (!src || srcLen == 0) return;
-    if (*len > 0 && *len + 1 < cap) dst[(*len)++] = L' ';
-    for (size_t i = 0; i < srcLen && *len + 1 < cap; i++) dst[(*len)++] = src[i];
-    dst[*len] = 0;
-}
+// Compile-time: the worker's text buffers are exactly the identity's field width (toastident.h).
+typedef char ThAssertCardTextUnits[(TOAST_CARD_TEXT_UNITS == TI_NORM_MAX) ? 1 : -1];
 
-// The RAW view, as the measurement (twprobe.ps1: RawViewWalker) and toastcrop's toast rule use: a cache
-// request whose TreeFilter is the raw-view condition drives both finds, so template-part TextBlocks that
-// the control view hides are seen. Name + AutomationId are cached: two RPC round trips for the whole read.
-static int ThUiaRead(IN IUIAutomation* uia, IN HWND window, OUT TOAST_IDENT* ident)
-{
-    IUIAutomationElement* root = NULL;
-    IUIAutomationElement* card = NULL;
-    IUIAutomationCondition* condCard = NULL;
-    IUIAutomationCondition* condText = NULL;
-    IUIAutomationCondition* rawView = NULL;
-    IUIAutomationCacheRequest* cache = NULL;
-    IUIAutomationElementArray* texts = NULL;
-    VARIANT v;
-    HRESULT hr;
-    int status = TH_READ_UIAFAIL;
-    int count = 0;
-    WCHAR sender[TI_NORM_MAX + 1] = { 0 };
-    WCHAR title[TI_NORM_MAX + 1] = { 0 };
-    WCHAR message[TI_NORM_MAX + 1] = { 0 };
-    size_t senderLen = 0, titleLen = 0, messageLen = 0;
-
-    ZeroMemory(ident, sizeof(*ident));
-
-    hr = IUIAutomation_ElementFromHandle(uia, window, &root);
-    if (FAILED(hr) || !root) goto end;
-
-    hr = IUIAutomation_CreateCacheRequest(uia, &cache);
-    if (FAILED(hr) || !cache) goto end;
-    IUIAutomationCacheRequest_AddProperty(cache, UIA_NamePropertyId);
-    IUIAutomationCacheRequest_AddProperty(cache, UIA_AutomationIdPropertyId);
-    if (SUCCEEDED(IUIAutomation_get_RawViewCondition(uia, &rawView)) && rawView)
-        IUIAutomationCacheRequest_put_TreeFilter(cache, rawView);   // RAW view for both finds below
-
-    // The card, by AutomationId NormalToastView (Win10 and Win11 alike). ClassName is NOT used: it is
-    // FlexibleToastView on 11 only. The card's Name is a localized composite and is NOT parsed.
-    VariantInit(&v);
-    V_VT(&v) = VT_BSTR;
-    V_BSTR(&v) = SysAllocString(L"NormalToastView");
-    hr = IUIAutomation_CreatePropertyCondition(uia, UIA_AutomationIdPropertyId, v, &condCard);
-    VariantClear(&v);
-    if (FAILED(hr) || !condCard) goto end;
-    hr = IUIAutomationElement_FindFirstBuildCache(root, TreeScope_Descendants, condCard, cache, &card);
-    if (FAILED(hr)) goto end;
-    if (!card) { status = TH_READ_NOCARD; goto end; }
-
-    // Every Text control under the card.
-    VariantInit(&v);
-    V_VT(&v) = VT_I4;
-    V_I4(&v) = UIA_TextControlTypeId;
-    hr = IUIAutomation_CreatePropertyCondition(uia, UIA_ControlTypePropertyId, v, &condText);
-    VariantClear(&v);
-    if (FAILED(hr) || !condText) goto end;
-    hr = IUIAutomationElement_FindAllBuildCache(card, TreeScope_Descendants, condText, cache, &texts);
-    if (FAILED(hr) || !texts) { status = TH_READ_NOTITLE; goto end; }
-    if (FAILED(IUIAutomationElementArray_get_Length(texts, &count))) count = 0;
-
-    for (int i = 0; i < count; i++)
-    {
-        IUIAutomationElement* el = NULL;
-        VARIANT va, vn;
-        if (FAILED(IUIAutomationElementArray_GetElement(texts, i, &el)) || !el) continue;
-        VariantInit(&va); VariantInit(&vn);
-        if (SUCCEEDED(IUIAutomationElement_GetCachedPropertyValue(el, UIA_AutomationIdPropertyId, &va)) &&
-            SUCCEEDED(IUIAutomationElement_GetCachedPropertyValue(el, UIA_NamePropertyId, &vn)))
-        {
-            const WCHAR* aid = (V_VT(&va) == VT_BSTR && V_BSTR(&va)) ? V_BSTR(&va) : L"";
-            const WCHAR* name = (V_VT(&vn) == VT_BSTR && V_BSTR(&vn)) ? V_BSTR(&vn) : L"";
-            const size_t nameLen = (V_VT(&vn) == VT_BSTR && V_BSTR(&vn)) ? SysStringLen(V_BSTR(&vn)) : 0;
-            if (TiIsSenderAutomationId(aid) && senderLen == 0)
-                ThAppend(sender, RTL_NUMBER_OF(sender), &senderLen, name, nameLen);
-            else if (TiIsTitleAutomationId(aid) && titleLen == 0)
-                ThAppend(title, RTL_NUMBER_OF(title), &titleLen, name, nameLen);
-            else if (TiIsMessageAutomationId(aid))
-                ThAppend(message, RTL_NUMBER_OF(message), &messageLen, name, nameLen);   // blocks joined by ' '
-        }
-        VariantClear(&va); VariantClear(&vn);
-        IUIAutomationElement_Release(el);
-    }
-
-    if (titleLen == 0) { status = TH_READ_NOTITLE; goto end; }
-    TiIdentFromTexts(sender, title, message, ident);
-    status = TH_READ_OK;
-
-end:
-    if (texts) IUIAutomationElementArray_Release(texts);
-    if (condText) IUIAutomationCondition_Release(condText);
-    if (card) IUIAutomationElement_Release(card);
-    if (condCard) IUIAutomationCondition_Release(condCard);
-    if (rawView) IUIAutomationCondition_Release(rawView);
-    if (cache) IUIAutomationCacheRequest_Release(cache);
-    if (root) IUIAutomationElement_Release(root);
-    return status;
-}
-
-void ToastHoldReadIdentity(IN void* uiaAutomation, IN HWND window, IN LONG incarnation)
+void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_STATUS cardStatus,
+                            IN const TOAST_CARD_TEXTS* texts)
 {
     TOAST_IDENT ident;
-    const int status = uiaAutomation ? ThUiaRead((IUIAutomation*)uiaAutomation, window, &ident) : TH_READ_UIAFAIL;
+    int status;
+    ZeroMemory(&ident, sizeof(ident));
+    switch (cardStatus)
+    {
+    case ToastCardOk:      status = TH_READ_OK; break;
+    case ToastCardNoCard:  status = TH_READ_NOCARD; break;
+    case ToastCardNoTitle: status = TH_READ_NOTITLE; break;
+    default:               status = TH_READ_UIAFAIL; break;
+    }
+    if (status == TH_READ_OK && texts)
+        TiIdentFromTexts(texts->Sender, texts->Title, texts->Message, &ident);   // the same normalization the bridge applies
+    else if (status == TH_READ_OK)
+        status = TH_READ_UIAFAIL;
     const ULONGLONG now = GetTickCount64();
     BOOL again = FALSE, logNoCard = FALSE, changed = FALSE, notBanner = FALSE;
     UINT64 before = 0, after = 0;

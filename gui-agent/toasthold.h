@@ -44,6 +44,7 @@
 #pragma once
 #include <windows.h>
 #include "main.h"
+#include "toastcrop.h"       // TOAST_CARD_TEXTS / TOAST_CARD_STATUS: the worker's header-free read contract
 #include "toasthold-core.h"
 
 // Resolve the gate once (after the NotifyBridge gate is known) and log the outcome. `bridgeGate` is
@@ -88,8 +89,8 @@ void ToastHoldOnSignal(void);
 ULONGLONG ToastHoldNextDue(void);
 void ToastHoldSweep(void);
 
-// Worker side (toastcrop.c's UIA worker thread, with its own IUIAutomation*): read the banner's card
-// identity and apply it to the entry whose incarnation the request named (a window removed and re-added
-// meanwhile is a new incarnation: the old reading is dropped). Declared with a void* so this header
-// stays free of <uiautomation.h>.
-void ToastHoldReadIdentity(IN void* uiaAutomation, IN HWND window, IN LONG incarnation);
+// Worker side (toastcrop.c's UIA worker thread, which performed the read - every UIA call lives there):
+// apply the card's three raw texts (or the read's failure) to the entry whose incarnation the request
+// named; a window removed and re-added meanwhile is a new incarnation and the old reading is dropped.
+void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_STATUS cardStatus,
+                            IN const TOAST_CARD_TEXTS* texts);
