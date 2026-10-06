@@ -96,38 +96,6 @@ extern "C" {
  * and reads the same key, so a script and the agent share one boot identity. */
 #define QERR_BOOT_KEY "SOFTWARE\\Invisible Things Lab\\Qubes Tools\\NotifyErrBoot"
 
-/* THE SHARED STATE IS SYSTEM'S TO PREPARE, AT START (findings/issues.md P3, fixed 2026-10-06). Three
- * writers share the per-boot token and the state directory: the agent (SYSTEM), the guest scripts
- * (SYSTEM, scheduled tasks) and the toast bridge notifhost.exe, which runs as the INTERACTIVE USER.
- * The user can neither mint the volatile HKLM token (KEY_WRITE needs SYSTEM) nor write a .count or a
- * marker that a SYSTEM process created under ProgramData (its default inheritance leaves such files
- * read-only to other users), so the bridge's own reports never left the guest. Hence: the agent
- * mints the token in QerrInit, before anything can report, and the bridge opens it READ-ONLY (no
- * token = nothing sent, loudly, the same rule QerrReport applies to itself); and the agent sets THIS
- * DACL on the state directory, with inheritance, at start: SYSTEM and Administrators full, the
- * interactive user read/write/traverse on the directory and read/write/delete on the files under it
- * (markers, .count, the one-shot notify files it must delete after sending), protected from
- * ProgramData's own inheritance, and NOTHING for anyone else - never Everyone, never full control
- * to the user. SetNamedSecurityInfo propagates the inheritable grants to files that already exist,
- * so a .count an older version's SYSTEM process left behind becomes writable too. */
-#ifdef NOTIFYERR_DEFECT_ACL_EVERYONE
-/* DEFECT (tools/tests/notifyerr-selftest.sh only): the lazy grant - Everyone, full control. */
-#define QERR_STATE_DIR_SDDL "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;WD)"
-#else
-#define QERR_STATE_DIR_SDDL "D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;CI;FRFWFX;;;IU)(A;OIIO;FRFWSD;;;IU)"
-#endif
-
-/* The DACL's safety, checkable offline: protected; grants the INTERACTIVE user; grants neither Everyone
- * (WD) nor Users (BU) nor Authenticated Users (AU); and the interactive user never gets full control. */
-static inline int QerrSddlIsSafe(const char* sddl)
-{
-    if (!sddl || strncmp(sddl, "D:P", 3) != 0) return 0;
-    if (!strstr(sddl, ";;;IU)")) return 0;
-    if (strstr(sddl, ";;;WD)") || strstr(sddl, ";;;BU)") || strstr(sddl, ";;;AU)")) return 0;
-    if (strstr(sddl, "FA;;;IU)") || strstr(sddl, "GA;;;IU)")) return 0;
-    return 1;
-}
-
 typedef enum QerrDecision {
     QERR_SEND = 0,
     QERR_REJECT_SEVERITY,
