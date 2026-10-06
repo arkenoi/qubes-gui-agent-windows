@@ -16,6 +16,7 @@
 #include "main.h"
 #include "toastcrop.h"
 #include "toastcrop-pick.h"
+#include "toasthold.h"   // ToastHoldReadIdentity: identity reads ride this module's UIA worker
 
 #include <log.h>
 #include <config.h>
@@ -223,6 +224,10 @@ typedef struct _TC_QUERY_REQ
     DWORD RawWidth;
     DWORD RawHeight;
     BOOL  Menu;      // IsMenuPopupWindow at enqueue time: selects the card rule (TcQueryCore)
+    // An IDENTITY read for the toast hold (toasthold.c), not a crop measurement: the worker hands the
+    // window to ToastHoldReadIdentity with its UIA instance and touches no crop slot. Raw/Menu unused.
+    BOOL  Identity;
+    LONG  Incarnation;   // identity reads: the requester's incarnation, handed back with the reading
     BOOL  Valid;
 } TC_QUERY_REQ;
 
@@ -1044,6 +1049,13 @@ static DWORD WINAPI TcWorkerThread(IN void* param)
             if (!have)
                 break;
 
+            if (req.Identity)
+            {
+                // The toast hold's identity read: same thread, same bounded UIA instance, no crop state.
+                ToastHoldReadIdentity(uia, req.Window, req.Incarnation);
+                continue;
+            }
+
             RECT insets;
             TcQueryCore(uia, req.Window, req.Raw, req.Menu, TRUE, &insets); // status is in the insets
             TcApplyResult(&req, &insets);
@@ -1054,8 +1066,9 @@ static DWORD WINAPI TcWorkerThread(IN void* param)
 
 // g_TcLock must be held. Queues one measurement for the worker; a full queue or an
 // already-queued duplicate is dropped silently - the slot's RetryAt pacing re-requests it.
+// `identity`: an identity read for the toast hold instead of a measurement (one pending per window).
 static BOOL TcEnqueueQueryLocked(IN HWND window, IN HWND cacheKey, IN const RECT* raw, IN DWORD rawWidth, IN DWORD rawHeight,
-    IN BOOL menu)
+    IN BOOL menu, IN BOOL identity, IN LONG incarnation)
 {
     int freeIdx = -1;
 
@@ -1066,9 +1079,13 @@ static BOOL TcEnqueueQueryLocked(IN HWND window, IN HWND cacheKey, IN const RECT
     {
         if (g_TcQueue[i].Valid)
         {
-            if (g_TcQueue[i].Window == window &&
-                g_TcQueue[i].RawWidth == rawWidth && g_TcQueue[i].RawHeight == rawHeight)
+            if (g_TcQueue[i].Window == window && g_TcQueue[i].Identity == identity &&
+                (identity || (g_TcQueue[i].RawWidth == rawWidth && g_TcQueue[i].RawHeight == rawHeight)))
+            {
+                if (identity)
+                    g_TcQueue[i].Incarnation = incarnation;   // the pending read answers for the newest life of the window
                 return TRUE; // already pending
+            }
         }
         else if (freeIdx < 0)
         {
@@ -1085,9 +1102,32 @@ static BOOL TcEnqueueQueryLocked(IN HWND window, IN HWND cacheKey, IN const RECT
     g_TcQueue[freeIdx].RawWidth = rawWidth;
     g_TcQueue[freeIdx].RawHeight = rawHeight;
     g_TcQueue[freeIdx].Menu = menu;
+    g_TcQueue[freeIdx].Identity = identity;
+    g_TcQueue[freeIdx].Incarnation = incarnation;
     g_TcQueue[freeIdx].Valid = TRUE;
     SetEvent(g_TcWorkQueued);
     return TRUE;
+}
+
+BOOL ToastCropWorkerAvailable(void)
+{
+    TcInit();
+    return g_TcWorkerOk;
+}
+
+BOOL ToastCropRequestIdentity(IN HWND window, IN LONG incarnation)
+{
+    RECT none = { 0, 0, 0, 0 };
+    BOOL queued;
+    if (!window)
+        return FALSE;
+    TcInit();
+    if (!g_TcWorkerOk)
+        return FALSE;
+    EnterCriticalSection(&g_TcLock);
+    queued = TcEnqueueQueryLocked(window, window, &none, 0, 0, FALSE, TRUE, incarnation);
+    LeaveCriticalSection(&g_TcLock);
+    return queued;
 }
 
 // The order of g_TcShellHostImages defines the kind mapping: [0] -> Toast, [1] -> Start, [2] -> Search.
@@ -1314,7 +1354,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
         rawc.right = data->X + (LONG)data->Width;
         rawc.bottom = data->Y + (LONG)data->Height;
         slot->ConfirmQueued = TRUE;   // one-shot whether or not the enqueue takes
-        (void)TcEnqueueQueryLocked(data->Handle, TcCacheKey(data), &rawc, slot->RawWidth, slot->RawHeight, FALSE);
+        (void)TcEnqueueQueryLocked(data->Handle, TcCacheKey(data), &rawc, slot->RawWidth, slot->RawHeight, FALSE, FALSE, 0);
     }
 
     if (!slot->Resolved &&
@@ -1358,7 +1398,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
             // tracking pass so the crop lands within one pass of the answer. Attempt
             // pacing (Attempts/RetryAt above) is unchanged: a lost or unanswered request
             // is simply re-queued at the next retry tick.
-            if (!TcEnqueueQueryLocked(data->Handle, TcCacheKey(data), &raw, data->Width, data->Height, menu))
+            if (!TcEnqueueQueryLocked(data->Handle, TcCacheKey(data), &raw, data->Width, data->Height, menu, FALSE, 0))
             {
                 // Worker unavailable (thread failed to start, or the queue is full with
                 // other windows). Fall back to the old inline query rather than never

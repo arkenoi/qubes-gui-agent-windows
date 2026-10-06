@@ -48,6 +48,7 @@
 #include "debug.h"
 #include "perf.h"
 #include "toastcrop.h"
+#include "toasthold.h"
 #include "slicepaint.h"
 #include "etwproxy.h"
 #include "faultinject.h"
@@ -1042,6 +1043,12 @@ static void CALLBACK WindowEventProc(
     // what the pacing actually existed to protect. One interlocked increment, on the same
     // events already being queued, so this adds nothing to the hook's cost.
     CropNoteWindowChanged();
+
+    // The toast hold (toasthold.c) re-reads a tracked banner's content on exactly these two events: a
+    // banner arriving IN PLACE keeps the window's rect, so the event itself is the only signal that the
+    // content may be new. One volatile read and a return for every window the hold does not track.
+    if (event == EVENT_OBJECT_LOCATIONCHANGE || event == EVENT_OBJECT_NAMECHANGE)
+        ToastHoldNoteChanged(window);
 
     QueueWindowEvent(window, event, FALSE);
 }
@@ -3409,6 +3416,24 @@ static HANDLE g_NotifBridgeProc = NULL;
 //   g_NotifReadyEvt - the bridge sets it after publishing its pid; it is in the main loop's wait array.
 static HANDLE g_NotifAlive = NULL, g_NotifReadyEvt = NULL;
 static WCHAR  g_NotifAliveName[96], g_NotifReadyName[96];
+//   g_NotifHoldMap/Base - the TOAST-HOLD RECORDS section (toastident.h, docs/ADR-toasts.md 10): the bridge writes one
+//                     record per listed notification (content identity hashes + verdict) and the agent reads them to
+//                     decide whether a toast banner may be mapped at all; created with the other IPC objects, named with
+//                     the same nonce, R/W for the interactive user (everything it writes is untrusted - toastident.h);
+//   g_NotifVerdictEvt - auto-reset, set by the bridge after every record write; in the main loop's wait array.
+static HANDLE g_NotifHoldMap = NULL, g_NotifVerdictEvt = NULL;
+static void*  g_NotifHoldBase = NULL;
+static WCHAR  g_NotifHoldName[96], g_NotifVerdictName[96];
+// THE DISPLAY MODE, for the bridge (docs/ADR-toasts.md 10, non-seamless). The hold exists only in seamless mode: in
+// non-seamless/fullscreen mode the guest draws its banner inside the one desktop window the agent maps, nothing can
+// withhold it, and a toast forwarded to dom0 then shows twice. So the agent publishes the mode in the records section
+// and the bridge forwards NOTHING while it is non-seamless (every toast takes the window path). Called at the section's
+// creation and on every mode switch; one interlocked store, no wake (the bridge reads it at each listing).
+static void NotifHoldPublishMode(void)
+{
+    if (g_NotifHoldBase)
+        TI_STORE32(&((TH_IPC_HEADER*)g_NotifHoldBase)->Seamless, g_SeamlessMode ? 1 : 0);
+}
 static BOOL NotifIpcEnsure(void)
 {
     if (g_NotifAlive && g_NotifReadyEvt) return TRUE;
@@ -3439,6 +3464,51 @@ static BOOL NotifIpcEnsure(void)
         return FALSE;
     }
     g_NotifAlive = m; g_NotifReadyEvt = e;
+
+    // The toast-hold records section + verdict event (toasthold.c). Best effort: without them the hold is INERT -
+    // ToastHoldInit says so as an ERROR, because every bridged toast then shows twice - and the bridge is launched
+    // without --hold/--verdict, which it tolerates (it just publishes nothing).
+    {
+        PSECURITY_DESCRIPTOR sdS = NULL, sdV = NULL;
+        StringCchPrintf(g_NotifHoldName, RTL_NUMBER_OF(g_NotifHoldName), L"Global\\QubesToastBridge_%llx_hold", nonce);
+        StringCchPrintf(g_NotifVerdictName, RTL_NUMBER_OF(g_NotifVerdictName), L"Global\\QubesToastBridge_%llx_verdict", nonce);
+        // section: SY full; the interactive user may query and map it for reading AND writing (0x7 =
+        // SECTION_QUERY|SECTION_MAP_WRITE|SECTION_MAP_READ) - it is the writer. Event: wait and set, as the others.
+        ConvertStringSecurityDescriptorToSecurityDescriptor(
+            L"D:P(A;;GA;;;SY)(A;;0x7;;;IU)S:(ML;;NW;;;ME)", SDDL_REVISION_1, &sdS, NULL);
+        ConvertStringSecurityDescriptorToSecurityDescriptor(
+            L"D:P(A;;GA;;;SY)(A;;0x100002;;;IU)S:(ML;;NW;;;ME)", SDDL_REVISION_1, &sdV, NULL);
+        if (sdS && sdV)
+        {
+            SECURITY_ATTRIBUTES saS = { sizeof(saS), sdS, FALSE }, saV = { sizeof(saV), sdV, FALSE };
+            HANDLE map = CreateFileMapping(INVALID_HANDLE_VALUE, &saS, PAGE_READWRITE, 0, (DWORD)TH_IPC_BYTES, g_NotifHoldName);
+            DWORD gleMap = GetLastError();
+            if (map && gleMap == ERROR_ALREADY_EXISTS) { CloseHandle(map); map = NULL; }
+            HANDLE ev = CreateEvent(&saV, FALSE, FALSE, g_NotifVerdictName);
+            DWORD gleEv = GetLastError();
+            if (ev && gleEv == ERROR_ALREADY_EXISTS) { CloseHandle(ev); ev = NULL; }
+            void* base = map ? MapViewOfFile(map, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0) : NULL;
+            if (map && ev && base)
+            {
+                ThIpcInit((TH_IPC_HEADER*)base);   // zeroed, header published Magic-last
+                g_NotifHoldMap = map; g_NotifHoldBase = base; g_NotifVerdictEvt = ev;
+                NotifHoldPublishMode();
+                ToastHoldAttachIpc((TH_IPC_HEADER*)base, ev);
+                LogInfo("QGANOTIFIPC toast-hold records section created (%lu bytes, %u records) + verdict event",
+                    (ULONG)TH_IPC_BYTES, (unsigned)TH_IPC_RECORDS);
+            }
+            else
+            {
+                LogError("QGANOTIFIPC toast-hold section/event NOT created (map=%d gle=%lu, event=%d gle=%lu, view=%d) - "
+                    L"the toast hold is INERT this run: a bridged toast shows twice", map != NULL, gleMap, ev != NULL, gleEv, base != NULL);
+                if (base) UnmapViewOfFile(base);
+                if (map) CloseHandle(map);
+                if (ev) CloseHandle(ev);
+            }
+        }
+        if (sdS) LocalFree(sdS);
+        if (sdV) LocalFree(sdV);
+    }
     return TRUE;
 }
 static DWORD  g_NotifBridgePid = 0;
@@ -3504,13 +3574,22 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs)
 
 static BOOL NotifBridgeLaunch(void)
 {
-    WCHAR args[384];
+    WCHAR args[768];
     if (!NotifIpcEnsure()) return FALSE;
     // --notify-errors: the resolved secondary-error-route gate, so the bridge can report its own
     // ACTION faults (listener access denied) without reading the gate itself (notifyerr.h).
     // --alive / --ready: the liveness mutex it waits on and the event it sets once its pid is published (S4c).
+    // --hold / --verdict: the toast-hold records section it writes and the event it signals after each write
+    // (toastident.h); absent when the section could not be created - the bridge then publishes nothing.
     StringCchPrintf(args, RTL_NUMBER_OF(args), L"--bridge --agent-pid %lu --notify-errors %d --alive %s --ready %s",
                     GetCurrentProcessId(), g_NotifyErrors ? 1 : 0, g_NotifAliveName, g_NotifReadyName);
+    if (g_NotifHoldBase && g_NotifVerdictEvt)
+    {
+        StringCchCat(args, RTL_NUMBER_OF(args), L" --hold ");
+        StringCchCat(args, RTL_NUMBER_OF(args), g_NotifHoldName);
+        StringCchCat(args, RTL_NUMBER_OF(args), L" --verdict ");
+        StringCchCat(args, RTL_NUMBER_OF(args), g_NotifVerdictName);
+    }
     return NotifRunInSession(NOTIF_TASK_NAME, args);
 }
 
@@ -3622,6 +3701,7 @@ static void NotifBridgeSupervise(void)
             L"names the reason; gui-agent log line QGANOTIFBRIDGEEXIT; a crash also leaves a Windows Error "
             L"Reporting record (AppCrash_notifhost.exe_*).");
         g_NotifBridgePid = 0;
+        ToastHoldSetBridgeUp(FALSE);   // every held banner fails open now: no verdict can arrive any more
     }
     if (g_NotifBridgeProc) return;            // running: nothing to do and nothing armed
     DWORD sid = WTSGetActiveConsoleSessionId();
@@ -3664,6 +3744,7 @@ static void NotifBridgeSupervise(void)
                     g_NotifLaunchPending = FALSE;
                     LogInfo("NOTIFBRIDGE ready (pid %lu published %I64u ms after the launch) - its exit is now waited on",
                             hbPid, hbTick - g_NotifLastLaunch);
+                    ToastHoldSetBridgeUp(TRUE);
                     return;
                 }
                 g_NotifBridgePidRejected = hbPid;
@@ -4444,6 +4525,13 @@ static void MapDeferWakeSweep(void)
         WINDOW_DATA* entry = CONTAINING_RECORD(le, WINDOW_DATA, ListEntry);
         if (!entry->MapDeferred || entry->DeletePending)
             continue;
+        // A banner the TOAST HOLD owns (held for its verdict, suppressed, pre-empted) is not this sweep's to
+        // re-check: it stays MapDeferred for its whole display (5-25 s, longer for a reminder), and the 32 ms /
+        // 100 ms tick here would run a pass for it that long - a timer at rest (owner rule). The hold wakes
+        // it through its own events (the verdict, its reads) and its own bounded deadlines; when it says
+        // show, the release arm re-arms this sweep for the crop if that is still outstanding.
+        if (entry->ToastHoldOwned)
+            continue;
         const ULONGLONG ceiling = entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10;
         if (DirectRequired())
         {
@@ -4532,6 +4620,49 @@ static BOOL DirectWouldShowBlack(IN const WINDOW_DATA* entry)
 {
     return DirectRequired() && entry->PwSliceFed && !SliceContentReady(entry) &&
            entry->PwBrokerFrames < DIRECT_DARK_FRAMES;
+}
+
+// IS THIS TOAST BANNER WITHHELD BY THE BRIDGE VERDICT? (docs/ADR-toasts.md 10; toasthold.c.) TRUE while the
+// toast hold says hold (verdict not yet known, bounded) or suppress (verdict=bridge: dom0 already has this
+// toast as a notification, so its guest banner must never be mapped - the owner's double). Like
+// DirectWouldShowBlack this is a property of the WINDOW asked at EVERY map site, because the first
+// crop-before-show guard was bypassed by a map site that knew nothing about held windows. Idempotent per
+// pass; records the answer in ToastHoldOwned (MapDeferWakeSweep and ToastBannerWithheld read it).
+//
+// ONLY THE BANNER. IsShellToastWindow admits every shell-host surface (Start, Search, the Action Center,
+// Quick Settings, every ShellExperienceHost flyout - there is no size ceiling, see toastcrop.h), and holding
+// those for 3 s with a false QGATOASTHOLDLATE is not the product. The banner is: the ShellExperienceHost kind
+// (ShellSurfaceToast); not a FULL-height or full-width surface (ThCoreSizeExcludes: >= 90 % of the screen in
+// either dimension - the Notification Center and the clock flyout; RELATIVE, because an absolute 60 % cut
+// excluded the measured 573 px banners at 1366x768 / 1600x900 / 125 %+ DPI, review N3), applied only to a
+// window the hold does not track yet so a banner is never released by its own growth; and - decided by the
+// hold from its UIA reads - a card readable as NormalToastView (a window without one in two paced reads is a
+// flyout: shown at once, never held). Quick Settings and the like are under 90 % and take that second path.
+static BOOL ToastHeldByBridge(IN OUT WINDOW_DATA* entry)
+{
+    if (!ToastHoldActive() || ShellSurfaceKind(entry) != ShellSurfaceToast)
+    {
+        entry->ToastHoldOwned = FALSE;
+        return FALSE;
+    }
+    if (!ToastHoldTracks(entry->Handle))
+    {
+        const ULONG rawW = entry->Width + (ULONG)(entry->CropLeft + entry->CropRight);
+        const ULONG rawH = entry->Height + (ULONG)(entry->CropTop + entry->CropBottom);
+        if (ThCoreSizeExcludes(rawW, rawH, (ULONG)g_ScreenWidth, (ULONG)g_ScreenHeight))
+        {
+            entry->ToastHoldOwned = FALSE;
+            return FALSE;
+        }
+    }
+    const BOOL held = ToastHoldDecide(entry) != ThDecShow;
+    entry->ToastHoldOwned = held;
+    return held;
+}
+
+BOOL ToastBannerWithheld(IN const WINDOW_DATA* entry)
+{
+    return entry != NULL && entry->MapDeferred && entry->ToastHoldOwned;
 }
 
 // Crop-before-show readiness: is the shadow-crop for this toast/menu resolved enough to map it
@@ -4984,8 +5115,13 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             (IsMenuPopupWindow(entry) || IsShellToastWindow(entry) ||
              (g_DeSlice && entry->PwSliceFed) ||
              (g_SliceMapHold && entry->PwSliceFed)) &&
-            !CropReadyForMap(entry))
+            (ToastHeldByBridge(entry) || !CropReadyForMap(entry)))
         {
+            // ToastHeldByBridge FIRST (it has the side effect that matters): a toast banner is also deferred
+            // until its bridge verdict (toasthold.c), and the hold - with its identity read - starts HERE,
+            // on the first pass, before anything of the banner reaches dom0; evaluated after the crop it
+            // would start only when the deferred window is next examined (the crop ceiling on a direct
+            // guest). The release arm in UpdateWindowData asks the same question.
             entry->MapDeferred = TRUE;
             entry->MapDeferSince = GetTickCount64();
             // Size AT DEFER TIME, to be compared with the size in QGAHELDMAP at release. The
@@ -5575,6 +5711,7 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
     // Windows recycles HWND values, so a slot left behind here would hand this window's
     // crop to whatever unrelated popup gets the handle next.
     ToastCropEvict(entry->Handle);
+    ToastHoldEvict(entry->Handle);   // same hazard: a stale hold would withhold whatever gets the handle next
 
     RemoveEntryList(&entry->ListEntry);
 
@@ -6120,7 +6257,7 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
                 }
             }
             else if (fgData && fgData->CreateSent && fgData->IsVisible && !fgData->IsIconic &&
-                !fgData->Synthesized && !DirectWouldShowBlack(fgData))
+                !fgData->Synthesized && !DirectWouldShowBlack(fgData) && !ToastHeldByBridge(fgData))
             {
                 // Legacy (composite-fed) windows still need it, but never faster than
                 // RAISE_DEBOUNCE_MS: a raise that answers our own previous raise is the loop.
@@ -6455,6 +6592,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     if (g_VchanClientConnected && !g_ScreenAnnounced)
     {
         g_SeamlessMode = seamlessMode;
+        NotifHoldPublishMode();
         LogWarning("NEVEREXIT seamless mode %d recorded only (screen window not announced); applied on capture (re)start",
             seamlessMode);
         status = ERROR_SUCCESS;
@@ -6543,6 +6681,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     }
 
     g_SeamlessMode = seamlessMode;
+    NotifHoldPublishMode();   // the bridge forwards nothing while non-seamless (ADR-toasts 10)
 
     // The switch HAS happened, so nothing is pending any more. Without this the flag survived a
     // switch that completed by the DIRECT route (preconditions already met, so neither deferral
@@ -7453,7 +7592,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     if (oldPopupState)
     {
         // popup state first, then configure
-        if (popupStateChanged)
+        // A popup-state flip re-announces through UNMAP+MAP (ToggleMap) - which would MAP a banner the toast hold
+        // is withholding. The daemon learns the flag at the eventual MAP anyway, so a held toast skips the toggle.
+        if (popupStateChanged && !ToastBannerWithheld(windowData))
         {
             status = ToggleMap(windowData);
             if (status != ERROR_SUCCESS)
@@ -7477,7 +7618,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 goto end;
         }
 
-        if (popupStateChanged)
+        // A popup-state flip re-announces through UNMAP+MAP (ToggleMap) - which would MAP a banner the toast hold
+        // is withholding. The daemon learns the flag at the eventual MAP anyway, so a held toast skips the toggle.
+        if (popupStateChanged && !ToastBannerWithheld(windowData))
         {
             status = ToggleMap(windowData);
             if (status != ERROR_SUCCESS)
@@ -7617,6 +7760,23 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             goto end;
     }
 
+    // TOAST HOLD ON A MAPPED BANNER (docs/ADR-toasts.md 10, toasthold.c). The shell's ONE banner window
+    // serves every toast and a new banner can arrive IN PLACE (same rect), so a banner already mapped for
+    // a window-path toast may now show - or be about to show - a toast the bridge forwards. When the hold
+    // says so (new content held for its verdict, or a bridge-bound toast queued behind this one), the
+    // window is UNMAPPED and handed back to the defer machinery, whose release arm below re-maps it the
+    // moment the hold says show again. Nothing is destroyed: CREATE and the buffer stay in place.
+    if (!windowData->MapDeferred && windowData->CreateSent && !windowData->Synthesized &&
+        windowData->IsVisible && !windowData->IsIconic && ToastHeldByBridge(windowData))
+    {
+        (void)SendWindowUnmap(windowData->Handle);
+        windowData->MapDeferred = TRUE;
+        windowData->MapDeferSince = GetTickCount64();
+        windowData->MapDeferDue = 0;
+        LogInfo("QGATOASTHOLD hwnd=0x%x unmapped a MAPPED banner: the hold governs it again (re-mapped when it says show)",
+            (DWORD)(ULONG_PTR)windowData->Handle);
+    }
+
     // CROP-BEFORE-SHOW: a toast/menu whose MAP was held in AddWindow now maps, once its crop has
     // resolved (so it appears already cropped) or the bounded timeout elapses (mapped uncropped,
     // never lost). CREATE and the per-window buffer are already in place; the cropped geometry has
@@ -7624,9 +7784,23 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     if (windowData->MapDeferred && windowData->IsVisible && !windowData->IsIconic &&
         !windowData->Synthesized)
     {
+        // The toast hold outranks every arm below: while it says hold/suppress nothing here may map the
+        // banner, whatever the crop or the timeout say. Its own deadlines and the bridge's verdict event
+        // re-drive this pass; its fail-open is reported by toasthold.c (QGATOASTHOLDLATE).
+        const BOOL wasToastOwned = windowData->ToastHoldOwned;
+        const BOOL toastHeld = ToastHeldByBridge(windowData);
         const BOOL cropReady = CropReadyForMap(windowData);
         const BOOL timedOut =
             (GetTickCount64() - windowData->MapDeferSince) > CROP_BEFORE_SHOW_TIMEOUT_MS;
+        // The hold just let go of a window whose crop is still outstanding: MapDeferWakeSweep skipped it
+        // while the hold owned it, so put it back on the sweep's clock or the crop ceiling never fires.
+        if (wasToastOwned && !toastHeld && !cropReady && !timedOut)
+        {
+            const ULONGLONG due = MapDeferFirstDue(windowData);
+            windowData->MapDeferDue = due;
+            if (g_MapDeferWake == 0 || due < g_MapDeferWake)
+                g_MapDeferWake = due;
+        }
 
         // DIRECT REQUIRED: never map a window we have NO PIXELS for (owner 2026-09-06: "not
         // appearing and error message aloud"). The timeout arm exists so a held window is never
@@ -7648,7 +7822,11 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // unpainted, the feed is demonstrably working and the blackness belongs to the surface,
         // not to us - map it and say so once (QGADIRECTDARK). One black frame is not evidence of
         // a working feed; it is the exact signature of the failure above.
-        if (!cropReady && timedOut && DirectWouldShowBlack(windowData))
+        if (toastHeld)
+        {
+            // Held or suppressed by the bridge verdict: stays unmapped (see above).
+        }
+        else if (!cropReady && timedOut && DirectWouldShowBlack(windowData))
         {
             // STARTING is not a fault. The window is still withheld (a black window is never
             // acceptable), but nothing here declares a defect: no DirectSuppressed increment, no
@@ -10175,7 +10353,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // PwDirectSuppressed windows are deliberately kept unmapped (no pixels, no
                 // composite to fall back on) - re-queueing them every frame would be pure churn.
                 // A real frame clears the flag through the same arm that maps them.
-                if (g_SliceMapHold && entry->MapDeferred && !entry->PwDirectSuppressed &&
+                // A banner the TOAST HOLD owns (suppressed, held, pre-empted) is likewise not this
+                // backstop's to re-queue: it stays MapDeferred for its whole display and the hold wakes it
+                // itself (see MapDeferWakeSweep's ToastHoldOwned skip).
+                if (g_SliceMapHold && entry->MapDeferred && !entry->PwDirectSuppressed && !entry->ToastHoldOwned &&
                     (GetTickCount64() - entry->MapDeferSince) > CROP_BEFORE_SHOW_TIMEOUT_MS)
                     QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
             }
@@ -11433,6 +11614,9 @@ static ULONG WINAPI WatchForEvents(void)
     // released the moment its pixels land instead of at desktop-capture cadence.
     // (Placed per iteration below - see there.)
     int frameEventIdx = -1;
+    // The bridge's VERDICT event (toasthold.c): a toast record was published or decided. Placed per
+    // iteration like the frame event; it has no case in the switch.
+    int verdictEventIdx = -1;
 
     CAPTURE_CONTEXT* capture = NULL;
 
@@ -11580,6 +11764,21 @@ static ULONG WINAPI WatchForEvents(void)
                 waitTimeout = toDefer;
         }
 
+        // TOAST-HOLD DEADLINE (toasthold.c): the fail-open bound of a banner held for its verdict - a
+        // failure-state deadline, armed only while a banner is held and disarmed when none is (0 at rest).
+        // The sweep queues the expired holds for the tracking pass that opens them.
+        ToastHoldSweep();
+        {
+            const ULONGLONG thDue = ToastHoldNextDue();
+            if (thDue != 0)
+            {
+                ULONGLONG now64 = GetTickCount64();
+                DWORD toHold = (thDue > now64) ? (DWORD)(thDue - now64) : 0;
+                if (waitTimeout == INFINITE || toHold < (DWORD)waitTimeout)
+                    waitTimeout = toHold;
+            }
+        }
+
         // DRAG SMOOTHNESS. While the user drags a window, its POSITION is the only thing
         // that matters (its content is frozen for the duration), yet g_WindowEventSignal
         // sits LAST in the wait array so a pending frame always wins. Announces are then
@@ -11704,6 +11903,16 @@ static ULONG WINAPI WatchForEvents(void)
             frameEventIdx = (int)eventCount;
             watchedEvents[eventCount++] = g_WgcFrame;
         }
+        // TOAST-HOLD VERDICTS (docs/ADR-toasts.md 10): the bridge sets this after every record write, so a banner
+        // held for its verdict is re-examined the moment the verdict exists - no poll, no timer. NULL when the hold
+        // is inactive on this run. AFTER the broker's frame event on purpose: WaitForMultipleObjects prefers the
+        // lower index, and a verdict must never take priority over a frame (review #17).
+        verdictEventIdx = -1;
+        if (ToastHoldVerdictEvent() && eventCount < MAXIMUM_WAIT_OBJECTS)
+        {
+            verdictEventIdx = (int)eventCount;
+            watchedEvents[eventCount++] = ToastHoldVerdictEvent();
+        }
         // THE CAPTURE THREAD'S EXIT WAKES THE LOOP (rest-zero S4). QGACAPDEAD below is evaluated on a wake; it used to
         // ride the 1 s cap, and the capture thread now blocks in its acquire with no timeout on a direct guest, so a
         // thread that leaves would otherwise go unnoticed until something unrelated happened. Only while the context is
@@ -11775,6 +11984,14 @@ static ULONG WINAPI WatchForEvents(void)
         NotifBridgeSupervise();   // every wake, waits for nothing; no-op unless the NotifyBridge gate is on
         EtwProxyPoke();   // launch-precondition only (console session / user change); proxy
                           // DEATH is detected by its exit-wait, not here (etwproxy.c)
+
+        if (verdictEventIdx >= 0 && (int)signaledEvent == verdictEventIdx)
+        {
+            // A toast record was published or its verdict decided. The decision is taken on the tracking
+            // pass (the only legal map/unmap site), so this just queues every held banner for one.
+            ToastHoldOnSignal();
+            continue;
+        }
 
         if (frameEventIdx >= 0 && (int)signaledEvent == frameEventIdx)
         {
@@ -12861,6 +13078,12 @@ static ULONG Init(void)
             LogInfo("NOTIFBRIDGE forced OFF by legacy_toasts - override-redirect toasts (window path)");
         }
         LogInfo("NOTIFBRIDGE gate: enabled=%d source=%s legacy_toasts=%d", g_NotifBridge, nbSrc, legacyToasts);
+        // The toast hold (docs/ADR-toasts.md 10) is a capability of THIS run, settled here with the gate: the IPC
+        // objects the bridge will write its records into are created now (this is the main-loop thread, which must
+        // own the liveness mutex NotifIpcEnsure creates), and the hold resolves its knob and its worker once.
+        if (g_NotifBridge)
+            (void)NotifIpcEnsure();
+        ToastHoldInit(g_NotifBridge);
         if (!g_NotifBridge)
         {
             // The opt-out must take effect NOW, not at the next reboot: a bridge launched
@@ -12927,6 +13150,7 @@ static ULONG Init(void)
     {
         g_SeamlessMode = seamlessMode;
     }
+    NotifHoldPublishMode();   // the records section was created above with the default; publish the real mode
 
     // Boot/shutdown full-desktop "flash" gate. See g_ShowFullscreenScreen above and the
     // class-based reject in ShouldAcceptWindow(). Default hidden; opt-in via the dom0 feature

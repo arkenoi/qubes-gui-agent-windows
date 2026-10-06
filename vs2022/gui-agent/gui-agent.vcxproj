@@ -26,6 +26,7 @@
     <ClCompile Include="..\..\gui-agent\xorg-keymap.c" />
     <ClCompile Include="..\..\gui-agent\perwindow.c" />
     <ClCompile Include="..\..\gui-agent\toastcrop.c" />
+    <ClCompile Include="..\..\gui-agent\toasthold.c" />
     <ClCompile Include="..\..\gui-agent\etwproxy.c" />
     <ClCompile Include="..\..\gui-agent\notifyerr.c" />
     <!-- C++/WinRT capture engine: needs C++17 + exceptions; SDK headers are not
@@ -58,6 +59,9 @@
     <ClInclude Include="..\..\gui-agent\wincapture.h" />
     <ClInclude Include="..\..\gui-agent\toastcrop.h" />
     <ClInclude Include="..\..\gui-agent\toastcrop-pick.h" />
+    <ClInclude Include="..\..\gui-agent\toasthold.h" />
+    <ClInclude Include="..\..\gui-agent\toasthold-core.h" />
+    <ClInclude Include="..\..\gui-agent\toastident.h" />
     <ClInclude Include="..\..\gui-agent\etwproxy.h" />
     <ClInclude Include="..\..\gui-agent\notifyerr.h" />
   </ItemGroup>
