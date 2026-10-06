@@ -6809,7 +6809,10 @@ static void StartDismissNotifyUser(void)
         StringCchCat(exe, RTL_NUMBER_OF(exe), L"notifhost.exe");
     }
     WCHAR cmd[MAX_PATH * 2];
-    StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\" --notify-file \"%s\"", exe, path);
+    // --severity info: the owner's rule (2026-10-06) is "errors stay. warnings are 60s. informational messages are 20s.", and this
+    // is informational - nothing is broken, the product did what it is designed to do (Jev 0.99). Without the flag notifhost sends
+    // an error, which stays until dismissed.
+    StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\" --notify-file \"%s\" --severity info", exe, path);
     STARTUPINFO si; ZeroMemory(&si, sizeof(si)); si.cb = sizeof(si);
     PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
     if (GetFileAttributes(exe) == INVALID_FILE_ATTRIBUTES)
