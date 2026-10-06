@@ -392,6 +392,35 @@ static BOOL VchanSendVectoredLocked(IN struct libvchan *vchan, IN const VCHAN_IO
     return TRUE;
 }
 
+// THE PROTOCOL VERSION IS THE FIRST THING ON THE WIRE (2026-10-06). dom0's gui-daemon reads exactly four bytes as the
+// agent's protocol version the moment it connects; whatever is in the ring first is read AS the version. Four zero bytes there
+// made dom0 show "The GUI agent that runs in the VM ... implements outdated protocol (0:0), and must be updated" and exit - the
+// qube has no GUI until it is restarted (the 4.3.35 release gate, in-place reinstall with the GUI connected; earlier on another
+// rig clone). The connect sequence opened the senders (g_VchanClientConnected) BEFORE it wrote the version, and not every sender
+// is gated on that flag (the screen-scoped window dump is not). Jev: bytes from our side 0.73, an ungated sender ahead of the
+// version 0.92. So the ring is closed to every message until the version exchange is complete: before it, the only write let
+// through is the one made by the thread running the handshake (the version itself); the gate opens once the daemon's own version
+// has been read back. A message refused here is DROPPED - the new daemon knows no window yet, and the connect sequence re-announces
+// the screen and every window after the handshake - and logged LOUDLY, because a sender writing before the handshake is a defect.
+static volatile LONG  g_VchanHandshakeOpen = 0;      // 1 once the version exchange is complete
+static volatile DWORD g_VchanHandshakeThread = 0;    // the thread allowed to write while it is not (the version send)
+static volatile LONG  g_VchanHandshakeDrops = 0;
+
+void VchanHandshakeBegin(void)
+{
+    InterlockedExchange(&g_VchanHandshakeOpen, 0);
+    g_VchanHandshakeThread = GetCurrentThreadId();
+}
+
+void VchanHandshakeComplete(void)
+{
+    g_VchanHandshakeThread = 0;
+    InterlockedExchange(&g_VchanHandshakeOpen, 1);
+    LONG drops = InterlockedCompareExchange(&g_VchanHandshakeDrops, 0, 0);
+    if (drops)
+        LogWarning("QGAHANDSHAKE the protocol version went out first; %ld message(s) were refused before it (see the lines above)", drops);
+}
+
 BOOL VchanSendVectored(IN struct libvchan *vchan, IN const VCHAN_IOV *iov, IN int iovCount, IN const WCHAR *what)
 {
     // The reservation is only sound while nothing else writes between it and the writes it
@@ -400,6 +429,15 @@ BOOL VchanSendVectored(IN struct libvchan *vchan, IN const VCHAN_IOV *iov, IN in
     assert(g_VchanCriticalSection.OwningThread == (HANDLE)(ULONG_PTR)GetCurrentThreadId());
 
     g_VchanLastSendResult = VCHAN_SEND_OK;
+
+    if (!InterlockedCompareExchange(&g_VchanHandshakeOpen, 0, 0) && g_VchanHandshakeThread != GetCurrentThreadId())
+    {
+        LONG drops = InterlockedIncrement(&g_VchanHandshakeDrops);
+        if (drops <= 20 || (drops % 1000) == 0)
+            LogWarning("QGAHANDSHAKE refused %s before the protocol version exchange: the daemon would read it as the version "
+                "(%ld refused so far) - an ungated sender, dropped", what, drops);
+        return TRUE;   // dropped on purpose; nothing the caller can act on (the handshake re-announces everything)
+    }
 
     if (!g_PerfEnabled)
         return VchanSendVectoredLocked(vchan, iov, iovCount, what);

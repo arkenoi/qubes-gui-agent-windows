@@ -12069,9 +12069,8 @@ static ULONG WINAPI WatchForEvents(void)
 
                 LogInfo("A vchan client has connected");
 
-                // needs to be set before enumerating windows so maps get sent
-                // (and before sending anything really)
-                g_VchanClientConnected = TRUE;
+                // g_VchanClientConnected is NOT set here any more (2026-10-06): it opens the senders, and the daemon reads the
+                // first four bytes on the ring as our protocol version - it is set once the version exchange is complete, below.
                 // A daemon attached, so the first-boot restart budget has done its job (or
                 // was never needed): clear it, or a later genuine first-boot failure on this
                 // guest would start with the budget already spent.
@@ -12088,6 +12087,10 @@ static ULONG WINAPI WatchForEvents(void)
                 // This daemon knows about no windows yet; forget what the previous one
                 // was told before any per-window message can be gated against it.
                 SendResetCreatedWindows();
+
+                // THE VERSION FIRST (vchan.c, QGAHANDSHAKE): from here until VchanHandshakeComplete only this thread may write,
+                // so nothing can reach the ring ahead of the version the daemon is about to read.
+                VchanHandshakeBegin();
 
                 // KEEP-FATAL: SendProtocolVersion only fails when the vchan write
                 // fails (daemon dead/EOF) - case (a). If the vchan somehow reports
@@ -12111,6 +12114,11 @@ static ULONG WINAPI WatchForEvents(void)
                     exitLoop = TRUE;
                     break;
                 }
+
+                // The version exchange is complete: the ring is open to every sender, and the flag that lets them send
+                // (and that must be set before windows are enumerated, so their maps go out) is set only now.
+                VchanHandshakeComplete();
+                g_VchanClientConnected = TRUE;
 
                 // This will probably change the current video mode if we don't have one saved in the registry.
                 // KEEP-FATAL here, but only the vchan receive failure can still reach

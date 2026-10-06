@@ -111,6 +111,9 @@ ULONG VchanLastSendError(void);
 // Only a DEAD peer (or an abandoned partly-written message) latches this. A daemon that is
 // merely not draining is NOT terminal - see VchanSendDegraded.
 BOOL VchanSendWedged(void);
+// The handshake gate (vchan.c): nothing but the version, written by the thread that calls Begin, reaches the ring until Complete.
+void VchanHandshakeBegin(void);
+void VchanHandshakeComplete(void);
 
 // Why it gave up (VCHAN_SEND_OK if it has not). Unlike VchanLastSendResult this is
 // process-wide rather than per-thread, because the wedge belongs to the connection and the
