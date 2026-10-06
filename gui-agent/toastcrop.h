@@ -193,3 +193,24 @@ BOOL ToastCropRequestIdentity(
 // Whether that worker exists on this run - decided at init like everything else here, so a caller can
 // settle its own capability at start instead of discovering it on the first toast.
 BOOL ToastCropWorkerAvailable(void);
+
+// THE READ'S RESULT, handed to the hold (ToastHoldApplyIdentity) by the worker. EVERY UI Automation call
+// of the agent lives in toastcrop.c: in C the SDK's UIAutomationClient.h defines its UIA_*Id /
+// AnnotationType_* ids as `const long` objects with EXTERNAL linkage, so a second .c file including it
+// duplicates hundreds of symbols at link time (LNK2005, CI run 37474444216). The hold therefore never
+// includes the UIA headers; it gets the card's three RAW texts (SenderName, Title|TitleText, MessageText
+// blocks joined by ' ') through this contract and normalizes/hashes them itself (toastident.h).
+#define TOAST_CARD_TEXT_UNITS 512   // == TI_NORM_MAX (toastident.h); toasthold.c asserts it at compile time
+typedef struct _TOAST_CARD_TEXTS
+{
+    WCHAR Sender[TOAST_CARD_TEXT_UNITS + 1];
+    WCHAR Title[TOAST_CARD_TEXT_UNITS + 1];
+    WCHAR Message[TOAST_CARD_TEXT_UNITS + 1];
+} TOAST_CARD_TEXTS;
+typedef enum _TOAST_CARD_STATUS
+{
+    ToastCardOk = 0,         // a title was found (sender/message may be empty)
+    ToastCardNoCard = 1,     // no NormalToastView under the window: a card not built yet, or not a banner
+    ToastCardNoTitle = 2,    // a card, but no Title/TitleText block (tree still populating)
+    ToastCardUiaFailed = 3   // ElementFromHandle/Find failed (a busy or closing shell host)
+} TOAST_CARD_STATUS;
