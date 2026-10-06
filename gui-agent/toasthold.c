@@ -395,6 +395,16 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         ThConsumedRemove(&g_ThCons, out.ReleaseSeq);
     if (in.MatchFound) notifForLog = in.MatchNotifId;
     if (e->Core.NotifId) notifForLog = e->Core.NotifId;
+    // The agent's one word back into a record (toastident.h AgentShownSeq, ADR-toasts 11): this banner shows the
+    // toast of a record that reads `window` - the correction just taken (ThEvShowCorrected) or a banner already
+    // visible. The bridge reads it after it turned a forwarded-with-actions toast's record `window` because the
+    // dom0 click could not be carried out: a mark means the user has the guest's own buttons now; none means
+    // the banner had already gone and the bridge tells the user through a dom0 error notice instead. The mark
+    // is the record's own sequence, so a store that races the bridge's reuse of the slot cannot be read as the
+    // next toast's.
+    if (in.MatchFound && in.MatchVerdict == TH_VERDICT_WINDOW && out.Decision == ThDecShow &&
+        e->Core.Phase == ThPhaseDecided && g_ThIpc)
+        ThIpcAgentMarkShown(g_ThIpc, in.MatchSeq);
 
     // Reads, bounded by the hold's own deadlines and never while one is in flight. Every interval is measured
     // from the last ATTEMPT and stretched by ThCoreRetryDelayMs while the worker's queue refuses (review N7),
@@ -482,9 +492,10 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         break;
     case ThEvShowCorrected:
         LogWarning("QGATOASTHOLD hwnd=0x%x state=show reason=record-turned-window ident=%016llx id=%lu after %llu ms suppressed: "
-            L"the bridge could not forward this toast after all (forward failed for good, or dom0 was unreachable) - the "
-            L"banner is shown now, late; if the banner has already timed out in the guest the toast is in its Notification "
-            L"Center only", hw, hc, (ULONG)notifForLog, out.HeldMs);
+            L"the bridge could not forward this toast after all (forward failed for good, or dom0 was unreachable), or a "
+            L"dom0 action on it could not be carried out in the guest (the bridge's ACTION lines) - the banner is shown now, "
+            L"late, and the record carries the agent's shown mark; if the banner has already timed out in the guest the toast "
+            L"is in its Notification Center only", hw, hc, (ULONG)notifForLog, out.HeldMs);
         break;
     case ThEvShowNoBridge:
         LogInfo("QGATOASTHOLD hwnd=0x%x state=show reason=bridge-down ident=%016llx (no bridge running: window path at once, by design)",

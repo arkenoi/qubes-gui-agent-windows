@@ -56,6 +56,11 @@
  *   TOASTIDENT_DEFECT_TIE_SLOTORDER - equal arrival ticks are broken by ring slot instead of by
  *                                 sequence: across a ring wrap the newer record (slot 0) is taken
  *                                 for the earlier banner (review #12)
+ *   TOASTIDENT_DEFECT_MARK_BY_SLOT - the agent's shown mark is a FLAG in the slot instead of the
+ *                                 sequence it marks: an agent store that races the bridge's republish
+ *                                 of that slot (find the slot, then store) lands the previous toast's
+ *                                 mark on the new toast's record, and a failed dom0 action on the new
+ *                                 toast then reads as "banner shown" - unreported (review 2026-10-07)
  *
  * VERDICT LIFECYCLE the bridge drives: PENDING at listing (or WINDOW/BRIDGE when the listing already
  * settles it: window-only app, allowlisted app over a live connection); the classifier's answer only
@@ -64,6 +69,20 @@
  * once dom0 acknowledged the forward. The agent suppresses on BRIDGE and FORWARDED, shows on WINDOW,
  * reopens a suppressed banner whose record turns WINDOW, and reopens one whose record is still BRIDGE
  * (not FORWARDED) when the bridge dies.
+ *
+ * THE ONE FIELD THE AGENT WRITES INTO A RECORD (docs/ADR-toasts.md 11): AgentShownSeq. When a forwarded
+ * toast's dom0 action cannot be carried out in the guest, the bridge turns the record WINDOW (rule 4 of
+ * ADR-toasts 10 reopens the banner if it is still displayed) and must then know whether a banner was
+ * there to reopen: on every pass in which the agent maps a banner for a record that reads window (the
+ * correction, or a banner already visible) it stores THAT RECORD'S SEQUENCE into the field. The bridge
+ * reads "shown" only when the field equals the sequence it asks about and the slot still holds that
+ * sequence. The mark carries the sequence, not a flag, because the agent's store races the bridge's
+ * republish of the slot (find the slot, then store): a flag stored late would land on the NEXT toast's
+ * record and read as its banner shown - a failed dom0 action on that toast would then go unreported.
+ * A late store of the old sequence can never equal the new one. No mark within the bridge's bound means
+ * the banner had already gone - the bridge then tells the user through a dom0 error notice. The field
+ * is carved from the record's reserved tail: the layout, size and ABI number are unchanged, an older
+ * agent never writes it (the bridge then always falls to the notice), an older bridge never reads it.
  */
 #ifndef QWT_TOASTIDENT_H
 #define QWT_TOASTIDENT_H
@@ -360,6 +379,11 @@ TI_INLINE BOOL TiVerdictSuppresses(LONG v) { return v == TH_VERDICT_BRIDGE || v 
 #define TH_REC_FLAG_WINDOWONLY  0x2u
 #define TH_REC_FLAG_NO_SENDER   0x4u   /* the listener could not resolve the app display name */
 
+/* The agent's word on a record, as ThIpcAgentState reports it (the one agent-written field, see the header). */
+#define TH_AGENT_NONE   0              /* the agent has not mapped a banner for this record */
+#define TH_AGENT_SHOWN  1              /* the agent maps (or mapped) a banner showing this toast: stored on every pass whose
+                                          decision is SHOW with this record's verdict read as window */
+
 typedef struct _TH_IPC_RECORD
 {
     volatile LONG Seq;        /* 0 = empty; else the publish sequence - written LAST (seqlock) */
@@ -369,7 +393,9 @@ typedef struct _TH_IPC_RECORD
     UINT64 ArrivalTick;       /* GetTickCount64 at listing - one system clock for both processes */
     UINT64 AumidHash;         /* FNV-1a of the AUMID (logs/diagnosis only) */
     TOAST_IDENT Ident;
-    UINT64 Reserved;
+    volatile LONG AgentShownSeq; /* AGENT-written, bridge-read: the sequence of the record the agent mapped a banner for
+                                    (== Seq: shown; anything else: not) - a sequence, never a flag, see the header */
+    LONG Reserved;
 } TH_IPC_RECORD;              /* 80 bytes */
 
 typedef struct _TH_IPC_HEADER
@@ -427,6 +453,7 @@ TI_INLINE LONG ThIpcPublish(TH_IPC_HEADER* h, UINT32 notifId, UINT32 flags, UINT
     r->ArrivalTick = arrivalTick;
     r->AumidHash = aumidHash;
     r->Ident = *ident;
+    TI_STORE32(&r->AgentShownSeq, 0);   /* hygiene only: a stale mark could never equal the new sequence anyway */
     r->Reserved = 0;
     TI_STORE32(&r->Verdict, verdict);
     TI_BARRIER();
@@ -434,20 +461,34 @@ TI_INLINE LONG ThIpcPublish(TH_IPC_HEADER* h, UINT32 notifId, UINT32 flags, UINT
     return seq;
 }
 
+/* The slot holding sequence `seq`, or -1 (the record was overwritten by the ring turning, or never existed). */
+TI_INLINE int ThIpcFindSeq(const TH_IPC_HEADER* h, LONG seq)
+{
+    int i;
+    if (!h || seq == 0) return -1;
+    for (i = 0; i < TH_IPC_RECORDS; i++)
+        if (TI_LOAD32(&ThIpcRecordsC(h)[i].Seq) == seq) return i;
+    return -1;
+}
+
 /* Writer side: update the verdict of the record for `notifId` (the newest if several). With
  * onlyIfPending a verdict already decided is kept - the classifier's late answer must never override
- * a route the listing already settled (WindowOnly app, allowlist, forward outcome). TRUE if found. */
-TI_INLINE BOOL ThIpcSetVerdict(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, BOOL onlyIfPending)
+ * a route the listing already settled (WindowOnly app, allowlist, forward outcome). TRUE if found;
+ * *seqOut (optional) receives the record's sequence, found or not stored, so the caller can read the
+ * agent's mark on exactly that record later (ThIpcAgentState). */
+TI_INLINE BOOL ThIpcSetVerdictSeq(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, BOOL onlyIfPending, LONG* seqOut)
 {
     int i, best = -1;
     LONG bestSeq = 0;
     TH_IPC_RECORD* recs = ThIpcRecords(h);
+    if (seqOut) *seqOut = 0;
     for (i = 0; i < TH_IPC_RECORDS; i++)
     {
         LONG s = TI_LOAD32(&recs[i].Seq);
         if (s != 0 && recs[i].NotifId == notifId && (best < 0 || s > bestSeq)) { best = i; bestSeq = s; }
     }
     if (best < 0) return FALSE;
+    if (seqOut) *seqOut = bestSeq;
 #ifdef TOASTIDENT_DEFECT_VERDICTOVERRIDE
     (void)onlyIfPending;
 #else
@@ -459,6 +500,51 @@ TI_INLINE BOOL ThIpcSetVerdict(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, B
 #endif
     TI_STORE32(&recs[best].Verdict, verdict);
     return TRUE;
+}
+
+TI_INLINE BOOL ThIpcSetVerdict(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, BOOL onlyIfPending)
+{
+    return ThIpcSetVerdictSeq(h, notifId, verdict, onlyIfPending, (LONG*)0);
+}
+
+/* AGENT side, the store itself: "I map a banner for the record with sequence `seq`" into `slot`. This is the
+ * step that can race the bridge's republish of the slot (the agent found the slot a moment ago): what it
+ * stores is the SEQUENCE, so a store that lands on a republished slot carries a sequence that record does
+ * not have and reads as none. Exposed for the suites, which interleave it with a publish. */
+TI_INLINE void ThIpcAgentStoreShown(TH_IPC_HEADER* h, int slot, LONG seq)
+{
+#ifdef TOASTIDENT_DEFECT_MARK_BY_SLOT
+    (void)seq;
+    TI_STORE32(&ThIpcRecords(h)[slot].AgentShownSeq, 1);   /* DEFECT: a flag - lands on whatever toast the slot holds now */
+#else
+    TI_STORE32(&ThIpcRecords(h)[slot].AgentShownSeq, seq);
+#endif
+}
+
+/* AGENT side: mark the record with sequence `seq` as shown (nothing happens when the record is gone). */
+TI_INLINE void ThIpcAgentMarkShown(TH_IPC_HEADER* h, LONG seq)
+{
+    int i = ThIpcFindSeq(h, seq);
+    if (i >= 0) ThIpcAgentStoreShown(h, i, seq);
+}
+
+/* Bridge side: the agent's mark on the record with sequence `seq`: TH_AGENT_SHOWN only when the slot that
+ * holds `seq` carries a mark FOR `seq`; TH_AGENT_NONE when the record is gone (a gone record cannot have a
+ * banner the agent would map for it), when the mark names another sequence (a late store from the slot's
+ * previous toast), or when the slot was republished between the lookup and the load. */
+TI_INLINE LONG ThIpcAgentState(const TH_IPC_HEADER* h, LONG seq)
+{
+    int i = ThIpcFindSeq(h, seq);
+    LONG v;
+    if (i < 0) return TH_AGENT_NONE;
+    v = TI_LOAD32(&ThIpcRecordsC(h)[i].AgentShownSeq);
+    TI_BARRIER();
+    if (TI_LOAD32(&ThIpcRecordsC(h)[i].Seq) != seq) return TH_AGENT_NONE;
+#ifdef TOASTIDENT_DEFECT_MARK_BY_SLOT
+    return v != 0 ? TH_AGENT_SHOWN : TH_AGENT_NONE;   /* DEFECT: any mark in the slot counts */
+#else
+    return v == seq ? TH_AGENT_SHOWN : TH_AGENT_NONE;
+#endif
 }
 
 /* Reader (agent) side: a consistent copy of slot `index`, or FALSE for an empty/torn slot (retry on
@@ -478,6 +564,7 @@ TI_INLINE BOOL ThIpcRead(const TH_IPC_HEADER* h, int index, TH_IPC_RECORD* out)
     out->ArrivalTick = r->ArrivalTick;
     out->AumidHash = r->AumidHash;
     out->Ident = r->Ident;
+    out->AgentShownSeq = TI_LOAD32(&r->AgentShownSeq);
     out->Reserved = 0;
     v = TI_LOAD32(&r->Verdict);
     TI_BARRIER();

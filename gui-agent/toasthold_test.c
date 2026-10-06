@@ -59,6 +59,9 @@
  *                                      (slot 0) is taken for the earlier banner (#12; TestSelect)
  *   TOASTHOLD_DEFECT_RECLAIM_ANY       the own consumed record is re-claimable for ANY new in-place content: a
  *                                      new same-title toast inherits another toast's verdict (N5; TestReclaim)
+ *   TOASTIDENT_DEFECT_MARK_BY_SLOT     the agent's shown mark is a flag in the slot, not the sequence it marks: a
+ *                                      store racing the bridge's republish of the slot makes the NEW toast read as
+ *                                      shown, and its failed dom0 action goes unreported (ADR-toasts 11; TestRing)
  */
 
 #include "toasthold-core.h"
@@ -369,6 +372,30 @@ static void TestRing(void)
     for (i = 0; i < TH_IPC_RECORDS; i++) if (ThIpcRead(h, i, &r) && r.NotifId == 118) found = 1;
     Check("ring: the overwritten record 118 is gone", !found);
     Check("ring: the header's NextSeq is 33", TI_LOAD32(&h->NextSeq) == 33);
+
+    /* the one agent-written record field (ADR-toasts 11): the shown mark the glue stores when it maps a banner for
+     * a record that reads window, read back by the bridge after a failed dom0 action turned the record window. The
+     * mark is the record's SEQUENCE: the glue's store (find the slot, then store) races the bridge's republish of
+     * that slot, and a late store must not read as the next toast's banner shown (review 2026-10-07). */
+    {
+        LONG seq = 0, s4;
+        int slot;
+        ThIpcInit(h);
+        s4 = ThIpcPublish(h, 300, 0, 0x9, &id1, TH_VERDICT_FORWARDED, 7000);
+        Check("agent mark: a fresh record reads none", ThIpcRead(h, 0, &r) && r.AgentShownSeq == 0 && ThIpcAgentState(h, s4) == TH_AGENT_NONE);
+        Check("agent mark: the bridge's unconditional window turn hands back the record's sequence", ThIpcSetVerdictSeq(h, 300, TH_VERDICT_WINDOW, FALSE, &seq) && seq == s4);
+        ThIpcAgentMarkShown(h, s4);
+        Check("agent mark: stored as the sequence, read back for that sequence", ThIpcAgentState(h, s4) == TH_AGENT_SHOWN && ThIpcRead(h, 0, &r) && r.AgentShownSeq == s4);
+        ThIpcAgentMarkShown(h, s4 + 5);
+        Check("agent mark: a sequence not in the ring is not marked and reads none", ThIpcAgentState(h, s4 + 5) == TH_AGENT_NONE);
+        slot = ThIpcFindSeq(h, s4);
+        for (i = 0; i < TH_IPC_RECORDS; i++) s3 = ThIpcPublish(h, 400 + (UINT32)i, 0, 0, &id2, TH_VERDICT_PENDING, 8000);
+        Check("agent mark: the ring turned - the slot holds the new toast, the old record is gone", slot == 0 && ThIpcFindSeq(h, s4) < 0 && ThIpcFindSeq(h, s3) == slot);
+        ThIpcAgentStoreShown(h, slot, s4);   /* the RACE: the old toast's late store lands after the republish */
+        Check("agent mark: RACE - a late store of the old toast's mark does not read as the new toast's banner shown", ThIpcAgentState(h, s3) == TH_AGENT_NONE);
+        ThIpcAgentMarkShown(h, s3);
+        Check("agent mark: the new toast's own mark reads back", ThIpcAgentState(h, s3) == TH_AGENT_SHOWN);
+    }
 }
 
 /* ---- the state machine ------------------------------------------------------------------------ */
@@ -927,7 +954,8 @@ int main(void)
     defined(TOASTHOLD_DEFECT_NORECLAIM) || defined(TOASTHOLD_DEFECT_NOIDENT_IGNORES_BRIDGE) || \
     defined(TOASTHOLD_DEFECT_NOFORWARDBOUND) || defined(TOASTHOLD_DEFECT_NOCARD_UNPACED) || \
     defined(TOASTHOLD_DEFECT_SIZE60) || defined(TOASTHOLD_DEFECT_DEADRECORDS) || defined(TOASTHOLD_DEFECT_NOBACKOFF) || \
-    defined(TOASTIDENT_DEFECT_TIE_SLOTORDER) || defined(TOASTHOLD_DEFECT_RECLAIM_ANY)
+    defined(TOASTIDENT_DEFECT_TIE_SLOTORDER) || defined(TOASTHOLD_DEFECT_RECLAIM_ANY) || \
+    defined(TOASTIDENT_DEFECT_MARK_BY_SLOT)
     printf("DEFECT BUILD: a TOASTIDENT_/TOASTHOLD_DEFECT_* switch is compiled in - this run MUST fail\n");
 #endif
     TestNormalization();
