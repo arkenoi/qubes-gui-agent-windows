@@ -335,7 +335,9 @@ TI_INLINE int TiSelect(const TI_CANDIDATE* c, int n, const TOAST_IDENT* seen, TI
 
 /* --- THE SHARED RING: bridge -> agent, per-notification records ----------------------------- */
 /* The agent creates the section (SYSTEM full; interactive user R/W) and the auto-reset VERDICT event
- * (IU: SYNCHRONIZE|MODIFY_STATE), hands both names to the bridge on its command line (--hold, --verdict),
+ * (IU: SYNCHRONIZE|MODIFY_STATE), tells the bridge they exist with a bare --hold on its command line (the bridge
+ * derives both names from its --alive name: one nonce'd prefix, suffixes _hold and _verdict - two more names put
+ * the task's /tr over Task Scheduler's 261 characters),
  * and keeps the event in its main loop's wait array. The bridge writes a record when it lists a new
  * toast (verdict pending, or final at once) and updates the verdict in place when it is decided; every
  * write ends with SetEvent. Nothing polls: the agent re-examines a held banner when the event fires,

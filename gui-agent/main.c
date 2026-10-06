@@ -3559,6 +3559,15 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs)
     else
         StringCchPrintf(tr, RTL_NUMBER_OF(tr), L"%s %s", shortExe, exeArgs);
 
+    // Task Scheduler refuses a /tr longer than 261 characters (schtasks /create fails); say so instead of a bare failure.
+    if (wcslen(tr) > 261)
+    {
+        LogError("NOTIFBRIDGE the task command line is %u characters, over Task Scheduler's 261 - %s cannot be launched (%s)",
+            (unsigned)wcslen(tr), taskName, tr);
+        WTSFreeMemory(user);
+        return FALSE;
+    }
+
     WCHAR args[2048];
     StringCchPrintf(args, RTL_NUMBER_OF(args), L"/delete /tn %s /f", taskName);
     WgcRunSchtasks(args);
@@ -3579,17 +3588,16 @@ static BOOL NotifBridgeLaunch(void)
     // --notify-errors: the resolved secondary-error-route gate, so the bridge can report its own
     // ACTION faults (listener access denied) without reading the gate itself (notifyerr.h).
     // --alive / --ready: the liveness mutex it waits on and the event it sets once its pid is published (S4c).
-    // --hold / --verdict: the toast-hold records section it writes and the event it signals after each write
-    // (toastident.h); absent when the section could not be created - the bridge then publishes nothing.
+    // --hold: the toast-hold records section it writes and the event it signals after each write (toastident.h), both
+    // named from the --alive prefix; absent when the section could not be created - the bridge then publishes nothing.
     StringCchPrintf(args, RTL_NUMBER_OF(args), L"--bridge --agent-pid %lu --notify-errors %d --alive %s --ready %s",
                     GetCurrentProcessId(), g_NotifyErrors ? 1 : 0, g_NotifAliveName, g_NotifReadyName);
+    // A BARE --hold: the bridge derives the section and the event from the --alive name (all four share the nonce'd
+    // prefix). Passing the two names made the task's /tr up to 303 characters, over Task Scheduler's 261, and the bridge
+    // never started (2026-10-06, toast-hold candidate: "NOTIFBRIDGE schtasks /create failed" every minute; on the guest
+    // schtasks answered "Value for '/tr' option cannot be more than 261 character(s)" at 262 and took 261; this form is 198).
     if (g_NotifHoldBase && g_NotifVerdictEvt)
-    {
-        StringCchCat(args, RTL_NUMBER_OF(args), L" --hold ");
-        StringCchCat(args, RTL_NUMBER_OF(args), g_NotifHoldName);
-        StringCchCat(args, RTL_NUMBER_OF(args), L" --verdict ");
-        StringCchCat(args, RTL_NUMBER_OF(args), g_NotifVerdictName);
-    }
+        StringCchCat(args, RTL_NUMBER_OF(args), L" --hold");
     return NotifRunInSession(NOTIF_TASK_NAME, args);
 }
 
