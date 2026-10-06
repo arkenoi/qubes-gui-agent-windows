@@ -6609,6 +6609,22 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
 
     if (!seamlessMode)
     {
+        // TELL DOM0 THE SIZE BEFORE THE MAP. dom0 still holds window 0 at the size it was last told - on the first switch
+        // after the agent started that is the CREATE size, the host-sized screen - and the entry guard above has just shrunk
+        // the desktop. Mapped at that stale size, dom0's window manager fits the window into its work area and reports the
+        // clamp back as a CONFIGURE, which HandleConfigure honours as dom0 sizing the qube: the guest desktop was resized to
+        // 5120x1384, covering the screen (measured 2026-10-06, toast test S5: shrink to 1280x800 at 23:10:27, MAP at 23:10:28,
+        // the 1280x800 CONFIGURE only at 23:10:29, then RESREQ 5120x1384). Before 2026-09-25 the entry replugged capture, and
+        // the restart announced window 0 at the new size before the map; the in-place grant (255e7aa) dropped that. The
+        // user maximizing the window afterwards stays the one way to fill the screen, and is still honoured.
+        if (g_ScreenWidth > 0 && g_ScreenHeight > 0)
+        {
+            ULONG cs = SendWindowConfigure(NULL, g_ScreenWinX, g_ScreenWinY, g_ScreenWidth, g_ScreenHeight, FALSE);
+            if (cs == ERROR_SUCCESS)
+                LogInfo("QGAFSFLASH window 0 announced at %ux%u before the map", g_ScreenWidth, g_ScreenHeight);
+            else
+                win_perror2(cs, "SendWindowConfigure (screen, before the non-seamless map)");
+        }
         // show the screen window
         status = SendWindowMap(NULL);
         if (ERROR_SUCCESS != status)
