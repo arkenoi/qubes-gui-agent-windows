@@ -35,6 +35,8 @@
 
 #ifdef QERR_AGENT_LAYER
 #include <windows.h>
+#include <sddl.h>      /* ConvertStringSecurityDescriptorToSecurityDescriptor (the state dir's DACL) */
+#include <aclapi.h>    /* SetNamedSecurityInfo */
 #include <strsafe.h>
 #include <log.h>
 #else
@@ -56,6 +58,7 @@ static char g_QerrStateDir[512] = { 0 };
 static void      PlatLog(const char* fmt, ...);
 static long long PlatBootStamp(void);
 static int       PlatEnsureDir(const char* dir);
+static int       PlatPrepareStateDir(const char* dir);                    /* create + the DACL (QERR_STATE_DIR_SDDL); 1 = ready */
 static int       PlatReadSmall(const char* path, char* buf, size_t cap);   /* 1 = read, 0 = absent/failed */
 static int       PlatWriteSmall(const char* path, const char* text);      /* 1 = written */
 static int       PlatWriteNotifyFile(const char* path, const char* utf8); /* UTF-16LE + BOM */
@@ -69,6 +72,7 @@ int  (*QerrTestSpawnHook)(const char* notifyPath) = NULL;   /* NULL = "notifhost
 void (*QerrTestLogHook)(const char* line) = NULL;
 long long QerrTestBootStamp = 0;                              /* 0 = wall clock (the suite always pins it) */
 unsigned long QerrTestPid = 4242;                             /* the pid the technical line shows under test */
+int QerrTestBootStampCalls = 0;                               /* how often the token was established (QerrInit must, once, at start) */
 #endif
 
 /* --- API ---------------------------------------------------------------------------------- */
@@ -83,6 +87,24 @@ void QerrInit(int gateOn, const char* stateDirUtf8)
     PlatLog("NOTIFYERR gate: enabled=%d state=%s (secondary route: dom0 notification via "
             "notifhost/qubes.Notifications; needs qrexec-agent; the log stays primary)",
             g_QerrGate, g_QerrStateDir);
+    /* The shared state is prepared HERE, at start, by the one writer that can (findings/issues.md P3):
+     * the per-boot token is minted now - the toast bridge runs as the interactive user and can only READ
+     * the volatile HKLM key - and the state directory is created with the DACL that lets that user write
+     * its markers and .count (QERR_STATE_DIR_SDDL). Gate on or off: a dom0-gated route still shares its
+     * state with the scripts, and the bridge decides its own gate from the agent's command line. */
+    {
+        int dirOk = PlatPrepareStateDir(g_QerrStateDir);
+#ifdef NOTIFYERR_DEFECT_LAZYMINT
+        long long tok = 1;   /* DEFECT (tools/tests/notifyerr-selftest.sh only): the token is minted lazily, at the first report */
+#else
+        long long tok = PlatBootStamp();
+#endif
+        PlatLog("NOTIFYERR shared state at start: per-boot token %s; state dir %s",
+                tok ? "established (the bridge reads it read-only)"
+                    : "NOT ESTABLISHED - every report on this boot fails loudly (see QGANOTIFYERR)",
+                dirOk ? "created with the interactive-user write grant"
+                      : "NOT prepared - the bridge's own reports will fail ('state dir not writable')");
+    }
 }
 
 /* Once-per-process failure logging. Under NOTIFYERR_DEFECT_FAILOPEN every call logs, which is
@@ -315,6 +337,32 @@ static int PlatEnsureDir(const char* dir)
     return CreateDirectoryA(dir, NULL) || GetLastError() == ERROR_ALREADY_EXISTS;
 }
 
+/* Create the state directory and set QERR_STATE_DIR_SDDL on it. SetNamedSecurityInfo with the DACL's
+ * inheritable ACEs re-propagates them to the children that already exist, so a .count or a marker an
+ * older version's SYSTEM process created becomes writable for the interactive user as well; the
+ * protected flag detaches the directory from ProgramData's own inheritance (which is what made those
+ * files user-read-only in the first place). Runs as SYSTEM at the agent's start; never as the user. */
+static int PlatPrepareStateDir(const char* dir)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    PACL dacl = NULL;
+    BOOL present = FALSE, defaulted = FALSE;
+    DWORD rc;
+    if (!PlatEnsureDir(dir)) return 0;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptorA(QERR_STATE_DIR_SDDL, SDDL_REVISION_1, &sd, NULL) || !sd)
+        return 0;
+    if (!GetSecurityDescriptorDacl(sd, &present, &dacl, &defaulted) || !present || !dacl)
+    {
+        LocalFree(sd);
+        return 0;
+    }
+    rc = SetNamedSecurityInfoA((LPSTR)dir, SE_FILE_OBJECT,
+                               DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                               NULL, NULL, dacl, NULL);
+    LocalFree(sd);
+    return rc == ERROR_SUCCESS;
+}
+
 static int PlatReadSmall(const char* path, char* buf, size_t cap)
 {
     HANDLE h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
@@ -393,6 +441,7 @@ static long long PlatBootStamp(void)
      * value for the life of the process: tokens now compare EXACTLY, and a bare time(NULL) read
      * twice would look like two different boots a second apart. */
     static long long s_token = 0;
+    QerrTestBootStampCalls++;
     if (QerrTestBootStamp) return QerrTestBootStamp;
     if (!s_token) s_token = (long long)time(NULL);
     return s_token;
@@ -412,6 +461,11 @@ static int PlatEnsureDir(const char* dir)
 {
     if (QerrMkdir(dir) == 0 || errno == EEXIST) return 1;
     return 0;
+}
+
+static int PlatPrepareStateDir(const char* dir)
+{
+    return PlatEnsureDir(dir);   /* no ACLs in plain C; the DACL's text is checked by the suite (QerrSddlIsSafe) */
 }
 
 static int PlatReadSmall(const char* path, char* buf, size_t cap)

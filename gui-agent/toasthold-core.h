@@ -59,6 +59,9 @@
  *                                          pre-empting: a toast nobody will forward stays suppressed (a LOSS)
  *   TOASTHOLD_DEFECT_NOBACKOFF             a refused identity request is retried without back-off (a spin on a
  *                                          full worker queue)
+ *   TOASTHOLD_DEFECT_RECLAIM_ANY           the own consumed record is re-claimable for ANY new content in the
+ *                                          window, not only for a reading that completes the old one: a new
+ *                                          same-title toast inherits another toast's verdict (review N5)
  */
 #ifndef QWT_TOASTHOLD_CORE_H
 #define QWT_TOASTHOLD_CORE_H
@@ -208,8 +211,32 @@ TI_INLINE void ThConsumedRemove(TH_CONSUMED* c, LONG seq)
     for (i = 0; i < TH_CONSUMED_SLOTS; i++) if (c->Seq[i] == seq) c->Seq[i] = 0;
 }
 
+/* Does the NEW reading of a banner merely COMPLETE the OLD one - the same sender and title, and the old
+ * message empty or a prefix of the new one under the shared normalization? Then the banner may re-claim
+ * the record it consumed on the old reading (a half-built card on the first read). Anything else is NEW
+ * content swapped into the window: a different toast, which must match its own record or fail open -
+ * inheriting the old record's verdict would route it on another toast's answer (review N5). */
+TI_INLINE int ThCoreReadingExtends(const TOAST_IDENT* oldId, const WCHAR* oldMsg, size_t oldLen,
+                                   const TOAST_IDENT* newId, const WCHAR* newMsg, size_t newLen)
+{
+#ifdef TOASTHOLD_DEFECT_RECLAIM_ANY
+    (void)oldId; (void)oldMsg; (void)oldLen; (void)newId; (void)newMsg; (void)newLen;
+    return 1;   /* DEFECT: the own record is re-claimable for ANY new content */
+#else
+    size_t i;
+    if (!oldId || !newId) return 0;
+    if (oldId->Sender != newId->Sender) return 0;
+    if (oldId->Title == 0 || oldId->Title != newId->Title) return 0;
+    if (oldLen == 0) return 1;
+    if (!oldMsg || !newMsg || newLen < oldLen) return 0;
+    for (i = 0; i < oldLen; i++) if (oldMsg[i] != newMsg[i]) return 0;
+    return 1;
+#endif
+}
+
 /* The candidate set for one banner from a snapshot of the ring: unconsumed records within their TTL -
- * plus the record THIS banner already consumed (`ownSeq`), so content that merely COMPLETES (a first
+ * plus the record THIS banner already consumed (`ownSeq`; the glue passes 0 unless the new reading
+ * EXTENDS the one that claimed it, ThCoreReadingExtends), so content that merely COMPLETES (a first
  * read of a half-built card took the unique partial match; the full read changes the identity) can
  * re-claim it instead of finding "no record" and failing open at the bound (review #5). A record some
  * OTHER banner consumed is never a candidate: it was shown or suppressed already. */

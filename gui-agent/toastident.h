@@ -53,6 +53,9 @@
  *                                 notification desyncs
  *   TOASTIDENT_DEFECT_VERDICTOVERRIDE - ThIpcSetVerdict ignores onlyIfPending: the classifier's
  *                                 late verdict overrides a WindowOnly/allowlist/forward-decided route
+ *   TOASTIDENT_DEFECT_TIE_SLOTORDER - equal arrival ticks are broken by ring slot instead of by
+ *                                 sequence: across a ring wrap the newer record (slot 0) is taken
+ *                                 for the earlier banner (review #12)
  *
  * VERDICT LIFECYCLE the bridge drives: PENDING at listing (or WINDOW/BRIDGE when the listing already
  * settles it: window-only app, allowlisted app over a live connection); the classifier's answer only
@@ -279,11 +282,23 @@ typedef struct _TI_CANDIDATE
     int         Eligible;      /* unconsumed, within its TTL - decided by the caller */
 } TI_CANDIDATE;
 
+/* Is candidate `a` EARLIER than candidate `b`? By arrival tick; equal ticks (several toasts listed in
+ * one bridge pass carry the same tick) by publish SEQUENCE - never by ring slot, which reorders across
+ * a wrap (slot 0 holds the newest record once the ring has turned; review #12). */
+TI_INLINE int TiEarlier(const TI_CANDIDATE* a, const TI_CANDIDATE* b)
+{
+#ifdef TOASTIDENT_DEFECT_TIE_SLOTORDER
+    return a->ArrivalTick < b->ArrivalTick;   /* DEFECT: ties fall to whichever slot the scan met first */
+#else
+    return a->ArrivalTick < b->ArrivalTick || (a->ArrivalTick == b->ArrivalTick && a->Seq < b->Seq);
+#endif
+}
+
 /* Picks the record a displayed banner belongs to. FULL matches win; among several, the EARLIEST
- * arrival (the shell shows banners FIFO, so identical toasts resolve in order). A PARTIAL match is
- * accepted only when it is the ONLY candidate carrying that sender+title - with two of them the
- * message is the only discriminator and it disagreed, so nothing is claimed (the caller fails open
- * and logs it). Returns the index or -1; *quality says which kind matched. */
+ * (TiEarlier: arrival, then sequence - the shell shows banners FIFO, so identical toasts resolve in
+ * order). A PARTIAL match is accepted only when it is the ONLY candidate carrying that sender+title -
+ * with two of them the message is the only discriminator and it disagreed, so nothing is claimed (the
+ * caller fails open and logs it). Returns the index or -1; *quality says which kind matched. */
 TI_INLINE int TiSelect(const TI_CANDIDATE* c, int n, const TOAST_IDENT* seen, TI_MATCH* quality)
 {
     int best = -1, partial = -1, partials = 0, i;
@@ -291,7 +306,7 @@ TI_INLINE int TiSelect(const TI_CANDIDATE* c, int n, const TOAST_IDENT* seen, TI
 #ifdef TOASTIDENT_DEFECT_ORDERONLY
     /* DEFECT: arrival order alone - the oldest eligible record, whatever it says. */
     for (i = 0; i < n; i++)
-        if (c[i].Eligible && (best < 0 || c[i].ArrivalTick < c[best].ArrivalTick)) best = i;
+        if (c[i].Eligible && (best < 0 || TiEarlier(&c[i], &c[best]))) best = i;
     if (quality) *quality = best >= 0 ? TiMatchFull : TiMatchNone;
     (void)seen; (void)partial; (void)partials; (void)q;
     return best;
@@ -303,13 +318,13 @@ TI_INLINE int TiSelect(const TI_CANDIDATE* c, int n, const TOAST_IDENT* seen, TI
         m = TiMatch(&c[i].Ident, seen);
         if (m == TiMatchFull)
         {
-            if (best < 0 || c[i].ArrivalTick < c[best].ArrivalTick) best = i;
+            if (best < 0 || TiEarlier(&c[i], &c[best])) best = i;
             q = TiMatchFull;
         }
         else if (m == TiMatchPartial)
         {
             partials++;
-            if (partial < 0 || c[i].ArrivalTick < c[partial].ArrivalTick) partial = i;
+            if (partial < 0 || TiEarlier(&c[i], &c[partial])) partial = i;
         }
     }
     if (best < 0 && partials == 1) { best = partial; q = TiMatchPartial; }

@@ -62,6 +62,13 @@ typedef struct _TH_ENTRY
     ULONGLONG LastReadReq;    // tick of the last request (0 = never)
     BOOL      IdentValid;     // some completed read yielded a title (the LAST such reading is in Ident)
     TOAST_IDENT Ident;
+    WCHAR     MsgNorm[TI_NORM_MAX];   // the latest reading's NORMALIZED message (for ThCoreReadingExtends)
+    size_t    MsgLen;
+    // The reading that CLAIMED Core.RecordSeq: only a later reading that merely completes it (same sender and
+    // title, message extended) may re-claim that record; different content is a new toast (review N5).
+    TOAST_IDENT ClaimIdent;
+    WCHAR     ClaimMsgNorm[TI_NORM_MAX];
+    size_t    ClaimMsgLen;
     int       ReadStatus;     // TH_READ_* of the last completed read
     UINT      ReadsWithoutTitle;
     UINT      ReadFails;      // consecutive completed reads that FAILED (any status but OK); bounds the decided-entry retry
@@ -336,10 +343,16 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         }
         else if (in.IdentKnown && (e->Core.RecordSeq == 0 || !sameContent))
         {
-            // A new match for this reading. The entry's own consumed record stays a candidate (re-claim:
-            // the identity may merely have completed - review #5); other banners' records never are.
+            // A new match for this reading. The entry's own consumed record stays a candidate ONLY when this
+            // reading merely completes the one that claimed it (same sender and title, message extended -
+            // a half-built card on the first read, review #5); different content in the same window is a
+            // new toast and must find its own record or fail open (review N5). Other banners' records never
+            // are candidates.
             TI_CANDIDATE cand[TH_IPC_RECORDS];
-            const int n = ThCoreCandidates(recs, nrec, &g_ThCons, e->Core.RecordSeq, now, cand);
+            const LONG ownSeq = (e->Core.RecordSeq != 0 &&
+                                 ThCoreReadingExtends(&e->ClaimIdent, e->ClaimMsgNorm, e->ClaimMsgLen,
+                                                      &e->Ident, e->MsgNorm, e->MsgLen)) ? e->Core.RecordSeq : 0;
+            const int n = ThCoreCandidates(recs, nrec, &g_ThCons, ownSeq, now, cand);
             const int pick = TiSelect(cand, n, &e->Ident, &quality);
             if (pick >= 0)
             {
@@ -347,6 +360,10 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
                 in.MatchVerdict = ThCoreDeadVerdict(recs[pick].Seq, recs[pick].Verdict, deadSeq);
                 ThConsumedAdd(&g_ThCons, recs[pick].Seq);
                 logPartial = (quality == TiMatchPartial);
+                // The reading this record is claimed on: the yardstick for a later re-claim.
+                e->ClaimIdent = e->Ident;
+                e->ClaimMsgLen = e->MsgLen;
+                memcpy(e->ClaimMsgNorm, e->MsgNorm, e->MsgLen * sizeof(WCHAR));
             }
         }
     }
@@ -648,8 +665,13 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
     case ToastCardNoTitle: status = TH_READ_NOTITLE; break;
     default:               status = TH_READ_UIAFAIL; break;
     }
+    WCHAR msgNorm[TI_NORM_MAX];
+    size_t msgLen = 0;
     if (status == TH_READ_OK && texts)
+    {
         TiIdentFromTexts(texts->Sender, texts->Title, texts->Message, &ident);   // the same normalization the bridge applies
+        msgLen = TiNormalize(texts->Message, msgNorm, TI_NORM_MAX);             // kept in clear for the re-claim rule only
+    }
     else if (status == TH_READ_OK)
         status = TH_READ_UIAFAIL;
     const ULONGLONG now = GetTickCount64();
@@ -675,6 +697,8 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
         changed = (before != after);
         e->Ident = ident;
         e->IdentValid = TRUE;
+        e->MsgLen = msgLen;
+        memcpy(e->MsgNorm, msgNorm, msgLen * sizeof(WCHAR));
         e->ReadsWithoutTitle = 0;
         e->ReadFails = 0;
         e->NoCardReads = 0;

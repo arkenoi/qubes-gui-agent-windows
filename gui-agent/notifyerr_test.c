@@ -46,6 +46,7 @@
 extern int  (*QerrTestSpawnHook)(const char* notifyPath);
 extern void (*QerrTestLogHook)(const char* line);
 extern long long QerrTestBootStamp;
+extern int QerrTestBootStampCalls;
 extern unsigned long QerrTestPid;
 
 static unsigned g_run = 0, g_fail = 0;
@@ -123,7 +124,8 @@ int main(void)
     const long long BOOT = 1757400000LL;   /* any fixed per-boot token; only equality matters */
 #if defined(NOTIFYERR_DEFECT_SEVERITY) || defined(NOTIFYERR_DEFECT_RATELIMIT) || \
     defined(NOTIFYERR_DEFECT_CAP) || defined(NOTIFYERR_DEFECT_REDACT) || \
-    defined(NOTIFYERR_DEFECT_FAILOPEN) || defined(NOTIFYERR_DEFECT_CLOSEREBOOT)
+    defined(NOTIFYERR_DEFECT_FAILOPEN) || defined(NOTIFYERR_DEFECT_CLOSEREBOOT) || \
+    defined(NOTIFYERR_DEFECT_LAZYMINT) || defined(NOTIFYERR_DEFECT_ACL_EVERYONE)
     const int defectBuild = 1;
     printf("NOTE: a NOTIFYERR_DEFECT_* switch is compiled in - this suite MUST fail now.\n");
 #else
@@ -390,6 +392,32 @@ int main(void)
         (void)QerrReport("gui-agent", "g", QERR_SEV_ACTION, "x", "y", NULL, "z");
         Check("fail-open: unwritable store spawned nothing", g_spawned == 0);
         Check("fail-open: unwritable store logged ONCE", LogCount("not writable") == 1);
+    }
+
+    /* ---- 7. the shared state is SYSTEM's to prepare, at START (findings/issues.md P3) --------- */
+    /* The toast bridge runs as the interactive user: it can only READ the per-boot token and can only write
+     * files under a directory that grants it. So QerrInit (the agent, SYSTEM) must establish the token and
+     * create the directory with that grant BEFORE any report - not lazily at the first report. */
+    {
+        char fresh[600];
+        struct stat st;
+        ResetStore();
+        snprintf(fresh, sizeof(fresh), "%s/fresh-at-start", g_dir);
+        QerrTestBootStampCalls = 0;
+        QerrInit(1, fresh);
+        Check("start: QerrInit establishes the per-boot token before any report (LAZYMINT: it does not)", QerrTestBootStampCalls >= 1);
+        Check("start: QerrInit creates the state directory before any report", stat(fresh, &st) == 0);
+        Check("acl: the state dir DACL is protected, grants the INTERACTIVE user, nobody else, never full control (ACL_EVERYONE: Everyone, full)",
+              QerrSddlIsSafe(QERR_STATE_DIR_SDDL));
+        Check("acl: directory grant = read/write/traverse, inherits to subcontainers, no delete of the directory",
+              strstr(QERR_STATE_DIR_SDDL, "(A;CI;FRFWFX;;;IU)") != NULL);
+        Check("acl: file grant (inherit-only, object inherit) = read/write/delete",
+              strstr(QERR_STATE_DIR_SDDL, "(A;OIIO;FRFWSD;;;IU)") != NULL);
+        Check("acl: SYSTEM and Administrators keep full control", strstr(QERR_STATE_DIR_SDDL, "(A;OICI;FA;;;SY)") && strstr(QERR_STATE_DIR_SDDL, "(A;OICI;FA;;;BA)"));
+        Check("acl: the checker refuses an Everyone grant", !QerrSddlIsSafe("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;WD)(A;CI;FRFWFX;;;IU)"));
+        Check("acl: the checker refuses full control for the interactive user", !QerrSddlIsSafe("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;IU)"));
+        Check("acl: the checker refuses an unprotected DACL (ProgramData's inheritance would return)", !QerrSddlIsSafe("D:(A;OICI;FA;;;SY)(A;CI;FRFWFX;;;IU)"));
+        Check("acl: the checker refuses a DACL without the interactive user", !QerrSddlIsSafe("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)"));
     }
 
     printf("--- %u checks, %u failed%s\n", g_run, g_fail, defectBuild ? " (defect build: failure expected)" : "");

@@ -55,6 +55,10 @@
  *                                      screens or 125 %+ DPI (N3; TestPureRules)
  *   TOASTHOLD_DEFECT_DEADRECORDS       a dead bridge's records stay authoritative / keep pre-empting (N6)
  *   TOASTHOLD_DEFECT_NOBACKOFF         a refused identity request is retried without back-off (N7)
+ *   TOASTIDENT_DEFECT_TIE_SLOTORDER    equal arrival ticks broken by ring slot: across a wrap the newer record
+ *                                      (slot 0) is taken for the earlier banner (#12; TestSelect)
+ *   TOASTHOLD_DEFECT_RECLAIM_ANY       the own consumed record is re-claimable for ANY new in-place content: a
+ *                                      new same-title toast inherits another toast's verdict (N5; TestReclaim)
  */
 
 #include "toasthold-core.h"
@@ -271,6 +275,37 @@ static void TestSelect(void)
     Cand(&c[0], "Other", "Else", "x", 100, 7, 1);
     i = TiSelect(c, 1, &seen, &q);
     Check("select: an unrelated record is never taken", i == -1);
+
+    /* #12: equal arrival ticks (one listing pass) are broken by SEQUENCE, not by slot - across a ring wrap
+     * the slot order is the reverse of the sequence order. Build it the way the glue does: ThIpcRead over
+     * the wrapped ring, slot by slot. */
+    {
+        unsigned char block[TH_IPC_BYTES];
+        TH_IPC_HEADER* h = (TH_IPC_HEADER*)block;
+        TH_IPC_RECORD recs[TH_IPC_RECORDS];
+        TI_CANDIDATE cand[TH_IPC_RECORDS];
+        TH_CONSUMED cons;
+        TOAST_IDENT same, filler;
+        int n = 0, k, pick;
+        memset(&cons, 0, sizeof(cons));
+        ThIpcInit(h);
+        TiIdentFromTexts(W("Dl"), W("Download complete"), W("file.zip"), &same);
+        TiIdentFromTexts(W("X"), W("unrelated"), W("y"), &filler);
+        for (k = 0; k < TH_IPC_RECORDS - 1; k++) ThIpcPublish(h, 500 + (UINT32)k, 0, 0, &filler, TH_VERDICT_WINDOW, 1000);   /* seq 1..31 */
+        ThIpcPublish(h, 601, 0, 0, &same, TH_VERDICT_WINDOW, 7000);   /* seq 32 -> slot 31: the EARLIER identical toast */
+        ThIpcPublish(h, 602, 0, 0, &same, TH_VERDICT_BRIDGE, 7000);   /* seq 33 -> slot 0 (wrap): the LATER one, same tick */
+        for (k = 0; k < TH_IPC_RECORDS; k++) if (ThIpcRead(h, k, &recs[n])) n++;
+        Check("select: (setup) the wrap put seq 33 into slot 0 and seq 32 into slot 31", recs[0].Seq == 33 && recs[n - 1].Seq == 32);
+        ThCoreCandidates(recs, n, &cons, 0, 7100, cand);
+        pick = TiSelect(cand, n, &same, &q);
+        Check("select: equal ticks across a ring wrap -> the EARLIER sequence (32) wins, whatever slot it sits in", pick >= 0 && cand[pick].Seq == 32 && recs[pick].NotifId == 601);
+        ThConsumedAdd(&cons, 32);
+        ThCoreCandidates(recs, n, &cons, 0, 7100, cand);
+        pick = TiSelect(cand, n, &same, &q);
+        Check("select: ...and the next banner takes seq 33", pick >= 0 && cand[pick].Seq == 33);
+        Check("select: TiEarlier - same tick, lower seq is earlier; lower tick wins regardless of seq",
+              TiEarlier(&cand[n - 1], &cand[0]) && !TiEarlier(&cand[0], &cand[n - 1]) && TiEarlier(&cand[1], &cand[0]));
+    }
 }
 
 /* ---- the shared ring -------------------------------------------------------------------------- */
@@ -646,14 +681,59 @@ static void TestReclaim(void)
     pick = TiSelect(cand, n, &fullRead, &q);
     Check("reclaim: another banner cannot take a record this one consumed", pick == -1);
 
-    /* a different toast with the same title, whose OWN record exists, wins over re-claiming the old one */
-    TiIdentFromTexts(W("Mail"), W("New message"), W("From Bob about lunch"), &other);
-    ThIpcPublish(h, 301, 0, 0, &other, TH_VERDICT_WINDOW, now - 100);
-    n = 0;
-    for (i = 0; i < TH_IPC_RECORDS; i++) if (ThIpcRead(h, i, &recs[n])) n++;
-    ThCoreCandidates(recs, n, &cons, recs[0].Seq, now + 300, cand);
-    pick = TiSelect(cand, n, &other, &q);
-    Check("reclaim: a genuinely different same-title toast takes its OWN record (FULL beats the re-claimable partial)", pick == 1 && q == TiMatchFull && recs[1].NotifId == 301);
+    /* N5: the re-claim is offered ONLY to a reading that COMPLETES the claiming one (same sender+title, old
+     * message empty or a prefix of the new one). Different content swapped into the window is a new toast. */
+    {
+        WCHAR oldMsg[TI_NORM_MAX], newMsg[TI_NORM_MAX];
+        size_t oldLen, newLen;
+        TOAST_IDENT alice, aliceLong, bob;
+        TiIdentFromTexts(W("Mail"), W("New message"), W("From Alice"), &alice);
+        oldLen = TiNormalize(W("From Alice"), oldMsg, TI_NORM_MAX);
+        TiIdentFromTexts(W("Mail"), W("New message"), W("From Alice about the agenda"), &aliceLong);
+        newLen = TiNormalize(W("From Alice about the agenda"), newMsg, TI_NORM_MAX);
+        Check("extends: empty old message -> completes", ThCoreReadingExtends(&firstRead, NULL, 0, &fullRead, newMsg, newLen));
+        Check("extends: old message a prefix of the new one -> completes", ThCoreReadingExtends(&alice, oldMsg, oldLen, &aliceLong, newMsg, newLen));
+        TiIdentFromTexts(W("Mail"), W("New message"), W("From Bob about lunch"), &bob);
+        newLen = TiNormalize(W("From Bob about lunch"), newMsg, TI_NORM_MAX);
+        Check("extends: same sender+title, a DIFFERENT non-extending message -> new content, no re-claim", !ThCoreReadingExtends(&alice, oldMsg, oldLen, &bob, newMsg, newLen));
+        Check("extends: a shorter message is not an extension", !ThCoreReadingExtends(&aliceLong, newMsg, newLen, &alice, oldMsg, oldLen) || newLen <= oldLen);
+        TiIdentFromTexts(W("Chat"), W("New message"), W("From Alice about the agenda"), &bob);
+        newLen = TiNormalize(W("From Alice about the agenda"), newMsg, TI_NORM_MAX);
+        Check("extends: another sender never completes", !ThCoreReadingExtends(&alice, oldMsg, oldLen, &bob, newMsg, newLen));
+        TiIdentFromTexts(W("Mail"), W("Reminder"), W("From Alice about the agenda"), &bob);
+        Check("extends: another title never completes", !ThCoreReadingExtends(&alice, oldMsg, oldLen, &bob, newMsg, newLen));
+
+        /* THE DEFECT SCENARIO: reading A claimed R (bridge); new in-place content B with the same sender+title
+         * but a different message, B's own record not yet published. The glue passes ownSeq=0 (not an
+         * extension), so R is not a candidate: no match -> held, fail-open at the bound - never R's verdict. */
+        memset(&cons, 0, sizeof(cons));
+        ThIpcInit(h);
+        TiIdentFromTexts(W("Mail"), W("New message"), W("From Alice about the agenda"), &rec);
+        ThIpcPublish(h, 310, 0, 0, &rec, TH_VERDICT_BRIDGE, now - 900);
+        n = 0;
+        for (i = 0; i < TH_IPC_RECORDS; i++) if (ThIpcRead(h, i, &recs[n])) n++;
+        oldLen = TiNormalize(W("From Alice about the agenda"), oldMsg, TI_NORM_MAX);
+        ThCoreCandidates(recs, n, &cons, 0, now, cand);
+        pick = TiSelect(cand, n, &rec, &q);
+        Check("N5: (setup) reading A claims its record", pick == 0);
+        ThConsumedAdd(&cons, recs[0].Seq);
+        TiIdentFromTexts(W("Mail"), W("New message"), W("From Bob about lunch"), &bob);
+        newLen = TiNormalize(W("From Bob about lunch"), newMsg, TI_NORM_MAX);
+        {
+            const LONG ownSeq = ThCoreReadingExtends(&rec, oldMsg, oldLen, &bob, newMsg, newLen) ? recs[0].Seq : 0;
+            ThCoreCandidates(recs, n, &cons, ownSeq, now + 500, cand);
+            pick = TiSelect(cand, n, &bob, &q);
+            Check("N5: new same-title content without its own record does NOT inherit the old record's verdict (no match)", pick == -1);
+        }
+        /* and once B's own record is published it is taken, FULL */
+        ThIpcPublish(h, 311, 0, 0, &bob, TH_VERDICT_WINDOW, now - 100);
+        n = 0;
+        for (i = 0; i < TH_IPC_RECORDS; i++) if (ThIpcRead(h, i, &recs[n])) n++;
+        ThCoreCandidates(recs, n, &cons, 0, now + 600, cand);
+        pick = TiSelect(cand, n, &bob, &q);
+        Check("N5: B's own record, once published, is taken FULL", pick == 1 && q == TiMatchFull && recs[1].NotifId == 311);
+        (void)other;
+    }
 
     /* the core: a hold reserved on seq 1 whose reading changes to the same record does NOT release it */
     {
@@ -846,7 +926,8 @@ int main(void)
     defined(TOASTHOLD_DEFECT_PREEMPT_IDENTGATE) || defined(TOASTHOLD_DEFECT_SUPPRESS_FINAL) || \
     defined(TOASTHOLD_DEFECT_NORECLAIM) || defined(TOASTHOLD_DEFECT_NOIDENT_IGNORES_BRIDGE) || \
     defined(TOASTHOLD_DEFECT_NOFORWARDBOUND) || defined(TOASTHOLD_DEFECT_NOCARD_UNPACED) || \
-    defined(TOASTHOLD_DEFECT_SIZE60) || defined(TOASTHOLD_DEFECT_DEADRECORDS) || defined(TOASTHOLD_DEFECT_NOBACKOFF)
+    defined(TOASTHOLD_DEFECT_SIZE60) || defined(TOASTHOLD_DEFECT_DEADRECORDS) || defined(TOASTHOLD_DEFECT_NOBACKOFF) || \
+    defined(TOASTIDENT_DEFECT_TIE_SLOTORDER) || defined(TOASTHOLD_DEFECT_RECLAIM_ANY)
     printf("DEFECT BUILD: a TOASTIDENT_/TOASTHOLD_DEFECT_* switch is compiled in - this run MUST fail\n");
 #endif
     TestNormalization();
