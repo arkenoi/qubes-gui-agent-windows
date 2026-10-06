@@ -148,6 +148,11 @@ typedef struct _WINDOW_DATA
     // Rest-zero S4 (DirectRequired guests): the ONE deadline armed for this held window - its crop ceiling, then the
     // declaration of a window that never got a frame; MAXULONGLONG = nothing more is armed for it (see MapDeferWakeSweep).
     ULONGLONG MapDeferDue;
+    // The TOAST HOLD (toasthold.c, docs/ADR-toasts.md 10) owns this window's map right now: held for its verdict,
+    // suppressed (forwarded to dom0) or pre-empted. Such a window is NOT re-checked by MapDeferWakeSweep's tick - the
+    // hold wakes it through its own events and deadlines - and no map site may map it (ToastBannerWithheld). Set and
+    // cleared by ToastHeldByBridge on every evaluation.
+    BOOL ToastHoldOwned;
     // Rest-zero E: the signature of this window's VISIBLE region (its rect + the opaque rects above it) on the last frame
     // that carried damage. A damage poke needs it unchanged: damage while it changes is reveal/occlusion, not W's own.
     UINT64 PwVisSig;
@@ -609,6 +614,10 @@ BOOL WgcBrokerActive(void);
 // Eligibility (not availability) for the per-window broker path: on a guest where it is TRUE
 // the whole-desktop composite is NOT an allowed source for a per-window window. See main.c.
 BOOL DirectRequired(void);
+// TRUE while the toast hold (toasthold.c) keeps this banner unmapped - held for its verdict, suppressed, or
+// pre-empted. Every site that would MAP a window outside the tracking pass's release arm (a resize re-attach,
+// a popup-state toggle, the foreground raise) asks this first. No side effects; cheap.
+BOOL ToastBannerWithheld(IN const WINDOW_DATA* entry);
 // rest-zero M1 attribution: name the calling thread (SetThreadDescription, looked up at run time - Windows 10 1607+), so
 // a per-thread wake count can be read against a name instead of a start address; logged as QGATHREAD as well.
 void QgaNameThread(IN const WCHAR* name);

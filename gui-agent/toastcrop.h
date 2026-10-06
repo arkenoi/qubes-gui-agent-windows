@@ -60,12 +60,16 @@
 #include <windows.h>
 #include "main.h"
 
-// TRUE for a shell toast banner: the narrow signature from the guest probe (class
+// TRUE for a SHELL SURFACE of the toast class: the signature from the guest probe (class
 // Windows.UI.Core.CoreWindow, WS_POPUP, TOPMOST|NOREDIRECTIONBITMAP, NOT TRANSPARENT,
-// NOT TOOLWINDOW, unowned, visible/uncloaked, owned by ShellExperienceHost.exe, under
-// the size ceiling that keeps the Action Center flyout out). Deliberately disjoint from
-// the shell-overlay and Office-shadow REJECT rules in ShouldAcceptWindow(), which all
-// require WS_EX_TRANSPARENT and/or WS_EX_TOOLWINDOW.
+// NOT TOOLWINDOW, unowned, visible/uncloaked, owned by one of the shell host processes -
+// ShellExperienceHost, StartMenuExperienceHost, SearchHost; ShellSurfaceKind says which).
+// THERE IS NO SIZE CEILING (removed 2026-08-12 for the 25H2 Start host, see ShellSurfaceKind):
+// the Action Center / Notification Center, Quick Settings and every ShellExperienceHost flyout
+// pass this too, not only the toast banner. Callers that need THE BANNER (the toast hold,
+// toasthold.c) narrow further: kind == ShellSurfaceToast, a size ceiling, and a card readable
+// as NormalToastView. Deliberately disjoint from the shell-overlay and Office-shadow REJECT
+// rules in ShouldAcceptWindow(), which all require WS_EX_TRANSPARENT and/or WS_EX_TOOLWINDOW.
 BOOL IsShellToastWindow(
     IN const WINDOW_DATA* data
     );
@@ -172,3 +176,20 @@ ULONG ToastCropQuery(
 void ToastCropEvict(
     IN HWND window
     );
+
+// IDENTITY READS FOR THE TOAST HOLD (toasthold.c). Queue a bounded UIA read of `window`'s toast card
+// on the SAME worker thread the crop measurements run on - with the worker's own IUIAutomation and its
+// 500 ms connection/transaction timeouts, never inline on the tracking thread (the 2026-08-12 input
+// stall). One pending identity request per window: duplicates coalesce. Returns FALSE when the worker
+// is not running (crop disabled or forced, or the thread failed to start); the caller then cannot learn
+// the identity and must fail open on its own bound. The worker hands the read to
+// ToastHoldReadIdentity() with `incarnation` (the requester's id for this life of the window, so a
+// reading about a window removed and re-added meanwhile is dropped) and never touches the crop cache.
+BOOL ToastCropRequestIdentity(
+    IN HWND window,
+    IN LONG incarnation
+    );
+
+// Whether that worker exists on this run - decided at init like everything else here, so a caller can
+// settle its own capability at start instead of discovering it on the first toast.
+BOOL ToastCropWorkerAvailable(void);

@@ -873,7 +873,10 @@ ULONG PwResizeWindow(IN OUT WINDOW_DATA* entry)
                    entry->Handle, status);
         if (entry->IsVisible || entry->IsIconic)
         {
-            if (SendWindowUnmap(entry->Handle) == ERROR_SUCCESS)
+            // The UNMAP makes the daemon release the image either way; the MAP is skipped for a toast banner
+            // the hold is withholding (main.c ToastBannerWithheld) - mapping it here would show the second
+            // copy of a forwarded toast. The hold's release arm maps it when its verdict says so.
+            if (SendWindowUnmap(entry->Handle) == ERROR_SUCCESS && !ToastBannerWithheld(entry))
                 (void)SendWindowMap(entry);
         }
     }
