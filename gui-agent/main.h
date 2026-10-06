@@ -153,6 +153,11 @@ typedef struct _WINDOW_DATA
     // hold wakes it through its own events and deadlines - and no map site may map it (ToastBannerWithheld). Set and
     // cleared by ToastHeldByBridge on every evaluation.
     BOOL ToastHoldOwned;
+    // The toast hold UNMAPPED this window after it had been mapped (a banner whose content changed in place, or a pre-empted
+    // one). dom0 released its mapping of the per-window buffer on that MSG_UNMAP (gui-daemon xside.c: MSG_UNMAP ->
+    // release_mapped_mfns), so the re-map must re-announce the buffer first, as ToggleMap does, or the banner comes back with
+    // no image. Set at that unmap, cleared when the buffer is re-announced.
+    BOOL ToastHoldUnmapped;
     // Rest-zero E: the signature of this window's VISIBLE region (its rect + the opaque rects above it) on the last frame
     // that carried damage. A damage poke needs it unchanged: damage while it changes is reveal/occlusion, not W's own.
     UINT64 PwVisSig;

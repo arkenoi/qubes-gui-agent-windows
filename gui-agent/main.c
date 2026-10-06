@@ -7778,6 +7778,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         windowData->IsVisible && !windowData->IsIconic && ToastHeldByBridge(windowData))
     {
         (void)SendWindowUnmap(windowData->Handle);
+        windowData->ToastHoldUnmapped = TRUE;   // dom0 just dropped its image of the buffer - re-announce it before any re-map
         windowData->MapDeferred = TRUE;
         windowData->MapDeferSince = GetTickCount64();
         windowData->MapDeferDue = 0;
@@ -7928,6 +7929,33 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             // The damage is re-sent after the map as well, a few lines below: if the daemon
             // ignores damage for a not-yet-mapped window this costs one redundant message, and
             // if it honours it the window is already painted the instant it appears.
+            // A banner the toast hold unmapped after it had been shown: dom0 dropped its image of the per-window buffer on
+            // that MSG_UNMAP, so re-announce the buffer BEFORE the map - the order of a first map, whose dump precedes it -
+            // or the banner comes back with no image. Found 2026-10-06 in review; no guest test had re-mapped a banner yet.
+            if (windowData->ToastHoldUnmapped)
+            {
+                if (!PwIsAttached(windowData))
+                {
+                    // Detached (legacy path): there is no per-window buffer to re-announce; the map shows what that path shows.
+                    windowData->ToastHoldUnmapped = FALSE;
+                    LogWarning("QGATOASTHOLD hwnd=0x%x is re-mapped detached - no per-window buffer to re-announce",
+                        (DWORD)(ULONG_PTR)windowData->Handle);
+                }
+                else
+                {
+                    // Cleared only once dom0 has the buffer again: a failed re-announce is retried at the next map attempt. A map
+                    // that fails AFTER a good re-announce needs nothing more - dom0 keeps the image until the next MSG_UNMAP.
+                    const ULONG rs = PwRemapWindow(windowData);
+                    if (rs == ERROR_SUCCESS)
+                    {
+                        windowData->ToastHoldUnmapped = FALSE;
+                        LogInfo("QGATOASTHOLD hwnd=0x%x re-announced its buffer before the re-map", (DWORD)(ULONG_PTR)windowData->Handle);
+                    }
+                    else
+                        LogWarning("QGATOASTHOLD hwnd=0x%x could not re-announce its buffer before the re-map (%lu) - the banner "
+                            L"may show without its image; retried at the next map attempt", (DWORD)(ULONG_PTR)windowData->Handle, rs);
+                }
+            }
             MenuFillNearBlack(windowData);
             (void)SendWindowDamageEvent(windowData->Handle, 0, 0,
                 windowData->Width, windowData->Height);
