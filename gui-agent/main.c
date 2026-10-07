@@ -12805,6 +12805,18 @@ static ULONG WINAPI WatchForEvents(void)
         libvchan_close(g_Vchan);
         g_VchanClientConnected = FALSE;
     }
+    else if (g_Vchan)
+    {
+        // NO CLIENT EVER CONNECTED: withdraw the vchan announcement. The library removes its xenstore entry only at the first
+        // client connection (libvchan_cleanup) or in libvchan_close, and the close above runs only for a connected client - so an
+        // agent that exited before dom0's daemon connected left its announcement behind, pointing at a ring that dies with this
+        // process, until the next agent announced anew. Measured 2026-10-07 on an in-place upgrade with the GUI open: three agent
+        // instances announced and exited without a client (04:07:45, 04:10:36 - killed, 04:10:38). A daemon (re)starting in that
+        // window connects to the dead ring - the leading candidate for dom0's "outdated protocol (0:0)" dialog (Jev 0.87, chain
+        // NOT established 0.11). libvchan_cleanup only removes the entry and is idempotent; the ring's resources go with the process.
+        libvchan_cleanup(g_Vchan);
+        LogInfo("VCHAN no client ever connected - the vchan announcement is withdrawn before exit");
+    }
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     if (capture)
