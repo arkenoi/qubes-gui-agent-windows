@@ -2875,7 +2875,19 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
         L"  <Principals><Principal id=\"Author\"><UserId>%s</UserId><LogonType>InteractiveToken</LogonType>"
         L"<RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n"
         L"  <Settings>\r\n"
-        L"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
+        // QUEUE, NOT IgnoreNew. These tasks fire on their RegistrationTrigger, and the agent re-registers them
+        // at every Init - so on an agent RESTART the start is requested while the PREVIOUS helper, owned by the
+        // agent that just exited, is still running as this task's instance. With IgnoreNew the scheduler silently
+        // dropped that start: measured 2026-10-07 on 4.3.36, twice. The agent logged the launch
+        // ("NOTIFHOST launched via Task Scheduler ... --agent-pid 4348"), \Qubes-NotifBridge came back
+        // status=Ready Last Result 0, the OLD bridge exited two seconds later ("agent gone (its liveness mutex
+        // was released)"), nothing replaced it, and sixty seconds on the agent reported QGANOTIFNOTREADY and -
+        // correctly, by policy - did not relaunch. The guest then had NO notification bridge for the rest of the
+        // session. Queue is the scheduler's own serialization: the new instance waits for the old one to finish
+        // leaving, which it does on its own (the helper watches its agent's liveness mutex), so nothing is
+        // terminated mid-flight - a bridge killed while holding a toast's banner is how a notification gets lost
+        // or doubled. If the old instance never leaves, the start stays queued and QGANOTIFNOTREADY still says so.
+        L"    <MultipleInstancesPolicy>Queue</MultipleInstancesPolicy>\r\n"
         L"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
         L"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
         L"    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
