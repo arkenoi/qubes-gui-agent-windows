@@ -5032,7 +5032,10 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
     }
     // Token missing, profile not loaded yet, or the helper did not exit 0 (SpawnHelperInSession
     // logs which) - in every case not applied, and the sweep retries.
-    LogWarning("no usable interactive session yet (token/profile/helper); cannot %s guest shadows (will retry)",
+    // At boot there is no interactive session yet and this retries - the message says so. An
+    // expected, self-correcting wait is not a warning; if it never succeeds, the caller's own
+    // failure path reports that.
+    LogInfo("no usable interactive session yet (token/profile/helper); cannot %s guest shadows (will retry)",
                enable ? L"restore" : L"disable");
     return FALSE;
 }
@@ -13200,7 +13203,8 @@ static ULONG WINAPI WatchForEvents(void)
     }
     else
     {
-        LogWarning("A6LEAK exit by design: daemon still alive and mapping - skipping all revokes "
+        // Its own text says "by design": this is the intended path, not a problem.
+        LogInfo("A6LEAK exit by design: daemon still alive and mapping - skipping all revokes "
             "(xenbus revoke-vs-unmap race; see FINDINGS 2026-08-05 cont 9)");
     }
 
@@ -13439,7 +13443,14 @@ static ULONG Init(void)
     status = CfgReadDword(moduleName, REG_CONFIG_CURSOR_VALUE, &g_DisableCursor, NULL);
     if (ERROR_SUCCESS != status)
     {
-        LogWarning("Failed to read '%s' config value, using default (TRUE)", REG_CONFIG_CURSOR_VALUE);
+        // ERROR_FILE_NOT_FOUND means NOBODY SET IT, which is the normal state of an optional
+        // value - the default is the answer, not a degradation, and a warning per boot for it is
+        // noise in a log whose cleanliness is the gate condition. Any OTHER status is a real read
+        // failure and stays a warning, with the code, so it can be acted on.
+        if (ERROR_FILE_NOT_FOUND == status)
+            LogDebug("'%s' is not set - using the default (TRUE)", REG_CONFIG_CURSOR_VALUE);
+        else
+            LogWarning("Failed to read '%s' config value (0x%x), using default (TRUE)", REG_CONFIG_CURSOR_VALUE, status);
         g_DisableCursor = TRUE;
     }
 
@@ -13769,7 +13780,14 @@ static ULONG Init(void)
     status = CfgReadDword(moduleName, REG_CONFIG_STAGING_VALUE, &stagingGrant, NULL);
     if (ERROR_SUCCESS != status)
     {
-        LogWarning("Failed to read '%s' config value, using default (TRUE)", REG_CONFIG_STAGING_VALUE);
+        // ERROR_FILE_NOT_FOUND means NOBODY SET IT, which is the normal state of an optional
+        // value - the default is the answer, not a degradation, and a warning per boot for it is
+        // noise in a log whose cleanliness is the gate condition. Any OTHER status is a real read
+        // failure and stays a warning, with the code, so it can be acted on.
+        if (ERROR_FILE_NOT_FOUND == status)
+            LogDebug("'%s' is not set - using the default (TRUE)", REG_CONFIG_STAGING_VALUE);
+        else
+            LogWarning("Failed to read '%s' config value (0x%x), using default (TRUE)", REG_CONFIG_STAGING_VALUE, status);
         g_StagingGrant = TRUE;
     }
     else
