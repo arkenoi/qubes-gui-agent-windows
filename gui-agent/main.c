@@ -54,11 +54,13 @@
 #include "lifecycle.h"      // the exit-code latch and the end-session handshake (docs/ADR-supervision.md 5)
 #include "errbox.h"         // QERR_BOX_TITLE_PREFIX: how the route titles the error window (docs/ADR-supervision.md 6)
 #include "errbox-order.h"   // the error window is announced first at start
+static BOOL ErrBoxIsSystemBoxHwnd(IN HWND hwnd);   // defined below; used by AddAllWindows above it
 #include "faultinject.h"
 #include "dragsim.h"
 #include "notifyerr.h"
 #include "notifytexts.h"   // every dom0 notification this agent sends, as data (rendered offline by the render test)
 #include "qga-exitcodes.h"
+#include "qga-lifecycle.h"   // QgaExitIsExpected / QgaExitReasonName: the agent reads its own exit code the way the service does
 #include "deathevent.h"
 #include "qubes-io.h"
 
