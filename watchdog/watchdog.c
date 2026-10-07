@@ -924,8 +924,9 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
             join = WaitForSingleObject(watchdogHandle, STOP_WAIT_HINT_MS);
             if (join != WAIT_OBJECT_0)
                 LogError("watchdog thread did not exit within %u ms of the stop request (wait 0x%x) - "
-                    L"reporting STOPPED anyway; the respawn loop is disarmed by g_ServiceStopping, "
-                    L"and the agent may still be running", STOP_WAIT_HINT_MS, join);
+                    L"reporting STOPPED anyway; no launch can follow (g_ServiceStopping is latched and this service "
+                    L"has no respawn loop since 2026-10-07), but the agent may still be running",
+                    STOP_WAIT_HINT_MS, join);
         }
         else
         {
