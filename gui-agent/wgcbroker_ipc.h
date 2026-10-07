@@ -401,6 +401,33 @@ typedef struct _WGCBRK_SLOT {
 #define WGCBRK_STG_SRC_PW     6u   /* RelaySourceChanged: PrintWindow of a quiet window's source */
 #define WGCBRK_STG_POLL_PW    7u   /* PublishPrintWindow: PrintWindow of a polled window */
 #define WGCBRK_STG_REPUBLISH  8u   /* RepublishRetained */
+
+/* HOW LONG A DECLARED STAGE MAY LAST BEFORE IT IS A HANG (ABI 19, 2026-10-07; findings/issues.md P1, Jev 0.97).
+ * The agent's R1 deadline asks two things - the request unacknowledged, and no progress - and a broker inside ONE long
+ * call satisfies both, because BrokerProgress only moves when a stage is entered or left. Measured 2026-10-01: a WGC
+ * channel open for a window that had just appeared took longer than WGCBRK_ACK_DEADLINE_MS and the agent terminated a
+ * broker that was working. So the deadline is per STAGE: a stage the broker has DECLARED gets the budget below, and
+ * only a stage that has not changed for that long is a hang. This is not a timeout standing in for an observable
+ * condition - the observable conditions (the ack, the progress counter) are still required; this is the third exit,
+ * and its expiry is the loud QGABROKERHUNG that names the stage.
+ * WGCBRK_STG_OPEN and _CLOSE call into WGC/DWM, which can block on a window that is itself busy; the rest are ours. */
+static __inline unsigned WgcbrkStageBudgetMs(unsigned stageCode)
+{
+    switch (stageCode)
+    {
+    case WGCBRK_STG_OPEN:
+    case WGCBRK_STG_CLOSE:
+    case WGCBRK_STG_RELAY_DWM:
+        return 8000u;    /* a capture session or a DWM thumbnail on a window that has just appeared */
+    case WGCBRK_STG_SRC_PW:
+    case WGCBRK_STG_POLL_PW:
+        return 6000u;    /* PrintWindow into an application that may be slow to paint (IsHungAppWindow is checked) */
+    default:
+        return WGCBRK_ACK_DEADLINE_MS;   /* our own bookkeeping: the ordinary deadline */
+    }
+}
+#define WGCBRK_STAGE_CODE(stg) ((unsigned)(((ULONG)(stg)) >> 8))
+#define WGCBRK_STAGE_SLOT(stg) ((int)(((ULONG)(stg)) & 0xFFu))
 #define WGCBRK_STG_SIGN       9u   /* FlushPendingSignatures */
 #define WGCBRK_STG_CLOSE_LOCK 10u  /* CloseChannel: acquiring the slot lock a FrameArrived handler may hold */
 #define WGCBRK_STG_CLOSE_REAP 11u  /* CloseChannel: handing the WGC teardown to its own thread (never waits) */

@@ -19,10 +19,34 @@
  *
  */
 
+// THE ONE JOB OF THIS SERVICE (docs/ADR-supervision.md sections 4 and 5, main repo): start a SYSTEM-token
+// gui-agent.exe inside the user's interactive session - the one thing no Windows mechanism does - ONCE per
+// session, and perform ONE relaunch: the agent's defined RECONNECT exit (dom0's gui-daemon went away; a
+// fresh agent re-announcing is the reconnect). Everything else about keeping the agent alive is Windows':
+// an agent that DIES makes this service end itself with a failure code (QGA_SVC_EXIT_AGENT_DIED), and the
+// SCM's recovery actions - armed by the installer: restart after 5 s, 15 s, then 60 s, failures counted for
+// error exits too - restart the service, which launches a new agent at its start. There is no relaunch
+// loop, no backoff and no poll in this file any more (owner, 2026-10-07: "rely on windows system
+// services if we need to keep smth running"; Jev keepalive_owner=scm-recovery 0.55).
+//
+// LAUNCH TRIGGERS, and only these: the service's start with a console session present; WTS_SESSION_LOGON /
+// WTS_CONSOLE_CONNECT for a session other than one that announced its end, when no agent of ours runs; the
+// agent's RECONNECT exit. A logoff that is not a shutdown ends the announced session (WTS_SESSION_LOGOFF
+// clears the latch), so the next logon into the console session - autologon, seconds later - gets an agent.
+//
+// THE SESSION END (the measured defect, 2026-10-07): Windows' session teardown terminated the agent with
+// 0x40010004 33-826 ms after the shutdown began and this service relaunched it into the same ending session,
+// three instances per shutdown. Now the agent tells this service "my session is ending" from its
+// WM_QUERYENDSESSION (through the per-pid channel of include/qga-lifecycle.h, created here before the agent
+// runs) and the service acknowledges before the end proceeds; from then on nothing is launched into that
+// session. Every agent exit is read through ONE pure decision, QgaDecideAgentExit, whose table the offline
+// suite holds row by row.
+
 #include <windows.h>
 #include <wtsapi32.h>
 #include <sas.h>
 #include <shlwapi.h>
+#include <sddl.h>
 #include <strsafe.h>
 #include "common.h"
 
@@ -31,23 +55,49 @@
 #include <qubes-io.h>
 #include "deathevent.h"
 #include "qga-exitcodes.h"
+#include "qga-lifecycle.h"
 
 #define SERVICE_NAME L"QgaWatchdog"
 
 SERVICE_STATUS g_Status;
 SERVICE_STATUS_HANDLE g_StatusHandle;
 
-// Set when the SCM tells us the service (or the machine) is going down. See
-// AgentRespawnPointless below.
+// Set when the SCM tells us the service (or the machine) is going down: the watchdog thread leaves
+// through its stop path and never launches again.
 volatile LONG g_ServiceStopping = 0;
 
-// Manual-reset: set by ControlHandlerEx on STOP/SHUTDOWN, ends WatchdogThread. Before this
+// Manual-reset: set by ControlHandlerEx on STOP/SHUTDOWN/PRESHUTDOWN, ends WatchdogThread. Before this
 // existed the handler reported STOPPED while the respawn loop was still live, so Stop-Service
 // returned and the loop could relaunch the agent under an installer that had just killed it.
 static HANDLE g_StopEvent = NULL;
-// Auto-reset: set on SERVICE_CONTROL_SESSIONCHANGE (console connect / logon) so the watchdog
-// starts the agent when the console session arrives instead of rediscovering it by polling.
-static HANDLE g_SessionEvent = NULL;
+// AN ANNOUNCED END THAT NEVER HAPPENS IS AN ANOMALY, NOT A STATE TO SIT IN (2026-10-07, from the Jev review of this
+// change: "a session latched as ending that then continues" scored 0.53 - the hole was real). The latch is normally
+// cleared by the session's logoff or by the agent's own "the end was cancelled" message. Neither can arrive if the end
+// is VETOED by another application AND the agent then dies: the dead agent cannot send the cancellation, no logoff
+// follows, and the session would run to its end with no GUI and nothing allowed to launch one.
+//
+// So the latch is also a BOUNDED FAILURE DETECTOR. Measured 2026-10-07: from the session teardown to this service's
+// PRESHUTDOWN was 4 s in one shutdown and 32 s in another, so a real shutdown resolves the latch well inside this
+// budget - and if it has not resolved, the end did not happen. On expiry the service says so at ERROR and allows
+// launches into that session again. It is not a timeout standing in for an observable condition: both observable
+// conditions (the logoff, the cancellation) are waited on, and this is the third exit of that wait (rule 6 of the
+// experimenter skill), reported loudly rather than silently recovered from.
+#define SESSION_END_NEVER_HAPPENED_MS (90u * 1000u)
+
+// Auto-reset, one each: a session ARRIVED (WTS_CONSOLE_CONNECT / WTS_SESSION_LOGON - a launch trigger) and
+// a session LEFT (WTS_SESSION_LOGOFF - the end of a session that announced it). The session ids ride in
+// the two LONGs; a burst that overwrites one is harmless, the handler re-reads the console session.
+static HANDLE g_SessionArriveEvent = NULL;
+static HANDLE g_SessionLeaveEvent = NULL;
+static volatile LONG g_ArriveSession = -1;
+static volatile LONG g_LeaveSession = -1;
+
+// The service-specific code this service ends with when its agent died or could not be launched
+// (0 = a clean stop). Set by WatchdogThread, reported by ServiceMain: the SCM then logs 7024 and runs the
+// recovery actions.
+static volatile LONG g_ServiceFailCode = 0;
+
+#define NO_SESSION 0xFFFFFFFFUL
 
 // StartTargetProcess: nothing was launched because there is no console session yet. Distinct
 // from a launch failure so the caller does not stamp a start it never made.
@@ -76,7 +126,6 @@ BOOL IsProcessRunning(IN const WCHAR *exeName, OUT DWORD *processId OPTIONAL, OU
 {
     WTS_PROCESS_INFO *processInfo = NULL;
     DWORD count = 0, i;
-    HANDLE shutdownEvent = NULL;
     BOOL found = FALSE;
 
     if (!WTSEnumerateProcesses(WTS_CURRENT_SERVER, 0, 1, &processInfo, &count))
@@ -105,11 +154,80 @@ cleanup:
     return found;
 }
 
-// Starts the process as SYSTEM in currently active console session.
-// Returns ERROR_SUCCESS with *processHandle/*processId set when a process was created,
-// START_SKIPPED_NO_SESSION when there is no console session to start it in (nothing was
-// launched), or the Win32 error of the failing call.
-DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD *processId) // non-const because it can be modified by CreateProcess*
+// ---- the lifecycle channel (include/qga-lifecycle.h) --------------------------------------------------
+typedef struct _LIFECYCLE_CHANNEL
+{
+    HANDLE Notice;     // manual-reset, agent -> service: "Windows is ending my session"
+    HANDLE Ack;        // manual-reset, service -> agent: acknowledged
+    HANDLE Continue;   // auto-reset, agent -> service: the end was cancelled
+} LIFECYCLE_CHANNEL;
+
+static void LifecycleChannelClose(IN OUT LIFECYCLE_CHANNEL *ch)
+{
+    if (ch->Notice) CloseHandle(ch->Notice);
+    if (ch->Ack) CloseHandle(ch->Ack);
+    if (ch->Continue) CloseHandle(ch->Continue);
+    ch->Notice = ch->Ack = ch->Continue = NULL;
+}
+
+static HANDLE LifecycleEventCreate(IN SECURITY_ATTRIBUTES *sa, IN DWORD agentPid, IN const WCHAR *which, IN BOOL manualReset)
+{
+    WCHAR name[96];
+    HANDLE h;
+    if (FAILED(QgaLifecycleObjectName(name, RTL_NUMBER_OF(name), agentPid, which)))
+        return NULL;
+    h = CreateEvent(sa, manualReset, FALSE, name);
+    if (!h)
+    {
+        win_perror("CreateEvent(lifecycle channel)");
+        return NULL;
+    }
+    if (GetLastError() == ERROR_ALREADY_EXISTS)
+    {
+        // Somebody holds a name made for a pid that does not exist yet: a squat. Refused - the agent is ended
+        // before it ran (the caller's job) and the launch is reported as failed.
+        LogError("QGAWDSQUAT the lifecycle object '%s' already exists before the agent it is named for has run - "
+            L"refusing it", name);
+        CloseHandle(h);
+        return NULL;
+    }
+    return h;
+}
+
+// Created by THIS service, SYSTEM-only, BEFORE the agent runs (it is suspended until this returns); the agent only
+// opens them. FALSE = nothing created (the caller ends the suspended agent).
+static BOOL LifecycleChannelCreate(IN DWORD agentPid, OUT LIFECYCLE_CHANNEL *ch)
+{
+    PSECURITY_DESCRIPTOR sd = NULL;
+    SECURITY_ATTRIBUTES sa;
+    BOOL ok;
+
+    ZeroMemory(ch, sizeof(*ch));
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptor(QGA_LIFECYCLE_SDDL, SDDL_REVISION_1, &sd, NULL) || !sd)
+    {
+        win_perror("ConvertStringSecurityDescriptorToSecurityDescriptor(lifecycle)");
+        return FALSE;
+    }
+    sa.nLength = sizeof(sa);
+    sa.lpSecurityDescriptor = sd;
+    sa.bInheritHandle = FALSE;
+    ch->Notice = LifecycleEventCreate(&sa, agentPid, QGA_LIFECYCLE_NOTICE, TRUE);
+    ch->Ack = LifecycleEventCreate(&sa, agentPid, QGA_LIFECYCLE_ACK, TRUE);
+    ch->Continue = LifecycleEventCreate(&sa, agentPid, QGA_LIFECYCLE_CONTINUE, FALSE);
+    LocalFree(sd);
+    ok = ch->Notice && ch->Ack && ch->Continue;
+    if (!ok)
+        LifecycleChannelClose(ch);
+    return ok;
+}
+
+// Starts the process as SYSTEM in the currently active console session, with its lifecycle channel created
+// before it runs (CREATE_SUSPENDED, the channel, then ResumeThread).
+// Returns ERROR_SUCCESS with *processHandle/*processId/*sessionId/*channel set when a process was created,
+// START_SKIPPED_NO_SESSION when there is no console session to start it in (nothing was launched), or the
+// Win32 error of the failing call.
+DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD *processId, OUT DWORD *sessionId,
+    OUT LIFECYCLE_CHANNEL *channel) // non-const because it can be modified by CreateProcess*
 {
     PROCESS_INFORMATION pi;
     STARTUPINFO si;
@@ -122,22 +240,21 @@ DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD
 
     *processHandle = NULL;
     *processId = 0;
+    *sessionId = NO_SESSION;
+    ZeroMemory(channel, sizeof(*channel));
 
     consoleSessionId = WTSGetActiveConsoleSessionId();
-    if (consoleSessionId == 0xFFFFFFFF) // disconnected or changing
+    if (consoleSessionId == NO_SESSION) // disconnected or changing
     {
         // Distinct code, not ERROR_SUCCESS: the caller used to treat this skip as a launch, find
-        // no agent a second later, and count it as a crash - backoff 1->2->...->60 s during early
-        // boot plus a "grant-table exhaustion, needs a reboot" warning for a transient.
+        // no agent a second later, and count it as a crash.
         LogDebug("console session is 0x%x, skipping", consoleSessionId);
         return START_SKIPPED_NO_SESSION;
         // we'll launch gui agent when the console connects to a session again
     }
 
     // Get access token from ourselves. Both tokens are closed before returning on every path:
-    // they used to leak on each launch (audit 2026-09-08) - bounded only by the 60 s backoff,
-    // but a service that respawns a crashing agent for days accumulated two handles per attempt.
-    // (GetCurrentProcess() is a pseudo-handle; it is not closed.)
+    // they used to leak on each launch (audit 2026-09-08). (GetCurrentProcess() is a pseudo-handle; it is not closed.)
     if (!OpenProcessToken(currentProcess, TOKEN_ALL_ACCESS, &currentToken))
     {
         return win_perror("OpenProcessToken");
@@ -171,7 +288,9 @@ DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD
 
     // No need to set desktop here, gui agent attaches to the input desktop anyway,
     // and hardcoding this to winlogon is wrong.
-    if (!CreateProcessAsUser(newToken, NULL, exePath, NULL, NULL, FALSE, 0, NULL, NULL, &si, &pi))
+    // SUSPENDED: the lifecycle channel is named by the agent's pid and must exist before the agent's first act
+    // opens it (include/qga-lifecycle.h). Resumed below once the channel exists; ended by handle if it cannot.
+    if (!CreateProcessAsUser(newToken, NULL, exePath, NULL, NULL, FALSE, CREATE_SUSPENDED, NULL, NULL, &si, &pi))
     {
         status = win_perror("CreateProcessAsUser");
         CloseHandle(newToken);
@@ -179,55 +298,33 @@ DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD
     }
     CloseHandle(newToken);   // the new process holds its own reference
 
-    // Keep the process handle: the watchdog waits on it, so the agent's exit is seen the instant
-    // it happens instead of on the next 1 s name-match enumeration (or 60 s when backed off).
+    if (!LifecycleChannelCreate(pi.dwProcessId, channel))
+    {
+        // Never ran (still suspended): ended by the handle we hold, which is this service's own child.
+        LogError("QGAWDLAUNCH the lifecycle channel for PID %u could not be created - ending the suspended agent "
+            L"before it runs; without the channel a session end could not be handshaken", pi.dwProcessId);
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        return ERROR_GEN_FAILURE;
+    }
+    if (ResumeThread(pi.hThread) == (DWORD)-1)
+    {
+        status = win_perror("ResumeThread(agent)");
+        TerminateProcess(pi.hProcess, 1);
+        CloseHandle(pi.hThread);
+        CloseHandle(pi.hProcess);
+        LifecycleChannelClose(channel);
+        return status != ERROR_SUCCESS ? status : ERROR_GEN_FAILURE;
+    }
+
+    // Keep the process handle: the watchdog waits on it, so the agent's exit is seen the instant it happens.
     *processHandle = pi.hProcess;
     *processId = pi.dwProcessId;
+    *sessionId = consoleSessionId;
     CloseHandle(pi.hThread);
 
     return ERROR_SUCCESS;
-}
-
-// DO NOT RESPAWN INTO A MACHINE THAT IS SHUTTING DOWN (2026-08-28).
-//
-// At shutdown the session-1 agent is torn down first, so this loop sees "not running", restarts
-// it, that instance dies too (the daemon is gone: "QioReadBuffer ... The pipe has been ended"),
-// and the loop restarts it again - all in the last seconds before the SCM stops us. The result is
-// a cluster of two dead agents plus "The guest has NO GUI while this lasts" written into the log
-// on every single normal shutdown.
-//
-// That noise is not cosmetic: it is indistinguishable from a real failure, and it sent this
-// project chasing a non-existent boot-time double-spawn race. GWeck's field log (posts 96-98)
-// shows the identical cluster at uptime 412 s and 414 s followed by a reboot - a shutdown, not a
-// boot. Whatever we suppress here, we LOG the signals we looked at, so the next occurrence says
-// which of them actually fired instead of leaving the next reader to guess as I did.
-//
-// Acted on: the SCM control (STOP/SHUTDOWN/PRESHUTDOWN) and SM_SHUTTINGDOWN. The WTS console
-// session state is recorded but NOT acted on - at the sign-in screen (pre-logon) the session is
-// legitimately not "active" and the agent must still be started there.
-static BOOL AgentRespawnPointless(OUT WCHAR *why, IN size_t whyChars)
-{
-    BOOL shuttingDown = (GetSystemMetrics(SM_SHUTTINGDOWN) != 0);
-    BOOL serviceStopping = (InterlockedCompareExchange(&g_ServiceStopping, 0, 0) != 0);
-
-    DWORD sessionId = WTSGetActiveConsoleSessionId();
-    int state = -1;
-    WTS_CONNECTSTATE_CLASS *sessionState = NULL;
-    DWORD size = 0;
-    if (sessionId != 0xFFFFFFFF &&
-        WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, sessionId, WTSConnectState,
-            (LPWSTR*)&sessionState, &size) &&
-        sessionState && size >= sizeof(*sessionState))
-    {
-        state = (int)*sessionState;
-    }
-    if (sessionState)
-        WTSFreeMemory(sessionState);
-
-    StringCchPrintf(why, whyChars, L"servicestop=%d sm_shuttingdown=%d console=0x%x wtsstate=%d",
-        serviceStopping ? 1 : 0, shuttingDown ? 1 : 0, sessionId, state);
-
-    return serviceStopping || shuttingDown;
 }
 
 // How long the agent gets to leave on its own stop request before it is terminated, how long the
@@ -245,13 +342,17 @@ static BOOL AgentRespawnPointless(OUT WCHAR *why, IN size_t whyChars)
 // its own stop event (QGA_SHUTDOWN - its exit path revokes the grants, which process death never
 // does, and tells its helpers to leave), wait on the HANDLE we hold from CreateProcessAsUser, and
 // only if it is still alive after AGENT_STOP_GRACE_MS end it with TerminateProcess on that handle.
+// While waiting, an end-session notice from the agent is still acknowledged (a shutdown and a service
+// stop can overlap; the agent's handshake is bounded, so the ack must not wait for this wait).
 // Every outcome is logged with the pid and the exit code; ServiceMain reports STOPPED only after
-// this has returned. Closes the handle.
-static void StopOwnAgent(IN HANDLE agentProcess, IN DWORD agentPid, IN const WCHAR *exeName)
+// this has returned. Closes the handle and the channel.
+static void StopOwnAgent(IN HANDLE agentProcess, IN DWORD agentPid, IN const WCHAR *exeName, IN OUT LIFECYCLE_CHANNEL *ch)
 {
     HANDLE shutdownEvent;
     DWORD wait;
     DWORD exitCode = 0xFFFFFFFF;
+    HANDLE waitHandles[2];
+    ULONGLONG deadline = GetTickCount64() + AGENT_STOP_GRACE_MS;
 
     shutdownEvent = OpenEvent(EVENT_MODIFY_STATE, FALSE, QGA_SHUTDOWN_EVENT_NAME);
     if (shutdownEvent)
@@ -272,7 +373,24 @@ static void StopOwnAgent(IN HANDLE agentProcess, IN DWORD agentPid, IN const WCH
             L"waiting on its handle, then terminating it", QGA_SHUTDOWN_EVENT_NAME, exeName, agentPid);
     }
 
-    wait = WaitForSingleObject(agentProcess, AGENT_STOP_GRACE_MS);
+    waitHandles[0] = agentProcess;
+    waitHandles[1] = ch->Notice;
+    for (;;)
+    {
+        ULONGLONG now = GetTickCount64();
+        DWORD left = (deadline > now) ? (DWORD)(deadline - now) : 0;
+        wait = WaitForMultipleObjects(ch->Notice ? 2 : 1, waitHandles, FALSE, left);
+        if (wait == WAIT_OBJECT_0 + 1)
+        {
+            // The agent's session is ending while we stop: acknowledge, so its WM_QUERYENDSESSION returns at once.
+            LogInfo("QGAWDSESSIONEND '%s' (PID %u) reports its session ending during the service stop - acknowledged",
+                exeName, agentPid);
+            SetEvent(ch->Ack);
+            ResetEvent(ch->Notice);
+            continue;
+        }
+        break;
+    }
     if (wait != WAIT_OBJECT_0)
     {
         LogWarning("service stopping: '%s' (PID %u) is still running %u ms after the exit request (wait 0x%x) - "
@@ -292,9 +410,100 @@ static void StopOwnAgent(IN HANDLE agentProcess, IN DWORD agentPid, IN const WCH
         LogInfo("service stopping: '%s' (PID %u) is gone, exit code 0x%x", exeName, agentPid, exitCode);
     }
     CloseHandle(agentProcess);
+    LifecycleChannelClose(ch);
 }
 
-// Restarts gui agent in active session if it's dead for too long.
+// What this service does about an agent exit, decided by include/qga-lifecycle.h's table and said in the log and,
+// for a death, in the Event Log. Returns the verdict for the caller's state changes.
+static QGA_EXIT_VERDICT JudgeAgentExit(IN const WCHAR *exeName, IN DWORD agentPid, IN DWORD agentSession,
+    IN DWORD exitCode, IN BOOL noticeAcked, IN ULONGLONG startedAt)
+{
+    const QGA_EXIT_VERDICT v = QgaDecideAgentExit(exitCode, noticeAcked);
+    const ULONGLONG ranMs = startedAt != 0 ? GetTickCount64() - startedAt : DEATHEVENT_RAN_UNKNOWN;
+
+    switch (v.Decision)
+    {
+    case QGA_DECIDE_NOTHING:
+        LogInfo("QGAWDREQUESTED '%s' (PID %u) exited on request (0x%x) - not a death, nothing relaunched; the next "
+            L"logon or console connect gets an agent", exeName, agentPid, exitCode);
+        break;
+    case QGA_DECIDE_SESSION_END:
+        LogInfo("QGAWDSESSIONEND '%s' (PID %u) left with its session %u (exit 0x%x, notice acknowledged) - not a death; "
+            L"no agent is launched into session %u", exeName, agentPid, agentSession, exitCode, agentSession);
+        break;
+    case QGA_DECIDE_SESSION_END_UNNOTICED:
+        LogError("QGAWDSESSIONEND-UNNOTICED '%s' (PID %u) left with its session %u (exit 0x%x) but this service never "
+            L"saw its end-session notice - the lifecycle channel failed; no agent is launched into session %u",
+            exeName, agentPid, agentSession, exitCode, agentSession);
+        break;
+    case QGA_DECIDE_SESSION_END_FORCED:
+        LogError("QGAWDSESSIONEND-FORCED '%s' (PID %u) was ended by the system (0x%x) after acknowledging its "
+            L"end-session notice - its orderly exit did not complete inside the end-session budget (its vchan "
+            L"announcement may be left behind); no agent is launched into session %u",
+            exeName, agentPid, exitCode, agentSession);
+        break;
+    case QGA_DECIDE_NOTICE_MISSED:
+        // THE SYSTEM'S OWN RECORD OF THE END OF THAT SESSION, with no word from the agent: either the agent died
+        // before its end-session window was up, or Windows never sent WM_QUERYENDSESSION to it. Not relaunched
+        // into that session - the measured defect - and LOUD, so the retest shows which it was.
+        LogError("QGAWDNOTICEMISSED end-session notice MISSED: '%s' (PID %u) was ended by the system (0x%x, "
+            L"DBG_TERMINATE_PROCESS - what Windows' session teardown leaves) and this service saw no end-session "
+            L"notice from it; its vchan announcement is left behind. No agent is launched into session %u. "
+            L"Check the agent's log for QGAENDSESSION / QGALIFECYCLE lines", exeName, agentPid, exitCode, agentSession);
+        break;
+    case QGA_DECIDE_NOGUI_LATCH:
+        // A START-TIME CONDITION, NOT A DEATH (include/qga-exitcodes.h; Jev 0.94): no GUI domain for this qube this boot.
+        // Logged once, no death event, no relaunch before the next boot - a relaunch would fail the same way every time.
+        LogInfo("QGAWDNOGUIDOMAIN '%s' (PID %u) found no GUI domain for this qube (guivm is '') - not relaunching it "
+            L"before the next boot; this is a start-time condition, not a death", exeName, agentPid);
+        break;
+    case QGA_DECIDE_RECONNECT:
+        // THE ONE RELAUNCH THIS SERVICE PERFORMS (Jev 1.0): a protocol event, not a death - dom0's gui-daemon went
+        // away or never came, and a fresh agent announcing a fresh vchan is the reconnect. The agent bounds this
+        // itself (its first-client restart budget), so a daemon that never returns cannot turn it into a loop.
+        LogInfo("QGAWDRECONNECT '%s' (PID %u) exited to reconnect (0x%x: dom0's gui-daemon went away or never came) "
+            L"after %I64u ms - relaunching at once; not a death", exeName, agentPid, exitCode, ranMs);
+        break;
+    case QGA_DECIDE_DEATH_IN_ENDING_SESSION:
+    case QGA_DECIDE_DEATH:
+    default:
+        // A DYING AGENT IS A MAJOR ERROR, not a warning (owner, 2026-10-03). This service did not ask it to exit (a
+        // requested stop is QGA_EXIT_REQUESTED, or the g_StopEvent path and StopOwnAgent) and it did not leave for a
+        // defined reason: it DIED. 0x5aa is ERROR_NO_SYSTEM_RESOURCES, which on this guest has meant an exhausted
+        // Xen grant table (measured 2026-08-15) - said only when that is the code.
+        LogError("QGAWDDEATH '%s' (PID %u) exited with code 0x%x without this service asking it to - the agent DIED "
+            L"after %I64u ms (%s).%s", exeName, agentPid, exitCode, ranMs,
+            v.Decision == QGA_DECIDE_DEATH_IN_ENDING_SESSION
+                ? L"its session is ending: not relaunched into it, the service stays"
+                : L"this service ends with QGA_SVC_EXIT_AGENT_DIED so the SCM's recovery restarts it and a new agent",
+            exitCode == 0x5aa
+                ? L" Exit code 0x5aa is ERROR_NO_SYSTEM_RESOURCES: on this guest that has meant an exhausted Xen "
+                  L"grant table, which only a reboot clears."
+                : L"");
+        break;
+    }
+    if (v.WriteDeathRecord)
+    {
+        // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo):
+        // a crash is in Windows Error Reporting and Application event 1000 already, but a clean,
+        // unasked exit is visible only here. ONE Event Log entry under our source, with the exit
+        // code and how long it ran; the dom0 notification is the event-triggered reporter's job
+        // (ADR 3), not this service's - nothing here waits on qrexec or on a session.
+        DeathEventReport(DEATHEVENT_ID_GUI_AGENT, exeName, agentPid, exitCode, ranMs,
+            v.FailService
+                ? L"The QubesGuiWatchdog service ends itself so that Windows' service recovery restarts it (after 5 s, "
+                  L"15 s, then 60 s) and the restarted service starts a new GUI agent. Its log and the agent's are in "
+                  L"the Qubes Tools log directory; a crash also leaves a Windows Error Reporting record "
+                  L"(AppCrash_gui-agent.exe_*)."
+                : L"Its session is ending, so nothing is relaunched into it; the next logon gets a new GUI agent. Its "
+                  L"log and the watchdog's are in the Qubes Tools log directory; a crash also leaves a Windows Error "
+                  L"Reporting record (AppCrash_gui-agent.exe_*).");
+    }
+    return v;
+}
+
+// Launches the agent once per session, relaunches it once on its RECONNECT exit, and otherwise leaves keeping it
+// alive to Windows (see the file header).
 DWORD WINAPI WatchdogThread(void *param)
 {
     WCHAR* cmdline = (WCHAR*) param;
@@ -304,71 +513,164 @@ DWORD WINAPI WatchdogThread(void *param)
 
     LogDebug("cmdline: '%s', exe: '%s'", cmdline, exeName);
 
-    // BACK OFF WHEN THE AGENT DIES IMMEDIATELY. The loop used to respawn once per second for
-    // ever, which is right for a crash but wrong for a failure the agent cannot recover from by
-    // being run again - measured 2026-08-15: with the Xen grant table exhausted the agent exits
-    // during vchan init (0x5aa) and the watchdog respawned it every second indefinitely, each
-    // attempt writing a fresh 0-byte log and asking for grants that are not there. A guest in
-    // that state answers qrexec and has no GUI at all, and hammering it only makes the table
-    // situation worse. Healthy restarts are unaffected: the delay only grows for an agent that
-    // dies again within QUICK_DEATH_MS of being started, and resets the moment one survives.
-    #define QUICK_DEATH_MS 10000
-    #define BACKOFF_MAX_MS 60000
-    DWORD backoffMs = 1000;
-    DWORD quickDeaths = 0;
-    ULONGLONG startedAt = 0;
-    // A launch attempt that failed in CreateProcessAsUser is backed off like a quick death but
-    // reported as what it is; the old code folded it into the "died within 10 s" grant-table text.
-    BOOL lastLaunchFailed = FALSE;
-    DWORD lastLaunchError = ERROR_SUCCESS;
-    // The exit code of the last death we observed, for the quick-death line: that line used to
-    // name ONE cause for every quick death (the grant-table line) - true for the 2026-08-15
-    // incident, a fabrication for every other code (rz39 defect 5).
-    DWORD lastExitCode = 0;
-    BOOL lastExitKnown = FALSE;
     // Handle of the agent WE STARTED - the only process this service owns. While we hold one it is
     // the liveness oracle: the loop sleeps on it and wakes the moment the process exits, and the
-    // stop path below ends it (StopOwnAgent). Without it the loop enumerated processes every
-    // second by name prefix, which both detected a death late and could adopt a same-named
-    // stranger as "running" without a word in the log.
+    // stop path below ends it (StopOwnAgent).
     HANDLE agentProcess = NULL;
     DWORD agentPid = 0;
+    DWORD agentSession = NO_SESSION;   // the console session it was launched into
+    ULONGLONG startedAt = 0;
+    LIFECYCLE_CHANNEL channel;
+    BOOL noticeAcked = FALSE;          // this instance announced its session's end and we acknowledged
+    // The session that announced its end: nothing is launched into it until WTS_SESSION_LOGOFF says it has ended.
+    DWORD endedSession = NO_SESSION;
+    // A launch trigger fired and no agent of ours runs: launch at the next opportunity (console session present,
+    // no foreign agent). TRUE at service start - "service start with a console session present" is a trigger.
+    BOOL launchWanted = TRUE;
+    BOOL waitingForSession = FALSE;
     // A same-named process this service did NOT start. Never adopted (owner's rule 2026-10-03:
-    // nothing is killed or adopted by NAME - until then it was OpenProcess'ed into agentProcess
-    // and supervised as ours, which the stop path would now terminate), never stopped; only
-    // WAITED ON, through this handle, so that no second agent is started while it lives (two
-    // agents fight for the vchan and the loser dies - main.c, the single-instance mutex), and
-    // reported once per episode (QGAWDFOREIGN).
+    // nothing is killed or adopted by NAME), never stopped; only WAITED ON, through this handle, so that
+    // no second agent is started while it lives (two agents fight for the vchan and the loser dies -
+    // main.c, the single-instance mutex), and reported once per episode (QGAWDFOREIGN).
     HANDLE foreignProcess = NULL;
     DWORD foreignPid = 0;
-    BOOL foreignLogged = FALSE;
-    BOOL waitingForSession = FALSE;
-    // The agent reported NO GUI DOMAIN this boot (include/qga-exitcodes.h): nothing is relaunched before the next boot, and the wait
-    // below has no timeout - only a service stop or a console-session change wakes it.
+    // The agent reported NO GUI DOMAIN this boot (include/qga-exitcodes.h): nothing is relaunched before the next boot.
     BOOL noGuiDomain = FALSE;
+    // When the latch above was set, and whether its expiry has already been reported (see
+    // SESSION_END_NEVER_HAPPENED_MS). 0 = no latch is being timed.
+    ULONGLONG endedSessionAt = 0;
+
+    ZeroMemory(&channel, sizeof(channel));
 
     while (TRUE)
     {
-        HANDLE waitHandles[3];
+        HANDLE waitHandles[6];
         DWORD waitCount = 0;
-        DWORD timeoutMs;
+        DWORD idxNotice = 0xFFFFFFFF, idxContinue = 0xFFFFFFFF, idxProcess = 0xFFFFFFFF;
         DWORD wait;
-        BOOL running;
-        BOOL exitedQuickly = FALSE;
 
+        // ---- a launch, if one is wanted and possible --------------------------------------------------------
+        if (launchWanted && !agentProcess && !foreignProcess && !noGuiDomain)   // QGA_NOGUI_NORELAUNCH
+        {
+            DWORD consoleSession = WTSGetActiveConsoleSessionId();
+            DWORD pid = 0, sid = 0;
+            if (consoleSession == NO_SESSION)
+            {
+                // No console session yet (early boot, or changing): nothing can be started. The arrival event wakes us.
+                if (!waitingForSession)
+                    LogInfo("QGAWDLAUNCH '%s' wanted but there is no console session yet - will start it when one connects",
+                        exeName);
+                waitingForSession = TRUE;
+            }
+            else if (consoleSession == endedSession)
+            {
+                // THE SESSION ANNOUNCED ITS END: never launched into (the measured defect). A LOGOFF of that session
+                // clears this; a LOGON that follows is a new trigger.
+                LogInfo("QGAWDNOLAUNCH '%s' not launched: console session %u announced its end and has not ended yet "
+                    L"(a logon after it ends is the next trigger)", exeName, consoleSession);
+                launchWanted = FALSE;
+                waitingForSession = FALSE;
+            }
+            else if (IsProcessRunning(exeName, &pid, &sid))
+            {
+                // Is the gui agent running already? Our handle is authoritative; without one, a same-named process
+                // may exist. It is NOT ours: never adopted, never stopped - reported once per episode as an anomaly,
+                // with pid and session, and waited out through a separate handle so that no second agent is started
+                // while it lives. The launch stays wanted and happens when it exits.
+                foreignProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                if (foreignProcess)
+                    foreignPid = pid;
+                else
+                    win_perror("OpenProcess(foreign agent, SYNCHRONIZE)");
+                LogError("QGAWDFOREIGN '%s' (PID %u, session %u) is running but was NOT started by this service - "
+                    L"not adopted, not stopped, and no second agent is started while it lives (%s)",
+                    exeName, pid, sid,
+                    foreignProcess ? L"waiting on its handle" : L"it cannot be opened - the service ends with a failure "
+                                                                   L"code so the SCM's recovery looks again");
+                if (!foreignProcess)
+                {
+                    InterlockedExchange(&g_ServiceFailCode, (LONG)QGA_SVC_EXIT_LAUNCH_FAILED);
+                    break;
+                }
+                waitingForSession = FALSE;
+            }
+            else
+            {
+                HANDLE newProcess = NULL;
+                DWORD newPid = 0, newSession = NO_SESSION;
+                DWORD status;
+                waitingForSession = FALSE;
+                status = StartTargetProcess(cmdline, &newProcess, &newPid, &newSession, &channel);
+                if (status == START_SKIPPED_NO_SESSION)
+                {
+                    // Session vanished between our check and the launch: not an attempt, the arrival event wakes us.
+                    waitingForSession = TRUE;
+                }
+                else if (status == ERROR_SUCCESS && newProcess)
+                {
+                    agentProcess = newProcess;
+                    agentPid = newPid;
+                    agentSession = newSession;
+                    startedAt = GetTickCount64();
+                    noticeAcked = FALSE;
+                    launchWanted = FALSE;
+                    LogInfo("QGAWDLAUNCH '%s' started as PID %u in session %u", exeName, agentPid, agentSession);
+                }
+                else
+                {
+                    // A LAUNCH THAT FAILS IS A FAILURE OF THIS SERVICE (already logged by win_perror): nothing ran, so
+                    // there is no 4001; the service ends with its own code and the SCM's recovery retries by restarting
+                    // it - no backoff loop here (owner, 2026-10-07).
+                    LogError("QGAWDFAIL starting '%s' failed (error 0x%x) - the guest has NO GUI; this service ends with "
+                        L"QGA_SVC_EXIT_LAUNCH_FAILED so the SCM's recovery restarts it and the launch is retried",
+                        exeName, status);
+                    InterlockedExchange(&g_ServiceFailCode, (LONG)QGA_SVC_EXIT_LAUNCH_FAILED);
+                    break;
+                }
+            }
+        }
+
+        // ---- the wait: no timeout - every wake is an event ------------------------------------------------
         waitHandles[waitCount++] = g_StopEvent;
-        waitHandles[waitCount++] = g_SessionEvent;
+        waitHandles[waitCount++] = g_SessionArriveEvent;
+        waitHandles[waitCount++] = g_SessionLeaveEvent;
         if (agentProcess)
-            waitHandles[waitCount++] = agentProcess;
+        {
+            idxProcess = waitCount; waitHandles[waitCount++] = agentProcess;
+            idxNotice = waitCount; waitHandles[waitCount++] = channel.Notice;
+            idxContinue = waitCount; waitHandles[waitCount++] = channel.Continue;
+        }
         else if (foreignProcess)
-            waitHandles[waitCount++] = foreignProcess;   // waited on, never acted on
+        {
+            idxProcess = waitCount; waitHandles[waitCount++] = foreignProcess;   // waited on, never acted on
+        }
 
-        // Holding a healthy agent's handle - or a stranger's, which is only waited out - there is
-        // nothing to poll for: its exit wakes us. The timeout is only the respawn backoff, plus the
-        // QUICK_DEATH_MS survival check while a backoff is in force.
-        timeoutMs = (noGuiDomain || ((agentProcess || foreignProcess) && quickDeaths == 0)) ? INFINITE : backoffMs;   // QGA_NOGUI_WAIT
-
-        wait = WaitForMultipleObjects(waitCount, waitHandles, FALSE, timeoutMs);
+        // The wait has a deadline ONLY while a latched session has no agent left in it: that is the one state that
+        // nothing observable may ever leave (above). Otherwise the events are the only wake-ups.
+        {
+            DWORD waitMs = INFINITE;
+            if (endedSessionAt != 0 && !agentProcess)
+            {
+                const ULONGLONG el = GetTickCount64() - endedSessionAt;
+                waitMs = (el >= SESSION_END_NEVER_HAPPENED_MS) ? 0 : (DWORD)(SESSION_END_NEVER_HAPPENED_MS - el);
+            }
+            wait = WaitForMultipleObjects(waitCount, waitHandles, FALSE, waitMs);
+        }
+        if (wait == WAIT_TIMEOUT)
+        {
+            // THE ANNOUNCED END NEVER HAPPENED (SESSION_END_NEVER_HAPPENED_MS). The session that said it was ending
+            // has neither ended nor cancelled, and the agent that announced it is gone - so the end was vetoed and
+            // took the cancellation with it. Say so loudly and allow launches again; the loop's next pass launches.
+            const DWORD cs = WTSGetActiveConsoleSessionId();
+            LogError("QGAWDSESSIONSTUCK session %u announced its end %u s ago and has neither ended nor cancelled it, "
+                L"and no agent of ours is left in it (console session is now %u) - the end was vetoed and the agent "
+                L"that announced it died with the cancellation. Allowing launches into it again; the guest had NO GUI "
+                L"for that time.", endedSession, (unsigned)(SESSION_END_NEVER_HAPPENED_MS / 1000), cs);
+            endedSession = NO_SESSION;
+            endedSessionAt = 0;
+            launchWanted = TRUE;
+            continue;
+        }
         if (wait == WAIT_OBJECT_0) // stop event
         {
             LogInfo("service stop requested, watchdog thread exiting");
@@ -376,250 +678,124 @@ DWORD WINAPI WatchdogThread(void *param)
         }
         if (wait == WAIT_FAILED)
         {
+            // Our own handle table is broken: the loop cannot wait at all. Not a state to spin in - end the
+            // service with a failure code; the SCM's recovery restarts it.
             win_perror("WaitForMultipleObjects");
-            Sleep(backoffMs); // do not spin
-            continue;
+            InterlockedExchange(&g_ServiceFailCode, (LONG)QGA_SVC_EXIT_LAUNCH_FAILED);
+            break;
         }
         if (wait == WAIT_OBJECT_0 + 1)
-            LogInfo("console session changed, checking the agent");
-        if (agentProcess && wait == WAIT_OBJECT_0 + 2)
         {
-            DWORD exitCode = 0;
-            WCHAR why[128] = L"";
-            if (!GetExitCodeProcess(agentProcess, &exitCode))
-                exitCode = 0xFFFFFFFF;
-            if (exitCode == QGA_EXIT_NO_GUI_DOMAIN)
-            {
-                // A START-TIME CONDITION, NOT A DEATH (include/qga-exitcodes.h; Jev 0.94): no GUI domain for this qube this boot.
-                // Logged once, no death event, no relaunch before the next boot - a relaunch would fail the same way every time.
-                LogInfo("QGAWDNOGUIDOMAIN '%s' (PID %u) found no GUI domain for this qube (guivm is '') - not relaunching it "
-                    L"before the next boot; this is a start-time condition, not a death", exeName, agentPid);
-                noGuiDomain = TRUE;   // QGA_NOGUI_LATCH
-                CloseHandle(agentProcess);
-                agentProcess = NULL;
-                agentPid = 0;
-                continue;
-            }
-            // A DYING AGENT IS A MAJOR ERROR, not a warning (owner, 2026-10-03). This service did
-            // not ask it to exit: a stop the service asked for takes the g_StopEvent path above and
-            // StopOwnAgent, never this line. So an exit seen here is the agent going away under us -
-            // logged at ERROR with the exit code, whatever the relaunch below then does. The one
-            // exit that is not a death: the machine is going down and the session-1 agent is torn
-            // down before the SCM reaches us (the measured shutdown cluster, AgentRespawnPointless
-            // above) - that stays INFO, with the signals that said so, as the respawn path does.
-            if (AgentRespawnPointless(why, RTL_NUMBER_OF(why)))
-                LogInfo("Process '%s' (PID %u) exited with code 0x%x while the system is going down (%s)",
-                    exeName, agentPid, exitCode, why);
+            // A SESSION ARRIVED (logon / console connect): a launch trigger when no agent of ours runs, for any
+            // session but one that announced its end.
+            DWORD sid = (DWORD)InterlockedCompareExchange(&g_ArriveSession, -1, -1);
+            if (agentProcess || foreignProcess)
+                LogInfo("QGAWDTRIGGER session %u arrived while an agent runs (PID %u) - nothing to launch", sid,
+                    agentProcess ? agentPid : foreignPid);
+            else if (sid == endedSession)
+                LogInfo("QGAWDTRIGGER session %u arrived but it announced its end and has not ended - not a launch trigger", sid);
             else
             {
-                LogError("Process '%s' (PID %u) exited with code 0x%x without this service asking it to - "
-                    L"the agent DIED (%s)", exeName, agentPid, exitCode, why);
-                // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo):
-                // a crash is in Windows Error Reporting and Application event 1000 already, but a clean,
-                // unasked exit is visible only here. ONE Event Log entry under our source, with the exit
-                // code and how long it ran; the dom0 notification is the event-triggered reporter's job
-                // (ADR 3), not this service's - nothing here waits on qrexec or on a session.
-                DeathEventReport(DEATHEVENT_ID_GUI_AGENT, exeName, agentPid, exitCode,
-                    startedAt != 0 ? GetTickCount64() - startedAt : DEATHEVENT_RAN_UNKNOWN,
-                    L"The QubesGuiWatchdog service relaunches it (backed off while it keeps dying quickly). "
-                    L"Its log and the agent's are in the Qubes Tools log directory; a crash also leaves a "
-                    L"Windows Error Reporting record (AppCrash_gui-agent.exe_*).");
+                LogInfo("QGAWDTRIGGER session %u arrived and no agent of ours runs - launching", sid);
+                launchWanted = TRUE;
             }
+            continue;
+        }
+        if (wait == WAIT_OBJECT_0 + 2)
+        {
+            // A SESSION LEFT (logoff). The session that announced its end has now ended: a logon that follows -
+            // autologon at the sign-in screen, seconds later on these guests - is a new session to launch into.
+            DWORD sid = (DWORD)InterlockedCompareExchange(&g_LeaveSession, -1, -1);
+            if (sid == endedSession)
+            {
+                LogInfo("QGAWDSESSIONEND session %u has ended (logoff) - a logon into the console session is the next "
+                    L"launch trigger", sid);
+                endedSession = NO_SESSION;
+                endedSessionAt = 0;
+            }
+            else
+                LogDebug("session %u logged off (not the announced one %u)", sid, endedSession);
+            continue;
+        }
+        if (agentProcess && wait == WAIT_OBJECT_0 + idxNotice)
+        {
+            // THE AGENT'S SESSION IS ENDING (its WM_QUERYENDSESSION). Acknowledge at once - its handler waits for this,
+            // bounded - and latch the session: nothing is launched into it from here on, whatever the exit code says.
+            noticeAcked = TRUE;
+            endedSession = agentSession;
+            endedSessionAt = GetTickCount64();   // the detector above starts once no agent is left in it
+            SetEvent(channel.Ack);
+            ResetEvent(channel.Notice);
+            LogInfo("QGAWDSESSIONEND '%s' (PID %u) reports session %u ending - acknowledged; no agent is launched into "
+                L"session %u from here on", exeName, agentPid, agentSession, agentSession);
+            continue;
+        }
+        if (agentProcess && wait == WAIT_OBJECT_0 + idxContinue)
+        {
+            // The end was cancelled (another application vetoed it): the session continues.
+            noticeAcked = FALSE;
+            if (endedSession == agentSession)
+            {
+                endedSession = NO_SESSION;
+                endedSessionAt = 0;
+            }
+            ResetEvent(channel.Ack);
+            LogWarning("QGAWDSESSIONCONTINUES '%s' (PID %u): the end of session %u was cancelled - launches into it are "
+                L"allowed again", exeName, agentPid, agentSession);
+            continue;
+        }
+        if (agentProcess && wait == WAIT_OBJECT_0 + idxProcess)
+        {
+            DWORD exitCode = 0;
+            QGA_EXIT_VERDICT v;
+            if (!GetExitCodeProcess(agentProcess, &exitCode))
+                exitCode = 0xFFFFFFFF;
+            v = JudgeAgentExit(exeName, agentPid, agentSession, exitCode, noticeAcked, startedAt);
+            if (v.NoLaunchIntoSession)
+                endedSession = agentSession;
+            if (v.Decision == QGA_DECIDE_NOGUI_LATCH)
+                noGuiDomain = TRUE;   // QGA_NOGUI_LATCH
             CloseHandle(agentProcess);
             agentProcess = NULL;
             agentPid = 0;
-            lastExitCode = exitCode;
-            lastExitKnown = (exitCode != 0xFFFFFFFF);
-            // Judge "quick" at the moment of death, not after the delay below (a 16 s+ delay made
-            // every death look old and reset the backoff). And KEEP the delay: the handle wakes
-            // us the instant the agent exits, so without it a quick death would be respawned
-            // immediately and the backoff would never hold - exactly the once-a-second grant-table
-            // hammering it was added to stop.
-            exitedQuickly = (startedAt != 0 && GetTickCount64() - startedAt < QUICK_DEATH_MS);
-            if (exitedQuickly &&
-                WaitForSingleObject(g_StopEvent, backoffMs) == WAIT_OBJECT_0)
+            LifecycleChannelClose(&channel);
+            noticeAcked = FALSE;
+            if (v.RelaunchNow)
+                launchWanted = TRUE;
+            if (v.FailService)
             {
-                LogInfo("service stop requested, watchdog thread exiting");
+                // THE SERVICE FAILS ITSELF so that Windows restarts it (and with it the agent): no relaunch loop and no
+                // backoff in this file - the SCM's recovery actions are the keep-alive (docs/ADR-supervision.md 4).
+                LogError("QGAWDFAIL ending this service with QGA_SVC_EXIT_AGENT_DIED (0x%x) for the SCM's recovery to "
+                    L"restart it", QGA_SVC_EXIT_AGENT_DIED);
+                InterlockedExchange(&g_ServiceFailCode, (LONG)QGA_SVC_EXIT_AGENT_DIED);
                 break;
             }
+            continue;
         }
-
-        // A stranger we were waiting out has exited: say so and let the loop start our own.
-        if (!agentProcess && foreignProcess && wait == WAIT_OBJECT_0 + 2)
+        if (foreignProcess && wait == WAIT_OBJECT_0 + idxProcess)
         {
+            // A stranger we were waiting out has exited: say so; the deferred launch happens at the top of the loop.
             DWORD exitCode = 0;
             if (!GetExitCodeProcess(foreignProcess, &exitCode))
                 exitCode = 0xFFFFFFFF;
             LogInfo("QGAWDFOREIGN the '%s' this service did not start (PID %u) has exited with code 0x%x - "
-                L"starting our own", exeName, foreignPid, exitCode);
+                L"the deferred launch proceeds", exeName, foreignPid, exitCode);
             CloseHandle(foreignProcess);
             foreignProcess = NULL;
             foreignPid = 0;
-            foreignLogged = FALSE;
+            launchWanted = TRUE;
+            continue;
         }
-
-        // Is the gui agent running? Our handle is authoritative. Without one (service start, or a
-        // restart while an agent we did not launch is alive) a same-named process may exist. It is
-        // NOT ours: it is never adopted and never stopped (the owner's rule - until 2026-10-03 this
-        // loop OpenProcess'ed it into agentProcess and supervised it as the agent it started). It is
-        // reported once per episode as an anomaly, with pid and session, and waited out through a
-        // separate handle so that no second agent is started while it lives. If it cannot be opened
-        // even for SYNCHRONIZE the loop falls back to the backoff-paced name poll for it.
-        running = (agentProcess != NULL);
-        if (!running && foreignProcess)
-        {
-            if (WaitForSingleObject(foreignProcess, 0) == WAIT_OBJECT_0)
-            {
-                // Exited between the wait above and here; the normal path is the block before.
-                CloseHandle(foreignProcess);
-                foreignProcess = NULL;
-                foreignPid = 0;
-                foreignLogged = FALSE;
-            }
-            else
-                running = TRUE;
-        }
-        if (!running)
-        {
-            DWORD pid = 0, sid = 0;
-            if (IsProcessRunning(exeName, &pid, &sid))
-            {
-                running = TRUE;
-                foreignProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                if (foreignProcess)
-                    foreignPid = pid;
-                else
-                    win_perror("OpenProcess(foreign agent, SYNCHRONIZE)");
-                if (!foreignLogged)
-                {
-                    LogError("QGAWDFOREIGN '%s' (PID %u, session %u) is running but was NOT started by this service - "
-                        L"not adopted, not stopped, and no second agent is started while it lives (%s)",
-                        exeName, pid, sid,
-                        foreignProcess ? L"waiting on its handle" : L"it cannot be opened, polling for it by name");
-                    foreignLogged = TRUE;
-                }
-            }
-            else
-            {
-                foreignLogged = FALSE;
-            }
-        }
-
-        if (!running && noGuiDomain) continue;   // QGA_NOGUI_NORELAUNCH - nothing to start before the next boot
-        if (!running)
-        {
-            WCHAR why[128] = L"";
-            HANDLE newProcess = NULL;
-            DWORD newPid = 0;
-            DWORD status;
-
-            if (AgentRespawnPointless(why, RTL_NUMBER_OF(why)))
-            {
-                LogInfo("Process '%s' not running and the system is going down (%s) - "
-                    L"not restarting it", exeName, why);
-                continue;
-            }
-
-            // No console session yet (early boot, or 0xFFFFFFFF while it is changing): nothing
-            // can be started, so nothing is recorded - this is not an agent death and must not
-            // grow the backoff. g_SessionEvent wakes us when the console connects.
-            if (WTSGetActiveConsoleSessionId() == 0xFFFFFFFF)
-            {
-                if (!waitingForSession)
-                    LogInfo("Process '%s' not running and there is no console session yet - "
-                        L"will start it when one connects (%s)", exeName, why);
-                waitingForSession = TRUE;
-                continue;
-            }
-            waitingForSession = FALSE;
-
-            // Fast failure = the agent we waited on died quickly, or the previous launch itself
-            // failed (nothing ran, so "ran long enough to be healthy" cannot apply), or - on the
-            // poll-by-name path only - the last start is recent.
-            if (exitedQuickly || lastLaunchFailed ||
-                (startedAt != 0 && GetTickCount64() - startedAt < QUICK_DEATH_MS))
-            {
-                quickDeaths++;
-                if (backoffMs < BACKOFF_MAX_MS)
-                {
-                    backoffMs *= 2;
-                    if (backoffMs > BACKOFF_MAX_MS)
-                        backoffMs = BACKOFF_MAX_MS;
-                }
-                // ERROR, not warning (owner, 2026-10-03): a launch that fails and an agent that
-                // dies on arrival are the guest having no GUI, and the backoff only spaces the
-                // attempts out - nothing here is recovering.
-                if (lastLaunchFailed)
-                    LogError("Starting process '%s' failed (error 0x%x), %u time(s) in a row - "
-                        L"backing off to %u ms (%s). The guest has NO GUI while this lasts.",
-                        exeName, lastLaunchError, quickDeaths, backoffMs, why);
-                else
-                {
-                    // The cause is the exit code we saw, not a presumption. 0x5aa is
-                    // ERROR_NO_SYSTEM_RESOURCES, which on this guest has meant an exhausted Xen
-                    // grant table (measured 2026-08-15) - said only when that is the code.
-                    WCHAR codeText[48];
-                    if (lastExitKnown)
-                        StringCchPrintfW(codeText, RTL_NUMBER_OF(codeText), L"exit code 0x%x", lastExitCode);
-                    else
-                        StringCchCopyW(codeText, RTL_NUMBER_OF(codeText), L"exit code unknown");
-                    LogError("Process '%s' died within %u ms of starting (%s), %u time(s) in a row - "
-                        L"backing off to %u ms (%s). The guest has NO GUI while this lasts; the agent "
-                        L"log names the failure.%s",
-                        exeName, QUICK_DEATH_MS, codeText, quickDeaths, backoffMs, why,
-                        (lastExitKnown && lastExitCode == 0x5aa)
-                            ? L" Exit code 0x5aa is ERROR_NO_SYSTEM_RESOURCES: on this guest that has "
-                              L"meant an exhausted Xen grant table, which only a reboot clears."
-                            : L"");   // QGA_QUICKDEATH_CODE
-                }
-            }
-            else
-            {
-                if (quickDeaths != 0)
-                    LogInfo("Process '%s' had been failing fast; it last ran long enough to count "
-                        L"as healthy, restart delay reset to 1000 ms", exeName);
-                quickDeaths = 0;
-                backoffMs = 1000;
-                LogWarning("Process '%s' not running, restarting it (%s)", exeName, why);
-            }
-
-            status = StartTargetProcess(cmdline, &newProcess, &newPid);
-            if (status == START_SKIPPED_NO_SESSION)
-            {
-                // Session vanished between our check and the launch: not an attempt, record nothing.
-                continue;
-            }
-            startedAt = GetTickCount64();
-            if (status == ERROR_SUCCESS && newProcess)
-            {
-                agentProcess = newProcess;
-                agentPid = newPid;
-                lastLaunchFailed = FALSE;
-                lastLaunchError = ERROR_SUCCESS;
-            }
-            else
-            {
-                // Real launch failure (already logged by win_perror): backed off via startedAt on
-                // the next tick, with the actual error in the text.
-                lastLaunchFailed = TRUE;
-                lastLaunchError = status;
-            }
-        }
-        else if (quickDeaths != 0 && startedAt != 0 &&
-                 GetTickCount64() - startedAt >= QUICK_DEATH_MS)
-        {
-            // Survived the window - stop punishing it.
-            LogInfo("Process '%s' has been up for %u ms, restart delay reset", exeName, QUICK_DEATH_MS);
-            quickDeaths = 0;
-            backoffMs = 1000;
-        }
+        LogWarning("unexpected wait result 0x%x", wait);
     }
 
     // THE OWNER STOPS ITS CHILD: the agent this service started goes down with the service, by
     // handle (StopOwnAgent logs every outcome). A stranger that was only waited out is left exactly
-    // as it was - it is not ours - and that is said.
+    // as it was - it is not ours - and that is said. On a FAILURE exit (the agent died) there is no
+    // agent to stop; the service ends and the SCM restarts it.
     if (agentProcess)
-        StopOwnAgent(agentProcess, agentPid, exeName);
+        StopOwnAgent(agentProcess, agentPid, exeName, &channel);
     if (foreignProcess)
     {
         LogError("QGAWDFOREIGN service stopping while '%s' (PID %u), which this service did not start, is running - "
@@ -634,6 +810,7 @@ DWORD WINAPI EventsThread(void *param)
     HANDLE events[1];
     DWORD signaledEvent = 2;
 
+    UNREFERENCED_PARAMETER(param);
     LogDebug("start");
 
     // Default security for the SAS event, only SYSTEM processes can signal it.
@@ -665,6 +842,10 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
     HANDLE watchdogHandle = NULL;
     DWORD status;
     BOOL cleanStop = FALSE;
+    LONG failCode = 0;
+
+    UNREFERENCED_PARAMETER(argc);
+    UNREFERENCED_PARAMETER(argv);
 
     WCHAR* cmdline = malloc(MAX_PATH_LONG_WSIZE);
     if (!cmdline)
@@ -681,8 +862,9 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
 
     // Created before the control handler is registered so a STOP arriving early cannot be missed.
     g_StopEvent = CreateEvent(NULL, TRUE, FALSE, NULL);
-    g_SessionEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
-    if (!g_StopEvent || !g_SessionEvent)
+    g_SessionArriveEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    g_SessionLeaveEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (!g_StopEvent || !g_SessionArriveEvent || !g_SessionLeaveEvent)
     {
         win_perror("CreateEvent");
         goto cleanup;
@@ -690,9 +872,8 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
 
     g_Status.dwServiceType = SERVICE_WIN32;
     g_Status.dwCurrentState = SERVICE_START_PENDING;
-    // PRESHUTDOWN arrives BEFORE the ordinary shutdown notifications, which is the only chance to
-    // know the machine is going down early enough to stop respawning the agent into it.
-    // SESSIONCHANGE tells the watchdog when the console session arrives (see g_SessionEvent).
+    // PRESHUTDOWN arrives BEFORE the ordinary shutdown notifications; SESSIONCHANGE tells the watchdog when a
+    // console session arrives (the launch trigger) and when one has left (the end of an announced session).
     g_Status.dwControlsAccepted = SERVICE_ACCEPT_STOP | SERVICE_ACCEPT_SHUTDOWN |
         SERVICE_ACCEPT_PRESHUTDOWN | SERVICE_ACCEPT_SESSIONCHANGE;
     g_Status.dwWin32ExitCode = 0;
@@ -728,17 +909,13 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
     g_Status.dwCurrentState = SERVICE_RUNNING;
     SetServiceStatus(g_StatusHandle, &g_Status);
 
-    // The watchdog thread exits on g_StopEvent (set by ControlHandlerEx on STOP/SHUTDOWN/
-    // PRESHUTDOWN, which report STOP_PENDING) - after stopping the agent it started (StopOwnAgent:
-    // the exit request, AGENT_STOP_GRACE_MS, then TerminateProcess and AGENT_KILL_WAIT_MS). STOPPED
-    // is reported here, after it has actually exited, so a caller whose Stop-Service returned is
-    // guaranteed no further agent launch from this service AND no agent of this service's left
-    // behind. The join is BOUNDED once the stop is requested, by STOP_WAIT_HINT_MS (what the
-    // handler told the SCM to allow): a service that never reaches a terminal state is waited out
-    // for the full preshutdown timeout (180 s by default) and logged as Event 7043 - observed on
-    // this rig (2026-08-29) and the reason PRESHUTDOWN once reported STOPPED straight from the
-    // handler. Every wait in the thread is bounded, so hitting this bound is an anomaly worth the
-    // error line; the stop proceeds regardless.
+    // The watchdog thread exits on g_StopEvent (set by ControlHandlerEx on STOP/SHUTDOWN/PRESHUTDOWN, which
+    // report STOP_PENDING) - after stopping the agent it started (StopOwnAgent, bounded) - OR on its own when the
+    // agent died or could not be launched (g_ServiceFailCode set): then this service reports STOPPED with that
+    // service-specific code, the SCM logs 7024 and its recovery actions restart the service. STOPPED is reported
+    // here, after the thread has actually exited, so a caller whose Stop-Service returned is guaranteed no
+    // further agent launch from this service AND no agent of this service's left behind. The join is BOUNDED
+    // once a stop is requested, by STOP_WAIT_HINT_MS (what the handler told the SCM to allow).
     {
         HANDLE joinHandles[2] = { watchdogHandle, g_StopEvent };
         DWORD join = WaitForMultipleObjects(2, joinHandles, FALSE, INFINITE);
@@ -750,13 +927,35 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
                     L"reporting STOPPED anyway; the respawn loop is disarmed by g_ServiceStopping, "
                     L"and the agent may still be running", STOP_WAIT_HINT_MS, join);
         }
+        else
+        {
+            failCode = InterlockedCompareExchange(&g_ServiceFailCode, 0, 0);
+            if (failCode != 0 && InterlockedCompareExchange(&g_ServiceStopping, 0, 0) == 0)
+            {
+                // Not asked to stop: the thread ended because the agent died or could not be launched. STOP_PENDING is
+                // not needed - nothing is left to stop - and the code below is what the SCM's recovery keys on.
+                LogError("QGAWDFAIL the service ends with service-specific code 0x%x (the SCM's recovery restarts it)",
+                    (DWORD)failCode);
+            }
+            else
+                failCode = 0;
+        }
     }
     cleanStop = TRUE;
 
 cleanup:
     // don't free cmdline here, a thread using it may be still running, memory is freed on exit anyway
     g_Status.dwCurrentState = SERVICE_STOPPED;
-    g_Status.dwWin32ExitCode = cleanStop ? 0 : GetLastError();
+    if (failCode != 0)
+    {
+        g_Status.dwWin32ExitCode = ERROR_SERVICE_SPECIFIC_ERROR;
+        g_Status.dwServiceSpecificExitCode = (DWORD)failCode;
+    }
+    else
+    {
+        g_Status.dwWin32ExitCode = cleanStop ? 0 : GetLastError();
+        g_Status.dwServiceSpecificExitCode = 0;
+    }
     g_Status.dwCheckPoint = 0;
     g_Status.dwWaitHint = 0;
     if (g_StatusHandle)
@@ -768,30 +967,17 @@ cleanup:
 
 DWORD WINAPI ControlHandlerEx(IN DWORD controlCode, IN DWORD eventType, IN void *eventData, IN void *context)
 {
+    UNREFERENCED_PARAMETER(context);
     switch (controlCode)
     {
     case SERVICE_CONTROL_PRESHUTDOWN:
-        // Earliest reliable "the machine is going down" signal: latch the flag so the watchdog
-        // stops respawning the agent into a dying machine.
-        //
-        // THEN REPORT STOPPED, IMMEDIATELY. The previous version only latched the flag, on the
-        // assumption that "the SCM follows this with SHUTDOWN/STOP, which is where the state
-        // transition belongs". That assumption is wrong and it cost ~3 minutes on EVERY clean
-        // shutdown: the SCM does not send SHUTDOWN until preshutdown COMPLETES, and a service that
-        // never reports a terminal state is waited out for the full preshutdown timeout (180 s by
-        // default) before the SCM gives up and logs
-        //     Event 7043: "The Qubes GUI agent watchdog service did not shut down properly after
-        //                  receiving a preshutdown control."
-        // That event was observed on this rig and traced here (2026-08-29). ServiceMain blocks
-        // INFINITE on a worker thread that never exits, so no other path can report the state.
-        //
-        // Reporting STOPPED from this handler while WatchdogThread was still alive was the
-        // second half of that problem: the SCM considered us gone while the respawn loop was
-        // still live (only g_ServiceStopping kept it from relaunching). Now that the loop waits
-        // on g_StopEvent it ends as soon as it has stopped the agent it started (StopOwnAgent,
-        // bounded), so PRESHUTDOWN takes the same path as STOP: STOP_PENDING here with a wait hint
-        // that covers that stop, STOPPED from ServiceMain once the thread has exited - and
-        // ServiceMain bounds that join, so a stuck thread can never bring Event 7043 back.
+        // The machine is going down. MEASURED 2026-10-07: this arrives 4-32 s after the shutdown began, AFTER
+        // session 1's logoff - too late to keep the agent from being relaunched into the ending session, which is
+        // why the session end is handshaken with the agent itself (the lifecycle channel). Here it only ends the
+        // service cleanly: REPORT STOP_PENDING AND STOP. A service that never reports a terminal state is waited
+        // out for the full preshutdown timeout (180 s by default) and logged as Event 7043 - observed on this rig
+        // (2026-08-29) and the reason this once reported STOPPED straight from the handler; now the thread stops
+        // the agent it started (StopOwnAgent, bounded) and ServiceMain reports STOPPED after it has exited.
         InterlockedExchange(&g_ServiceStopping, 1);
         LogInfo("preshutdown - the agent will not be restarted from here on, stopping");
         g_Status.dwWin32ExitCode = 0;
@@ -821,21 +1007,31 @@ DWORD WINAPI ControlHandlerEx(IN DWORD controlCode, IN DWORD eventType, IN void 
             SetEvent(g_StopEvent);
         break;
     case SERVICE_CONTROL_SESSIONCHANGE:
-        // Console session arrival is what the watchdog waits for when it could not start the
-        // agent (no session yet); wake it instead of leaving it to rediscover the session by polling.
+    {
+        // A console session ARRIVING is the launch trigger (service start aside); a session LEAVING is how an
+        // announced end becomes final (a logoff without a shutdown, so the next logon can get an agent).
+        WTSSESSION_NOTIFICATION *notification = (WTSSESSION_NOTIFICATION *)eventData;
+        DWORD sid = notification ? notification->dwSessionId : NO_SESSION;
         if (eventType == WTS_CONSOLE_CONNECT || eventType == WTS_SESSION_LOGON)
         {
-            WTSSESSION_NOTIFICATION *notification = (WTSSESSION_NOTIFICATION *)eventData;
-            LogInfo("session change 0x%x, session %u", eventType,
-                notification ? notification->dwSessionId : 0xFFFFFFFF);
-            if (g_SessionEvent)
-                SetEvent(g_SessionEvent);
+            LogInfo("session change 0x%x (arrival), session %u", eventType, sid);
+            InterlockedExchange(&g_ArriveSession, (LONG)sid);
+            if (g_SessionArriveEvent)
+                SetEvent(g_SessionArriveEvent);
+        }
+        else if (eventType == WTS_SESSION_LOGOFF)
+        {
+            LogInfo("session change 0x%x (logoff), session %u", eventType, sid);
+            InterlockedExchange(&g_LeaveSession, (LONG)sid);
+            if (g_SessionLeaveEvent)
+                SetEvent(g_SessionLeaveEvent);
         }
         else
         {
-            LogDebug("session change 0x%x (ignored)", eventType);
+            LogDebug("session change 0x%x, session %u (ignored)", eventType, sid);
         }
         break;
+    }
     default:
         LogDebug("code 0x%x, event 0x%x", controlCode, eventType);
         break;

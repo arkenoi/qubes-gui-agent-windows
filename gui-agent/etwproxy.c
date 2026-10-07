@@ -72,15 +72,25 @@
  * session too - nothing would consume it.
  *
  * SUPERVISION IS EXIT-WAIT (owner directive; sec 10.14.6): RegisterWaitForSingleObject
- * on the process handle; the callback fires the moment the proxy exits and schedules a
- * relaunch on a one-shot timer-queue timer with exponential backoff 5 s -> 5 min
- * (reset after 10 min of healthy uptime). No heartbeat file, no staleness poll: a
- * hung-but-alive proxy is indistinguishable from a silent provider and costs only the
- * ETW tier, which is not an urgent condition (sec 10.14.6). EtwProxyPoke() is not a
- * health check - it only covers "no console session yet" at first launch and "console
- * user changed" (new pipe-DACL SID needed), conditions no exit-wait can observe.
- * Session lifecycle rides supervision: every launch stops-then-starts the session
- * (stale reap included), every park and the agent shutdown stop it.
+ * on the process handle; the callback fires the moment the proxy exits, records the death
+ * (ERROR + Application event 4004) and that is ALL: since 2026-10-07 nothing here relaunches
+ * (owner: no hand-written relaunch or keep-alive loop anywhere; every death is a major
+ * failure, brought back only by a Windows mechanism or not at all). The proxy is launched
+ * ONCE per agent life; the exponential-backoff relaunch timer (5 s -> 5 min) this file
+ * carried is GONE, and a launch-step failure is terminal for this agent's life too.
+ * WHY NOT A TASK SCHEDULER TASK (the Windows relauncher the other helpers now use): the
+ * proxy runs under a provisioned account whose password is reset per launch and kept
+ * NOWHERE (the in-memory creds contract above), inside a job sandbox (64 MB, 1 process,
+ * UI-restricted, kill-on-close) assigned BEFORE its first instruction, with its token
+ * censused for never-SYSTEM / no PLU / no SeSystemProfilePrivilege. A task would need a
+ * stored password or an S4U logon, and the sandbox could be applied only after the process
+ * ran - both weaken the guarantees, so the single launch with no relaunch is what remains.
+ * No heartbeat file, no staleness poll: a hung-but-alive proxy is indistinguishable from a
+ * silent provider and costs only the ETW tier, which is not an urgent condition (sec
+ * 10.14.6). EtwProxyPoke() is not a health check - it only covers "no console session yet"
+ * at first launch, a condition no exit-wait can observe. Session lifecycle rides
+ * supervision: the launch stops-then-starts the session (stale reap included), every park,
+ * every death and the agent shutdown stop it.
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -132,9 +142,6 @@ static const GUID ETWPROXY_SESSION_GUID = /* generated once for this project, re
 // (private winsta creation, DACL builder, lpDesktop) is REMOVED, not relocated.
 
 #define ETWPROXY_MEM_LIMIT    (64ull * 1024 * 1024)  // sec 10.14.4: a decode bomb dies, the guest does not
-#define ETWPROXY_BACKOFF_MIN  5000                    // ms; sec 10.14.6 (5 s -> 5 min)
-#define ETWPROXY_BACKOFF_MAX  300000
-#define ETWPROXY_HEALTHY_MS   (10 * 60 * 1000)        // uptime that resets the backoff
 #define ETWPROXY_POKE_MS      5000                    // Poke self-throttle (launch precondition only)
 #define ETWPROXY_EXIT_DENIED    5   // proxy: OpenTrace/consume access denied under the DACL
                                     // grant - sec 10.16.3b's datum as redefined by the split
@@ -151,9 +158,8 @@ static const GUID ETWPROXY_SESSION_GUID = /* generated once for this project, re
                                     // IMPOSES on a force-kill (taskkill /f, Stop-Process
                                     // -Force, or our OWN stop-by-name reap of a stale
                                     // instance). Expected on any SUPERVISED kill - park,
-                                    // shutdown, job-kill, the next-launch reap, and the p3a
-                                    // T5/T8c drills - so it is logged quietly (its own token,
-                                    // still greppable) and relaunched, NOT raised as
+                                    // shutdown, job-kill, and the p3a T5/T8c drills - so it is
+                                    // logged with its own token (still greppable), NOT raised as
                                     // EtwProxyUnknownExit. That anomaly stays reserved for a
                                     // TRULY unaccounted code (a crash: 0xC0000005 / __fastfail
                                     // / a CRT abort) - a benign external kill by 1 must not
@@ -170,7 +176,7 @@ typedef enum
     EPS_DISABLED = 0,   // gate off - inert for the whole run
     EPS_IDLE,           // armed, not running: launch as soon as a console user exists
     EPS_RUNNING,        // proxy alive, exit-wait registered
-    EPS_BACKOFF,        // exited; one-shot relaunch timer pending
+    EPS_DEAD,           // exited, or a launch step failed: NOT relaunched this agent life (owner, 2026-10-07)
     EPS_PARKED,         // permanent for this boot (account absent / logon denied / token
                         // drift / rc 5 / rc 9)
 } ETWPROXY_STATE;
@@ -183,16 +189,14 @@ static ETWPROXY_STATE   g_State = EPS_DISABLED;
 static HANDLE           g_Job;
 static HANDLE           g_Proc;
 static HANDLE           g_Wait;         // RegisterWaitForSingleObject handle
-static HANDLE           g_Timer;        // one-shot relaunch timer (timer queue)
 static ULONGLONG        g_LaunchTick;
-static DWORD            g_Backoff = ETWPROXY_BACKOFF_MIN;
+static BOOL             g_Disarmed;     // the session is ending (HelpersDisarm): no launch, and an exit is expected
 static ULONGLONG        g_NextPoke;     // Poke throttle (main-loop thread only)
 static WCHAR            g_ClientSid[192]; // SID string the running proxy was launched with
 static BOOL             g_SessLive;     // this agent started the ETW session and owns stopping it
 static BOOL             g_CensusLogged; // token group/priv census printed once per boot
 
 static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut);
-static VOID CALLBACK EtwProxyRelaunchCb(PVOID context, BOOLEAN timerFired);
 static void EtwProxyTryLaunchLocked(void);
 
 // ---- ETW session controller (agent-side; the sec 10.14 control calls) ----------------
@@ -396,16 +400,15 @@ static void EtwProxyParkLocked(const char* reason, DWORD code)
              "bridge degrades to listener/DB (fail-open)", reason, code);
 }
 
-// ---- backoff: schedule one relaunch attempt; the session is stopped meanwhile (a
-// session nobody consumes only accumulates loss counters). Callers hold g_Lock.
-static void EtwProxyBackoffLocked(void)
+// ---- dead for this agent's life: the ETW tier stays down until the next GUI agent start. This replaced the
+// backoff relaunch timer (owner, 2026-10-07: no relaunch loops; a death is a major failure, recorded once). The
+// session is stopped (a session nobody consumes only accumulates loss counters). Callers hold g_Lock.
+static void EtwProxyDeadLocked(const char* reason, DWORD code)
 {
     EtwProxySessionStopLocked();
-    g_State = EPS_BACKOFF;
-    if (!CreateTimerQueueTimer(&g_Timer, NULL, EtwProxyRelaunchCb, NULL, g_Backoff, 0,
-                               WT_EXECUTEONLYONCE | WT_EXECUTELONGFUNCTION))
-        g_State = EPS_IDLE;   // timer refused: Poke's throttle becomes the retry pace
-    g_Backoff = min(g_Backoff * 2, ETWPROXY_BACKOFF_MAX);
+    g_State = EPS_DEAD;
+    LogError("ETWPROXYSUP DOWN for this agent's life: %S (code %lu) - not relaunched (no relaunch loop, owner "
+             "2026-10-07); the bridge degrades to listener/DB (fail-open) until the next GUI agent start", reason, code);
 }
 
 // ---- credentials: generate + set + prove, all in memory (the in-memory creds contract) -
@@ -661,7 +664,7 @@ static HANDLE EtwProxyBuildJob(void)
 //      ProcessTrace only - proxy-side, in tools/notifhost/etwproxy.cpp.
 static void EtwProxyTryLaunchLocked(void)
 {
-    if (g_State != EPS_IDLE || g_Shutdown)
+    if (g_State != EPS_IDLE || g_Shutdown || g_Disarmed)
         return;
 
     WCHAR clientSid[RTL_NUMBER_OF(g_ClientSid)];
@@ -755,13 +758,10 @@ static void EtwProxyTryLaunchLocked(void)
     if (rc != ERROR_SUCCESS)
     {
         CloseHandle(job); CloseHandle(token);
-        // No session is running yet; EtwProxyBackoffLocked's StopLocked is a no-op
-        // (g_SessLive is still FALSE). SYSTEM being denied WRITE_DAC on its own session GUID
-        // would mean the trace config is broken, but that is vanishingly unlikely for SYSTEM;
-        // treat any grant failure as transient and retry on backoff.
-        LogWarning("ETWPROXYSUP EventAccessControl grant failed (%lu) - consumer not authorized; "
-                   "will retry on backoff", rc);
-        EtwProxyBackoffLocked();
+        // No session is running yet; EtwProxyDeadLocked's StopLocked is a no-op (g_SessLive is still
+        // FALSE). SYSTEM being denied WRITE_DAC on its own session GUID means the trace config is
+        // broken; nothing here retries it (no relaunch loop).
+        EtwProxyDeadLocked("EventAccessControl grant failed - consumer not authorized", rc);
         return;
     }
     TRACEHANDLE sess = 0;
@@ -771,14 +771,11 @@ static void EtwProxyTryLaunchLocked(void)
     {
         CloseHandle(job); CloseHandle(token);
         // SYSTEM being denied session control means the machine's trace config is broken
-        // in a way a relaunch cannot fix; anything else gets the backoff retry.
+        // in a way a relaunch cannot fix; anything else is a failure of this one launch - and there is no other.
         if (rc == ERROR_ACCESS_DENIED)
             EtwProxyParkLocked("StartTrace access-denied for SYSTEM - trace configuration broken", rc);
         else
-        {
-            LogWarning("ETWPROXYSUP StartTrace failed (%lu) - will retry on backoff", rc);
-            EtwProxyBackoffLocked();
-        }
+            EtwProxyDeadLocked("StartTrace failed", rc);
         return;
     }
     g_SessLive = TRUE;
@@ -786,8 +783,7 @@ static void EtwProxyTryLaunchLocked(void)
     if (enabled == 0)
     {
         CloseHandle(job); CloseHandle(token);
-        LogWarning("ETWPROXYSUP zero providers enabled - will retry on backoff");
-        EtwProxyBackoffLocked();   // stops the session
+        EtwProxyDeadLocked("zero providers enabled", 0);   // stops the session
         return;
     }
 
@@ -842,8 +838,7 @@ static void EtwProxyTryLaunchLocked(void)
     if (!created)
     {
         CloseHandle(job);
-        LogWarning("ETWPROXYSUP CreateProcessAsUser failed (%lu) - will retry on backoff", createGle);
-        EtwProxyBackoffLocked();   // stops the session
+        EtwProxyDeadLocked("CreateProcessAsUser failed", createGle);   // stops the session
         return;
     }
 
@@ -915,21 +910,33 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
     CloseHandle(g_Job);   // process already gone; KILL_ON_JOB_CLOSE has nothing left to kill
     g_Job = NULL;
 
+    if (g_Disarmed)
+    {
+        // EXPECTED (R5): helper launches are disarmed because the session is ending, and the proxy went with it
+        // (Windows ends every process of the session). Not a death: INFO, no record, nothing comes back.
+        LogInfo("ETWPROXYSUP proxy exited rc=%lu after %llu ms while the session is ending - expected, not a death",
+                rc, uptimeMs);
+        EtwProxySessionStopLocked();
+        g_State = EPS_DEAD;
+        LeaveCriticalSection(&g_Lock);
+        return;
+    }
+
     // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo): every exit
     // that reaches this point is one this agent did not ask for (a shutdown or a park has already
     // left EPS_RUNNING and returned above), so each is ONE Event Log entry under our source, with the
-    // exit code and the run time, whatever this function then decides - park or relaunch. The dom0
-    // notification is the event-triggered reporter's job (ADR 3); nothing here waits on anything.
+    // exit code and the run time, whatever this function then decides - park, or dead for this agent's
+    // life. The dom0 notification is the event-triggered reporter's job (ADR 3); nothing here waits on anything.
     DeathEventReport(DEATHEVENT_ID_ETWPROXY, L"etwproxy.exe", pid, rc, uptimeMs,
         (rc == ETWPROXY_EXIT_DENIED || rc == ETWPROXY_EXIT_BADTOKEN) ?
             L"A rights problem a relaunch cannot fix: the agent parks the ETW toast tier for this boot. "
             L"gui-agent log line ETWPROXYSUP; etw-proxy.log in the Qubes Tools log directory." :
         (rc == ETWPROXY_EXIT_KILLED) ?
-            L"Exit code 1 is what TerminateProcess imposes - an external force-kill. The agent relaunches "
-            L"it on a backoff. gui-agent log line ETWPROXYSUP; etw-proxy.log in the Qubes Tools log directory." :
-            L"The agent relaunches it on a backoff (5 s to 5 min). gui-agent log line ETWPROXYSUP; "
-            L"etw-proxy.log in the Qubes Tools log directory; a crash also leaves a Windows Error "
-            L"Reporting record (AppCrash_etwproxy.exe_*).");
+            L"Exit code 1 is what TerminateProcess imposes - an external force-kill. Nothing relaunches it before "
+            L"the next GUI agent start. gui-agent log line ETWPROXYSUP; etw-proxy.log in the Qubes Tools log directory." :
+            L"Nothing relaunches it before the next GUI agent start (the GUI agent launches it once per start). "
+            L"gui-agent log line ETWPROXYSUP; etw-proxy.log in the Qubes Tools log directory; a crash also leaves a "
+            L"Windows Error Reporting record (AppCrash_etwproxy.exe_*).");
 
     if (rc == ETWPROXY_EXIT_DENIED)
     {
@@ -959,72 +966,41 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
         return;
     }
 
-    if (uptimeMs > ETWPROXY_HEALTHY_MS)
-        g_Backoff = ETWPROXY_BACKOFF_MIN;   // it ran healthily; treat this exit as fresh
-
     // The 'proxy exited rc=<n> after' prefix is a GREP CONTRACT with the p3a gate
     // (t2-proxy-exits collection + the T8c 'proxy exited rc=8 after' detector) - the
     // decode/anomaly text goes AFTER it, never inside it. All three are ERROR, not warning
-    // (owner, 2026-10-03, docs/ADR-supervision.md 1): an exit nobody asked for is a death,
-    // and the relaunch that follows does not make it benign.
+    // (owner, 2026-10-03, docs/ADR-supervision.md 1): an exit nobody asked for is a death -
+    // and since 2026-10-07 nothing relaunches it: the tier is down until the next agent start.
     if (rc == 0 || rc == ETWPROXY_EXIT_CONSUME || rc == ETWPROXY_EXIT_PIPE)
     {
-        LogError("ETWPROXYSUP proxy exited rc=%lu after %llu ms (%S) - relaunch in %lu ms",
+        LogError("ETWPROXYSUP proxy exited rc=%lu after %llu ms (%S) - not relaunched (no relaunch loop)",
                  rc, uptimeMs,
                  rc == 0 ? "clean stop - session ended externally or console ctrl" :
                  rc == ETWPROXY_EXIT_CONSUME ? "consumer open/thread failure" :
-                 "pipe failure: squatter or persistent connect faults",
-                 g_Backoff);
+                 "pipe failure: squatter or persistent connect faults");
     }
     else if (rc == ETWPROXY_EXIT_KILLED)
     {
-        // rc=1 is the code TerminateProcess IMPOSES - taskkill /f, Stop-Process -Force, or
-        // our own stop-by-name reap. It is NOT a proxy return path, but it is EXPECTED on any
-        // supervised kill (park/shutdown/job-kill, the next-launch reap, the p3a T5/T8c
-        // drills). Log it quietly + machine-readably (its own token, still greppable) and
-        // relaunch; do NOT raise EtwProxyUnknownExit, which stays reserved for a TRULY
-        // unaccounted code (a crash) so a benign external kill cannot desensitize it.
+        // rc=1 is the code TerminateProcess IMPOSES - taskkill /f, Stop-Process -Force, an
+        // external kill. It is NOT a proxy return path. Logged machine-readably (its own
+        // token, still greppable); do NOT raise EtwProxyUnknownExit, which stays reserved for
+        // a TRULY unaccounted code (a crash) so an external kill cannot desensitize it.
         LogError("ETWPROXYSUP proxy exited rc=%lu after %llu ms (external force-termination: "
-                 "TerminateProcess/taskkill/Stop-Process/reap - expected on a supervised "
-                 "kill, not a proxy return path) - relaunch in %lu ms",
-                 rc, uptimeMs, g_Backoff);
+                 "TerminateProcess/taskkill/Stop-Process - not a proxy return path) - not relaunched "
+                 "(no relaunch loop)", rc, uptimeMs);
     }
     else
     {
         // NOT a code the proxy can return (0/5/7/8/9) NOR the force-kill code (1): an
         // uncommanded crash. A fallback firing silently is how defects hide - log the anomaly
-        // loudly and machine-readably, then still relaunch (the tier is not worth wedging
-        // over, but the datum must not vanish into a routine line).
+        // loudly and machine-readably (the datum must not vanish into a routine line).
         LogError("ETWPROXYSUP proxy exited rc=%lu after %llu ms - ANOMALY "
                  "EtwProxyUnknownExit (0x%lX): not an ETWPROXY_EXIT_* code (0/5/7/8/9) and "
                  "not the force-kill code 1 - the proxy binary has no such return path, so "
-                 "it CRASHED (check etw-proxy.log for a CRASH line). Diagnose before "
-                 "trusting the tier; relaunch in %lu ms",
-                 rc, uptimeMs, rc, g_Backoff);
+                 "it CRASHED (check etw-proxy.log for a CRASH line). Not relaunched (no relaunch loop)",
+                 rc, uptimeMs, rc);
     }
-    EtwProxyBackoffLocked();   // stops the session; the relaunch restarts it fresh
-    LeaveCriticalSection(&g_Lock);
-}
-
-// ---- backoff timer callback (thread pool): relaunch ----------------------------------
-static VOID CALLBACK EtwProxyRelaunchCb(PVOID context, BOOLEAN timerFired)
-{
-    UNREFERENCED_PARAMETER(context);
-    UNREFERENCED_PARAMETER(timerFired);
-
-    EnterCriticalSection(&g_Lock);
-    if (g_Timer)
-    {
-        // Deleting our own one-shot timer with a NULL completion event is the
-        // documented in-callback cleanup; it cannot deadlock and frees the timer.
-        DeleteTimerQueueTimer(NULL, g_Timer, NULL);
-        g_Timer = NULL;
-    }
-    if (!g_Shutdown && g_State == EPS_BACKOFF)
-    {
-        g_State = EPS_IDLE;
-        EtwProxyTryLaunchLocked();   // no console user yet -> stays IDLE, Poke picks it up
-    }
+    EtwProxyDeadLocked("the proxy exited", rc);   // stops the session; the tier is down until the next agent start
     LeaveCriticalSection(&g_Lock);
 }
 
@@ -1059,18 +1035,19 @@ void EtwProxyPoke(void)
             EtwProxyTryLaunchLocked();
         else if (g_State == EPS_RUNNING)
         {
-            // Console user changed: the pipe DACL admits exactly the launched SID, so a
-            // proxy serving the OLD user is useless to the NEW user's bridge. Kill the
-            // job; the exit-wait relaunches with the fresh SID (backoff reset - this is
-            // a deliberate restart, not a crash). The relaunch also restarts the session
-            // and re-issues the grant, so nothing stale survives the user change.
+            // Console user changed: the pipe DACL admits exactly the launched SID, so a proxy serving
+            // the OLD user is useless to the NEW user's bridge. This used to kill the job and relaunch
+            // with the fresh SID - a spawn-again-on-exit path, removed 2026-10-07 (no relaunch loops).
+            // These guests run one autologon user, so this is said once, at ERROR, and the tier serves
+            // the previous user until the next agent start.
+            static BOOL s_UserChangeSaid = FALSE;
             WCHAR sid[RTL_NUMBER_OF(g_ClientSid)];
-            if (EtwProxyClientSid(sid, RTL_NUMBER_OF(sid)) && wcscmp(sid, g_ClientSid) != 0)
+            if (!s_UserChangeSaid && EtwProxyClientSid(sid, RTL_NUMBER_OF(sid)) && wcscmp(sid, g_ClientSid) != 0)
             {
-                LogInfo("ETWPROXYSUP console user changed (%s -> %s) - restarting proxy for the new client SID",
-                        g_ClientSid, sid);
-                g_Backoff = ETWPROXY_BACKOFF_MIN;
-                TerminateJobObject(g_Job, 0);
+                s_UserChangeSaid = TRUE;
+                LogError("ETWPROXYSUP console user changed (%s -> %s) - the running proxy serves the previous user "
+                         "and is NOT restarted (no relaunch loop, owner 2026-10-07); the next GUI agent start "
+                         "launches it for the current user", g_ClientSid, sid);
             }
         }
     }
@@ -1086,15 +1063,12 @@ void EtwProxyShutdown(void)
     EnterCriticalSection(&g_Lock);
     g_Shutdown = TRUE;
     HANDLE wait = g_Wait;   g_Wait = NULL;
-    HANDLE timer = g_Timer; g_Timer = NULL;
     LeaveCriticalSection(&g_Lock);
 
-    // Phase 2: blocking drains OUTSIDE the lock (the callbacks take it; holding it
-    // here would deadlock). After these return no callback is running or pending.
+    // Phase 2: blocking drain OUTSIDE the lock (the callback takes it; holding it
+    // here would deadlock). After this returns no callback is running or pending.
     if (wait)
         UnregisterWaitEx(wait, INVALID_HANDLE_VALUE);
-    if (timer)
-        DeleteTimerQueueTimer(NULL, timer, INVALID_HANDLE_VALUE);
 
     // Phase 3: tear the proxy down, then the session (the agent owns its lifecycle now:
     // stop at shutdown, stale reap at next start covers the crash path). TerminateJobObject
@@ -1117,5 +1091,26 @@ void EtwProxyShutdown(void)
     // window-station objects and the agent creates none for it.)
     EtwProxySessionStopLocked();
     g_State = g_Enabled ? EPS_IDLE : EPS_DISABLED;
+    LeaveCriticalSection(&g_Lock);
+}
+
+// ---- the session-end order (main.c HelpersDisarm / HelpersRearm; docs/ADR-supervision.md 5) ------------------
+// Disarmed: no launch from here on, and an exit of the running proxy is EXPECTED (the session's teardown ends it) -
+// INFO, no 4004. Re-armed only when the end of the session was cancelled.
+void EtwProxyDisarm(void)
+{
+    if (!g_Inited)
+        return;
+    EnterCriticalSection(&g_Lock);
+    g_Disarmed = TRUE;
+    LeaveCriticalSection(&g_Lock);
+}
+
+void EtwProxyRearm(void)
+{
+    if (!g_Inited)
+        return;
+    EnterCriticalSection(&g_Lock);
+    g_Disarmed = FALSE;
     LeaveCriticalSection(&g_Lock);
 }

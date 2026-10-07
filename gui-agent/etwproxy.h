@@ -13,8 +13,10 @@
  * The SYSTEM agent's entire involvement with the ETW tier is process lifecycle: it
  * never connects to the proxy's pipe and never reads an event (design sec 10.10.1).
  * Supervision is EXIT-WAIT, not heartbeat-poll (owner directive, sec 10.14.6/10.15):
- * RegisterWaitForSingleObject on the proxy process handle; the callback schedules a
- * relaunch with exponential backoff via a one-shot timer-queue timer. There is no
+ * RegisterWaitForSingleObject on the proxy process handle; the callback records the death
+ * (ERROR + event 4004) and nothing relaunches it - the proxy is launched ONCE per agent
+ * life (owner, 2026-10-07: no hand-written relaunch loops; see etwproxy.c's header for why
+ * it cannot become a Task Scheduler task without weakening its sandbox). There is no
  * proxy heartbeat file at all - a hung-but-silent proxy merely leaves the bridge's ETW
  * tier down, and the bridge already degrades to the listener/DB rung (fail-open).
  */
@@ -28,14 +30,17 @@ void EtwProxyInit(BOOL bridgeEnabled);
 
 // Cheap, self-throttled (5 s) tick, called from the existing main-loop supervise site
 // (next to NotifBridgeSupervise). It is NOT a health poll - process death is detected
-// by the registered exit-wait. This only covers the two conditions an exit-wait cannot
-// see because no process exists yet or the precondition changed under a live one:
-//   * first launch: the --client-sid to put on the proxy's command line is the console
-//     user's SID, so the launch must wait for a console session to exist;
-//   * console user CHANGE: the pipe DACL admits exactly one SID, so a different user
-//     logging on needs a proxy restart (TerminateJobObject; the exit-wait relaunches).
+// by the registered exit-wait. This only covers the condition an exit-wait cannot see
+// because no process exists yet: the first (and only) launch waits for a console session,
+// since the --client-sid on the proxy's command line is the console user's SID. A console
+// user CHANGE under a running proxy is said once at ERROR and not acted on (no relaunch).
 void EtwProxyPoke(void);
 
-// Tear down: unregister the wait, cancel any pending relaunch timer, TerminateJobObject
-// (KILL_ON_JOB_CLOSE also covers agent crash). Safe to call when never armed.
+// Tear down: unregister the wait, TerminateJobObject (KILL_ON_JOB_CLOSE also covers agent
+// crash). Safe to call when never armed.
 void EtwProxyShutdown(void);
+
+// The session-end order (main.c HelpersDisarm/HelpersRearm, docs/ADR-supervision.md 5):
+// disarmed, nothing is launched and the running proxy's exit is expected (no 4004).
+void EtwProxyDisarm(void);
+void EtwProxyRearm(void);
