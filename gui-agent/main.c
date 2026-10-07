@@ -1107,7 +1107,21 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
         if (ownDesktop)
         {
             if (!SetThreadDesktop(ownDesktop))
-                win_perror("SetThreadDesktop");
+            {
+                // NOT A FAILURE WHILE THIS AGENT IS LEAVING (2026-10-07). The sweep flagged one
+                // "SetThreadDesktop failed with error 0xaa: The requested resource is in use." sitting between
+                // "QGAEXIT stop event signalled - leaving" and "duplication recreated ... windows kept": the hooks
+                // thread re-attached to the input desktop while the exit was already under way, which is a race the
+                // exit wins and nothing is owed. An ERROR there sends the next reader hunting (0xaa = ERROR_BUSY,
+                // the desktop is switching), and an expected line logged as a failure is the defect this release
+                // spent the day removing. While the agent is NOT leaving it stays a failure: the hooks are this
+                // thread's whole purpose.
+                if (LifecycleSessionEnding())
+                    LogInfo("SetThreadDesktop did not take (error 0x%x) while this agent is leaving - expected: the "
+                        L"input desktop is switching and the exit wins the race", GetLastError());
+                else
+                    win_perror("SetThreadDesktop");
+            }
         }
         else
         {
