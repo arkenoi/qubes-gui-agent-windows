@@ -439,6 +439,21 @@ static QGA_EXIT_VERDICT JudgeAgentExit(IN const WCHAR *exeName, IN DWORD agentPi
             L"saw its end-session notice - the lifecycle channel failed; no agent is launched into session %u",
             exeName, agentPid, agentSession, exitCode, agentSession);
         break;
+    case QGA_DECIDE_SESSION_END_REAPED:
+        // THE CLEAN SHUTDOWN. The system reaped the agent a few milliseconds AFTER its orderly exit
+        // completed - acknowledged notice, `done` signalled - which is what every measured clean
+        // session end does. Its verdict row already said so (IsError FALSE, no relaunch, no death
+        // record, no service failure); this case was simply never added, so the decision fell
+        // through `default:` into the QGAWDDEATH branch and a completed exit was reported as a
+        // death at ERROR, with text claiming the service was ending for the SCM's recovery when
+        // FailService is FALSE and it was not. Measured on win11r-logvol 2026-10-08: the agent
+        // logged "QGAENDSESSION orderly exit complete" and the watchdog logged QGAWDDEATH in the
+        // same second. This is the row the 2026-10-07 split was added for; only its log line was
+        // missing.
+        LogInfo("QGAWDSESSIONEND-REAPED '%s' (PID %u) finished its orderly exit and was then reaped by the system "
+            L"with its session %u (exit 0x%x, notice acknowledged, completion signalled) - not a death; no agent "
+            L"is launched into session %u", exeName, agentPid, agentSession, exitCode, agentSession);
+        break;
     case QGA_DECIDE_SESSION_END_FORCED:
         // SAYS ONLY WHAT THE SERVICE KNOWS. It used to assert "its orderly exit did not complete
         // inside the end-session budget" - a cause the service has no way to establish: it never
