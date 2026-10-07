@@ -29,6 +29,7 @@ static HANDLE g_ExitDone = NULL;              // manual-reset: the orderly exit 
 static HANDLE g_Notice = NULL;                // the service's channel, opened by our pid (NULL = started outside the service)
 static HANDLE g_Ack = NULL;
 static HANDLE g_Continue = NULL;
+static HANDLE g_Done = NULL;                  // agent -> service: the orderly exit COMPLETED (qga-lifecycle.h)
 static HANDLE g_WindowReady = NULL;           // manual-reset: the window thread has its window (or gave up)
 static HWND g_Window = NULL;
 
@@ -52,6 +53,13 @@ BOOL LifecycleSessionEnding(void)
 
 void LifecycleExitDone(void)
 {
+    // THE SERVICE IS TOLD HERE, on the thread that finished the work and in the same breath - not by whoever
+    // wakes on g_ExitDone. The gap between "the orderly exit is complete" and "the service knows it" is what
+    // makes a completed exit read as a forced one when the system's kill lands inside it, and a handoff to
+    // another thread is a much wider gap than this. What remains is the few instructions between the last
+    // orderly step and this SetEvent, which no signal can remove.
+    if (g_Done)
+        SetEvent(g_Done);
     if (g_ExitDone)
         SetEvent(g_ExitDone);
 }
@@ -113,6 +121,9 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             w = g_ExitDone ? WaitForSingleObject(g_ExitDone, QGA_ENDSESSION_EXIT_WAIT_MS) : WAIT_FAILED;
             if (w == WAIT_OBJECT_0)
             {
+                // The service already knows: LifecycleExitDone signalled `done` on the thread that finished
+                // the work. Measured 2026-10-07: this line went out at 153432.110 and the watchdog recorded
+                // the forced end at 153432.214 - one ERROR per shutdown for an exit that had completed.
                 LogInfo("QGAENDSESSION orderly exit complete - exit code QGA_EXIT_SESSION_END");
                 LogFlush();
                 ExitProcess(QGA_EXIT_SESSION_END);
@@ -192,7 +203,9 @@ void LifecycleStart(void)
         g_Ack = OpenEvent(SYNCHRONIZE, FALSE, name);
     if (SUCCEEDED(QgaLifecycleObjectName(name, RTL_NUMBER_OF(name), pid, QGA_LIFECYCLE_CONTINUE)))
         g_Continue = OpenEvent(EVENT_MODIFY_STATE, FALSE, name);
-    if (g_Notice && g_Ack && g_Continue)
+    if (SUCCEEDED(QgaLifecycleObjectName(name, RTL_NUMBER_OF(name), pid, QGA_LIFECYCLE_DONE)))
+        g_Done = OpenEvent(EVENT_MODIFY_STATE, FALSE, name);
+    if (g_Notice && g_Ack && g_Continue && g_Done)
         LogInfo("QGALIFECYCLE channel to the QubesGuiWatchdog service open (" QGA_LIFECYCLE_NAME_FMT L")", pid, L"*");
     else
     {

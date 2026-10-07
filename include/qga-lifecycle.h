@@ -47,6 +47,14 @@
 //   notice    manual-reset, agent -> service: "Windows is ending my session"
 //   ack       manual-reset, service -> agent: "acknowledged: no launch into that session from here on"
 //   continue  auto-reset,   agent -> service: "the end was cancelled (WM_ENDSESSION FALSE); the session continues"
+//   done      manual-reset, agent -> service: "my orderly exit is COMPLETE - the vchan is withdrawn, window 0 is
+//             unmapped, the staging grants are released; a kill after this point costs nothing". Added
+//             2026-10-07 because the service could not tell two cases apart from the observed process code
+//             alone: killed BEFORE finishing (a real defect - dom0 loses a clean withdrawal) and reaped a
+//             few milliseconds AFTER finishing, which is what every measured clean shutdown does. Both
+//             landed on the same ERROR row, so our own log carried one error per shutdown. The level is not
+//             demoted - the case that really is an error still is one (Jev: demoting without this evidence
+//             would be hiding, 0.87; declaring it in the harness likewise, 0.78).
 
 #include <windows.h>
 #include <strsafe.h>
@@ -56,6 +64,7 @@
 #define QGA_LIFECYCLE_NOTICE        L"notice"
 #define QGA_LIFECYCLE_ACK           L"ack"
 #define QGA_LIFECYCLE_CONTINUE      L"continue"
+#define QGA_LIFECYCLE_DONE          L"done"
 // SYSTEM only: the agent runs as SYSTEM in the console session, the service as SYSTEM in session 0. Nothing
 // else may signal "my session is ending" for an agent, or acknowledge it.
 #define QGA_LIFECYCLE_SDDL          L"D:P(A;;GA;;;SY)"
@@ -85,7 +94,8 @@ typedef enum _QGA_EXIT_DECISION
     QGA_DECIDE_NOTHING = 0,             // a requested exit: no record, no relaunch; the service waits for its next launch trigger
     QGA_DECIDE_SESSION_END,             // orderly end after an acknowledged notice: INFO; never launch into that session again
     QGA_DECIDE_SESSION_END_UNNOTICED,   // QGA_EXIT_SESSION_END with no notice seen: the channel failed - ERROR, no launch into that session
-    QGA_DECIDE_SESSION_END_FORCED,      // the system ended it after an acknowledged notice: the orderly exit did not finish in time - ERROR, no launch into that session
+    QGA_DECIDE_SESSION_END_FORCED,      // the system ended it after an acknowledged notice and its orderly exit had NOT finished - ERROR
+    QGA_DECIDE_SESSION_END_REAPED,      // the system ended it after an acknowledged notice and AFTER its orderly exit completed: INFO, no launch into that session
     QGA_DECIDE_NOTICE_MISSED,           // the system ended it and no notice came: ERROR "end-session notice missed", no launch into that session
     QGA_DECIDE_NOGUI_LATCH,             // no GUI domain this boot: latched, nothing relaunched before the next boot
     QGA_DECIDE_RECONNECT,               // relaunch at once - the one relaunch the service performs; not a death
@@ -108,10 +118,12 @@ typedef struct _QGA_EXIT_ROW
 {
     DWORD ExitCode;            // QGA_EXIT_* / QGA_EXIT_SYSTEM_TERMINATED, or QGA_EXIT_ANY
     int NoticeAcked;           // 1, 0, or QGA_NOTICE_ANY
+    int OrderlyDone;           // 1, 0, or QGA_DONE_ANY - the agent signalled that its orderly exit completed
     QGA_EXIT_DECISION Decision;
 } QGA_EXIT_ROW;
 #define QGA_EXIT_ANY    0xFFFFFFFFUL
 #define QGA_NOTICE_ANY  (-1)
+#define QGA_DONE_ANY    (-1)
 
 // The attributes of each decision, indexed by QGA_EXIT_DECISION.
 static const QGA_EXIT_VERDICT QgaExitVerdicts[] =
@@ -121,6 +133,7 @@ static const QGA_EXIT_VERDICT QgaExitVerdicts[] =
     { QGA_DECIDE_SESSION_END,             FALSE,    TRUE,     FALSE,  FALSE, FALSE, L"SESSIONEND" },
     { QGA_DECIDE_SESSION_END_UNNOTICED,   FALSE,    TRUE,     FALSE,  FALSE, TRUE,  L"SESSIONEND-UNNOTICED" },
     { QGA_DECIDE_SESSION_END_FORCED,      FALSE,    TRUE,     FALSE,  FALSE, TRUE,  L"SESSIONEND-FORCED" },
+    { QGA_DECIDE_SESSION_END_REAPED,      FALSE,    TRUE,     FALSE,  FALSE, FALSE, L"SESSIONEND-REAPED" },
     { QGA_DECIDE_NOTICE_MISSED,           FALSE,    TRUE,     FALSE,  FALSE, TRUE,  L"NOTICEMISSED" },
     { QGA_DECIDE_NOGUI_LATCH,             FALSE,    FALSE,    FALSE,  FALSE, FALSE, L"NOGUIDOMAIN" },
 #ifdef QGA_LIFECYCLE_DEFECT_RECONNECTDEATH
@@ -140,22 +153,25 @@ static const QGA_EXIT_VERDICT QgaExitVerdicts[] =
 static const QGA_EXIT_ROW QgaExitRows[] =
 {
 #ifndef QGA_LIFECYCLE_DEFECT_REQUESTEDDEATH
-    { QGA_EXIT_REQUESTED,         QGA_NOTICE_ANY, QGA_DECIDE_NOTHING },
+    { QGA_EXIT_REQUESTED,         QGA_NOTICE_ANY, QGA_DONE_ANY, QGA_DECIDE_NOTHING },
 #endif
-    { QGA_EXIT_NO_GUI_DOMAIN,     QGA_NOTICE_ANY, QGA_DECIDE_NOGUI_LATCH },
-    { QGA_EXIT_SESSION_END,       1,              QGA_DECIDE_SESSION_END },
-    { QGA_EXIT_SESSION_END,       0,              QGA_DECIDE_SESSION_END_UNNOTICED },
+    { QGA_EXIT_NO_GUI_DOMAIN,     QGA_NOTICE_ANY, QGA_DONE_ANY, QGA_DECIDE_NOGUI_LATCH },
+    { QGA_EXIT_SESSION_END,       1,              QGA_DONE_ANY, QGA_DECIDE_SESSION_END },
+    { QGA_EXIT_SESSION_END,       0,              QGA_DONE_ANY, QGA_DECIDE_SESSION_END_UNNOTICED },
 #ifndef QGA_LIFECYCLE_DEFECT_TERMINATEDDEATH
-    { QGA_EXIT_SYSTEM_TERMINATED, 1,              QGA_DECIDE_SESSION_END_FORCED },
-    { QGA_EXIT_SYSTEM_TERMINATED, 0,              QGA_DECIDE_NOTICE_MISSED },   // DEFECT (knob TERMINATEDDEATH): the measured relaunch into the ending session
+    // THE SYSTEM'S TERMINATION, split on whether the orderly exit had finished. Before 2026-10-07 both were
+    // SESSIONEND-FORCED, so every clean shutdown wrote an ERROR line about an exit that had in fact completed.
+    { QGA_EXIT_SYSTEM_TERMINATED, 1,              1,            QGA_DECIDE_SESSION_END_REAPED },
+    { QGA_EXIT_SYSTEM_TERMINATED, 1,              0,            QGA_DECIDE_SESSION_END_FORCED },
+    { QGA_EXIT_SYSTEM_TERMINATED, 0,              QGA_DONE_ANY, QGA_DECIDE_NOTICE_MISSED },   // DEFECT (knob TERMINATEDDEATH): the measured relaunch into the ending session
 #endif
-    { QGA_EXIT_RECONNECT,         1,              QGA_DECIDE_SESSION_END },     // a notice always wins: nothing is launched into an ending session
-    { QGA_EXIT_RECONNECT,         0,              QGA_DECIDE_RECONNECT },
-    { QGA_EXIT_ANY,               1,              QGA_DECIDE_DEATH_IN_ENDING_SESSION },
-    { QGA_EXIT_ANY,               QGA_NOTICE_ANY, QGA_DECIDE_DEATH },
+    { QGA_EXIT_RECONNECT,         1,              QGA_DONE_ANY, QGA_DECIDE_SESSION_END },     // a notice always wins: nothing is launched into an ending session
+    { QGA_EXIT_RECONNECT,         0,              QGA_DONE_ANY, QGA_DECIDE_RECONNECT },
+    { QGA_EXIT_ANY,               1,              QGA_DONE_ANY, QGA_DECIDE_DEATH_IN_ENDING_SESSION },
+    { QGA_EXIT_ANY,               QGA_NOTICE_ANY, QGA_DONE_ANY, QGA_DECIDE_DEATH },
 };
 
-static __inline QGA_EXIT_VERDICT QgaDecideAgentExit(IN DWORD exitCode, IN BOOL noticeAcked)
+static __inline QGA_EXIT_VERDICT QgaDecideAgentExit(IN DWORD exitCode, IN BOOL noticeAcked, IN BOOL orderlyDone)
 {
     size_t i;
     QGA_EXIT_DECISION d = QGA_DECIDE_DEATH;
@@ -165,6 +181,8 @@ static __inline QGA_EXIT_VERDICT QgaDecideAgentExit(IN DWORD exitCode, IN BOOL n
         if (r->ExitCode != QGA_EXIT_ANY && r->ExitCode != exitCode)
             continue;
         if (r->NoticeAcked != QGA_NOTICE_ANY && (r->NoticeAcked != 0) != (noticeAcked != 0))
+            continue;
+        if (r->OrderlyDone != QGA_DONE_ANY && (r->OrderlyDone != 0) != (orderlyDone != 0))
             continue;
         d = r->Decision;
         break;

@@ -43,47 +43,64 @@ int main(void)
     const DWORD crashes[] = { 0xC0000005UL, 0xC0000409UL, 0x5aaUL, 0x0UL, 0xb7UL, 1UL, 0xFFFFFFFFUL };
 
     /* ---- 1. the defined codes --------------------------------------------------------------------------- */
-    v = QgaDecideAgentExit(QGA_EXIT_REQUESTED, FALSE);
+    v = QgaDecideAgentExit(QGA_EXIT_REQUESTED, FALSE, FALSE);
     check("requested exit: nothing - no record, no relaunch, no service failure, INFO", verdictIs(v, QGA_DECIDE_NOTHING, 0, 0, 0, 0, 0));
-    v = QgaDecideAgentExit(QGA_EXIT_REQUESTED, TRUE);
+    v = QgaDecideAgentExit(QGA_EXIT_REQUESTED, TRUE, FALSE);
     check("requested exit during a session end: still nothing", verdictIs(v, QGA_DECIDE_NOTHING, 0, 0, 0, 0, 0));
-    v = QgaDecideAgentExit(QGA_EXIT_NO_GUI_DOMAIN, FALSE);
+    v = QgaDecideAgentExit(QGA_EXIT_NO_GUI_DOMAIN, FALSE, FALSE);
     check("no GUI domain: the boot latch - no record, no relaunch, no failure", verdictIs(v, QGA_DECIDE_NOGUI_LATCH, 0, 0, 0, 0, 0));
-    v = QgaDecideAgentExit(QGA_EXIT_RECONNECT, FALSE);
+    v = QgaDecideAgentExit(QGA_EXIT_RECONNECT, FALSE, FALSE);
     check("reconnect: relaunch at once, no record, no failure, INFO (the one relaunch)", verdictIs(v, QGA_DECIDE_RECONNECT, 1, 0, 0, 0, 0));
-    v = QgaDecideAgentExit(QGA_EXIT_RECONNECT, TRUE);
+    v = QgaDecideAgentExit(QGA_EXIT_RECONNECT, TRUE, FALSE);
     check("reconnect after an acknowledged notice: a notice wins - no launch into the ending session, no record",
           verdictIs(v, QGA_DECIDE_SESSION_END, 0, 1, 0, 0, 0));
 
     /* ---- 2. the session end ------------------------------------------------------------------------------ */
-    v = QgaDecideAgentExit(QGA_EXIT_SESSION_END, TRUE);
+    v = QgaDecideAgentExit(QGA_EXIT_SESSION_END, TRUE, FALSE);
     check("session end after an acknowledged notice: INFO, no launch into that session, no record", verdictIs(v, QGA_DECIDE_SESSION_END, 0, 1, 0, 0, 0));
-    v = QgaDecideAgentExit(QGA_EXIT_SESSION_END, FALSE);
+    v = QgaDecideAgentExit(QGA_EXIT_SESSION_END, FALSE, FALSE);
     check("session end with no notice seen: ERROR (the channel failed), still no launch into that session, no record",
           verdictIs(v, QGA_DECIDE_SESSION_END_UNNOTICED, 0, 1, 0, 0, 1));
-    v = QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE);
-    check("0x40010004 after an acknowledged notice: the orderly exit was cut short - ERROR, no launch into that session, no record, service stays",
+    /* THE SYSTEM'S KILL, SPLIT ON WHETHER THE ORDERLY EXIT HAD FINISHED. Both cases arrive as 0x40010004 and
+       before 2026-10-07 both were SESSIONEND-FORCED, so every clean shutdown wrote an ERROR line about an
+       exit that had in fact completed (measured: the agent logged "orderly exit complete" at 153432.110 and
+       the watchdog the forced end at 153432.214). The agent now signals completion on the channel, so the
+       one that really is an error still is one and the benign reap is not. */
+    v = QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE, FALSE);
+    check("0x40010004 after an acknowledged notice, orderly exit NOT signalled: cut short - ERROR, no launch into that session, no record, service stays",
           verdictIs(v, QGA_DECIDE_SESSION_END_FORCED, 0, 1, 0, 0, 1));
-    v = QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, FALSE);
+    v = QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE, TRUE);
+    check("0x40010004 after an acknowledged notice AND a signalled orderly exit: reaped after finishing - INFO, no launch, no record",
+          verdictIs(v, QGA_DECIDE_SESSION_END_REAPED, 0, 1, 0, 0, 0));
+    check("the only thing that separates those two is the agent's own completion signal",
+          QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE, TRUE).IsError == FALSE &&
+          QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE, FALSE).IsError == TRUE);
+    check("a completion signal NEVER excuses a missing notice - that is still NOTICEMISSED at ERROR",
+          QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, FALSE, TRUE).Decision == QGA_DECIDE_NOTICE_MISSED &&
+          QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, FALSE, TRUE).IsError == TRUE);
+    check("nor does it excuse a death: an undefined code with the signal set is still a death",
+          QgaDecideAgentExit(0xC0000005UL, FALSE, TRUE).Decision == QGA_DECIDE_DEATH &&
+          QgaDecideAgentExit(0xC0000005UL, FALSE, TRUE).WriteDeathRecord == TRUE);
+    v = QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, FALSE, FALSE);
     check("0x40010004 with no notice: NOTICE MISSED - ERROR, no launch into that session, no record, service stays (the measured defect)",
           verdictIs(v, QGA_DECIDE_NOTICE_MISSED, 0, 1, 0, 0, 1));
     check("0x40010004 is never relaunched by the service and never fails the service",
-          !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, FALSE).RelaunchNow && !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, FALSE).FailService &&
-          !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE).RelaunchNow && !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE).FailService);
+          !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, FALSE, FALSE).RelaunchNow && !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, FALSE, FALSE).FailService &&
+          !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE, FALSE).RelaunchNow && !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE, FALSE).FailService);
 
     /* ---- 3. deaths: every undefined code, crash or not ---------------------------------------------------- */
     for (i = 0; i < RTL_NUMBER_OF(crashes); i++)
     {
         char name[160];
-        v = QgaDecideAgentExit(crashes[i], FALSE);
+        v = QgaDecideAgentExit(crashes[i], FALSE, FALSE);
         snprintf(name, sizeof(name), "death 0x%08lx: 4001 + ERROR, the service fails itself, no relaunch by the service", (unsigned long)crashes[i]);
         check(name, verdictIs(v, QGA_DECIDE_DEATH, 0, 0, 1, 1, 1));
-        v = QgaDecideAgentExit(crashes[i], TRUE);
+        v = QgaDecideAgentExit(crashes[i], TRUE, FALSE);
         snprintf(name, sizeof(name), "death 0x%08lx in an ending session: 4001 + ERROR, no launch into it, the service stays", (unsigned long)crashes[i]);
         check(name, verdictIs(v, QGA_DECIDE_DEATH_IN_ENDING_SESSION, 0, 1, 1, 0, 1));
     }
-    check("a clean exit 0 is a death (no path returns 0 on purpose)", QgaDecideAgentExit(0, FALSE).Decision == QGA_DECIDE_DEATH);
-    check("the stale 0xb7 the old WinMain returned is a death, not a requested exit", QgaDecideAgentExit(0xb7, FALSE).Decision == QGA_DECIDE_DEATH);
+    check("a clean exit 0 is a death (no path returns 0 on purpose)", QgaDecideAgentExit(0, FALSE, FALSE).Decision == QGA_DECIDE_DEATH);
+    check("the stale 0xb7 the old WinMain returned is a death, not a requested exit", QgaDecideAgentExit(0xb7, FALSE, FALSE).Decision == QGA_DECIDE_DEATH);
 
     /* ---- 4. the invariants over the whole table ---------------------------------------------------------- */
     {
@@ -91,11 +108,14 @@ int main(void)
         const DWORD codes[] = { QGA_EXIT_REQUESTED, QGA_EXIT_SESSION_END, QGA_EXIT_RECONNECT, QGA_EXIT_NO_GUI_DOMAIN,
                                 QGA_EXIT_SYSTEM_TERMINATED, 0xC0000005UL, 0, 1, 0xb7UL };
         size_t c;
-        int acked;
+        int acked, done;
+        /* the invariants hold over the WHOLE space, including the completion signal added 2026-10-07 - a
+           signal must not buy a relaunch, a missing record, or a quiet death anywhere in the table */
         for (c = 0; c < RTL_NUMBER_OF(codes); c++)
             for (acked = 0; acked < 2; acked++)
+            for (done = 0; done < 2; done++)
             {
-                v = QgaDecideAgentExit(codes[c], acked);
+                v = QgaDecideAgentExit(codes[c], acked, done);
                 if (v.RelaunchNow && v.Decision != QGA_DECIDE_RECONNECT) relaunchOnlyReconnect = 0;
                 if (acked && codes[c] != QGA_EXIT_REQUESTED && codes[c] != QGA_EXIT_NO_GUI_DOMAIN && !v.NoLaunchIntoSession) noLaunchWhenAcked = 0;
                 if (v.WriteDeathRecord != (v.Decision == QGA_DECIDE_DEATH || v.Decision == QGA_DECIDE_DEATH_IN_ENDING_SESSION)) recordIffDeath = 0;

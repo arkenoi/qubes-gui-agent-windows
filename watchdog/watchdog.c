@@ -160,6 +160,7 @@ typedef struct _LIFECYCLE_CHANNEL
     HANDLE Notice;     // manual-reset, agent -> service: "Windows is ending my session"
     HANDLE Ack;        // manual-reset, service -> agent: acknowledged
     HANDLE Continue;   // auto-reset, agent -> service: the end was cancelled
+    HANDLE Done;       // manual-reset, agent -> service: the orderly exit is COMPLETE (see include/qga-lifecycle.h)
 } LIFECYCLE_CHANNEL;
 
 static void LifecycleChannelClose(IN OUT LIFECYCLE_CHANNEL *ch)
@@ -167,7 +168,8 @@ static void LifecycleChannelClose(IN OUT LIFECYCLE_CHANNEL *ch)
     if (ch->Notice) CloseHandle(ch->Notice);
     if (ch->Ack) CloseHandle(ch->Ack);
     if (ch->Continue) CloseHandle(ch->Continue);
-    ch->Notice = ch->Ack = ch->Continue = NULL;
+    if (ch->Done) CloseHandle(ch->Done);
+    ch->Notice = ch->Ack = ch->Continue = ch->Done = NULL;
 }
 
 static HANDLE LifecycleEventCreate(IN SECURITY_ATTRIBUTES *sa, IN DWORD agentPid, IN const WCHAR *which, IN BOOL manualReset)
@@ -214,8 +216,9 @@ static BOOL LifecycleChannelCreate(IN DWORD agentPid, OUT LIFECYCLE_CHANNEL *ch)
     ch->Notice = LifecycleEventCreate(&sa, agentPid, QGA_LIFECYCLE_NOTICE, TRUE);
     ch->Ack = LifecycleEventCreate(&sa, agentPid, QGA_LIFECYCLE_ACK, TRUE);
     ch->Continue = LifecycleEventCreate(&sa, agentPid, QGA_LIFECYCLE_CONTINUE, FALSE);
+    ch->Done = LifecycleEventCreate(&sa, agentPid, QGA_LIFECYCLE_DONE, TRUE);
     LocalFree(sd);
-    ok = ch->Notice && ch->Ack && ch->Continue;
+    ok = ch->Notice && ch->Ack && ch->Continue && ch->Done;
     if (!ok)
         LifecycleChannelClose(ch);
     return ok;
@@ -416,9 +419,9 @@ static void StopOwnAgent(IN HANDLE agentProcess, IN DWORD agentPid, IN const WCH
 // What this service does about an agent exit, decided by include/qga-lifecycle.h's table and said in the log and,
 // for a death, in the Event Log. Returns the verdict for the caller's state changes.
 static QGA_EXIT_VERDICT JudgeAgentExit(IN const WCHAR *exeName, IN DWORD agentPid, IN DWORD agentSession,
-    IN DWORD exitCode, IN BOOL noticeAcked, IN ULONGLONG startedAt)
+    IN DWORD exitCode, IN BOOL noticeAcked, IN BOOL orderlyDone, IN ULONGLONG startedAt)
 {
-    const QGA_EXIT_VERDICT v = QgaDecideAgentExit(exitCode, noticeAcked);
+    const QGA_EXIT_VERDICT v = QgaDecideAgentExit(exitCode, noticeAcked, orderlyDone);
     const ULONGLONG ranMs = startedAt != 0 ? GetTickCount64() - startedAt : DEATHEVENT_RAN_UNKNOWN;
 
     switch (v.Decision)
@@ -522,6 +525,7 @@ DWORD WINAPI WatchdogThread(void *param)
     ULONGLONG startedAt = 0;
     LIFECYCLE_CHANNEL channel;
     BOOL noticeAcked = FALSE;          // this instance announced its session's end and we acknowledged
+    BOOL orderlyDone = FALSE;          // ...and it signalled that its orderly exit had COMPLETED
     // The session that announced its end: nothing is launched into it until WTS_SESSION_LOGOFF says it has ended.
     DWORD endedSession = NO_SESSION;
     // A launch trigger fired and no agent of ours runs: launch at the next opportunity (console session present,
@@ -750,7 +754,10 @@ DWORD WINAPI WatchdogThread(void *param)
             QGA_EXIT_VERDICT v;
             if (!GetExitCodeProcess(agentProcess, &exitCode))
                 exitCode = 0xFFFFFFFF;
-            v = JudgeAgentExit(exeName, agentPid, agentSession, exitCode, noticeAcked, startedAt);
+            // Did the agent get to the END of its orderly exit before the system reaped it? Its own signal
+            // answers that; the observed process code cannot (both cases arrive as 0x40010004).
+            orderlyDone = (channel.Done != NULL && WaitForSingleObject(channel.Done, 0) == WAIT_OBJECT_0);
+            v = JudgeAgentExit(exeName, agentPid, agentSession, exitCode, noticeAcked, orderlyDone, startedAt);
             if (v.NoLaunchIntoSession)
                 endedSession = agentSession;
             if (v.Decision == QGA_DECIDE_NOGUI_LATCH)
