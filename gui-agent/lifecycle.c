@@ -51,6 +51,24 @@ BOOL LifecycleSessionEnding(void)
     return InterlockedCompareExchange(&g_SessionEnding, 0, 0) != 0;
 }
 
+// THE ORDERLY CONTRACT IS SATISFIED. Separate from LifecycleExitDone because the two meanings were
+// one call, and that is what left the signal too late: `done` was set only once the main thread was
+// actually leaving - after the window-event thread's 2 s join - while the work the service cares
+// about (the vchan withdrawal, the window-0 unmap sweep, the staging grant) had finished long
+// before. Windows reaps the process during session teardown, so a shutdown could land in that gap
+// and the service would read 0x40010004 with no `done` set and call a COMPLETED exit forced.
+// Measured on a clean shutdown: the agent logged "QGAENDSESSION orderly exit complete" at
+// 153432.110 and the watchdog logged QGAWDSESSIONEND-FORCED at 153432.214 - 104 ms later, with the
+// 10 s budget never approached. This is "if something runs too early, run it in time" read the
+// other way round: the signal ran too LATE.
+//
+// Manual-reset, so calling it twice is idempotent and LifecycleExitDone may still set it.
+void LifecycleOrderlyComplete(void)
+{
+    if (g_Done)
+        SetEvent(g_Done);
+}
+
 void LifecycleExitDone(void)
 {
     // THE SERVICE IS TOLD HERE, on the thread that finished the work and in the same breath - not by whoever
@@ -58,8 +76,10 @@ void LifecycleExitDone(void)
     // makes a completed exit read as a forced one when the system's kill lands inside it, and a handoff to
     // another thread is a much wider gap than this. What remains is the few instructions between the last
     // orderly step and this SetEvent, which no signal can remove.
-    if (g_Done)
-        SetEvent(g_Done);
+    // ONE setter, called from here too: the Init-failure paths and the ordinary leave both still
+    // need `done` set, and on those paths no vchan was ever opened so there is nothing to withdraw.
+    // The event is manual-reset, so a second call after LifecycleOrderlyComplete() is a no-op.
+    LifecycleOrderlyComplete();
     if (g_ExitDone)
         SetEvent(g_ExitDone);
 }

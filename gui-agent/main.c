@@ -13250,6 +13250,15 @@ static ULONG WINAPI WatchForEvents(void)
     // logged and the single buffer leaked, never a stall.
     CaptureStagingRevokeOnExit();
 
+    // THE ORDERLY CONTRACT IS SATISFIED HERE, not three steps later. Every path that reaches this
+    // line has withdrawn the vchan announcement (a connected client above, or one that never
+    // connected), swept the UNMAP/DESTROYs, and dealt with the staging grant - including the
+    // by-design A6LEAK branch, which is announced and still counts as complete. Signalling later,
+    // from LifecycleExitDone, left a window in which the system's reap made a finished exit read
+    // as a forced one. Nothing is suppressed: SESSIONEND-FORCED keeps its ERROR level and now
+    // means what it says - terminated with the notice acked and NO completion signalled.
+    LifecycleOrderlyComplete();
+
     LogInfo("exiting");
     // all handles will be closed on exit anyway
 

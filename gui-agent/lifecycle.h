@@ -26,6 +26,10 @@ DWORD LifecycleExitCode(void);
 // TRUE from WM_QUERYENDSESSION until a WM_ENDSESSION(FALSE) cancels it.
 BOOL LifecycleSessionEnding(void);
 // WinMain, right before it returns: the orderly exit has run. The end-session handler waits on this.
+// The ORDERLY CONTRACT is satisfied - call it where the last orderly step finishes, not where the
+// main thread leaves. Idempotent (the event is manual-reset).
+void LifecycleOrderlyComplete(void);
+
 void LifecycleExitDone(void);
 
 // Defined in main.c; called from the end-session handler, in this order: disarm FIRST, then the service is told.

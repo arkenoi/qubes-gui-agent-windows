@@ -440,9 +440,15 @@ static QGA_EXIT_VERDICT JudgeAgentExit(IN const WCHAR *exeName, IN DWORD agentPi
             exeName, agentPid, agentSession, exitCode, agentSession);
         break;
     case QGA_DECIDE_SESSION_END_FORCED:
+        // SAYS ONLY WHAT THE SERVICE KNOWS. It used to assert "its orderly exit did not complete
+        // inside the end-session budget" - a cause the service has no way to establish: it never
+        // sees the agent's own exit code on a session end (Windows reaps the process before
+        // ExitProcess can set it, so this reads 0x40010004 = DBG_TERMINATE_PROCESS), and it cannot
+        // tell a budget expiry from a kill mid-teardown. The agent's own QGAENDSESSION lines can.
         LogError("QGAWDSESSIONEND-FORCED '%s' (PID %u) was ended by the system (0x%x) after acknowledging its "
-            L"end-session notice - its orderly exit did not complete inside the end-session budget (its vchan "
-            L"announcement may be left behind); no agent is launched into session %u",
+            L"end-session notice and had NOT signalled that its orderly exit was complete - it was ended "
+            L"mid-teardown or its exit budget expired, and the agent's own QGAENDSESSION lines say which "
+            L"(its vchan announcement may be left behind); no agent is launched into session %u",
             exeName, agentPid, exitCode, agentSession);
         break;
     case QGA_DECIDE_NOTICE_MISSED:
