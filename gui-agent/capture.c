@@ -447,6 +447,11 @@ BOOL CaptureHasStaleGrants(IN CAPTURE_CONTEXT* ctx)
 
 static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
 {
+    // WHICH TRIGGER was recovered from, decided by whether the geometry moved. The two triggers
+    // that raise DXGI_ERROR_ACCESS_LOST are not equally benign and this function used to report
+    // both the same way - see the split at the success line below.
+    BOOL geometryChanged = FALSE;
+
     // Retry cadence. The recovery WINDOW is unchanged (the old loop was 20 attempts
     // x 250 ms = 5 s): a trip to the secure desktop lasts seconds and must still be
     // ridden out, so shortening the window would trade a rare blink for a rare
@@ -564,6 +569,7 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                 // window 0 from the same fields (main.c, grants_changed).
                 LogInfo("A6REGRANT resolution changed during recovery (%ux%u -> %ux%u), adopting in place",
                     ctx->width, ctx->height, width, height);
+                geometryChanged = TRUE;
                 ctx->width = width;
                 ctx->height = height;
             }
@@ -582,7 +588,46 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
             // INFO, not DEBUG: the guest runs LogLevel=3 by default, so at DEBUG this
             // recovery is invisible and an operator cannot tell in-place recovery from
             // a silent teardown. This line is the evidence that the fix worked.
-            LogInfo("duplication recreated in place after %u attempt(s) - windows kept", attempt + 1);
+            // WHICH TRIGGER, because the two that produce DXGI_ERROR_ACCESS_LOST are not equally
+            // benign and this line used to call both a success.
+            //
+            //  * NO geometry change - the Winlogon->Default input-desktop flip at logon, and the
+            //    only trigger actually measured here. The API documents ACCESS_LOST as "your
+            //    duplication is stale, make a new one"; we did, in the same millisecond, one
+            //    attempt, windows kept. Ordinary.
+            //  * geometry CHANGED - a resolution change, which is the trigger the still-open P2
+            //    names (findings/issues.md, "win11-24H2 resolution-change capture FREEZE"): THIS
+            //    SAME CODE reports "recreated in place - windows kept" while the pixels the guest
+            //    goes on to send are STALE. So the recovery returning TRUE does not establish that
+            //    capture is healthy, and log-sweep-baseline.json's own reason field already ties
+            //    this exact text to that P2. Reporting it as a success is how a known-open freeze
+            //    reads as routine, so it stays at WARNING and names the P2.
+            //
+            // A first pass at this downgraded BOTH to INFO and declared them expected. The
+            // independent verification rejected exactly that: "the fix does not disambiguate; it
+            // downgrades both triggers to the same INFO/expected classification", with the RCA's
+            // own both-cases-share-one-message at 0.31 - and the same session had already had
+            // three severity changes reverted at gaming_the_gate 0.70.
+            // ERROR, not Warning, for the geometry-changed case: it was an ERROR before (through
+            // win_perror2) and demoting the trigger of an OPEN defect by even one level is still a
+            // demotion. A clean error log is the gate condition, so the trigger of a filed freeze
+            // belongs in what breaches it. Jev was split on this - warning 0.52 against error 0.47
+            // at only 0.36 confidence - and a tie goes to the louder side.
+            if (geometryChanged)
+                LogError("duplication recreated in place after %u attempt(s) - windows kept - BUT THE GEOMETRY CHANGED, "
+                    L"which is the resolution-change trigger the open P2 (win11-24H2 resolution-change capture freeze) "
+                    L"says this same path reports as recovered while the pixels stay stale: recovery returning true does "
+                    L"NOT establish that the frames are fresh", attempt + 1);
+            else
+                // WARNING, not Info, for the benign case too. Info would have put it below the
+                // level anything watches, so a RISE - the input-desktop flip starting to happen
+                // fifty times a boot instead of once - would have become invisible, and that is a
+                // loss of signal rather than a removal of noise. One line per recovery at WARNING
+                // keeps the rate visible while removing the four ERRORs and the FormatMessage
+                // fiction about a keyed mutex. NOTHING in this change is quieter than a warning.
+                LogWarning("duplication recreated in place after %u attempt(s) - windows kept (0x887a0026 "
+                    L"DXGI_ERROR_ACCESS_LOST at an input-desktop switch, geometry unchanged - the documented "
+                    L"stale-duplication signal, recovered in place)", attempt + 1);
             M0BlinkMark(L"recreate-done", attempt + 1);
             return TRUE;
         }
@@ -1281,7 +1326,15 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
         {
             _InterlockedIncrement(&g_AcqError);
             g_AcqLastHr = (LONG)status;
-            win_perror2(status, "duplication->AcquireNextFrame()");
+            // ACCESS_LOST / ACCESS_DENIED is the API's documented "your duplication is stale,
+            // make a new one" and the frame loop routes exactly those into RecreateDuplication,
+            // which reports the outcome - including a WARNING when the geometry moved. This call
+            // site runs ~350 lines before that classification and cannot know it, so reporting
+            // here was reporting a condition before anything had decided what it meant. The
+            // counters above are untouched, so g_AcqError still rises and QGACAPSTAT still shows
+            // it. Every OTHER HRESULT keeps win_perror2 at ERROR, unchanged.
+            if (status != DXGI_ERROR_ACCESS_LOST && status != DXGI_ERROR_ACCESS_DENIED)
+                win_perror2(status, "duplication->AcquireNextFrame()");
         }
         else
         {
@@ -1539,7 +1592,10 @@ static HRESULT ReleaseFrame(IN OUT CAPTURE_CONTEXT* ctx)
     status = IDXGIOutputDuplication_ReleaseFrame(ctx->duplication);
     if (FAILED(status))
     {
-        win_perror2(status, "duplication->ReleaseFrame");
+        // same split as the acquire side above: the recovery path is the single reporter for the
+        // stale-duplication signal, every other HRESULT stays an ERROR here.
+        if (status != DXGI_ERROR_ACCESS_LOST && status != DXGI_ERROR_ACCESS_DENIED)
+            win_perror2(status, "duplication->ReleaseFrame");
         goto end;
     }
 
