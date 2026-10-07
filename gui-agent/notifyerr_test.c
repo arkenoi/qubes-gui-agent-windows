@@ -23,7 +23,10 @@
  *   fail-open  NOTIFYERR_DEFECT_FAILOPEN  - transport missing/failed/unwritable store: the caller
  *                                           gets a return, not a crash, and the failure is logged
  *                                           ONCE per process for repeated errors
- * Plus the gate (off -> nothing leaves the log), the notify-file text shape (header / line 1 /
+ *   the window NOTIFYERR_DEFECT_NOBOX     - dom0 not told (failed:transport, gated) -> the error window
+ *                                           is shown; never on send / duplicate / cap / rejection
+ *   no storm   NOTIFYERR_DEFECT_BOXSTORM  - the window shares the per-boot dedupe and the cap
+ * Plus the gate (off -> nothing goes to dom0, the window is shown), the notify-file text shape (header / line 1 /
  * cause / technical line, rz39), the row glue QerrReportText, and the marker file contract shared
  * with guest/qwt-notify-error.ps1. The texts themselves are held to the rules by
  * notifyrender_test.c, which renders every row of notifytexts.h.
@@ -44,6 +47,7 @@
 #endif
 
 extern int  (*QerrTestSpawnHook)(const char* notifyPath);
+extern int  (*QerrTestBoxHook)(const char* header, const char* text);
 extern void (*QerrTestLogHook)(const char* line);
 extern long long QerrTestBootStamp;
 extern unsigned long QerrTestPid;
@@ -79,6 +83,17 @@ static int SpawnOk(const char* path)
     return 1;
 }
 static int SpawnFail(const char* path) { (void)path; return 0; }
+/* the error window: every box the route shows is recorded (header + text), as WTSSendMessage would get them */
+static unsigned g_boxes = 0;
+static char g_lastBoxHeader[256], g_lastBoxText[2048];
+static int BoxOk(const char* header, const char* text)
+{
+    g_boxes++;
+    strncpy(g_lastBoxHeader, header ? header : "", sizeof(g_lastBoxHeader) - 1);
+    strncpy(g_lastBoxText, text ? text : "", sizeof(g_lastBoxText) - 1);
+    return 1;
+}
+static int BoxFail(const char* header, const char* text) { (void)header; (void)text; return 0; }
 
 /* --- harness ------------------------------------------------------------------------------- */
 static void Check(const char* name, int ok)
@@ -100,6 +115,7 @@ static void ResetStore(void)
     snprintf(g_dir, sizeof(g_dir), "%s/store%u", g_base, ++g_storeN);
     if (TestMkdir(g_dir) != 0 && errno != EEXIST) { fprintf(stderr, "cannot create %s\n", g_dir); exit(2); }
     g_logN = 0; g_spawned = 0; g_lastNotify[0] = 0;
+    g_boxes = 0; g_lastBoxHeader[0] = 0; g_lastBoxText[0] = 0;
 }
 static int FileExists(const char* rel)
 {
@@ -123,7 +139,8 @@ int main(void)
     const long long BOOT = 1757400000LL;   /* any fixed per-boot token; only equality matters */
 #if defined(NOTIFYERR_DEFECT_SEVERITY) || defined(NOTIFYERR_DEFECT_RATELIMIT) || \
     defined(NOTIFYERR_DEFECT_CAP) || defined(NOTIFYERR_DEFECT_REDACT) || \
-    defined(NOTIFYERR_DEFECT_FAILOPEN) || defined(NOTIFYERR_DEFECT_CLOSEREBOOT)
+    defined(NOTIFYERR_DEFECT_FAILOPEN) || defined(NOTIFYERR_DEFECT_CLOSEREBOOT) || \
+    defined(NOTIFYERR_DEFECT_NOBOX) || defined(NOTIFYERR_DEFECT_BOXSTORM)
     const int defectBuild = 1;
     printf("NOTE: a NOTIFYERR_DEFECT_* switch is compiled in - this suite MUST fail now.\n");
 #else
@@ -149,6 +166,7 @@ int main(void)
     }
 
     QerrTestLogHook = LogSink;
+    QerrTestBoxHook = BoxOk;
     QerrTestBootStamp = BOOT;
 
     /* ---- 1. pure redaction --------------------------------------------------------------- */
@@ -273,12 +291,33 @@ int main(void)
             QerrDecide(QERR_SEV_ACTION, "gui-agent", "y", "password=abc", 0, 0, 0, 0, 0, BOOT, &nc), QERR_REJECT_REDACT);
     }
 
-    /* ---- 4. glue end-to-end: gate off ---------------------------------------------------- */
+    /* ---- 4. glue end-to-end: gate off -> nothing to dom0, THE WINDOW instead (owner 2026-10-07; Jev gated=window 0.76) */
     ResetStore();
     QerrTestSpawnHook = SpawnOk;
     QerrInit(0, g_dir);
-    CheckDecision("gate off: ACTION error is not sent", QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_REJECT_SEVERITY);
-    Check("gate off: nothing spawned, no marker", g_spawned == 0 && !FileExists("gui-agent.deslicedown"));
+    CheckDecision("gate off: ACTION error is not sent to dom0 (gated)", QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "The notification and menu capture helper is not running", "y", NULL, "z"), QERR_GATED);
+    Check("gate off: nothing spawned", g_spawned == 0);
+    Check("gate off: the error window is shown once, with the header and the whole text",
+          g_boxes == 1 && strcmp(g_lastBoxHeader, "The notification and menu capture helper is not running") == 0 &&
+          strcmp(g_lastBoxText, "The notification and menu capture helper is not running\r\ny\r\nz") == 0);
+    Check("gate off: the per-boot record is written (the window shares the dedupe)", FileExists("gui-agent.deslicedown") && FileExists(".count"));
+    Check("gate off: the window is logged (QGAERRBOX)", LogCount("QGAERRBOX gui-agent.deslicedown shown") == 1);
+    CheckDecision("gate off: the same error again this boot is a duplicate", QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_SUPPRESS_DUP);
+    Check("gate off: a duplicate shows NO second window (no storm)", g_boxes == 1);
+    CheckDecision("gate off: a DEGRADED report is rejected by severity, not shown", QerrReport("gui-agent", "brokerdied", QERR_SEV_DEGRADED, "x", "y", NULL, "z"), QERR_REJECT_SEVERITY);
+    CheckDecision("gate off: secret-shaped text is refused, not shown", QerrReport("gui-agent", "secret", QERR_SEV_ACTION, "password=abc", "y", NULL, "z"), QERR_REJECT_REDACT);
+    Check("gate off: rejections show no window", g_boxes == 1);
+    {
+        char id[16]; unsigned i; QerrDecision last = QERR_GATED;
+        for (i = 2; i <= QERR_CAP_PER_BOOT; i++) {
+            snprintf(id, sizeof(id), "gated-%u", i);
+            last = QerrReport("gui-agent", id, QERR_SEV_ACTION, "x", "y", NULL, "z");
+        }
+        CheckDecision("gate off: the 8th distinct gated error is still shown", last, QERR_GATED);
+        Check("gate off: eight windows this boot", g_boxes == QERR_CAP_PER_BOOT);
+        CheckDecision("gate off: the 9th distinct gated error is capped", QerrReport("gui-agent", "gated-9", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_SUPPRESS_CAP);
+        Check("gate off: the cap holds for windows too (still eight)", g_boxes == QERR_CAP_PER_BOOT);
+    }
 
     /* ---- 5. glue end-to-end: sends, dedupe, cap ----------------------------------------- */
     ResetStore();
@@ -289,6 +328,7 @@ int main(void)
                    "Cause: wgcbroker.exe has not been running for over 30 s (log line QGADESLICEDOWN).",
                    "gui-agent.exe pid 4242; reported once per boot. Evidence: C:\\Qubes Logs\\gui-agent.log, line QGADESLICEDOWN."), QERR_SEND);
     Check("send: notifhost spawned once with a file", g_spawned == 1);
+    Check("send: dom0 was told, so NO window", g_boxes == 0);
     Check("send: notify text line 1 is the header, alone",
           strncmp(g_lastNotify, "The notification and menu capture helper is not running\r\n", strlen("The notification and menu capture helper is not running\r\n")) == 0);
     Check("send: notify text body is line 1, the cause and the technical line",
@@ -321,6 +361,7 @@ int main(void)
             QerrReport("gui-agent", "cap-9", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_SUPPRESS_CAP);
         Check("cap: exactly QERR_CAP_PER_BOOT spawns this boot", g_spawned == QERR_CAP_PER_BOOT);
         Check("cap: suppression was logged", LogCount("suppressed:cap") == 1);
+        Check("cap and dedupe: nothing suppressed by the policy was shown as a window", g_boxes == 0);
     }
 
     /* ---- 5b. the row glue: QerrReportText renders a notifytexts.h row exactly as the render test does */
@@ -368,14 +409,24 @@ int main(void)
     QerrInit(1, g_dir);
     QerrTestSpawnHook = NULL;   /* notifhost.exe missing */
     CheckDecision("fail-open: exe missing -> caller gets a return, transport failed",
-        QerrReport("gui-agent", "a", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_FAIL_TRANSPORT);
+        QerrReport("gui-agent", "a", QERR_SEV_ACTION, "The GUI agent crashed", "y", NULL, "z"), QERR_FAIL_TRANSPORT);
+    Check("fail-open: dom0 not told -> the error window IS shown, with the text dom0 would have got",
+          g_boxes == 1 && strcmp(g_lastBoxHeader, "The GUI agent crashed") == 0 && strcmp(g_lastBoxText, "The GUI agent crashed\r\ny\r\nz") == 0);
     (void)QerrReport("gui-agent", "b", QERR_SEV_ACTION, "x", "y", NULL, "z");
     (void)QerrReport("gui-agent", "c", QERR_SEV_ACTION, "x", "y", NULL, "z");
     Check("fail-open: three failures, the missing exe logged ONCE", LogCount("NOT PRESENT") == 1);
+    Check("fail-open: three distinct errors, three windows (each under its own per-boot record)", g_boxes == 3);
+    CheckDecision("fail-open: the same error again is a duplicate - no second window", QerrReport("gui-agent", "a", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_SUPPRESS_DUP);
+    Check("fail-open: still three windows", g_boxes == 3);
     QerrTestSpawnHook = SpawnFail;
     (void)QerrReport("gui-agent", "d", QERR_SEV_ACTION, "x", "y", NULL, "z");
     (void)QerrReport("gui-agent", "e", QERR_SEV_ACTION, "x", "y", NULL, "z");
     Check("fail-open: spawn failures logged ONCE", LogCount("CreateProcess") == 1);
+    Check("fail-open: a spawn failure shows the window too", g_boxes == 5);
+    QerrTestBoxHook = BoxFail;
+    (void)QerrReport("gui-agent", "f-nobox", QERR_SEV_ACTION, "x", "y", NULL, "z");
+    Check("fail-open: a window that cannot be shown is a loud line, and the caller still gets a return", LogCount("could NOT be shown") == 1);
+    QerrTestBoxHook = BoxOk;
     Check("fail-open: caller reached this line (no crash, no exit)", 1);
     /* unwritable store: no send, one line */
     {
@@ -385,11 +436,13 @@ int main(void)
         g_logN = 0;
         QerrInit(1, bad);
         QerrTestSpawnHook = SpawnOk; g_spawned = 0;
+        g_boxes = 0;
         CheckDecision("fail-open: unwritable store -> no send",
             QerrReport("gui-agent", "f", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_FAIL_TRANSPORT);
         (void)QerrReport("gui-agent", "g", QERR_SEV_ACTION, "x", "y", NULL, "z");
         Check("fail-open: unwritable store spawned nothing", g_spawned == 0);
         Check("fail-open: unwritable store logged ONCE", LogCount("not writable") == 1);
+        Check("fail-open: with no per-boot record the window is shown at most ONCE per process (no dedupe, so no storm)", g_boxes == 1);
     }
 
     printf("--- %u checks, %u failed%s\n", g_run, g_fail, defectBuild ? " (defect build: failure expected)" : "");

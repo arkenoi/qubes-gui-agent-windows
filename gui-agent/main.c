@@ -51,6 +51,9 @@
 #include "toasthold.h"
 #include "slicepaint.h"
 #include "etwproxy.h"
+#include "lifecycle.h"      // the exit-code latch and the end-session handshake (docs/ADR-supervision.md 5)
+#include "errbox.h"         // QERR_BOX_TITLE_PREFIX: how the route titles the error window (docs/ADR-supervision.md 6)
+#include "errbox-order.h"   // the error window is announced first at start
 #include "faultinject.h"
 #include "dragsim.h"
 #include "notifyerr.h"
@@ -1059,6 +1062,7 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
     HWINEVENTHOOK hooks[RTL_NUMBER_OF(g_HookedEventRanges)];
     HANDLE waitFor[WINDOW_EVENT_WAIT_COUNT];
     BOOL exitThread = FALSE;
+    BOOL stopRequested = FALSE;   // the agent asked (StopWindowEventThread): an expected exit, not a fallback
     HDESK ownDesktop = NULL; // the desktop THIS thread opened, closed only by this thread
 
     UNREFERENCED_PARAMETER(param);
@@ -1136,6 +1140,7 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
             if (signaled == WAIT_OBJECT_0) // stop
             {
                 exitThread = TRUE;
+                stopRequested = TRUE;
                 break;
             }
 
@@ -1190,7 +1195,15 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
     // to the 2 s resync - i.e. 0.5 Hz, WORSE than the 6.6 Hz the old per-frame enumeration
     // achieved. Make that loud rather than a silent regression, and let the frame path fall
     // back to a short resync so behaviour degrades to roughly the old code instead.
-    LogError("window event thread exiting - tracking falls back to periodic resync");
+    // AN EXIT THE AGENT ASKED FOR IS NOT A FALLBACK: this line was ERROR on every clean exit ("tracking falls back to
+    // periodic resync" - a fallback that does not happen in a process that is leaving; measured 2026-10-07). It stays
+    // ERROR only when the thread dies while the agent keeps running - a real fallback, diagnosed as one.
+    if (stopRequested)
+        LogInfo("window event thread exiting on request - the agent is leaving");   // QGA_WINEVT_EXPECTED
+    else
+        LogError("QGAWINEVTDEAD window event thread exiting while the agent keeps running - tracking falls back to the "
+            L"periodic resync (a FALLBACK: window moves are seen at 0.5 Hz until the agent restarts; the lines above "
+            L"name the failure - a wait or hook call that failed, or a WM_QUIT on this thread)");
     InterlockedExchange(&g_WindowEventThreadDead, 1);
 
     LogDebug("end");
@@ -2726,27 +2739,219 @@ static BOOL WgcRunSchtasks(const WCHAR* argtail)
     return ec == 0;
 }
 
-// Launch wgcbroker.exe into the interactive user session via the TASK SCHEDULER (/ru <user> /it).
-// This is the only launch method under which WGC's CreateForMonitor succeeds on this guest:
-// CreateProcessAsUser - even on the correct WTS session token WITH the user's environment block -
-// fails CreateForMonitor with E_HANDLE, while a schtasks /ru user /it launch captures the monitor
-// fine (proven directly by wgcprobe "mon" mode: content 5120x1440, hr 0). There is no child HANDLE
-// to keep; liveness is inferred from the broker's shared-memory heartbeat (see BrokerSupervise).
+// ---- HELPER LIFECYCLE: ONE LAUNCH PER AGENT LIFE, WINDOWS RELAUNCHES (owner, 2026-10-07) ------------------------
+//
+// The agent used to keep its own relaunch loops for the user-session helpers it launches through Task Scheduler
+// (the de-slice broker: an ~8 s throttle; the notification bridge: once per 60 s), on the argument that Task
+// Scheduler's restart-on-failure interval (one minute at minimum) was too slow for the broker. The owner withdrew
+// that argument on 2026-10-07 ("broker death is major failure anyway, so there is no point of making it extra
+// smooth") and made the rule general: NO hand-written relaunch or keep-alive loop anywhere; every death of ours is
+// a major failure - logged at ERROR, recorded once (4002/4003, and the task's own 201) - and brought back ONLY by a
+// Windows mechanism or not at all. So each resident helper's TASK carries Task Scheduler's own RestartOnFailure
+// (HELPER_TASK_RESTART_INTERVAL, at most HELPER_TASK_RESTART_COUNT times), written into the task definition this
+// agent registers from XML (schtasks' command line cannot express it); the agent launches each helper ONCE per its
+// own life and never relaunches it, and an instance Task Scheduler brought back is adopted exactly like the first
+// (it publishes its pid; the supervisors validate it). Both helpers exit 0 when the agent is gone (wgcbroker.cpp,
+// notifhost.cpp BridgeMain), so an agent death does not make Task Scheduler restart helpers into an agent-less session.
+//
+// R1 - "if you terminate something that relaunches, make sure it STOPS relaunching beforehand": before this agent
+// ends a helper on purpose (its own exit, a session end, the hung-broker reap) it DISARMS the task first (schtasks
+// /change /disable - a disabled task is not restarted by RestartOnFailure), then ends the helper, then deletes the
+// task; the next agent start re-creates (re-arms) it. HelpersDisarm() is the first step of every such path and the
+// first act of the end-session handshake (lifecycle.c): once set, no helper is launched into this session any more
+// and a helper's exit while it is set is EXPECTED (the session's teardown, or our own stop) - INFO, not a death.
+static volatile LONG g_HelpersDisarmed = 0;
+#define HELPER_TASK_RESTART_INTERVAL L"PT1M"   // Task Scheduler's minimum
+#define HELPER_TASK_RESTART_COUNT    L"3"
+
+BOOL HelpersDisarmed(void)
+{
+    return InterlockedCompareExchange(&g_HelpersDisarmed, 0, 0) != 0;
+}
+void HelpersDisarm(IN const WCHAR *why)
+{
+    if (InterlockedExchange(&g_HelpersDisarmed, 1) == 0)
+        LogInfo("QGAHELPERSDISARM helper launches disarmed (%s): no helper is launched into this session from here on, "
+            L"and a helper's exit from now is expected, not a death", why);
+    EtwProxyDisarm();
+}
+void HelpersRearm(void)
+{
+    if (InterlockedExchange(&g_HelpersDisarmed, 0) != 0)
+        LogInfo("QGAHELPERSREARM helper launches re-armed (the end of the session was cancelled)");
+    EtwProxyRearm();
+}
+
+// The five XML-significant characters, escaped; the task XML carries our own paths and arguments only.
+static void XmlEscapeInto(OUT WCHAR *out, IN size_t cch, IN const WCHAR *in)
+{
+    size_t o = 0;
+    out[0] = 0;
+    for (; *in && o + 8 < cch; in++)
+    {
+        const WCHAR *rep = NULL;
+        switch (*in)
+        {
+        case L'&':  rep = L"&amp;"; break;
+        case L'<':  rep = L"&lt;"; break;
+        case L'>':  rep = L"&gt;"; break;
+        case L'"':  rep = L"&quot;"; break;
+        case L'\'': rep = L"&apos;"; break;
+        default: break;
+        }
+        if (rep) { while (*rep) out[o++] = *rep++; }
+        else out[o++] = *in;
+        out[o] = 0;
+    }
+}
+
+// The interactive user of the console session as a SID string - the task's principal. The name (WTSUserName) was
+// the /ru of the old command-line form; the SID is what the XML form takes without a domain lookup.
+static BOOL TaskUserId(IN DWORD sid, OUT WCHAR *out, IN size_t cch)
+{
+    HANDLE tok = NULL;
+    BYTE buf[SECURITY_MAX_SID_SIZE + sizeof(TOKEN_USER)];
+    DWORD cb = 0;
+    LPWSTR s = NULL;
+    BOOL ok = FALSE;
+    out[0] = 0;
+    if (!WTSQueryUserToken(sid, &tok)) { win_perror("WTSQueryUserToken"); return FALSE; }
+    if (GetTokenInformation(tok, TokenUser, buf, sizeof(buf), &cb) &&
+        ConvertSidToStringSidW(((TOKEN_USER*)buf)->User.Sid, &s) && s)
+    {
+        ok = SUCCEEDED(StringCchCopyW(out, cch, s));
+        LocalFree(s);
+    }
+    else
+        win_perror("GetTokenInformation(TokenUser)");
+    CloseHandle(tok);
+    return ok;
+}
+
+// Registers a helper task of ours from XML - the only form that carries RestartOnFailure - and starts it: the
+// RegistrationTrigger fires on registration, so no /run follows (a restart-on-failure applies to an instance Task
+// Scheduler itself started). resident: TRUE arms RestartOnFailure (the broker, the bridge); FALSE for a one-shot
+// (a notify, the banner restore), which must never be retried by the scheduler. InteractiveToken is the /it of the
+// old form; LeastPrivilege what /ru <user> gave. ExecutionTimeLimit PT0S = none: the old /sc once form inherited
+// Task Scheduler's 72 h default, after which a resident helper would have been ended by the scheduler.
+static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath, IN const WCHAR *args,
+    IN const WCHAR *userId, IN BOOL resident, IN const WCHAR *description)
+{
+    static const BYTE bom[2] = { 0xFF, 0xFE };
+    WCHAR tmp[MAX_PATH], file[MAX_PATH], xExe[MAX_PATH * 2], xArgs[2048], xDesc[512], cmd[MAX_PATH + 128];
+    const size_t cap = 8192;
+    WCHAR *xml = (WCHAR*)malloc(cap * sizeof(WCHAR));
+    HANDLE h;
+    DWORD wr = 0;
+    size_t len = 0;
+    BOOL ok;
+
+    if (!xml) return FALSE;
+    XmlEscapeInto(xExe, RTL_NUMBER_OF(xExe), exePath);
+    XmlEscapeInto(xArgs, RTL_NUMBER_OF(xArgs), args);
+    XmlEscapeInto(xDesc, RTL_NUMBER_OF(xDesc), description);
+    // The element order is the one Task Scheduler itself exports (its schema is a sequence); RestartOnFailure last.
+    if (FAILED(StringCchPrintfW(xml, cap,
+        L"<?xml version=\"1.0\" encoding=\"UTF-16\"?>\r\n"
+        L"<Task version=\"1.3\" xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\">\r\n"
+        L"  <RegistrationInfo><Description>%s</Description></RegistrationInfo>\r\n"
+        L"  <Triggers><RegistrationTrigger><Enabled>true</Enabled></RegistrationTrigger></Triggers>\r\n"
+        L"  <Principals><Principal id=\"Author\"><UserId>%s</UserId><LogonType>InteractiveToken</LogonType>"
+        L"<RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\r\n"
+        L"  <Settings>\r\n"
+        L"    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\r\n"
+        L"    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\r\n"
+        L"    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\r\n"
+        L"    <AllowHardTerminate>true</AllowHardTerminate>\r\n"
+        L"    <StartWhenAvailable>false</StartWhenAvailable>\r\n"
+        L"    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>\r\n"
+        L"    <AllowStartOnDemand>true</AllowStartOnDemand>\r\n"
+        L"    <Enabled>true</Enabled>\r\n"
+        L"    <Hidden>true</Hidden>\r\n"
+        L"    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n"
+        L"    <WakeToRun>false</WakeToRun>\r\n"
+        L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n"
+        L"    <Priority>7</Priority>\r\n"
+        L"%s"
+        L"  </Settings>\r\n"
+        L"  <Actions Context=\"Author\"><Exec><Command>%s</Command><Arguments>%s</Arguments></Exec></Actions>\r\n"
+        L"</Task>\r\n",
+        xDesc, userId,
+        resident ? L"    <RestartOnFailure><Interval>" HELPER_TASK_RESTART_INTERVAL L"</Interval><Count>"
+                   HELPER_TASK_RESTART_COUNT L"</Count></RestartOnFailure>\r\n" : L"",
+        xExe, xArgs)))
+    {
+        LogError("QGAHELPERTASK the task XML for %s does not fit", taskName);
+        free(xml);
+        return FALSE;
+    }
+    StringCchLengthW(xml, cap, &len);
+    if (!GetTempPathW(RTL_NUMBER_OF(tmp), tmp) ||
+        FAILED(StringCchPrintfW(file, RTL_NUMBER_OF(file), L"%sqga-task-%s.xml", tmp, taskName)))
+    {
+        free(xml);
+        return FALSE;
+    }
+    h = CreateFileW(file, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE)
+    {
+        win_perror("CreateFile(task xml)");
+        free(xml);
+        return FALSE;
+    }
+    ok = WriteFile(h, bom, 2, &wr, NULL) && WriteFile(h, xml, (DWORD)(len * sizeof(WCHAR)), &wr, NULL);
+    CloseHandle(h);
+    free(xml);
+    if (!ok)
+    {
+        win_perror("WriteFile(task xml)");
+        DeleteFileW(file);
+        return FALSE;
+    }
+    StringCchPrintfW(cmd, RTL_NUMBER_OF(cmd), L"/create /tn %s /xml \"%s\" /f", taskName, file);
+    ok = WgcRunSchtasks(cmd);
+    DeleteFileW(file);
+    if (!ok)
+        LogError("QGAHELPERTASK schtasks /create /xml failed for %s (resident=%d) - the helper does not start",
+            taskName, resident);
+    else
+        LogInfo("QGAHELPERTASK %s registered from XML and started by its registration trigger%s", taskName,
+            resident ? L" (Task Scheduler restart-on-failure " HELPER_TASK_RESTART_INTERVAL L" x" HELPER_TASK_RESTART_COUNT L")"
+                     : L" (one-shot, no restart)");
+    return ok;
+}
+
+// R1: Task Scheduler must not restart what this agent is about to end. A disabled task is not restarted by
+// RestartOnFailure; the next agent start re-creates it enabled.
+static void HelperTaskDisarm(IN const WCHAR *taskName, IN const WCHAR *why)
+{
+    WCHAR cmd[256];
+    StringCchPrintfW(cmd, RTL_NUMBER_OF(cmd), L"/change /tn %s /disable", taskName);
+    if (WgcRunSchtasks(cmd))
+        LogInfo("QGAHELPERTASK %s disarmed before %s (restart-on-failure cannot fire)", taskName, why);
+    else
+        LogError("QGAHELPERTASK schtasks /change /disable failed for %s before %s - Task Scheduler may restart the "
+            L"helper this agent is about to end", taskName, why);
+}
+// Launch wgcbroker.exe into the interactive user session via the TASK SCHEDULER, ONCE per agent life. This is the
+// only launch method under which WGC's CreateForMonitor succeeds on this guest: CreateProcessAsUser - even on the
+// correct WTS session token WITH the user's environment block - fails CreateForMonitor with E_HANDLE, while a task
+// run as the interactive user captures the monitor fine (proven directly by wgcprobe "mon" mode: content
+// 5120x1440, hr 0). The task is registered from XML (HelperTaskRegister) so it carries Task Scheduler's own
+// RestartOnFailure - the ONLY relauncher the broker has since 2026-10-07 (see HELPER LIFECYCLE above). There is
+// no child HANDLE to keep; BrokerSupervise opens one (validated) from the pid the broker publishes.
 static BOOL WgcLaunch(void)
 {
     DWORD sid = WTSGetActiveConsoleSessionId();
     if (sid == 0xFFFFFFFF) return FALSE;
 
-    // Interactive user name for /ru (bare name, e.g. "user").
-    WCHAR* user = NULL; DWORD userLen = 0;
-    if (!WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, sid, WTSUserName, &user, &userLen) ||
-        !user || !*user)
-    { if (user) WTSFreeMemory(user); win_perror("WTSQuerySessionInformation(UserName)"); return FALSE; }
+    WCHAR userId[256];
+    if (!TaskUserId(sid, userId, RTL_NUMBER_OF(userId))) return FALSE;
 
-    // Broker path next to gui-agent.exe, taken as an 8.3 SHORT path so the /tr value carries no
-    // spaces in the program token and needs no embedded quoting (the long path has spaces).
+    // Broker path next to gui-agent.exe. The XML form takes the long path as it is: the 8.3 contortion of the old
+    // /tr form existed only because schtasks parses /tr by spaces.
     WCHAR self[MAX_PATH] = { 0 };
-    if (!GetModuleFileName(NULL, self, RTL_NUMBER_OF(self))) { WTSFreeMemory(user); return FALSE; }
+    if (!GetModuleFileName(NULL, self, RTL_NUMBER_OF(self))) return FALSE;
     WCHAR* sl = wcsrchr(self, L'\\'); if (sl) *(sl + 1) = 0;   // keep the trailing backslash
     WCHAR longExe[MAX_PATH];
     StringCchPrintf(longExe, RTL_NUMBER_OF(longExe), L"%swgcbroker.exe", self);
@@ -2756,7 +2961,6 @@ static BOOL WgcLaunch(void)
     // broker inert on every clean install because wgcbroker.exe was never staged into the MSI.
     if (GetFileAttributes(longExe) == INVALID_FILE_ATTRIBUTES)
     {
-        WTSFreeMemory(user);
         LogError("QGABROKERMISSING wgcbroker.exe is NOT PRESENT at %s - the de-slice broker cannot "
             L"start, so on this eligible guest toasts, menus and WinUI surfaces will be WITHHELD "
             L"(there is no composite fallback). This is a PACKAGING GAP: the helper was built but "
@@ -2768,38 +2972,31 @@ static BOOL WgcLaunch(void)
         QerrReportText(QerrTextFind("broker-missing"), NULL, NULL);
         return FALSE;
     }
-    WCHAR shortExe[MAX_PATH] = { 0 };
-    if (!GetShortPathName(longExe, shortExe, RTL_NUMBER_OF(shortExe)))
-        StringCchCopy(shortExe, RTL_NUMBER_OF(shortExe), longExe);
 
-    // /tr command: "<exe> --serve --agent-pid <pid> --shm ... --ctl ...". If 8.3 was unavailable
-    // and the path still has spaces, escape-quote the program token for schtasks.
-    WCHAR tr[1024];
-    if (wcschr(shortExe, L' '))
-        StringCchPrintf(tr, RTL_NUMBER_OF(tr),
-            L"\\\"%s\\\" --serve --agent-pid %lu --shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl --frame Global\\QubesWgcBrk_%llx_frm",
-            shortExe, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce, g_WgcNonce);
-    else
-        StringCchPrintf(tr, RTL_NUMBER_OF(tr),
-            L"%s --serve --agent-pid %lu --shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl --frame Global\\QubesWgcBrk_%llx_frm",
-            shortExe, GetCurrentProcessId(), g_WgcNonce, g_WgcNonce, g_WgcNonce);
-
-    // Recreate the task fresh each launch (idempotent), then run it now.
-    WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
-    WCHAR args[2048];
+    // The arguments: "--serve --agent-pid <pid> --shm ... --ctl ... --frame ..." - the names a Task Scheduler
+    // restart reuses, so a restarted instance attaches to the same section and events.
+    WCHAR args[1024];
     StringCchPrintf(args, RTL_NUMBER_OF(args),
-        L"/create /tn " WGC_TASK_NAME L" /tr \"%s\" /sc once /st 00:00 /ru %s /it /f", tr, user);
-    WTSFreeMemory(user);
-    if (!WgcRunSchtasks(args)) { LogWarning("WGCBROKER schtasks /create failed"); return FALSE; }
-    if (!WgcRunSchtasks(L"/run /tn " WGC_TASK_NAME)) { LogError("QGABROKERLAUNCHFAIL schtasks /run of " 
-        "the de-slice broker FAILED - it cannot start, so per-window surfaces will be withheld. "
-        "Check that the task exists and that Task Scheduler is running."); return FALSE; }
-    // No child handle under Task Scheduler; BrokerSupervise opens one (validated) from the pid the
-    // broker publishes, once its heartbeat is live. Until then the heartbeat is the only signal.
-    LogInfo("WGCBROKER launched via Task Scheduler (user session %lu)", sid);
+        L"--serve --agent-pid %lu --shm Global\\QubesWgcBrk_%llx_shm --ctl Global\\QubesWgcBrk_%llx_ctl --frame Global\\QubesWgcBrk_%llx_frm",
+        GetCurrentProcessId(), g_WgcNonce, g_WgcNonce, g_WgcNonce);
+
+    // Recreate the task fresh (idempotent): /delete ENDS an instance a previous agent left behind (measured,
+    // notifhost.cpp) and drops any restart Task Scheduler still owed its definition; the registration then starts
+    // the new one with its own restart-on-failure armed.
+    WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
+    if (!HelperTaskRegister(WGC_TASK_NAME, longExe, args, userId, TRUE,
+            L"QWT: the GUI agent's de-slice capture broker (re-created by the GUI agent at each of its starts; "
+            L"restarted on failure by Task Scheduler, never by the agent)"))
+    {
+        LogError("QGABROKERLAUNCHFAIL registering/starting the de-slice broker's task FAILED - it cannot start, "
+            L"so per-window surfaces will be withheld. Check that Task Scheduler is running and that the task "
+            L"XML was accepted (a schtasks error is logged above).");
+        return FALSE;
+    }
+    LogInfo("WGCBROKER launched via Task Scheduler (user session %lu; restart-on-failure " HELPER_TASK_RESTART_INTERVAL
+        L" x" HELPER_TASK_RESTART_COUNT L" is the scheduler's, not this agent's)", sid);
     return TRUE;
 }
-
 // Open a helper process published by pid for SYNCHRONIZE/TERMINATE - VALIDATED first. The pid
 // is written by a user-session helper into something the interactive user can write (the
 // broker's shared section per the wgcbroker_ipc.h security note; the bridge's ProgramData
@@ -2902,9 +3099,8 @@ static ULONGLONG BrokerNextDue(void)
             }
         return due;
     }
-    // g_WgcLastLaunch == 0 included: BrokerSupervise's throttle (now - g_WgcLastLaunch < 8000) also holds back the FIRST
-    // launch during the first 8 s of uptime, and nothing else would wake the loop for it.
-    if (g_WgcLastLaunch + 8000 > now) due = g_WgcLastLaunch + 8000;
+    // No launch throttle any more (HELPER LIFECYCLE): the one launch happens on the first eligible wake, and nothing
+    // relaunches - only the QGADESLICEDOWN cadence needs the loop awake while the broker is down.
     if (g_BrokerNextWarn > now && (!due || g_BrokerNextWarn < due)) due = g_BrokerNextWarn;
     return due;
 }
@@ -3036,10 +3232,13 @@ static BOOL g_WgcBrokerHung = FALSE;
 
 // The broker supervisor - EVENT-DRIVEN since rest-zero S4: it runs on every main-loop wake, waits for nothing, and arms
 // no timer while the broker is up and its requests are answered. Creates the section on the first eligible pass;
-// (re)launches the broker when it is absent, dead, hung or in another console session; marks it ready when the pid it
-// publishes validates. EXIT is the broker's process handle (in the main loop's wait array); READY is the pid the broker
-// publishes and then signals the frame event for; a HANG is a request it has not acknowledged within
-// WGCBRK_ACK_DEADLINE_MS (R1/R4). No heartbeat is read or written.
+// launches the broker ONCE per agent life when a session with a shell exists (HELPER LIFECYCLE above - since 2026-10-07
+// nothing here relaunches it: Task Scheduler's restart-on-failure does, and an instance it brings back is adopted like
+// the first); marks it ready when the pid it publishes validates. EXIT is the broker's process handle (in the main
+// loop's wait array); READY is the pid the broker publishes and then signals the frame event for; a HANG is a request
+// it has not acknowledged within WGCBRK_ACK_DEADLINE_MS (R1/R4). No heartbeat is read or written.
+static ULONGLONG g_BrokerReadyAt = 0;   // tick the current instance became ready: its run time in a death record
+static BOOL g_WgcLaunched = FALSE;      // the ONE launch this agent performs (HELPER LIFECYCLE above)
 static void BrokerSupervise(void)
 {
     if (!g_WgcBroker || g_OsBuild < 26100 || !PwEnabled()) return;
@@ -3060,14 +3259,18 @@ static void BrokerSupervise(void)
         g_WgcBrokerHung = FALSE;
         _InterlockedExchange(&g_WgcBrokerPidValidated, 0);   // a dead broker must not keep suppressing windows
         // Its pid stays in the section: zero it, or the next pass would try to validate a dead process and report a
-        // forged pid (QGABROKERPID) for an ordinary exit.
+        // forged pid (QGABROKERPID) for an ordinary exit - and a new instance's readiness can only mean a NEW pid.
         WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
+        // The old instance is gone: nothing can write the arena regions it was asked to release any more, so all of
+        // them are reusable now (R4 without the ack). This ran at the relaunch; there is no relaunch, so it runs here.
+        WgcArenaReapPending(TRUE);
     }
 
     DWORD sid = WTSGetActiveConsoleSessionId();
     // READY = the pid this launch's broker published, VALIDATED (WgcOpenBrokerProcess). The broker publishes it and then
     // signals the frame event, so this runs on that wake. The pid field is user-writable, so a pid that does not
-    // validate is one loud line per pid; without a handle a broker's exit cannot be waited on.
+    // validate is one loud line per pid; without a handle a broker's exit cannot be waited on. An instance Task
+    // Scheduler restarted after a failure is adopted exactly here: it publishes its pid like the first one.
     if (!brokerExited && !g_WgcBrokerProc && g_WgcSession == sid)
     {
         LONG pid = WGCBRK_HDR(g_WgcBase)->BrokerPid;
@@ -3086,7 +3289,7 @@ static void BrokerSupervise(void)
         }
     }
     // HUNG = a request this READY instance has not acknowledged within WGCBRK_ACK_DEADLINE_MS. Checked only once ready:
-    // requests outstanding across a relaunch get a fresh clock at the ready transition below.
+    // requests outstanding across a restart get a fresh clock at the ready transition below.
     int hungSlot = -1; ULONGLONG hungMs = 0;
     const BOOL hung = (!g_WgcBrokerHung && g_WgcBrokerProc && g_BrokerReady) ?
                       BrokerAckOverdue(now, &hungSlot, &hungMs) : FALSE;
@@ -3097,18 +3300,19 @@ static void BrokerSupervise(void)
         if (!g_BrokerReady)
         {
             _InterlockedExchange(&g_BrokerReady, 1);
+            g_BrokerReadyAt = now;
             // A fresh instance answers every slot on its first pass: requests left outstanding by the previous one get
             // a fresh clock rather than being charged to this one.
             for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
                 if (g_SlotCtlSince[i]) g_SlotCtlSince[i] = now;
-            // RECOVERY FROM A DEATH IS ITSELF REPORTABLE. A broker that crashed and came back is
-            // not a non-event just because the pixels resumed: something killed it, and the only
-            // record that it happened is this line plus BrokerDeaths.
+            // RECOVERY FROM A DEATH IS ITSELF REPORTABLE. A broker that died and came back (Task Scheduler's
+            // restart-on-failure) is not a non-event just because the pixels resumed: something killed it, and the
+            // only record that it happened is this line plus BrokerDeaths and the 4002 already written.
             if (g_BrokerDiedAt)
             {
-                LogWarning("QGABROKERBACK de-slice broker RECOVERED after %I64u ms down (deaths=%lu). "
-                    L"The relaunch worked, but a broker death is a real failure - windows withheld "
-                    L"during the outage were never shown. Collect the wgcbroker log for the crash.",
+                LogWarning("QGABROKERBACK de-slice broker is BACK after %I64u ms down (deaths=%lu) - Task Scheduler "
+                    L"restarted it. A broker death is a real failure - windows withheld during the outage were never "
+                    L"shown. Collect the wgcbroker log for the crash.",
                     GetTickCount64() - g_BrokerDiedAt, g_BrokerDeaths);
                 g_BrokerDiedAt = 0;
             }
@@ -3127,18 +3331,27 @@ static void BrokerSupervise(void)
         BrokerReportDeaf();
         return;
     }
-    // THE DEATH TRANSITION IS THE LOUD MOMENT, not the 30 s mark. Before this, a broker that
-    // crashed and was relaunched inside DESLICE_FIRST_WARN_MS produced NO log line and NO flag at
-    // all - the failure recovered silently and nobody could know it had happened. Excluding logoff
-    // and fast-user-switch (these guests enforce autologon with one user, so neither occurs), a
-    // CRASH is essentially the only way a ready broker dies, which makes this the realistic case.
+    // THE DEATH TRANSITION IS THE LOUD MOMENT, not the 30 s mark. Excluding logoff and fast-user-switch (these guests
+    // enforce autologon with one user, so neither occurs), a CRASH is essentially the only way a ready broker dies,
+    // which makes this the realistic case - and since 2026-10-07 nothing here relaunches it: Task Scheduler does
+    // (restart-on-failure), or nothing does, and the record below is what says it happened.
     if (_InterlockedExchange(&g_BrokerReady, 0) != 0)
     {
+        if (HelpersDisarmed())
+        {
+            // EXPECTED (R5): helper launches are disarmed - the session is ending or this agent is leaving - and the
+            // broker went with it. Not a death: INFO, no record, nothing comes back (and nothing should).
+            LogInfo("WGCBROKER the broker %s (code %lu) while helper launches are disarmed (session ending / agent "
+                L"exiting) - expected, not a death", brokerExited ? L"exited" : L"stopped answering", brokerExitCode);
+            if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
+                                   _InterlockedExchange(&g_WgcBrokerPidValidated, 0); }
+            return;
+        }
         g_BrokerDiedAt = now;
         (void)CfgWriteDword(NULL, REG_CONFIG_BROKER_DEATHS_VALUE, ++g_BrokerDeaths, NULL);
         // Say WHICH signal fired: an exit (with the broker's own exit code - the broker has no log
         // of its own) is a crash/self-exit; an unanswered request with the process still running is a
-        // HANG, reaped below before the relaunch.
+        // HANG, ended below (its task disarmed first) - and not brought back before the next agent start.
         if (brokerExited)
             LogError("QGABROKEREXIT de-slice broker process EXITED (exit code %lu) - detected by "
                 L"process wait.", brokerExitCode);
@@ -3162,32 +3375,58 @@ static void BrokerSupervise(void)
         LogError("QGABROKERDIED de-slice broker STOPPED SERVING after being ready (death #%lu, "
             L"pid was %ld). This is a MAJOR FAILURE, not a hiccup: while it is gone there is NO "
             L"composite fallback on an eligible guest, so toasts, menus and WinUI surfaces are "
-            L"WITHHELD rather than drawn. A relaunch follows within ~8 s and may well succeed - "
-            L"that recovery does NOT make this benign, and it is reported here precisely so it "
-            L"cannot pass silently. BrokerDeaths=%lu is published under the Qubes Tools config key.",
-            g_BrokerDeaths, (long)pidBefore, g_BrokerDeaths);
+            L"WITHHELD rather than drawn. This agent relaunches nothing (owner, 2026-10-07): %s. "
+            L"BrokerDeaths=%lu is published under the Qubes Tools config key.",
+            g_BrokerDeaths, (long)pidBefore,
+            hung ? L"the hung instance is ended (its task disarmed first) and nothing brings it back before the "
+                   L"next agent start"
+                 : L"Task Scheduler restarts it on failure (its task is armed: " HELPER_TASK_RESTART_INTERVAL L" x"
+                   HELPER_TASK_RESTART_COUNT L"); a clean exit 0 is not restarted",
+            g_BrokerDeaths);
         // Secondary route, DEGRADED - deliberately BELOW the route's ACTION threshold, so this is
-        // rejected and stays in the log: a relaunch follows within ~8 s, and if it does not take,
-        // QGADESLICEDOWN below escalates to ACTION 30 s later. Wired so the threshold is exercised
-        // by a real site and a future promotion is a one-word change, not new plumbing.
+        // rejected and stays in the log; if the scheduler's restart does not take, QGADESLICEDOWN below
+        // escalates to ACTION 30 s later. Wired so the threshold is exercised by a real site.
         QerrReportText(QerrTextFind("broker-died"), NULL, NULL);
+        // THE HUNG-BROKER REAP (R1: disarm first, then end). A hung broker holds the singleton mutex, its WGC sessions
+        // and the shared section; it is ended by the validated handle - only our own wgcbroker.exe in the console
+        // session - with its task disarmed first, so the kill (exit code 1) does not make Task Scheduler restart it.
+        // Nothing relaunches it: the next agent start re-creates the task (owner, 2026-10-07).
+        if (hung && g_WgcBrokerProc)
+        {
+            HelperTaskDisarm(WGC_TASK_NAME, L"ending the hung broker");
+            LogWarning("QGABROKERREAP terminating the hung de-slice broker pid %ld (its task disarmed first) - "
+                L"nothing relaunches it before the next agent start", (long)pidBefore);
+            if (TerminateProcess(g_WgcBrokerProc, 1))
+                WaitForSingleObject(g_WgcBrokerProc, 2000);
+            else
+                LogError("QGABROKERREAP TerminateProcess failed (0x%x) - the hung instance stays, holding the "
+                    L"singleton mutex", GetLastError());
+            CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
+            g_WgcBrokerHung = FALSE;
+            _InterlockedExchange(&g_WgcBrokerPidValidated, 0);
+            WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
+            WgcArenaReapPending(TRUE);
+        }
         // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo): a crash
         // is in Windows Error Reporting already, a clean unasked exit and a hang are visible only here.
-        // ONE Event Log entry under our source, with the exit code (unknown for a hang: the agent reaps
-        // it) and the run time since the launch; the dom0 notification is the event-triggered reporter's
+        // ONE Event Log entry under our source, with the exit code (unknown for a hang: the agent ends
+        // it) and the run time since it became ready; the dom0 notification is the event-triggered reporter's
         // job (ADR 3), which is also why the DEGRADED QerrReport above stays below the ACTION threshold.
         // A HANG IS NOT AN EXIT: the broker that stopped answering is still running when this is
-        // written and is reaped below, so its record says "hung" (DEATHEVENT_EXIT_HUNG), never
+        // written and is ended above, so its record says "hung" (DEATHEVENT_EXIT_HUNG), never
         // "exit code unknown" - the reporter renders a hang as a hang (rz39 defect 2). "unknown"
         // is kept for a death that is neither an observed exit nor an observed hang (the session
         // changed under it, the handle is gone).
         DeathEventReport(DEATHEVENT_ID_WGCBROKER, L"wgcbroker.exe", (DWORD)pidBefore,
             brokerExited ? brokerExitCode : (hung ? DEATHEVENT_EXIT_HUNG : DEATHEVENT_EXIT_UNKNOWN),
-            g_WgcLastLaunch != 0 ? now - g_WgcLastLaunch : DEATHEVENT_RAN_UNKNOWN,
-            hung ? L"It was running but stopped answering (a hang): the agent reaps it and relaunches within "
-                   L"~8 s. gui-agent log lines QGABROKERHUNG and QGABROKERDIED name the stage it hung in."
-                 : L"The agent relaunches it within ~8 s. gui-agent log lines QGABROKEREXIT and QGABROKERDIED; "
-                   L"a crash also leaves a Windows Error Reporting record (AppCrash_wgcbroker.exe_*).");
+            g_BrokerReadyAt != 0 ? now - g_BrokerReadyAt : DEATHEVENT_RAN_UNKNOWN,
+            hung ? L"It was running but stopped answering (a hang): the agent ended it, its task disarmed first, and "
+                   L"nothing relaunches it before the next GUI agent start. gui-agent log lines QGABROKERHUNG and "
+                   L"QGABROKERDIED name the stage it hung in."
+                 : L"Task Scheduler restarts it on failure (its task is armed: at most 3 times, a minute apart; a "
+                   L"clean exit is not restarted); the GUI agent itself relaunches nothing. gui-agent log lines "
+                   L"QGABROKEREXIT and QGABROKERDIED; a crash also leaves a Windows Error Reporting record "
+                   L"(AppCrash_wgcbroker.exe_*).");
     }
 
     // HARD-FAIL, LOUDLY, ON AN ELIGIBLE SYSTEM (owner 2026-09-04: "I want deslicer to hard fail
@@ -3238,60 +3477,45 @@ static void BrokerSupervise(void)
         QerrReportText(QerrTextFind(binPresent ? "deslice-down-present" : "deslice-down-missing"), NULL, NULL);
     }
 
-    // Throttle relaunch: a freshly launched broker needs a few seconds to attach and publish its pid;
-    // don't re-fire schtasks in the meantime. The throttle's end is a deadline (BrokerNextDue) - a
-    // failure state's bounded timer, armed only while the broker is down.
-    if (now - g_WgcLastLaunch < 8000) return;
-    if (sid != 0xFFFFFFFF && GetShellWindow())
+    // THE ONE LAUNCH PER AGENT LIFE (HELPER LIFECYCLE above): once a console session with a shell exists, and never
+    // into a session that is ending. No throttle, no retry - a launch that fails is said at ERROR and QGADESLICEDOWN
+    // escalates; Task Scheduler's restart-on-failure is the only relauncher of what did start.
+    if (!g_WgcLaunched && !HelpersDisarmed() && sid != 0xFFFFFFFF && GetShellWindow())
     {
+        g_WgcLaunched = TRUE;
         g_WgcLastLaunch = now;
-        // REAP A HUNG INSTANCE BEFORE RELAUNCHING. The broker holds Global\QubesWgcBrokerSingleton;
-        // a second instance exits 0, silently, on it (wgcbroker.cpp wmain). So when the old broker
-        // is HUNG (a request unanswered, process alive - e.g. blocked in PrintWindow on a hung target)
-        // every relaunch here was refused without a trace and the outage lasted until the hung app
-        // died or the guest rebooted, while QGADESLICEDOWN pointed at a wgcbroker log that does not
-        // exist (audit 2026-09-08). The handle was validated when taken (WgcOpenBrokerProcess), so
-        // this terminates only our own wgcbroker.exe in the console session. Bounded wait: the
-        // mutex is released (abandoned, which the broker accepts) once the process is gone.
-        if (g_WgcBrokerProc)
-        {
-            if (WaitForSingleObject(g_WgcBrokerProc, 0) == WAIT_TIMEOUT)
-            {
-                LogWarning("QGABROKERREAP terminating hung de-slice broker pid %ld before relaunch - "
-                    L"without this the new instance exits on the singleton mutex and the outage "
-                    L"never ends.", (long)WGCBRK_HDR(g_WgcBase)->BrokerPid);
-                if (TerminateProcess(g_WgcBrokerProc, 1))
-                    WaitForSingleObject(g_WgcBrokerProc, 2000);
-                else
-                    LogError("QGABROKERREAP TerminateProcess failed (0x%x) - the relaunch will "
-                        L"most likely be refused by the singleton mutex", GetLastError());
-            }
-            CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
-            g_WgcBrokerHung = FALSE;
-            _InterlockedExchange(&g_WgcBrokerPidValidated, 0);   // a dead broker must not keep suppressing windows
-        }
-        // The old instance is gone (exited, or terminated just above): nothing can write the arena regions
-        // it was asked to release any more, so all of them are reusable now (R4 without the ack).
-        WgcArenaReapPending(TRUE);
-        // ZERO THE SHARED PID, so "ready" can only mean the NEW instance published one. A dead broker's
-        // last value stays in the section for ever - the same trap that made a stale heartbeat certify a
-        // corpse as alive (measured 2026-09-08) - and every request clock restarts for the new instance.
+        // ZERO THE SHARED PID, so "ready" can only mean the NEW instance published one - the same trap that made a
+        // stale heartbeat certify a corpse as alive (measured 2026-09-08) - and every request clock starts fresh.
         WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
         for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
             if (g_SlotCtlSince[i]) g_SlotCtlSince[i] = now;
         if (WgcLaunch()) g_WgcSession = sid;
+        else LogError("QGABROKERLAUNCHFAIL the de-slice broker's one launch failed and is not retried (no relaunch "
+                      L"loop, owner 2026-10-07) - QGADESLICEDOWN says so until the next GUI agent start");
     }
 }
 
 static void BrokerShutdown(void)
 {
+    // ORDER (R1): disarm Task Scheduler first - a broker that exits on our flag may exit with a code the scheduler
+    // would restart on - then ask the broker to leave (the Shutdown flag, read when it wakes on the ctl event), wait
+    // bounded on the validated handle, then delete the task, which ENDS an instance that did not leave (measured,
+    // notifhost.cpp). A helper ended here is never relaunched: the next agent start re-creates the task.
+    if (g_WgcLaunched)
+        HelperTaskDisarm(WGC_TASK_NAME, L"the agent's exit");
     if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->Shutdown = 1;   // broker self-exits on this flag...
     if (g_WgcCtl) SetEvent(g_WgcCtl);                      // ...read when it wakes: it has no timer any more
+    if (g_WgcBrokerProc)
+    {
+        // BOUNDED: a failure detector. The broker leaves within milliseconds of the flag; expiry is an ERROR and the
+        // task delete below ends it anyway.
+        if (WaitForSingleObject(g_WgcBrokerProc, 2000) != WAIT_OBJECT_0)
+            LogError("WGCBROKER the broker did not leave within 2 s of the shutdown flag - the task delete ends it");
+        CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
+        _InterlockedExchange(&g_WgcBrokerPidValidated, 0);
+    }
     WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
-    if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
-                           _InterlockedExchange(&g_WgcBrokerPidValidated, 0); }
 }
-
 // ---- notification bridge launch/supervise (gate g_NotifBridge) ---------------------------
 #define NOTIF_TASK_NAME L"Qubes-NotifBridge"
 #define NOTIF_RESTORE_TASK_NAME L"Qubes-NotifRestore"
@@ -3320,7 +3544,7 @@ static void BrokerShutdown(void)
 #define DIRECT_DARK_FRAMES 2u
 #define DIRECT_NOTIFY_REPEAT_MS (5u * 60u * 1000u)
 static ULONGLONG g_DirectNotifyNext = 0;
-static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs);   // defined below
+static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL resident);   // defined below
 static void DirectSuppressNotifyUser(IN DWORD count)
 {
     ULONGLONG now = GetTickCount64();
@@ -3518,13 +3742,14 @@ static DWORD  g_NotifBridgePidRejected = 0;   // last heartbeat pid that failed 
 // bounded so the sweep gets loop time on a quiet guest.
 static BOOL g_NotifRestorePending = FALSE;
 
-// Run notifhost.exe with the given arguments inside the interactive user session via a
-// one-shot Task Scheduler task - the same /ru <user> /it launch as WgcLaunch, proven to put a
-// helper into the interactive session with a full user context (the run-as-user pattern the
-// bridge's listener was demonstrated under). There is no child handle AT LAUNCH; callers watch
-// their own signals (the bridge: its heartbeat file, then the validated process handle taken
-// from the pid it publishes there; the restore one-shot: its marker deletion).
-static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs)
+// Run notifhost.exe with the given arguments inside the interactive user session via a Task Scheduler task
+// registered from XML (HelperTaskRegister) - the same interactive-user launch as WgcLaunch, proven to put a
+// helper into the interactive session with a full user context (the run-as-user pattern the bridge's listener
+// was demonstrated under). resident: the bridge (Task Scheduler's restart-on-failure armed - its ONLY relauncher
+// since 2026-10-07); FALSE for a one-shot (a notify, the banner restore), which the scheduler must never retry.
+// There is no child handle AT LAUNCH; callers watch their own signals (the bridge: its heartbeat file, then the
+// validated process handle taken from the pid it publishes there; the restore one-shot: its marker deletion).
+static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL resident)
 {
     DWORD sid = WTSGetActiveConsoleSessionId();
     if (sid == 0xFFFFFFFF) return FALSE;
@@ -3539,48 +3764,33 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs)
     // interactive session?" and keep the failure in the log), not a silent drop.
     if (!GetShellWindow()) return FALSE;
 
-    WCHAR* user = NULL; DWORD userLen = 0;
-    if (!WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, sid, WTSUserName, &user, &userLen) ||
-        !user || !*user)
-    { if (user) WTSFreeMemory(user); return FALSE; }
+    WCHAR userId[256];
+    if (!TaskUserId(sid, userId, RTL_NUMBER_OF(userId))) return FALSE;
 
     WCHAR self[MAX_PATH] = { 0 };
-    if (!GetModuleFileName(NULL, self, RTL_NUMBER_OF(self))) { WTSFreeMemory(user); return FALSE; }
+    if (!GetModuleFileName(NULL, self, RTL_NUMBER_OF(self))) return FALSE;
     WCHAR* sl = wcsrchr(self, L'\\'); if (sl) *(sl + 1) = 0;   // keep the trailing backslash
     WCHAR longExe[MAX_PATH];
     StringCchPrintf(longExe, RTL_NUMBER_OF(longExe), L"%snotifhost.exe", self);
-    WCHAR shortExe[MAX_PATH] = { 0 };
-    if (!GetShortPathName(longExe, shortExe, RTL_NUMBER_OF(shortExe)))
-        StringCchCopy(shortExe, RTL_NUMBER_OF(shortExe), longExe);
 
-    WCHAR tr[1024];
-    if (wcschr(shortExe, L' '))
-        StringCchPrintf(tr, RTL_NUMBER_OF(tr), L"\\\"%s\\\" %s", shortExe, exeArgs);
-    else
-        StringCchPrintf(tr, RTL_NUMBER_OF(tr), L"%s %s", shortExe, exeArgs);
-
-    // Task Scheduler refuses a /tr longer than 261 characters (schtasks /create fails); say so instead of a bare failure.
-    if (wcslen(tr) > 261)
-    {
-        LogError("NOTIFBRIDGE the task command line is %u characters, over Task Scheduler's 261 - %s cannot be launched (%s)",
-            (unsigned)wcslen(tr), taskName, tr);
-        WTSFreeMemory(user);
-        return FALSE;
-    }
-
+    // Recreate the task fresh (idempotent): /delete ENDS an instance a previous agent left running under it
+    // (measured, notifhost.cpp) and drops any restart Task Scheduler still owed the old definition. The XML form
+    // has no 261-character /tr limit (the 2026-10-06 "schtasks /create failed" was that limit).
     WCHAR args[2048];
     StringCchPrintf(args, RTL_NUMBER_OF(args), L"/delete /tn %s /f", taskName);
     WgcRunSchtasks(args);
-    StringCchPrintf(args, RTL_NUMBER_OF(args),
-        L"/create /tn %s /tr \"%s\" /sc once /st 00:00 /ru %s /it /f", taskName, tr, user);
-    WTSFreeMemory(user);
-    if (!WgcRunSchtasks(args)) { LogWarning("NOTIFBRIDGE schtasks /create failed (%s)", taskName); return FALSE; }
-    StringCchPrintf(args, RTL_NUMBER_OF(args), L"/run /tn %s", taskName);
-    if (!WgcRunSchtasks(args)) { LogWarning("NOTIFBRIDGE schtasks /run failed (%s)", taskName); return FALSE; }
-    LogInfo("NOTIFHOST launched via Task Scheduler (user session %lu, args: %s)", sid, exeArgs);
+    if (!HelperTaskRegister(taskName, longExe, exeArgs, userId, resident,
+            resident ? L"QWT: the GUI agent's notification bridge (re-created by the GUI agent at each of its starts; "
+                       L"restarted on failure by Task Scheduler, never by the agent)"
+                     : L"QWT: a one-shot notification helper run by the GUI agent (not restarted)"))
+    {
+        LogWarning("NOTIFBRIDGE schtasks /create /xml failed (%s)", taskName);
+        return FALSE;
+    }
+    LogInfo("NOTIFHOST launched via Task Scheduler (user session %lu, %s, args: %s)", sid,
+        resident ? L"resident, restart-on-failure is the scheduler's" : L"one-shot", exeArgs);
     return TRUE;
 }
-
 static BOOL NotifBridgeLaunch(void)
 {
     WCHAR args[768];
@@ -3598,7 +3808,7 @@ static BOOL NotifBridgeLaunch(void)
     // schtasks answered "Value for '/tr' option cannot be more than 261 character(s)" at 262 and took 261; this form is 198).
     if (g_NotifHoldBase && g_NotifVerdictEvt)
         StringCchCat(args, RTL_NUMBER_OF(args), L" --hold");
-    return NotifRunInSession(NOTIF_TASK_NAME, args);
+    return NotifRunInSession(NOTIF_TASK_NAME, args, TRUE);
 }
 
 // Second stop channel, reaching a RUNNING bridge: write the ProgramData stop file BridgeMain
@@ -3662,22 +3872,26 @@ static void NotifBridgeRestoreSweep(void)
     if (now < g_NotifNextPoll) return;
     g_NotifNextPoll = now + 5000;
     if (WTSGetActiveConsoleSessionId() == 0xFFFFFFFF || !GetShellWindow()) return;
-    if (NotifRunInSession(NOTIF_RESTORE_TASK_NAME, L"--restore-banners"))
+    if (NotifRunInSession(NOTIF_RESTORE_TASK_NAME, L"--restore-banners", FALSE))
     {
         LogInfo("NOTIFBRIDGE gate-off restore sweep launched (crash-leftover banner markers)");
         g_NotifRestorePending = FALSE;
     }
 }
 
-// THE BRIDGE SUPERVISOR - EVENT-DRIVEN since rest-zero S4c (docs/DESIGN-rest-zero-capture.md C). It runs on every
-// main-loop wake, waits for nothing, and arms no timer while the bridge runs. EXIT = the validated process handle in the
-// wait array; READY = the pid the bridge publishes ONCE in its state file, read on the wake its ready event gives and
-// accepted only from a file written after the launch it answers; DOWN = no handle, (re)launched at most once per 60 s
-// (a failure state's bounded timer, BridgeNextDue). The bridge fails OPEN by construction (it restores ShowBanner on
+// THE BRIDGE SUPERVISOR - EVENT-DRIVEN since rest-zero S4c (docs/DESIGN-rest-zero-capture.md C), and since
+// 2026-10-07 NOT A RELAUNCHER (HELPER LIFECYCLE above). It runs on every main-loop wake, waits for nothing, and
+// arms no timer while the bridge runs. EXIT = the validated process handle in the wait array: a death, recorded
+// once (QGANOTIFBRIDGEEXIT + 4003) and left to Task Scheduler's restart-on-failure; READY = the pid an instance
+// publishes ONCE in its state file, read on the wake its ready event gives and accepted only from a file written
+// after the launch - or after the exit it replaces, which is how a scheduler-restarted instance is adopted. The
+// agent launches the bridge ONCE per its life. The bridge fails OPEN by construction (it restores ShowBanner on
 // every exit path and only suppresses while its dom0 connection is up), so a supervision gap costs dom0-native
 // prettiness, never a lost notification. Gate OFF: the only supervision left is the crash-leftover banner restore sweep.
 static ULONGLONG g_NotifBridgeExitedAt = 0;   // tick of an exit already reported; 0 = none pending
 static BOOL g_NotifNoPidLogged = FALSE;
+static BOOL g_NotifLaunched = FALSE;           // the ONE launch this agent performs
+static BOOL g_NotifNotReadyLogged = FALSE;     // "no instance published its pid" said once per launch/exit
 static void NotifBridgeSupervise(void)
 {
     if (!g_NotifBridge) { NotifBridgeRestoreSweep(); return; }
@@ -3692,33 +3906,51 @@ static void NotifBridgeSupervise(void)
         CloseHandle(g_NotifBridgeProc); g_NotifBridgeProc = NULL;
         bridgeExited = TRUE;
         g_NotifBridgeExitedAt = now;
+        ToastHoldSetBridgeUp(FALSE);   // every held banner fails open now: no verdict can arrive any more
+        if (HelpersDisarmed())
+        {
+            // EXPECTED (R5): helper launches are disarmed - the session is ending or this agent is leaving - and the
+            // bridge went with it. Not a death: INFO, no record, nothing comes back (and nothing should).
+            LogInfo("NOTIFBRIDGE the bridge pid %lu exited (code %lu) while helper launches are disarmed (session "
+                L"ending / agent exiting) - expected, not a death", g_NotifBridgePid, exitCode);
+            g_NotifBridgePid = 0;
+            return;
+        }
         // A bridge exit is a FAILURE to report, not a supervision detail: the gate is ON (checked
         // above), so nothing here asked it to stop. Its exit codes (notifhost.cpp BridgeMain):
         // 0 = singleton held / agent gone / stop file / session changed, 2 = listener access
         // denied (consent), 3 = listener init threw. ShowBanner is restored on every exit path,
         // so the cost is dom0-native toasts, not lost ones - which does not make it benign.
         LogError("QGANOTIFBRIDGEEXIT notification bridge pid %lu EXITED (exit code %lu) - detected "
-            L"by process wait. Guest toasts take the window path until the relaunch (throttled to one per "
-            L"60 s). bridge.log names the reason.", g_NotifBridgePid, exitCode);
+            L"by process wait. Guest toasts take the window path until Task Scheduler restarts it (its task is armed "
+            L"to restart on failure, " HELPER_TASK_RESTART_INTERVAL L" x" HELPER_TASK_RESTART_COUNT L"; a clean exit 0 "
+            L"is not restarted); this agent relaunches nothing (owner, 2026-10-07). bridge.log names the reason.",
+            g_NotifBridgePid, exitCode);
         // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo): a crash
         // is in Windows Error Reporting already, a clean unasked exit is visible only here. ONE Event Log
         // entry under our source; the dom0 notification is the event-triggered reporter's job (ADR 3).
         DeathEventReport(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", g_NotifBridgePid, exitCode,
             g_NotifLastLaunch != 0 ? now - g_NotifLastLaunch : DEATHEVENT_RAN_UNKNOWN,
-            L"The agent relaunches it, at most once per 60 s. bridge.log in ProgramData\\qubes-toast-bridge "
+            L"Task Scheduler restarts it on failure (its task is armed: at most 3 times, a minute apart; a clean exit "
+            L"is not restarted); the GUI agent itself relaunches nothing. bridge.log in ProgramData\\qubes-toast-bridge "
             L"names the reason; gui-agent log line QGANOTIFBRIDGEEXIT; a crash also leaves a Windows Error "
             L"Reporting record (AppCrash_notifhost.exe_*).");
         g_NotifBridgePid = 0;
-        ToastHoldSetBridgeUp(FALSE);   // every held banner fails open now: no verdict can arrive any more
+        // ADOPT WHAT THE SCHEDULER BRINGS BACK: a restarted instance publishes a heartbeat written AFTER this exit, so
+        // the READY path below looks again, accepting only ticks from now on. Nothing is launched by this agent.
+        g_NotifLaunchPending = TRUE;
+        g_NotifLastLaunch = now;
+        g_NotifNotReadyLogged = FALSE;
     }
     if (g_NotifBridgeProc) return;            // running: nothing to do and nothing armed
     DWORD sid = WTSGetActiveConsoleSessionId();
     // No session or no shell yet: the shell's own window events wake this loop when it comes up.
     if (sid == 0xFFFFFFFF || !GetShellWindow()) return;
 
-    // READY? A launch is in flight: take the pid its instance published - only from a file written AFTER that launch
-    // (a dead instance's file can still be there, and a reused pid could then validate as another notifhost.exe).
-    if (!bridgeExited && g_NotifLaunchPending)
+    // READY? A launch (or a scheduler restart after an exit) is in flight: take the pid its instance published - only
+    // from a file written AFTER that launch or exit (a dead instance's file can still be there, and a reused pid could
+    // then validate as another notifhost.exe).
+    if (g_NotifLaunchPending)
     {
         WCHAR hb[MAX_PATH];
         BOOL parsed = FALSE; ULONGLONG hbTick = 0; DWORD hbPid = 0;
@@ -3748,10 +3980,11 @@ static void NotifBridgeSupervise(void)
                 if (g_NotifBridgeProc)
                 {
                     g_NotifBridgePid = hbPid;
-                    g_NotifBridgeExitedAt = 0;
                     g_NotifLaunchPending = FALSE;
-                    LogInfo("NOTIFBRIDGE ready (pid %lu published %I64u ms after the launch) - its exit is now waited on",
-                            hbPid, hbTick - g_NotifLastLaunch);
+                    LogInfo("NOTIFBRIDGE ready (pid %lu published %I64u ms after the %s) - its exit is now waited on",
+                            hbPid, hbTick - g_NotifLastLaunch,
+                            g_NotifBridgeExitedAt != 0 ? L"exit it replaces (Task Scheduler restarted it)" : L"launch");
+                    g_NotifBridgeExitedAt = 0;
                     ToastHoldSetBridgeUp(TRUE);
                     return;
                 }
@@ -3761,7 +3994,7 @@ static void NotifBridgeSupervise(void)
                 HANDLE probe = OpenProcess(SYNCHRONIZE, FALSE, hbPid);
                 if (!probe)
                     LogWarning("NOTIFBRIDGE published pid %lu is gone - the bridge exited right after starting (a "
-                        L"crash, not a forged pid); the relaunch deadline brings it back.", hbPid);
+                        L"crash, not a forged pid); Task Scheduler restarts it only if it exited with a failure.", hbPid);
                 else
                 {
                     CloseHandle(probe);
@@ -3777,33 +4010,39 @@ static void NotifBridgeSupervise(void)
                     L"predates this agent (mixed install); its exit cannot be waited on.");
             }
         }
-        // Not published yet: its ready event wakes this loop; the relaunch deadline bounds the wait.
-        if (now - g_NotifLastLaunch < 60000) return;
+        // Not published yet: its ready event wakes this loop. Past 60 s (BridgeNextDue arms that one deadline) it is
+        // said ONCE, at ERROR, and NOT relaunched: this agent launches each helper once; what runs without publishing
+        // is Task Scheduler's to restart only if it exits with a failure.
+        if (now - g_NotifLastLaunch >= 60000 && !g_NotifNotReadyLogged)
+        {
+            g_NotifNotReadyLogged = TRUE;
+            LogError("QGANOTIFNOTREADY no notification bridge instance published its pid within %I64u ms of the %s - "
+                L"not relaunched (no relaunch loop, owner 2026-10-07); guest toasts take the window path. bridge.log "
+                L"says whether it started; Task Scheduler's history (task " NOTIF_TASK_NAME L") whether it was restarted.",
+                now - g_NotifLastLaunch, g_NotifBridgeExitedAt != 0 ? L"exit it should have replaced" : L"launch");
+        }
+        return;
     }
-    // DOWN: (re)launch, at most once per 60 s - a bridge that exits fatally on purpose (consent revoked, listener
-    // broken) must not become a process treadmill. Not before the FIRST launch, though (g_NotifLastLaunch == 0).
-    // schtasks /delete (inside the launch) ENDS any instance still running under the old task, so a hung or orphaned
-    // bridge cannot keep the new one out on its singleton mutex.
-    if (g_NotifLastLaunch != 0 && now - g_NotifLastLaunch < 60000) return;
-    if (bridgeExited || g_NotifBridgeExitedAt != 0)
-        LogInfo("NOTIFBRIDGE relaunching after the exit reported %I64u ms ago", now - g_NotifBridgeExitedAt);
-    else if (g_NotifLaunchPending)
-        LogWarning("QGANOTIFNOTREADY the bridge launched %I64u ms ago never published its pid - relaunching",
-                   now - g_NotifLastLaunch);
+    // THE ONE LAUNCH PER AGENT LIFE: never into a session that is ending; a failed launch is said at ERROR and not retried.
+    if (g_NotifLaunched || HelpersDisarmed()) return;
+    g_NotifLaunched = TRUE;
     g_NotifLastLaunch = now;
     g_NotifBridgeExitedAt = 0;
     g_NotifLaunchPending = NotifBridgeLaunch();
+    if (!g_NotifLaunchPending)
+        LogError("QGANOTIFLAUNCHFAIL the notification bridge's one launch failed and is not retried (no relaunch loop, "
+            L"owner 2026-10-07) - guest toasts take the window path until the next GUI agent start");
 }
 
 // The earliest moment the bridge's supervision needs the main loop awake; 0 = nothing armed (the rest state). Bridge
-// up: nothing. Down or launching: the relaunch throttle. Gate off with leftover markers: the restore sweep's throttle.
-// Never a past deadline - a launch that is due but cannot happen (no session/shell) waits for the shell's events.
+// up: nothing. A launch or a scheduler restart pending: the one deadline at which "no instance published its pid" is
+// said. Gate off with leftover markers: the restore sweep's throttle. Never a past deadline.
 static ULONGLONG BridgeNextDue(void)
 {
     const ULONGLONG now = GetTickCount64();
     if (!g_NotifBridge)
         return (g_NotifRestorePending && g_NotifNextPoll > now) ? g_NotifNextPoll : 0;
-    if (g_NotifBridgeProc || g_NotifLastLaunch == 0)
+    if (g_NotifBridgeProc || !g_NotifLaunchPending || g_NotifNotReadyLogged)
         return 0;
     const ULONGLONG at = g_NotifLastLaunch + 60000;
     return (at > now) ? at : 0;
@@ -3811,22 +4050,25 @@ static ULONGLONG BridgeNextDue(void)
 
 static void NotifBridgeShutdown(void)
 {
-    // Remove the scheduled task so a stale definition cannot linger, AND write the stop
-    // file: the --agent-pid self-exit is not a reliable channel (OpenProcess(SYNCHRONIZE)
-    // on this SYSTEM process is denied to the bridge's limited token; its snapshot-poll
-    // fallback loses to PID reuse), and /delete ENDS a running instance abruptly (measured,
-    // notifhost.cpp) without its banner-restore exit path - so on this ordering a live bridge
-    // is killed before the stop file can reach it; the stop file still covers a bridge whose
-    // task definition is already gone. A bridge stopped via the file restores every banner
-    // suppression on its way out.
+    // ORDER (R1): disarm Task Scheduler first (the stop that follows must not read as a failure it restarts), ask the
+    // bridge to leave through its stop file (BridgeMain polls it and watches its directory; the exit path restores
+    // every banner suppression), wait bounded on the validated handle, then delete the task - which ENDS an instance
+    // that did not leave (measured, notifhost.cpp) and drops any restart still owed. The --agent-pid self-exit is not
+    // a reliable channel (OpenProcess(SYNCHRONIZE) on this SYSTEM process is denied to the bridge's limited token).
     if (g_NotifBridge)
     {
-        WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
+        if (g_NotifLaunched)
+            HelperTaskDisarm(NOTIF_TASK_NAME, L"the agent's exit");
         NotifBridgeRequestStop();
+        // BOUNDED: a failure detector. Expiry is an ERROR - the delete then ends the bridge without its banner-restore
+        // exit path, and the gate-off sweep at the next start restores the markers it left.
+        if (g_NotifBridgeProc && WaitForSingleObject(g_NotifBridgeProc, 3000) != WAIT_OBJECT_0)
+            LogError("NOTIFBRIDGE the bridge did not leave within 3 s of the stop file - the task delete ends it "
+                L"without its banner-restore exit path");
+        WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
     }
     if (g_NotifBridgeProc) { CloseHandle(g_NotifBridgeProc); g_NotifBridgeProc = NULL; }
 }
-
 // ---- WGC broker stage 2b: register occluded NRB app windows, consume their frames --------
 BOOL WgcBrokerActive(void)
 {
@@ -6198,9 +6440,19 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
     // A BULK pass (nothing tracked yet: agent start, seamless re-entry) re-creates windows dom0 already knew at their synced
     // positions; each is marked so its first dom0 placement is not obeyed (restart placement, HandleConfigure).
     const BOOL bulk = IsListEmpty(&g_WatchedWindowsList);
-    for (UINT i = context.PendingCount; i > 0 && status == ERROR_SUCCESS; i--)
+    // THE ERROR WINDOW FIRST (errbox-order.h; docs/ADR-supervision.md 6): the box the route showed while no agent was
+    // alive is announced before every other window - bottom-first among the boxes, then the rest bottom-first - so a
+    // restarted agent's first dom0 window is the error that killed its predecessor. The partition is the pure
+    // ErrBoxAnnounceOrder, held by the offline suite; the membership test is ErrBoxIsSystemBoxHwnd (QGAERRBOX).
+    int isBox[ADD_WINDOWS_PENDING_MAX];
+    unsigned order[ADD_WINDOWS_PENDING_MAX];
+    unsigned orderCount, k;
+    for (k = 0; k < context.PendingCount; k++)
+        isBox[k] = ErrBoxIsSystemBoxHwnd(context.Pending[k]) ? 1 : 0;
+    orderCount = ErrBoxAnnounceOrder(isBox, context.PendingCount, order);
+    for (k = 0; k < orderCount && status == ERROR_SUCCESS; k++)
     {
-        HWND w = context.Pending[i - 1];
+        HWND w = context.Pending[order[k]];
         if (FindWindowByHandle(w)) // examined meanwhile (taskbar path, event races)
             continue;
         status = ExamineWindow(w, &context.Interrogated);
@@ -6932,6 +7184,89 @@ static void DismissHiddenStartSurface(IN HWND start)
     }
 }
 
+// ---- THE ERROR WINDOW (docs/ADR-supervision.md 6, main repo; owner 2026-10-07) -----------------------------------
+//
+// When dom0 could not be told of a loud error (the route returned failed:transport or gated), the reporting
+// component shows the same text as a Windows message box on the console session (WTSSendMessage, errbox.h) - the
+// SYSTEM death reporter from session 0 while this agent is dead, the agent itself otherwise. The box must reach
+// dom0: a restarted agent maps it FIRST, before every other window (AddAllWindows), and the filter accepts it
+// explicitly and says so (QGAERRBOX), so the retest proves which process owns the box and that it passed.
+//
+// WHAT WTSSENDMESSAGE CREATES is not pinned by documentation (Jev named the filter dropping the box the main risk,
+// 0.71): the box is a standard dialog (class #32770) drawn by the system's own process in the target session -
+// csrss.exe is what Process Explorer attributes msg.exe's boxes to, winlogon.exe the other candidate. So the
+// predicate is EXPLICIT - the dialog class, our title prefix, and an owning image that is one of those two under
+// System32 - and every window carrying our title prefix is LOGGED with its owner, accepted or not: a wrong guess
+// shows up as a QGAERRBOX line with an unexpected owner, never as a silent drop (a box from any other process is
+// left to the ordinary rules, which accept a normal dialog anyway). Never on the secure desktop in seamless mode:
+// the frame path freezes there (ProcessNewFrame), unchanged.
+#define ERRBOX_TITLE_PREFIX QERR_BOX_TITLE_PREFIX   // errbox.h: what the route puts in the title
+
+// The base name of the owning process's image (lower-case), "?" when it cannot be read.
+static void ErrBoxOwnerImage(IN DWORD pid, OUT WCHAR *image, IN size_t cch)
+{
+    WCHAR path[MAX_PATH] = { 0 };
+    DWORD n = RTL_NUMBER_OF(path);
+    HANDLE h;
+    StringCchCopyW(image, cch, L"?");
+    if (!pid) return;
+    h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!h) return;
+    if (QueryFullProcessImageNameW(h, 0, path, &n))
+    {
+        const WCHAR *base = wcsrchr(path, L'\\');
+        StringCchCopyW(image, cch, base ? base + 1 : path);
+        _wcslwr_s(image, cch);
+    }
+    CloseHandle(h);
+}
+
+// TRUE iff this is the system-drawn box the route showed. Logged once per window handle (QGAERRBOX), whatever the answer.
+BOOL ErrBoxIsSystemBox(IN const WINDOW_DATA *data)
+{
+    static HWND s_logged[16];
+    static unsigned s_loggedNext;
+    WCHAR image[64];
+    BOOL systemOwned;
+    unsigned i;
+    BOOL said = FALSE;
+
+    if (wcscmp(data->Class, L"#32770") != 0)
+        return FALSE;
+    if (wcsncmp(data->Caption, ERRBOX_TITLE_PREFIX, wcslen(ERRBOX_TITLE_PREFIX)) != 0)
+        return FALSE;
+    ErrBoxOwnerImage(data->ProcessId, image, RTL_NUMBER_OF(image));
+    systemOwned = (wcscmp(image, L"csrss.exe") == 0 || wcscmp(image, L"winlogon.exe") == 0);
+    for (i = 0; i < RTL_NUMBER_OF(s_logged); i++)
+        if (s_logged[i] == data->Handle) { said = TRUE; break; }
+    if (!said)
+    {
+        s_logged[s_loggedNext++ % RTL_NUMBER_OF(s_logged)] = data->Handle;
+        // The title is our own text (the product prefix and the notification's header), never user data.
+        LogInfo("QGAERRBOX error window 0x%x (class %s, our title prefix, owning process %lu = %s, %ux%u) - %s",
+            data->Handle, data->Class, data->ProcessId, image, data->Width, data->Height,
+            systemOwned ? L"the system's box: ACCEPTED (mapped first at the agent's start)"
+                        : L"NOT a process WTSSendMessage is known to draw with: left to the ordinary rules");
+    }
+    return systemOwned;
+}
+
+// The same question for a bare HWND (the start enumeration, before any WINDOW_DATA exists): class, title prefix, owner.
+static BOOL ErrBoxIsSystemBoxHwnd(IN HWND hwnd)
+{
+    WINDOW_DATA d;
+    ZeroMemory(&d, sizeof(d));
+    d.Handle = hwnd;
+    if (!GetClassName(hwnd, d.Class, RTL_NUMBER_OF(d.Class)) || wcscmp(d.Class, L"#32770") != 0)
+        return FALSE;
+    GetWindowText(hwnd, d.Caption, RTL_NUMBER_OF(d.Caption));
+    GetWindowThreadProcessId(hwnd, &d.ProcessId);
+    {
+        RECT r;
+        if (GetWindowRect(hwnd, &r)) { d.Width = (DWORD)(r.right - r.left); d.Height = (DWORD)(r.bottom - r.top); }
+    }
+    return ErrBoxIsSystemBox(&d);
+}
 BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 {
     StartDismissMaybeRearm();   // GUARD:startrearm
@@ -6947,6 +7282,12 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 
     if (data->DeletePending)
         return FALSE;
+
+    // THE ERROR WINDOW (the block before this function): the system-drawn box the route showed because dom0 could not
+    // be told. Accepted here, explicitly and loudly (QGAERRBOX), before any rule below can drop it. It is a normal-sized
+    // dialog, never fullscreen; the secure-desktop freeze (ProcessNewFrame) still applies to it like to everything.
+    if (ErrBoxIsSystemBox(data))
+        return TRUE;
 
     if (!(g_DiagWindowFilterOff & 1) && data->Handle == GetShellWindow())
         return FALSE;
@@ -11508,6 +11849,7 @@ static BOOL DrainVchanInput(IN OUT struct _CAPTURE_CONTEXT* capture, OUT BOOL* e
     {
         // KEEP-FATAL, same rule as the vchan case: the daemon is gone (case (a)).
         LogError("vchan disconnected");
+        LifecycleLatchExit(QGA_EXIT_RECONNECT);
         *exitLoop = TRUE;
         LeaveCriticalSection(&g_VchanCriticalSection);
         return FALSE;
@@ -11522,6 +11864,7 @@ static BOOL DrainVchanInput(IN OUT struct _CAPTURE_CONTEXT* capture, OUT BOOL* e
             // KEEP-FATAL for the same reason as the vchan case: a partially consumed
             // body means the stream is desynced and later bytes could be parsed as
             // synthesized input.
+            LifecycleLatchExit(QGA_EXIT_RECONNECT);
             *exitLoop = TRUE;
             LogError("HandleServerData failed: 0x%x", status);
             LeaveCriticalSection(&g_VchanCriticalSection);
@@ -11556,6 +11899,14 @@ static int FiEventSignalled(IN HANDLE h)
 }
 #endif
 
+// A failure before the main loop exits with the Win32 error that caused it - never with 0, which a stale GetLastError
+// can read (the service treats an undefined code as a death; 0 would be one that cannot be told from a clean exit).
+static DWORD LastErrorOrFailure(void)
+{
+    DWORD e = GetLastError();
+    return e != ERROR_SUCCESS ? e : ERROR_GEN_FAILURE;
+}
+
 static ULONG WINAPI WatchForEvents(void)
 {
     LogInfo("QGATHREAD role=main tid=%lu", GetCurrentThreadId());   // M1 instrument (restwatch's per-thread join)
@@ -11582,17 +11933,17 @@ static ULONG WINAPI WatchForEvents(void)
     if (!VchanInit(g_GuiDomainId, 6000))
     {
         LogError("VchanInit() failed");
-        return GetLastError();
+        return LastErrorOrFailure();
     }
 
     // KEEP-FATAL (both): startup resource failure before any daemon connection;
     // there is no degraded state to fall back to and nothing connected to protect.
     HANDLE fullScreenOnEvent = CreateNamedEvent(FULLSCREEN_ON_EVENT_NAME);
     if (!fullScreenOnEvent)
-        return GetLastError();
+        return LastErrorOrFailure();
     HANDLE fullScreenOffEvent = CreateNamedEvent(FULLSCREEN_OFF_EVENT_NAME);
     if (!fullScreenOffEvent)
-        return GetLastError();
+        return LastErrorOrFailure();
 
     g_VchanClientConnected = FALSE;
     vchanIoInProgress = FALSE;
@@ -11895,6 +12246,7 @@ static ULONG WINAPI WatchForEvents(void)
                     (DWORD)CAPTURE_GATE_MAX_REASSERTS,
                     (DWORD)(CAPTURE_GATE_WAIT_MS * (CAPTURE_GATE_MAX_REASSERTS + 1)));
                 status = ERROR_TIMEOUT;
+                LifecycleLatchExit(QGA_EXIT_RECONNECT);   // a fresh agent re-announces: the service's one relaunch
                 exitLoop = TRUE;
                 break;
             }
@@ -11922,6 +12274,7 @@ static ULONG WINAPI WatchForEvents(void)
                     LogError("no gui-daemon client in %lu ms and none ever connected - exiting so the watchdog respawns the agent (attempt %lu of %lu). This is the first-boot AppVM case: the qube has qrexec but no windows.",
                         VCHAN_FIRST_CLIENT_WAIT_MS, restarts + 1, (DWORD)VCHAN_FIRST_CLIENT_MAX_RESTARTS);
                 status = ERROR_TIMEOUT;
+                LifecycleLatchExit(QGA_EXIT_RECONNECT);   // a fresh agent re-announces: the service's one relaunch
                 exitLoop = TRUE;
                 break;
             }
@@ -12024,8 +12377,9 @@ static ULONG WINAPI WatchForEvents(void)
 
         if (0 == signaledEvent)
         {
-            // KEEP-FATAL: QGA_SHUTDOWN - the explicit stop request, case (b).
-            LogDebug("Shutdown event signaled");
+            // QGA_SHUTDOWN - the explicit stop request, case (b): QGA_EXIT_REQUESTED, unless the end-session handler
+            // already latched QGA_EXIT_SESSION_END (it signals this same event). Not a failure, so not an ERROR line.
+            LogInfo("QGAEXIT stop event signalled - leaving with 0x%x", LifecycleLatchExit(QGA_EXIT_REQUESTED));
             exitLoop = TRUE;
             break;
         }
@@ -12332,6 +12686,7 @@ static ULONG WINAPI WatchForEvents(void)
                 {
                     LogError("vchan send gave up on this connection (see VCHANWEDGE) - "
                         "refusing to re-run the handshake, exiting for a clean respawn");
+                    LifecycleLatchExit(QGA_EXIT_RECONNECT);
                     exitLoop = TRUE;
                     break;
                 }
@@ -12372,6 +12727,7 @@ static ULONG WINAPI WatchForEvents(void)
                 {
                     LogError("SendProtocolVersion failed (vchan open=%d) - "
                         "handshake cannot proceed, exiting", libvchan_is_open(g_Vchan));
+                    LifecycleLatchExit(QGA_EXIT_RECONNECT);
                     exitLoop = TRUE;
                     break;
                 }
@@ -12383,6 +12739,7 @@ static ULONG WINAPI WatchForEvents(void)
                 {
                     LogError("HandleVersion failed (vchan open=%d) - "
                         "handshake cannot proceed, exiting", libvchan_is_open(g_Vchan));
+                    LifecycleLatchExit(QGA_EXIT_RECONNECT);
                     exitLoop = TRUE;
                     break;
                 }
@@ -12400,6 +12757,7 @@ static ULONG WINAPI WatchForEvents(void)
                 if (ERROR_SUCCESS != HandleXconf())
                 {
                     LogError("HandleXconf failed (vchan open=%d) - exiting", libvchan_is_open(g_Vchan));
+                    LifecycleLatchExit(QGA_EXIT_RECONNECT);
                     exitLoop = TRUE;
                     break;
                 }
@@ -12440,6 +12798,7 @@ static ULONG WINAPI WatchForEvents(void)
                 // KEEP-FATAL: the vchan is genuinely dead / the daemon disconnected -
                 // case (a). Exit is harmless here and the service respawn handles it.
                 LogError("vchan disconnected");
+                LifecycleLatchExit(QGA_EXIT_RECONNECT);
                 exitLoop = TRUE;
                 LeaveCriticalSection(&g_VchanCriticalSection);
                 break;
@@ -12457,6 +12816,7 @@ static ULONG WINAPI WatchForEvents(void)
                     // was left partially consumed. Re-parsing a desynced stream could
                     // interpret arbitrary bytes as messages (including synthesized
                     // input), so this must never be converted. Case (a).
+                    LifecycleLatchExit(QGA_EXIT_RECONNECT);
                     exitLoop = TRUE;
                     LogError("HandleServerData failed: 0x%x", status);
                     break;
@@ -12714,7 +13074,10 @@ static ULONG WINAPI WatchForEvents(void)
 
     LogDebug("main loop finished");
 
-    // Signal the user-session WGC broker to exit and reap it (harmless no-op if never started).
+    // ORDER (R1, docs/ADR-supervision.md 5): helper relaunch disarmed BEFORE any helper is told to leave or ended, on
+    // EVERY exit path - requested stop, session end, reconnect, fatal. Each shutdown below then disarms its task first.
+    HelpersDisarm(L"the agent is exiting");
+    // Signal the user-session WGC broker to exit (harmless no-op if never started).
     BrokerShutdown();
     NotifBridgeShutdown();
     EtwProxyShutdown();   // exit-wait unregistered, backoff timer cancelled, job terminated
@@ -12834,7 +13197,19 @@ static ULONG WINAPI WatchForEvents(void)
     LogInfo("exiting");
     // all handles will be closed on exit anyway
 
-    return exitLoop ? ERROR_INVALID_FUNCTION : ERROR_SUCCESS;
+    // THE EXIT CODE IS THE REASON (include/qga-exitcodes.h): the code latched by the path that ended the loop. A loop
+    // that ended without naming one (the wait itself failed, or a site that forgot) is a failure - never 0, which the
+    // service would read as an undefined death anyway, and said so.
+    {
+        DWORD code = LifecycleExitCode();
+        if (code == 0)
+        {
+            code = (status != ERROR_SUCCESS) ? status : ERROR_GEN_FAILURE;
+            LogError("QGAEXITCODE the main loop ended without a defined exit reason (status 0x%x) - exiting with 0x%x, "
+                L"which the service treats as a death", status, code);
+        }
+        return code;
+    }
 }
 
 static DWORD GetDomainName(OUT char *nameBuffer, IN DWORD nameLength)
@@ -13169,8 +13544,12 @@ static ULONG Init(void)
             // runs BannerRestoreAll. If instead it CRASHED (markers but no live bridge),
             // nothing is left to restore the suppressions with the gate off - arm the
             // one-shot restore sweep, which runs once a user session is up.
-            WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
+            // ORDER (R1): the task a previous gate-on agent left armed is DISABLED first (Task Scheduler must not
+            // restart what is being stopped), the bridge is asked to leave through its stop file, then the definition
+            // is deleted - which ends an instance that has not read the file yet (measured, notifhost.cpp).
+            WgcRunSchtasks(L"/change /tn " NOTIF_TASK_NAME L" /disable");
             NotifBridgeRequestStop();
+            WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
             g_NotifRestorePending = NotifMarkersPresent();
             if (g_NotifRestorePending)
                 LogInfo("NOTIFBRIDGE gate off with leftover banner markers - restore sweep armed");
@@ -13654,27 +14033,49 @@ int CALLBACK WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLi
     if (lpCmdLine && 0 == strncmp(lpCmdLine, "--set-shadows", 13))
         return SetShadowsMain(lpCmdLine);
 
+    // THE FIRST ACT: the end-session window and the service's lifecycle channel (lifecycle.c), before Init - so even an
+    // instance still initializing gets Windows' WM_QUERYENDSESSION and the orderly exit, and the service is told.
+    LifecycleStart();
+
     // Init's OWN status is the exit code: win_perror() reported GetLastError(), which is 0 here, so every Init failure used to exit 0
     // ("Init failed with error 0x0") and could not be told from a clean exit. No GUI domain is the one start-time condition
     // (include/qga-exitcodes.h) - not logged as a failure.
     DWORD initStatus = Init();
     if (initStatus == QGA_EXIT_NO_GUI_DOMAIN)
+    {
+        LifecycleExitDone();
         return (int)QGA_EXIT_NO_GUI_DOMAIN;
+    }
     if (ERROR_SUCCESS != initStatus)
+    {
+        LifecycleExitDone();
         return (int)win_perror2(initStatus, "Init");
+    }
+    // A session end that arrived during Init: nothing has been announced yet (the vchan is opened by WatchForEvents), so
+    // the orderly exit is just leaving, with the reason latched by the end-session handler.
+    if (LifecycleExitCode() != 0)
+    {
+        LogInfo("QGAEXIT exit reason 0x%x latched during Init - leaving before the main loop", LifecycleExitCode());
+        StopWindowEventThread();
+        LifecycleExitDone();
+        return (int)LifecycleExitCode();
+    }
 
     InitializeCriticalSection(&g_VchanCriticalSection);
 
-    // Call the thread proc directly.
-    if (ERROR_SUCCESS != WatchForEvents())
-    {
-        StopWindowEventThread();
-        return win_perror("WatchForEvents");
-    }
+    // Call the thread proc directly. It returns the QGA_EXIT_* code latched by the path that ended the loop (a defined
+    // reason: requested, session end, reconnect), or a Win32 error from a failure before the loop. A defined reason is
+    // not a failure and is logged as what it is; "WatchForEvents failed with error 0xb7" at ERROR on a requested stop was
+    // a stale GetLastError (measured 2026-10-07).
+    DWORD exitCode = WatchForEvents();
 
     StopWindowEventThread();
     DeleteCriticalSection(&g_VchanCriticalSection);
 
-    LogInfo("exiting");
-    return ERROR_SUCCESS;
+    if (QgaExitIsExpected(exitCode))
+        LogInfo("QGAEXIT exiting with 0x%x (%s) - an expected exit, not a failure", exitCode, QgaExitReasonName(exitCode));
+    else
+        LogError("QGAEXIT exiting with 0x%x: %s", exitCode, QgaExitReasonName(exitCode));
+    LifecycleExitDone();
+    return (int)exitCode;
 }

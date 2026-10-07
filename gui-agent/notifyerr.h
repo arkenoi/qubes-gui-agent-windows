@@ -51,6 +51,13 @@
  *              A marker store that cannot be written means NO SEND (missing data fails): without
  *              persistence the dedupe would be per-process, and a helper relaunched every minute
  *              would turn one fault into a notification per minute.
+ *   the window WHEN DOM0 CANNOT BE TOLD, THE USER IS (owner 2026-10-07; docs/ADR-supervision.md 6,
+ *              main repo): an error the policy said to send that the transport could not deliver
+ *              (failed:transport), or that the operator's gate kept from dom0 (gated), is shown as
+ *              a Windows message box on the console session instead (errbox.h, WTSSendMessage) -
+ *              the same text, under the SAME per-boot dedupe and cap (the marker and the count are
+ *              written before the choice between dom0 and the box is made), so a window never
+ *              storms and never doubles a dom0 notification. QerrWindowWanted is the one rule.
  *
  * DEFECT RE-INTRODUCTION (CLAUDE.md: a check counts once it has been seen to FAIL). Each guard
  * has a compile-time defect switch that removes it; notifyerr_test MUST then exit nonzero:
@@ -59,6 +66,8 @@
  *   NOTIFYERR_DEFECT_CAP       - the per-boot cap is ignored
  *   NOTIFYERR_DEFECT_REDACT    - redaction always says "clean"
  *   NOTIFYERR_DEFECT_FAILOPEN  - transport failures are logged on every call (notifyerr.c)
+ *   NOTIFYERR_DEFECT_NOBOX     - the error window is never shown (dom0 unreachable = silence)
+ *   NOTIFYERR_DEFECT_BOXSTORM  - the gated window skips the dedupe and the cap (notifyerr.c)
  */
 #ifndef QWT_NOTIFYERR_H
 #define QWT_NOTIFYERR_H
@@ -103,7 +112,8 @@ typedef enum QerrDecision {
     QERR_REJECT_REDACT,
     QERR_SUPPRESS_DUP,
     QERR_SUPPRESS_CAP,
-    QERR_FAIL_TRANSPORT     /* glue only: policy said send, the store or the spawn failed */
+    QERR_FAIL_TRANSPORT,    /* glue only: policy said send, the store or the spawn failed */
+    QERR_GATED              /* glue only: policy said send, the operator's gate keeps it from dom0 */
 } QerrDecision;
 
 static inline const char* QerrDecisionName(QerrDecision d)
@@ -116,8 +126,23 @@ static inline const char* QerrDecisionName(QerrDecision d)
     case QERR_SUPPRESS_DUP:    return "suppressed:duplicate";
     case QERR_SUPPRESS_CAP:    return "suppressed:cap";
     case QERR_FAIL_TRANSPORT:  return "failed:transport";
+    case QERR_GATED:           return "gated";
     }
     return "?";
+}
+
+/* THE ERROR WINDOW'S RULE (docs/ADR-supervision.md 6; Jev: also when gated, 0.76). Shown exactly when the policy said
+ * to tell dom0 and dom0 was NOT told - the transport failed, or the operator's gate kept it - and never when the
+ * policy itself suppressed (a duplicate, the cap, the severity, a refused text, a bad name), nor when dom0 was told.
+ * Pure; the glue asks it after the per-boot record is written, so the box shares the dedupe and the cap. */
+static inline int QerrWindowWanted(QerrDecision d)
+{
+#ifdef NOTIFYERR_DEFECT_NOBOX
+    (void)d;
+    return 0;   /* DEFECT: dom0 unreachable means silence */
+#else
+    return d == QERR_FAIL_TRANSPORT || d == QERR_GATED;
+#endif
 }
 
 /* --- names ------------------------------------------------------------------------------ */

@@ -13,6 +13,13 @@
  * packaged notifhost.exe, and dom0 policy. None of that is checked here beyond "the exe
  * exists" - notifhost logs its own outcome (NOTIFY one-shot: sent ok=...) in bridge.log.
  *
+ * THE ERROR WINDOW (owner 2026-10-07, docs/ADR-supervision.md 6): when the policy said to tell
+ * dom0 and dom0 was not told - the transport failed, or the operator's gate keeps the route off -
+ * the same text is shown as a Windows message box on the console session (errbox.h), AFTER the
+ * per-boot record was written, so the box shares the route's dedupe and cap: never a storm, never
+ * a box beside a dom0 notification for one error. Without a per-boot record (no boot token, the
+ * store unwritable) there is no dedupe, so the box is shown at most once per process then.
+ *
  * FAIL-OPEN CONTRACT: this function never blocks (no waits, no round trips), never raises, and
  * returns to the caller with its state untouched whatever happened. Its own failures are
  * logged ONCE per process per kind (no exe, spawn failed, store unwritable) - the
@@ -21,9 +28,9 @@
  *
  * PORTABLE ON PURPOSE: the platform layer at the bottom has a Win32 body (the agent) and a plain-C
  * TEST body (notifyerr_test.c: gcc on any host, or MSVC with NOTIFYERR_TEST_LAYER defined by the
- * notifyerr-test vcxproj - stdio only, the spawn and the log routed through test hooks), so the
- * offline suite exercises THIS file's control flow - the fail-open path, the marker and count
- * writes, the once-per-process logging - not a re-implementation of it.
+ * notifyerr-test vcxproj - stdio only, the spawn, the box and the log routed through test hooks),
+ * so the offline suite exercises THIS file's control flow - the fail-open path, the marker and
+ * count writes, the once-per-process logging, the window - not a re-implementation of it.
  */
 #include "notifyerr.h"
 #include <stdarg.h>
@@ -37,6 +44,7 @@
 #include <windows.h>
 #include <strsafe.h>
 #include <log.h>
+#include "errbox.h"
 #else
 #include <sys/stat.h>
 #include <errno.h>
@@ -60,12 +68,14 @@ static int       PlatReadSmall(const char* path, char* buf, size_t cap);   /* 1 
 static int       PlatWriteSmall(const char* path, const char* text);      /* 1 = written */
 static int       PlatWriteNotifyFile(const char* path, const char* utf8); /* UTF-16LE + BOM */
 static int       PlatSpawnNotify(const char* notifyPath, int* exeMissing);
+static int       PlatShowErrorBox(const char* header, const char* text, unsigned long* error);   /* 1 = shown */
 static void      PlatDefaultStateDir(char* out, size_t cap);
 static unsigned long PlatPid(void);                                       /* this process, for the technical line */
 
 #ifndef QERR_AGENT_LAYER
-/* Test hooks (notifyerr_test.c): the spawn outcome and the log sink are the test's. */
+/* Test hooks (notifyerr_test.c): the spawn outcome, the box and the log sink are the test's. */
 int  (*QerrTestSpawnHook)(const char* notifyPath) = NULL;   /* NULL = "notifhost.exe missing" */
+int  (*QerrTestBoxHook)(const char* header, const char* text) = NULL;   /* NULL = the box cannot be shown */
 void (*QerrTestLogHook)(const char* line) = NULL;
 long long QerrTestBootStamp = 0;                              /* 0 = wall clock (the suite always pins it) */
 unsigned long QerrTestPid = 4242;                             /* the pid the technical line shows under test */
@@ -81,7 +91,8 @@ void QerrInit(int gateOn, const char* stateDirUtf8)
         PlatDefaultStateDir(g_QerrStateDir, sizeof(g_QerrStateDir));
     }
     PlatLog("NOTIFYERR gate: enabled=%d state=%s (secondary route: dom0 notification via "
-            "notifhost/qubes.Notifications; needs qrexec-agent; the log stays primary)",
+            "notifhost/qubes.Notifications; needs qrexec-agent; the log stays primary; when dom0 cannot be "
+            "told - transport failed, or gate off - the error is shown as a window on the console session)",
             g_QerrGate, g_QerrStateDir);
 }
 
@@ -104,6 +115,33 @@ static void LogOnce(int* flag, const char* fmt, ...)
     PlatLog("%s", line);
 }
 
+/* THE WINDOW: the one place the box is shown from. d is what the route decided; the box appears only when the
+ * pure rule says dom0 was not told (QerrWindowWanted). The outcome is logged either way - a box that could not be
+ * shown is a loud error of its own, since it was the last way to reach a human. */
+static void ShowWindowFallback(QerrDecision d, const char* component, const char* id, const char* header,
+                               const char* text, const char* why)
+{
+    unsigned long err = 0;
+    if (!QerrWindowWanted(d)) return;
+    if (PlatShowErrorBox(header, text, &err))
+        PlatLog("QGAERRBOX %s.%s shown as an error window on the console session (%s)",
+                component ? component : "-", id ? id : "-", why);
+    else
+        PlatLog("QGAERRBOX %s.%s could NOT be shown as an error window (error %lu) after %s - the log is the only "
+                "record", component ? component : "-", id ? id : "-", err, why);
+}
+
+/* No per-boot record could be written (no boot token, the store unwritable): no dedupe is possible, so the box is
+ * shown at most ONCE per process - a window per call would storm, which is the defect the dedupe exists to prevent. */
+static void ShowWindowWithoutRecord(const char* component, const char* id, const char* header, const char* text,
+                                    const char* why)
+{
+    static int s_shown = 0;
+    if (s_shown) return;
+    s_shown = 1;
+    ShowWindowFallback(QERR_FAIL_TRANSPORT, component, id, header, text, why);
+}
+
 QerrDecision QerrReport(const char* component, const char* id, int sev, const char* header,
                         const char* next, const char* cause, const char* tech)
 {
@@ -117,8 +155,6 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
     int markerPresent, countPresent, exeMissing = 0;
     QerrDecision d;
 
-    if (!g_QerrGate) return QERR_REJECT_SEVERITY;   /* gate off: nothing leaves the log */
-
     /* Compose first: the text is what redaction judges, and a text that does not fit - or lacks
      * its header, line 1 or technical line - is not sent at all (QerrComposeNotifyText returns 0).
      * Logged: a notification that is never composed is otherwise a silent one. */
@@ -131,6 +167,14 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
         return QERR_REJECT_REDACT;
     }
 
+#ifdef NOTIFYERR_DEFECT_BOXSTORM
+    /* DEFECT: the gated window skips the policy - a box per call, duplicates and the cap ignored. */
+    if (!g_QerrGate && sev >= QERR_SEV_THRESHOLD) {
+        ShowWindowFallback(QERR_GATED, component, id, header, text, "gated (defect: no dedupe)");
+        return QERR_GATED;
+    }
+#endif
+
     /* Cheap, store-free checks come first inside QerrDecide; only a candidate for sending
      * reads the store. Read both files up front anyway - they are tiny and this keeps the
      * decision a single pure call the test can pin. */
@@ -139,10 +183,12 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
         /* No boot identity means neither once-per-boot nor the cap can be honoured. Guessing would
          * either storm dom0 or swallow errors, so this fails - LOUDLY, because on a guest where the
          * agent runs as SYSTEM this cannot happen by design and is therefore a bug of ours, not a
-         * condition to degrade around. */
+         * condition to degrade around. The window is still the user's last chance to see it: once. */
         PlatLog("QGANOTIFYERR no per-boot token (HKLM\\%s): dedupe and the per-boot cap cannot be "
                 "honoured, so %s.%s is NOT notified - it is in the log only",
                 QERR_BOOT_KEY, component ? component : "-", id ? id : "-");
+        if (sev >= QERR_SEV_THRESHOLD)
+            ShowWindowWithoutRecord(component, id, header, text, "no boot identity");
         return QERR_FAIL_TRANSPORT;
     }
     snprintf(markerPath, sizeof(markerPath), "%s/%s.%s", g_QerrStateDir,
@@ -155,7 +201,8 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
                    count, now, &newCount);
     if (d != QERR_SEND) {
         /* Rejections are not failures of the route; they are the policy working. One log line
-         * each at debug cost - severity rejections are the common case and stay quiet. */
+         * each at debug cost - severity rejections are the common case and stay quiet. No window:
+         * the policy suppressed it, dom0 was not meant to be told either. */
         if (d != QERR_REJECT_SEVERITY)
             PlatLog("NOTIFYERR %s.%s not sent: %s", component ? component : "-", id ? id : "-",
                     QerrDecisionName(d));
@@ -163,7 +210,8 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
     }
 
     /* MISSING DATA FAILS: no persisted marker -> no send. Without persistence the dedupe is
-     * per-process, and a relaunched helper would notify once per launch. */
+     * per-process, and a relaunched helper would notify once per launch. The record is written
+     * BEFORE the choice between dom0 and the window, so the window shares it. */
     if (!PlatEnsureDir(g_QerrStateDir) ||
         !QerrFormatMarker(fileBuf, sizeof(fileBuf), now) || !PlatWriteSmall(markerPath, fileBuf) ||
         !QerrFormatCount(fileBuf, sizeof(fileBuf), now, newCount) || !PlatWriteSmall(countPath, fileBuf))
@@ -171,13 +219,25 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
         LogOnce(&s_LoggedStore, "NOTIFYERR state dir %s is not writable - the route is OFF for "
                 "this process (a notification with no once-per-boot record would repeat)",
                 g_QerrStateDir);
+        ShowWindowWithoutRecord(component, id, header, text, "the state dir could not be written");
         return QERR_FAIL_TRANSPORT;
+    }
+
+    /* GATED: the operator turned the route off, so dom0 is not told - but "not available" includes a
+     * disabled route (Jev 0.76), and a loud error must reach a human: the window, under the record
+     * just written (once per (component, id) per boot, inside the cap). */
+    if (!g_QerrGate) {
+        PlatLog("NOTIFYERR %s.%s not sent to dom0: gated (service.notify-errors off) - shown as a window instead",
+                component, id);
+        ShowWindowFallback(QERR_GATED, component, id, header, text, "gated");
+        return QERR_GATED;
     }
 
     snprintf(notifyPath, sizeof(notifyPath), "%s/out-%s-%u.txt", g_QerrStateDir,
              component ? component : "-", ++s_Seq);
     if (!PlatWriteNotifyFile(notifyPath, text)) {
         LogOnce(&s_LoggedStore, "NOTIFYERR cannot write %s - notification not sent", notifyPath);
+        ShowWindowFallback(QERR_FAIL_TRANSPORT, component, id, header, text, "the notify file could not be written");
         return QERR_FAIL_TRANSPORT;
     }
     if (!PlatSpawnNotify(notifyPath, &exeMissing)) {
@@ -188,6 +248,8 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
         else
             LogOnce(&s_LoggedSpawn, "NOTIFYERR CreateProcess(notifhost --notify-file) failed - "
                     "notification not sent (the log remains the record)");
+        ShowWindowFallback(QERR_FAIL_TRANSPORT, component, id, header, text,
+                           exeMissing ? "notifhost.exe is missing" : "notifhost could not be started");
         return QERR_FAIL_TRANSPORT;
     }
     PlatLog("NOTIFYERR %s.%s sent to dom0 (#%u this boot; delivery is notifhost's to log)",
@@ -374,6 +436,15 @@ static int PlatSpawnNotify(const char* notifyPath, int* exeMissing)
     return 1;
 }
 
+/* The box: a system-drawn message box on the console session (errbox.h). Non-blocking; the box outlives this call. */
+static int PlatShowErrorBox(const char* header, const char* text, unsigned long* error)
+{
+    DWORD e = 0;
+    const BOOL ok = QerrShowErrorBox(header, text, &e);
+    if (error) *error = (unsigned long)e;
+    return ok ? 1 : 0;
+}
+
 #else
 /* --- plain-C test platform layer (offline suite only, any host) --------------------------- */
 
@@ -446,5 +517,12 @@ static int PlatSpawnNotify(const char* notifyPath, int* exeMissing)
     *exeMissing = 0;
     if (!QerrTestSpawnHook) { *exeMissing = 1; return 0; }
     return QerrTestSpawnHook(notifyPath);
+}
+
+static int PlatShowErrorBox(const char* header, const char* text, unsigned long* error)
+{
+    if (error) *error = 0;
+    if (!QerrTestBoxHook) { if (error) *error = 1; return 0; }
+    return QerrTestBoxHook(header, text);
 }
 #endif

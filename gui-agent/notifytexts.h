@@ -74,12 +74,12 @@ static const QerrText QerrTexts[] = {
       "Cause: Windows delivers no new pictures of that window to the capture, even after the capture was re-created (log line QGAWGCDEAF).",
       QERR_GUI_AGENT_LOG ", line QGAWGCDEAF", NULL },
 
-    /* DEGRADED on purpose: below the route's ACTION threshold, so it stays in the log (a relaunch
-     * follows within ~8 s; deslice-down escalates 30 s later). Wired so the threshold is exercised
-     * by a real site and a promotion is a one-word change. */
+    /* DEGRADED on purpose: below the route's ACTION threshold, so it stays in the log (Task Scheduler's
+     * restart-on-failure may bring it back; deslice-down escalates 30 s later if not). Wired so the threshold
+     * is exercised by a real site and a promotion is a one-word change. */
     { "broker-died", "gui-agent", "broker-died", QERR_SEV_DEGRADED, "gui-agent.exe", NULL,
       "The notification and menu capture helper stopped serving",
-      "The GUI agent relaunches it within about 8 s; until then, menus, modern app windows and notification windows do not appear in dom0.",
+      "Task Scheduler restarts it on failure (at most three times, a minute apart); the GUI agent relaunches nothing. Until it is back, menus, modern app windows and notification windows do not appear in dom0.",
       "Cause: the broker process exited or stopped answering after it was ready (log line QGABROKERDIED).",
       QERR_GUI_AGENT_LOG ", line QGABROKERDIED", NULL },
 
@@ -111,7 +111,7 @@ static const QerrText QerrTexts[] = {
 
     { "listener-init", "notifhost", "listener-init", QERR_SEV_ACTION, "notifhost.exe", "exit code 3",
       "The notification bridge could not start",
-      "Bridged apps keep the plain window path; the GUI agent relaunches the bridge, at most once per 60 s.",
+      "Bridged apps keep the plain window path; Task Scheduler restarts the bridge on failure (at most three times, a minute apart), the GUI agent relaunches nothing.",
       "Cause: the toast listener threw while starting (exit code 3).",
       "bridge.log in ProgramData\\qubes-toast-bridge", NULL },
 };

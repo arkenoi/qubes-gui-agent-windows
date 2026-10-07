@@ -29,6 +29,7 @@
     <ClCompile Include="..\..\gui-agent\toasthold.c" />
     <ClCompile Include="..\..\gui-agent\etwproxy.c" />
     <ClCompile Include="..\..\gui-agent\notifyerr.c" />
+    <ClCompile Include="..\..\gui-agent\lifecycle.c" />
     <!-- C++/WinRT capture engine: needs C++17 + exceptions; SDK headers are not
          /W4-clean, so warnings-as-errors is relaxed for this one TU only. -->
     <ClCompile Include="..\..\gui-agent\wincapture.cpp">
@@ -64,6 +65,11 @@
     <ClInclude Include="..\..\gui-agent\toastident.h" />
     <ClInclude Include="..\..\gui-agent\etwproxy.h" />
     <ClInclude Include="..\..\gui-agent\notifyerr.h" />
+    <ClInclude Include="..\..\gui-agent\lifecycle.h" />
+    <ClInclude Include="..\..\gui-agent\errbox.h" />
+    <ClInclude Include="..\..\gui-agent\errbox-order.h" />
+    <ClInclude Include="..\..\include\qga-exitcodes.h" />
+    <ClInclude Include="..\..\include\qga-lifecycle.h" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\gui-agent\blank.cur" />
