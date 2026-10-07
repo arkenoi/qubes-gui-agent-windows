@@ -5032,10 +5032,14 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
     }
     // Token missing, profile not loaded yet, or the helper did not exit 0 (SpawnHelperInSession
     // logs which) - in every case not applied, and the sweep retries.
-    // At boot there is no interactive session yet and this retries - the message says so. An
-    // expected, self-correcting wait is not a warning; if it never succeeds, the caller's own
-    // failure path reports that.
-    LogInfo("no usable interactive session yet (token/profile/helper); cannot %s guest shadows (will retry)",
+    // WARNING, and NOT lowered to Info: it was, on 2026-10-07, with a comment claiming "if it
+    // never succeeds, the caller's own failure path reports that". That was checked and is FALSE -
+    // the only caller does `g_SeamlessShadowsDone = ApplyGuestShadows(FALSE); // retried by the
+    // sweep until applied`, with no attempt counter and no final report anywhere. So a session
+    // that never becomes usable leaves guest shadows on in seamless mode for the whole session, a
+    // visible defect, and Info would have said so for ever with nothing escalating. Jev 0.06.
+    // A bounded retry with a loud final failure would justify Info; until it exists, this stays.
+    LogWarning("no usable interactive session yet (token/profile/helper); cannot %s guest shadows (will retry)",
                enable ? L"restore" : L"disable");
     return FALSE;
 }
@@ -13203,8 +13207,12 @@ static ULONG WINAPI WatchForEvents(void)
     }
     else
     {
-        // Its own text says "by design": this is the intended path, not a problem.
-        LogInfo("A6LEAK exit by design: daemon still alive and mapping - skipping all revokes "
+        // WARNING, deliberately, and NOT lowered to Info: moved to Info 2026-10-07 on the
+        // grounds that the text says "by design", then reverted the same day - Jev 0.07. The
+        // identifier is A6LEAK and the action is "skipping all revokes": this path leaves grants
+        // unrevoked ON PURPOSE to dodge the xenbus revoke-vs-unmap race, nothing bounds how many,
+        // and anyone auditing grant lifetime needs to see it at the default level.
+        LogWarning("A6LEAK exit by design: daemon still alive and mapping - skipping all revokes "
             "(xenbus revoke-vs-unmap race; see FINDINGS 2026-08-05 cont 9)");
     }
 

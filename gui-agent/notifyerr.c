@@ -62,7 +62,6 @@ static char g_QerrStateDir[512] = { 0 };
 
 /* --- platform layer ----------------------------------------------------------------------- */
 static void      PlatLog(const char* fmt, ...);
-static void      PlatInfo(const char* fmt, ...);   /* the same text at INFO: configuration is not a fault */
 static long long PlatBootStamp(void);
 static int       PlatEnsureDir(const char* dir);
 static int       PlatReadSmall(const char* path, char* buf, size_t cap);   /* 1 = read, 0 = absent/failed */
@@ -91,7 +90,7 @@ void QerrInit(int gateOn, const char* stateDirUtf8)
     } else {
         PlatDefaultStateDir(g_QerrStateDir, sizeof(g_QerrStateDir));
     }
-    PlatInfo("NOTIFYERR gate: enabled=%d state=%s (secondary route: dom0 notification via "
+    PlatLog("NOTIFYERR gate: enabled=%d state=%s (secondary route: dom0 notification via "
             "notifhost/qubes.Notifications; needs qrexec-agent; the log stays primary; when dom0 cannot be "
             "told - transport failed, or gate off - the error is shown as a window on the console session)",
             g_QerrGate, g_QerrStateDir);
@@ -294,21 +293,6 @@ static void PlatLog(const char* fmt, ...)
     LogWarning("%S", line);   /* WARNING: visible in the default log like QGADESLICEDOWN */
 }
 
-/* PlatLog puts EVERY message it is given at WARNING, which is right for a fault and wrong for a
- * statement of configuration. The gate announcement below went out once per agent start as
- * "[W] PlatLog: NOTIFYERR gate: enabled=1 ..." - three of them in the 766 error/warning lines one
- * install and three boots produced, describing a feature that was working. A clean error log is
- * the gate condition, so what is merely true goes out at INFO and WARNING is kept for faults. */
-static void PlatInfo(const char* fmt, ...)
-{
-    char line[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    (void)StringCchVPrintfA(line, RTL_NUMBER_OF(line), fmt, ap);
-    va_end(ap);
-    LogInfo("%S", line);
-}
-
 /* An opaque token minted once per boot and identical for every process in that boot.
  *
  * A VOLATILE registry key is the OS's own per-boot object: the kernel discards it at shutdown, so
@@ -465,18 +449,6 @@ static int PlatShowErrorBox(const char* header, const char* text, unsigned long*
 /* --- plain-C test platform layer (offline suite only, any host) --------------------------- */
 
 static void PlatLog(const char* fmt, ...)
-{
-    char line[1024];
-    va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(line, sizeof(line), fmt, ap);
-    va_end(ap);
-    if (QerrTestLogHook) QerrTestLogHook(line); else fprintf(stderr, "%s\n", line);
-}
-
-/* The non-Windows platform has one sink, so INFO and WARNING land in the same place here. It still
- * needs the symbol: the shared code above calls PlatInfo, and the offline test links this file. */
-static void PlatInfo(const char* fmt, ...)
 {
     char line[1024];
     va_list ap;
