@@ -3057,10 +3057,19 @@ static void BrokerRequestSent(int slot)
 // hang or get it relaunched.
 static LONG      g_BrokerProgressSeen = 0;
 static ULONGLONG g_BrokerProgressAt = 0;
+// A DECLARED STAGE GETS ITS OWN BUDGET (WgcbrkStageBudgetMs; 2026-10-07). The broker publishes the call its main loop
+// is in; a long WGC open satisfies both tests above (no ack, no progress - the counter moves only between stages), and
+// a working broker was terminated for it. So the stage it declares is stamped here, and a hang also requires that
+// stage to have stood still for its OWN budget. A broker that keeps changing stage is making declared progress and is
+// never reaped.
+static LONG      g_BrokerStageSeen = 0;
+static ULONGLONG g_BrokerStageAt = 0;
 static void BrokerNoteProgress(IN ULONGLONG now)
 {
     const LONG p = WGCBRK_HDR(g_WgcBase)->BrokerProgress;
+    const LONG stg = WGCBRK_HDR(g_WgcBase)->BrokerStage;
     if (p != g_BrokerProgressSeen || g_BrokerProgressAt == 0) { g_BrokerProgressSeen = p; g_BrokerProgressAt = now; }
+    if (stg != g_BrokerStageSeen || g_BrokerStageAt == 0) { g_BrokerStageSeen = stg; g_BrokerStageAt = now; }
 }
 static BOOL BrokerAckOverdue(IN ULONGLONG now, OUT int* slotOut, OUT ULONGLONG* ageOut)
 {
@@ -3070,7 +3079,8 @@ static BOOL BrokerAckOverdue(IN ULONGLONG now, OUT int* slotOut, OUT ULONGLONG* 
     {
         if (!g_SlotCtlSince[i]) continue;
         if ((LONG)((ULONG)slots[i].CtlAck - (ULONG)g_SlotCtlWant[i]) >= 0) { g_SlotCtlSince[i] = 0; continue; }
-        if (now - g_SlotCtlSince[i] >= WGCBRK_ACK_DEADLINE_MS && now - g_BrokerProgressAt >= WGCBRK_ACK_DEADLINE_MS)
+        if (now - g_SlotCtlSince[i] >= WGCBRK_ACK_DEADLINE_MS && now - g_BrokerProgressAt >= WGCBRK_ACK_DEADLINE_MS &&
+            now - g_BrokerStageAt >= WgcbrkStageBudgetMs(WGCBRK_STAGE_CODE(g_BrokerStageSeen)))   // GUARD:stagebudget
         {
             *slotOut = i; *ageOut = now - g_SlotCtlSince[i];
             return TRUE;
@@ -3091,14 +3101,20 @@ static ULONGLONG BrokerNextDue(void)
     ULONGLONG due = 0;
     if (g_BrokerReady)
     {
-        // The later of the request's deadline and the broker's last progress + the deadline (see BrokerAckOverdue).
-        for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
-            if (g_SlotCtlSince[i])
-            {
-                ULONGLONG d = g_SlotCtlSince[i] + WGCBRK_ACK_DEADLINE_MS;
-                if (g_BrokerProgressAt + WGCBRK_ACK_DEADLINE_MS > d) d = g_BrokerProgressAt + WGCBRK_ACK_DEADLINE_MS;
-                if (!due || d < due) due = d;
-            }
+        // The LATEST of the three things BrokerAckOverdue requires: the request's deadline, the broker's last
+        // progress + the deadline, and the declared stage's own budget. Waking before all three are due would only
+        // find the check false - and at rest a wake that does nothing is exactly what the idle-load work removed.
+        {
+            const ULONGLONG stageDue = g_BrokerStageAt + WgcbrkStageBudgetMs(WGCBRK_STAGE_CODE(g_BrokerStageSeen));
+            for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
+                if (g_SlotCtlSince[i])
+                {
+                    ULONGLONG d = g_SlotCtlSince[i] + WGCBRK_ACK_DEADLINE_MS;
+                    if (g_BrokerProgressAt + WGCBRK_ACK_DEADLINE_MS > d) d = g_BrokerProgressAt + WGCBRK_ACK_DEADLINE_MS;
+                    if (stageDue > d) d = stageDue;
+                    if (!due || d < due) due = d;
+                }
+        }
         return due;
     }
     // No launch throttle any more (HELPER LIFECYCLE): the one launch happens on the first eligible wake, and nothing
