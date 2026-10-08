@@ -116,6 +116,17 @@ static const QerrText QerrTexts[] = {
       "Cause: Windows did not raise the prompt and offers only a taskbar button, which does not exist before the guest's shell has started (log line QGAUACPENDING).",
       QERR_GUI_AGENT_LOG ", line QGAUACPENDING", NULL },
 
+    /* Owner, 2026-10-08: "normally we dont do this at all: our session is single builtin user ...
+     * now we make sure session stays", and then "but if it happens, it needs to happen loud". On
+     * these guests - one built-in user, autologon - the console session is not supposed to change
+     * at all, so a change is not a condition to work around quietly: it goes to dom0. ACTION,
+     * because nothing in the guest will put it right and only a human can find out why it happened. */
+    { "session-changed", "gui-agent", "session-changed", QERR_SEV_ACTION, "gui-agent.exe", NULL,
+      "The guest's sign-in session changed unexpectedly",
+      "Guest notifications fall back to plain windows until this qube is restarted. This qube signs in one built-in user automatically, so the session should never change - find out what signed out, switched user or started a second session.",
+      "Cause: the sign-in session the notification bridge was serving was replaced while the qube was running (log line QGANOTIFSESSION).",
+      QERR_GUI_AGENT_LOG ", line QGANOTIFSESSION", NULL },
+
     /* --- the notification bridge's own faults (notifhost.cpp ReportErrorSelf) --------------- */
     /* its exit codes are its own (BridgeMain): 2 = listener access denied, 3 = listener init threw */
     { "listener-denied", "notifhost", "listener-denied", QERR_SEV_ACTION, "notifhost.exe", QERR_TXT_LISTENER_DENIED_CODE,

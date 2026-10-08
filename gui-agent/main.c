@@ -4007,6 +4007,15 @@ static void NotifBridgeRestoreSweep(void)
 static ULONGLONG g_NotifBridgeExitedAt = 0;   // tick of an exit already reported; 0 = none pending
 static BOOL g_NotifNoPidLogged = FALSE;
 static BOOL g_NotifLaunched = FALSE;           // the ONE launch this agent performs
+// ...PER SESSION, which is what "once" has always meant here and was never written down. The bridge
+// serves the console session it was launched into and leaves when that session changes; nothing
+// restarts it (Task Scheduler ignores its exit 0), so before this the guest simply had no bridge
+// after a sign-out and sign-in, silently, for the rest of the agent's life. Recording the session
+// the launch went into is what lets the exit handler arm ONE launch for a session that has never
+// had one - not a relaunch into the session that just ended, which is the thing the owner's
+// 2026-10-07 rule forbids. Jev: launching one into a NEW session does not violate that rule (0.29),
+// and removing the exit report without it would be a silencing (0.90).
+static DWORD g_NotifLaunchedSession = 0;
 static BOOL g_NotifNotReadyLogged = FALSE;     // "no instance published its pid" said once per launch/exit
 static void NotifBridgeSupervise(void)
 {
@@ -4050,6 +4059,94 @@ static void NotifBridgeSupervise(void)
                 L"so the bridge IS running. Not a death, and no relaunch is armed.", g_NotifBridgePid, exitCode);
             g_NotifBridgePid = 0;
             return;
+        }
+        // AN EXIT WE ASKED FOR IS NOT A DEATH EITHER, and exit 0 still covers three of them: the
+        // bridge leaves when this agent goes away, when the interactive session changes under it,
+        // and when something writes its stop file. All three were reported as "a clean exit nobody
+        // asked for" - the same false death QTB_EXIT_ALREADY_RUNNING removed for the fourth case,
+        // and the rest of the flood in GWeck's screenshot (his FIRST bridge notification ran
+        // 0:00:20, which the singleton case cannot produce).
+        //
+        // THEY KEEP EXIT 0 ON PURPOSE: Task Scheduler restarts a non-zero exit and leaves zero
+        // alone, so their own codes would relaunch a bridge that was deliberately stopped, or push
+        // one into a session that is gone - and since 2026-10-07 nothing else relaunches it. Jev:
+        // noise 0.90, relaunch hazard real 0.90, keep-zero-and-record-the-reason 0.92 against
+        // distinct-codes 0.00. So the bridge RECORDS why it left and this reads it.
+        //
+        // THE PID IS THE POINT. The reason is accepted only from the instance that just exited, so
+        // a file left by an earlier bridge can never excuse a later real death; an unreadable,
+        // absent or mismatched reason falls through to the ERROR below, which is the safe
+        // direction. NOT CLAIMED: which of the three his 20-second exit took - that is in his
+        // bridge.log, which we do not hold (Jev, on it being the sign-in session change:
+        // insufficient-evidence 0.61).
+        if (exitCode == 0)
+        {
+            WCHAR reasonPath[MAX_PATH] = { 0 }, reason[64] = { 0 };
+            DWORD reasonPid = 0;
+            if (ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge\\exit-reason",
+                                         reasonPath, RTL_NUMBER_OF(reasonPath)))
+            {
+                HANDLE rf = CreateFile(reasonPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (rf != INVALID_HANDLE_VALUE)
+                {
+                    char buf[128] = { 0 };
+                    DWORD rd = 0;
+                    if (ReadFile(rf, buf, sizeof(buf) - 1, &rd, NULL) && rd > 0)
+                    {
+                        char word[64] = { 0 };
+                        if (sscanf_s(buf, "%lu %63s", &reasonPid, word, (unsigned)sizeof(word)) == 2)
+                            MultiByteToWideChar(CP_ACP, 0, word, -1, reason, RTL_NUMBER_OF(reason));
+                    }
+                    CloseHandle(rf);
+                }
+            }
+            if (reason[0] && reasonPid == g_NotifBridgePid)
+            {
+                // A SESSION CHANGE IS NOT ACCOMMODATED - IT IS REPORTED. Owner, 2026-10-08:
+                // "normally we dont do this at all: our session is single builtin user. if we EVER
+                // want to handle it properly, i'd write an ADR on how to decouple system-level stuff
+                // from session-level, but we are NOT doing it now. now we make sure session stays."
+                //
+                // So nothing here launches a bridge into a new session, and nothing re-arms. On
+                // these guests there is ONE built-in user and autologon, so the console session is
+                // not supposed to change at all: if it did, that is the thing to find out about, and
+                // accommodating it would hide exactly the anomaly we want to see. A DRAFT that armed
+                // a launch for the new session was built and reverted the same hour on his
+                // instruction; decoupling session-level from system-level is a future ADR he will
+                // write, not something to improvise here.
+                //
+                // AND IT IS LOUD. Owner, minutes later: "but if it happens, it needs to happen
+                // loud." It was briefly a WARNING on the reasoning that the window-path fallback
+                // makes it workable - but workable is not the test here. This configuration says the
+                // session cannot change, so a change means that premise is wrong, and a premise that
+                // is wrong is an ERROR and a dom0 notification, not a line in a log nobody opens.
+                // agent-gone and stop-requested stay INFO: one is this agent leaving, the other is
+                // somebody having asked it to stop.
+                const DWORD curSession = WTSGetActiveConsoleSessionId();
+                if (0 == wcscmp(reason, L"session-changed"))
+                {
+                    LogError("QGANOTIFSESSION the bridge pid %lu left because the console session "
+                        L"changed (%lu -> %lu). On this guest - one built-in user, autologon - the "
+                        L"session is not expected to change at all, so this is an anomaly to find, "
+                        L"not a condition to work around. Nothing is relaunched (owner 2026-10-08: "
+                        L"\"now we make sure session stays\"); guest toasts take the plain window "
+                        L"path until the agent starts again, so nothing is lost meanwhile.",
+                        g_NotifBridgePid, g_NotifLaunchedSession, curSession);
+                    QerrReportText(QerrTextFind("session-changed"), NULL, NULL);
+                }
+                else
+                    LogInfo("NOTIFBRIDGE the bridge pid %lu left on purpose (%s) and said so - an intended "
+                        L"departure, not a death. Nothing is relaunched and nothing is reported to dom0.",
+                        g_NotifBridgePid, reason);
+                DeleteFile(reasonPath);   // consumed: it may not excuse the next exit
+                g_NotifBridgePid = 0;
+                return;
+            }
+            if (reason[0])
+                LogWarning("NOTIFBRIDGE an exit reason is present (%s) but it names pid %lu, not the "
+                    L"bridge that just exited (%lu) - a leftover from an earlier instance, ignored. "
+                    L"This exit is reported as a death.", reason, reasonPid, g_NotifBridgePid);
         }
         // A bridge exit is a FAILURE to report, not a supervision detail: the gate is ON (checked
         // above), so nothing here asked it to stop. Its exit codes (notifhost.cpp, and
@@ -4162,6 +4259,7 @@ static void NotifBridgeSupervise(void)
     // THE ONE LAUNCH PER AGENT LIFE: never into a session that is ending; a failed launch is said at ERROR and not retried.
     if (g_NotifLaunched || HelpersDisarmed()) return;
     g_NotifLaunched = TRUE;
+    g_NotifLaunchedSession = WTSGetActiveConsoleSessionId();   // which session this one serves
     g_NotifLastLaunch = now;
     g_NotifBridgeExitedAt = 0;
     g_NotifLaunchPending = NotifBridgeLaunch();
