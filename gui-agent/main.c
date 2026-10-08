@@ -3541,7 +3541,51 @@ static void BrokerSupervise(void)
     // fault is the one QGADESKSTUCK names, and this one is its shadow.
     // The clock is NOT reset: g_BrokerDownSince keeps running, so the moment the desktop is Default
     // again a broker that is genuinely down is reported with its true duration, not a fresh one.
-    if (!g_BrokerDownSince) { g_BrokerDownSince = now; g_BrokerNextWarn = now + DESLICE_FIRST_WARN_MS; }
+    //
+    // ...BUT IT MUST NOT RUN BEFORE THE BROKER COULD HAVE BEEN LAUNCHED AT ALL. The launch below is
+    // gated on GetShellWindow(): the broker runs in the user's session, so until a shell exists
+    // there is nothing to launch and "not running for 30 s" is not a fault, it is arithmetic about a
+    // window in which starting was impossible.
+    //
+    // MEASURED 2026-10-08 on a clone matching the reporter's environment, one cold boot, from the
+    // agent's own log:
+    //     18:04:24  Init: WGCBROKER gate enabled
+    //     18:04:51  WgcLaunch: launched via Task Scheduler (user session 1)   <- 27 s after Init
+    //     18:04:55  QGADESLICEDOWN "not running for 30 s"                     <- the complaint
+    //     18:04:56  BrokerSupervise: WGCBROKER ready (pid 3248 validated)     <- ready 1 s later
+    // The broker was healthy. The shell took 27 s to appear on that boot, so the deadline left it
+    // about three seconds, and a dom0 ACTION notification went out about a helper that was fine.
+    // The same delta contains the contrast: an instance whose session already existed launched 1 s
+    // after Init and was ready at +2 s, with no complaint.
+    //
+    // So the clock is ANCHORED AT THE LAUNCH. While no shell exists it is held at zero; once the
+    // launch happens g_WgcLastLaunch is the anchor, which is what "has not been running for 30 s"
+    // was always meant to measure. A broker that genuinely never becomes ready still reports, with
+    // its true duration since the launch - only the impossible window is excluded.
+    // TWO THINGS CHECKED BEFORE WRITING THIS, because both would silently break it:
+    //   - g_WgcLastLaunch does NOT slide. It is assigned at exactly one site, inside the
+    //     one-launch-per-agent-life guard. BrokerState's comment warns that an older version
+    //     "refreshes every ~8 s while it keeps retrying" - that version is gone, and anchoring on a
+    //     sliding value would mean this report could never fire at all.
+    //   - BrokerState() is unaffected. It anchors on `g_BrokerDownSince ? g_BrokerDownSince :
+    //     g_AgentStartTick`, so holding the clock at zero here makes it fall back to the agent's
+    //     start tick - which is what the old Init-time anchor amounted to. BRK_STARTING/BRK_DOWN
+    //     therefore behave exactly as before; only this report's deadline moves.
+    if (!GetShellWindow() && !g_WgcLaunched)
+    {
+        // Not a fault and not a grace period: there is no session to run it in. The guest having no
+        // shell is its own condition and QGADESKSTUCK owns reporting it.
+        if (g_BrokerDownSince)
+            LogDebug("QGADESLICEDOWN clock held: no shell window yet, so the broker cannot be launched "
+                L"and its absence is not a fault (it is launched into the user's session)");
+        g_BrokerDownSince = 0; g_BrokerNextWarn = 0;
+    }
+    else if (!g_BrokerDownSince)
+    {
+        const ULONGLONG anchor = (g_WgcLaunched && g_WgcLastLaunch) ? g_WgcLastLaunch : now;
+        g_BrokerDownSince = anchor;
+        g_BrokerNextWarn = anchor + DESLICE_FIRST_WARN_MS;
+    }
     // SKIP THE REPORT, NOT THE REST OF THE FUNCTION. An early return here would also skip the launch
     // block below, and a secure desktop can be a passing UAC prompt on a guest whose shell is up -
     // so the broker would stop being started for a reason that has nothing to do with it. (The
