@@ -3984,7 +3984,7 @@ static void NotifBridgeSupervise(void)
         DeathEventReport(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", g_NotifBridgePid, exitCode,
             g_NotifLastLaunch != 0 ? now - g_NotifLastLaunch : DEATHEVENT_RAN_UNKNOWN,
             L"Task Scheduler restarts it on failure (its task is armed: at most 3 times, a minute apart; a clean exit "
-            L"is not restarted); the GUI agent itself relaunches nothing. bridge.log in ProgramData\\qubes-toast-bridge "
+            L"is not restarted); the GUI agent itself relaunches nothing. bridge.log in Qubes Logs "
             L"names the reason; gui-agent log line QGANOTIFBRIDGEEXIT; a crash also leaves a Windows Error "
             L"Reporting record (AppCrash_notifhost.exe_*).");
         g_NotifBridgePid = 0;

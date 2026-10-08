@@ -50,6 +50,11 @@
 #endif
 
 #define QERR_GUI_AGENT_LOG "gui-agent log in Qubes Logs"
+/* bridge.log is in the COMMON log directory, not the bridge's state directory. It moved there in
+ * 7e349bac and these two rows kept naming ProgramData\qubes-toast-bridge, so a user following the
+ * notification opened a directory with no log in it. The state directory still holds the bridge's
+ * CONTROL surfaces - stop file, heartbeat, banner markers - which is what its ACLs are for. */
+#define QERR_BRIDGE_LOG "bridge.log in Qubes Logs"
 
 static const QerrText QerrTexts[] = {
     /* --- the agent's own faults (component gui-agent, one per (component, id) per boot) --- */
@@ -107,13 +112,13 @@ static const QerrText QerrTexts[] = {
       "The notification bridge may not read toasts",
       "Bridged apps keep the plain window path: allow notification access for this user in Settings, or turn service.notify-bridge off.",
       QERR_TXT_LISTENER_DENIED_CAUSE,
-      "bridge.log in ProgramData\\qubes-toast-bridge", NULL },
+      QERR_BRIDGE_LOG, NULL },
 
     { "listener-init", "notifhost", "listener-init", QERR_SEV_ACTION, "notifhost.exe", "exit code 3",
       "The notification bridge could not start",
       "Bridged apps keep the plain window path; Task Scheduler restarts the bridge on failure (at most three times, a minute apart), the GUI agent relaunches nothing.",
       "Cause: the toast listener threw while starting (exit code 3).",
-      "bridge.log in ProgramData\\qubes-toast-bridge", NULL },
+      QERR_BRIDGE_LOG, NULL },
 };
 #define QERR_TEXT_COUNT (sizeof(QerrTexts) / sizeof(QerrTexts[0]))
 
