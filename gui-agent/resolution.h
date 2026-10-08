@@ -91,3 +91,14 @@ extern volatile LONG64 g_M0BlinkFirstPaintStart;
 // phase markers on the applied->repaint tail (capture.c). 0 = no obtain in
 // flight, marker stays silent.
 LONG64 ResolutionM0BlinkObtainStart(void);
+
+// WAS THE MODE WE JUST GAVE UP ON THE ONE THAT TURNED UP? When SetVideoModeExact's wait expires it
+// returns having applied NOTHING - and the mode can still go live afterwards, because giving up
+// cancels nothing. The desktop duplication then sees the geometry change and, until 2026-10-08,
+// reported it as the trigger of the OPEN P2 (win11-24H2 resolution-change capture freeze). That
+// attribution points maintainers at someone else's defect for an event we caused ourselves; Jev:
+// misattribution_is_a_real_harm 0.86. TRUE when a wait for exactly these dimensions expired within
+// the last few seconds; *agoMs, when given, gets how long ago.
+// This says nothing about WHY the wait expired - that is unresolved (Jev: root_cause
+// insufficient-evidence 0.70, chain_established 0.24) - only that WE were the ones waiting.
+BOOL ResolutionWaitExpiredFor(IN ULONG width, IN ULONG height, OUT ULONGLONG* agoMs);

@@ -768,7 +768,50 @@ DWORD SelectSupportedMode(IN DWORD width, IN DWORD height)
 
 // CDS_TEST the exact size directly with a DEVMODE. Deliberately does NOT consult
 // the Init-time g_SupportedModes cache: it goes stale across IDD replugs.
-static BOOL IsExactModeAvailable(IN ULONG width, IN ULONG height)
+// NAME THE DEVICE. ChangeDisplaySettings WITHOUT a device name operates on the DEFAULT/PRIMARY
+// display device, and this product's guest desktop is not guaranteed to be on it - "Guest desktop
+// is on DISPLAY2 - name the device explicitly" is a rule this repo already carries, and the IDD is
+// certainly not primary while its topology is being reloaded. So the probe could be asking a
+// different adapter whether the IDD's mode is available.
+// THIS IS NOT CLAIMED AS THE ROOT CAUSE of the 2026-10-08 "mode-never-appeared" (Jev:
+// insufficient-evidence 0.70 across three live candidates - wrong device, a bound shorter than the
+// driver took, and a DEVMODE too under-specified to pass CDS_TEST). It is correct either way: ask
+// the device we are driving, and if we cannot identify it, fall back to the old device-less probe
+// rather than answering "unavailable" for a reason that has nothing to do with the mode.
+// THE LAST EXPIRED WAIT, so capture.c can tell our own late-arriving mode from the open P2's
+// trigger. Written only on the deadline path; read with a short validity window.
+static volatile LONG  s_ExactWaitExpiredW = 0;
+static volatile LONG  s_ExactWaitExpiredH = 0;
+static volatile LONG64 s_ExactWaitExpiredAt = 0;
+
+static void RecordExactWaitExpiry(IN ULONG width, IN ULONG height)
+{
+    InterlockedExchange(&s_ExactWaitExpiredW, (LONG)width);
+    InterlockedExchange(&s_ExactWaitExpiredH, (LONG)height);
+    InterlockedExchange64(&s_ExactWaitExpiredAt, (LONG64)GetTickCount64());
+}
+
+// 30 s: generous enough for a driver that was merely slower than the bound, short enough that a
+// LATER, genuine resolution change is never excused by an expiry from minutes ago.
+#define EXACT_WAIT_EXPIRY_CREDIT_MS 30000
+
+BOOL ResolutionWaitExpiredFor(IN ULONG width, IN ULONG height, OUT ULONGLONG* agoMs)
+{
+    LONG64 at = InterlockedCompareExchange64(&s_ExactWaitExpiredAt, 0, 0);
+    if (at == 0)
+        return FALSE;
+    if ((ULONG)InterlockedCompareExchange(&s_ExactWaitExpiredW, 0, 0) != width ||
+        (ULONG)InterlockedCompareExchange(&s_ExactWaitExpiredH, 0, 0) != height)
+        return FALSE;
+    ULONGLONG ago = GetTickCount64() - (ULONGLONG)at;
+    if (ago > EXACT_WAIT_EXPIRY_CREDIT_MS)
+        return FALSE;
+    if (agoMs)
+        *agoMs = ago;
+    return TRUE;
+}
+
+static BOOL IsExactModeAvailableOn(IN const WCHAR* deviceName, IN ULONG width, IN ULONG height)
 {
     DEVMODE devMode;
     ZeroMemory(&devMode, sizeof(devMode));
@@ -777,7 +820,14 @@ static BOOL IsExactModeAvailable(IN ULONG width, IN ULONG height)
     devMode.dmPelsHeight = height;
     devMode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
 
+    if (deviceName && *deviceName)
+        return DISP_CHANGE_SUCCESSFUL == ChangeDisplaySettingsEx(deviceName, &devMode, NULL, CDS_TEST, NULL);
     return DISP_CHANGE_SUCCESSFUL == ChangeDisplaySettings(&devMode, CDS_TEST);
+}
+
+static BOOL IsExactModeAvailable(IN ULONG width, IN ULONG height)
+{
+    return IsExactModeAvailableOn(NULL, width, height);
 }
 
 // ---- M6: computed IDD mode set ---------------------------------------------
@@ -1635,13 +1685,41 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
 
         if (!offered)
         {
-            LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=mode-never-appeared",
-                width, height, g_ScreenWidth, g_ScreenHeight);
-            InterlockedExchange64(&g_M0BlinkObtainStart, 0); // obtain aborted, no repaint expected
-            InterlockedExchange64(&g_M0BlinkFirstPaintStart, 0);
-            InterlockedExchange(&g_ExactInFlight, 0);
-            return ERROR_SUCCESS;
+            // A DEADLINE IS NOT A STATEMENT ABOUT THE FUTURE. "mode-never-appeared" claimed the mode
+            // would never come, and on 2026-10-08 it came 1.4 s later: the duplication adopted
+            // exactly the requested 5120x1440 while this line said it was unavailable. The wait has
+            // three exits and this is the DEADLINE one, so it says so, with the bound it used.
+            // And "keeping %lux%lu" printed "keeping 0x0", because at agent start g_ScreenWidth and
+            // g_ScreenHeight are unset - there was no current mode to keep. Say THAT instead of
+            // printing a size that does not exist.
+            // A FAILED PRE-FLIGHT MUST NOT VETO THE REAL OPERATION. This branch used to
+            // `return ERROR_SUCCESS` here - BEFORE SetVideoModeInternal, which is the actual
+            // apply - so a CDS_TEST that said "no" meant the requested mode was never even
+            // attempted: twelve seconds of polling, nothing applied, and a warning claiming the
+            // mode would never appear. MEASURED 2026-10-08 on win11r-logvol: it appeared 1.4 s
+            // later and the duplication adopted exactly the 5120x1440 we had asked for, so the
+            // guest got its resolution by luck rather than because we applied it.
+            // CDS_TEST IS A QUERY, NOT AN ORACLE, and it is a query we may be putting to the wrong
+            // adapter (it was device-less until today, and this product's desktop is not
+            // necessarily on the primary display). Attempting the apply costs ONE call and either
+            // works or returns a SPECIFIC error, which the apply-failed path below already logs
+            // with its status - a real diagnosis instead of "never appeared".
+            // Why the pre-flight missed it is still unresolved (Jev: root_cause
+            // insufficient-evidence 0.70 across three candidates). This does not need that answer:
+            // trying the operation is right whichever of them is true.
+            // The M0BLINK stamps are deliberately NOT cleared - a repaint IS expected if the apply
+            // works - and $g_ExactInFlight stays held until the common exit below.
+            RecordExactWaitExpiry(width, height);
+            if (g_ScreenWidth == 0 || g_ScreenHeight == 0)
+                LogWarning("RESWAIT %lux%lu not offered within %u ms (deadline; %lu polls) - no current mode is recorded yet. "
+                    L"Attempting the apply anyway: CDS_TEST is a query, not a veto, and a failure there reports its own status.",
+                    width, height, (unsigned)EXACT_MODE_WAIT_TIMEOUT_MS, polls);
+            else
+                LogWarning("RESWAIT %lux%lu not offered within %u ms (deadline; %lu polls) - current mode is %lux%lu. "
+                    L"Attempting the apply anyway: CDS_TEST is a query, not a veto, and a failure there reports its own status.",
+                    width, height, (unsigned)EXACT_MODE_WAIT_TIMEOUT_MS, polls, g_ScreenWidth, g_ScreenHeight);
         }
+        else
 
         {
             ULONGLONG now = GetTickCount64();
@@ -1649,7 +1727,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
                 now, polls, now - m0Start);
         }
 
-        replugged = TRUE;
+        replugged = TRUE;   // reached on BOTH paths now: the apply is attempted either way
     }
 
     ULONG status = SetVideoModeInternal(width, height);

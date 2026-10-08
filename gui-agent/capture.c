@@ -622,7 +622,23 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
             // demotion. A clean error log is the gate condition, so the trigger of a filed freeze
             // belongs in what breaches it. Jev was split on this - warning 0.52 against error 0.47
             // at only 0.36 confidence - and a tie goes to the louder side.
-            if (geometryChanged)
+            ULONGLONG waitAgo = 0;
+            if (geometryChanged && ResolutionWaitExpiredFor(ctx->width, ctx->height, &waitAgo))
+                // OUR OWN LATE MODE, NOT SOMEBODY ELSE'S OPEN DEFECT. SetVideoModeExact asked for
+                // exactly these dimensions, its wait expired, and it returned having applied
+                // nothing - giving up cancels nothing, so the mode went live afterwards and this is
+                // where we find out. Reporting that as the P2's trigger sends maintainers after a
+                // capture freeze for an event we caused; Jev: misattribution_is_a_real_harm 0.86.
+                // INFO, because nothing is wrong with the capture here - the geometry moved for a
+                // reason we know - while the WAIT that expired is already a WARNING of its own, so
+                // the anomaly is still reported exactly once, at the place that owns it.
+                // WHY THE WAIT EXPIRED IS UNRESOLVED (Jev: root_cause insufficient-evidence 0.70,
+                // chain_established 0.24) and this line does not pretend otherwise.
+                LogInfo("RecreateDuplication: the %ux%u mode this agent gave up waiting for %I64u ms ago has gone live, and the "
+                    L"duplication adopted it in place after %u attempt(s) - windows kept. This geometry change is OURS: see the "
+                    L"RESKEEP deadline line above. NOT the P2 resolution-change trigger.",
+                    ctx->width, ctx->height, waitAgo, attempt + 1);
+            else if (geometryChanged)
                 LogError("duplication recreated in place after %u attempt(s) - windows kept - BUT THE GEOMETRY CHANGED, "
                     L"which is the resolution-change trigger the open P2 (win11-24H2 resolution-change capture freeze) "
                     L"says this same path reports as recovered while the pixels stay stale: recovery returning true does "
