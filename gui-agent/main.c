@@ -7219,23 +7219,36 @@ static void DismissHiddenStartSurface(IN HWND start)
         StartDismissCheckStuck(start, fgPid);   // closing, or - after the settle time - stuck (once, LOUDLY)
         return;
     }
-    INPUT in[2];
-    ZeroMemory(in, sizeof(in));
-    in[0].type = INPUT_KEYBOARD;
-    in[0].ki.wVk = VK_ESCAPE;
-    in[1].type = INPUT_KEYBOARD;
-    in[1].ki.wVk = VK_ESCAPE;
-    in[1].ki.dwFlags = KEYEVENTF_KEYUP;
-    UINT sent = SendInput(2, in, sizeof(INPUT));
+    // TARGETED, NEVER GLOBAL. This used to be SendInput(VK_ESCAPE), which injects into the SYSTEM
+    // input queue: the guard above reads the foreground BEFORE the call, and the keystroke is
+    // delivered to whatever holds the foreground when it is DEQUEUED. The guard therefore
+    // constrains the check and not the delivery, so our Escape could land in another process's
+    // window - and the one process guaranteed to be competing for the foreground on the very key
+    // press that opens Start is a third-party menu like Open-Shell, which is exactly the
+    // configuration this defect was reported from (service.enableWinKey 1, Open-Shell user).
+    // MEASURED SHAPE, recorded and then wrongly dismissed at p=0.22: on 4.3.35, Open-Shell's menu
+    // closed itself 6-15 ms after taking the foreground in 3 of 57 Win presses, against 0 of 36 on
+    // 4.3.34 - and 6-15 ms is the latency of an injected keystroke being dequeued, not a
+    // coincidence. Jev on the mechanism alone, independent of any field report: race_is_real 0.96.
+    // Owner, 2026-10-08: "the reproduction is never source of truth" - so this is fixed as a CLASS,
+    // by making misdelivery impossible, rather than by demonstrating a symptom on a rig.
+    // PostMessage goes to THAT WINDOW's queue and nowhere else. If the Start surface ignores it,
+    // nothing else is affected and the existing stuck-check says so LOUDLY after the settle time -
+    // and there is deliberately NO fallback to a global inject, because a fallback here is the bug.
+    BOOL posted = PostMessage(start, WM_KEYDOWN, VK_ESCAPE, 0x00010001)
+               && PostMessage(start, WM_KEYUP, VK_ESCAPE, (LPARAM)0xC0010001);
+    UINT sent = posted ? 2 : 0;
     g_StartDismissSent = TRUE;
     g_StartDismissSentAt = GetTickCount64();
     g_StartDismissStuckLogged = FALSE;
     if (sent == 2)
         LogInfo("QGASTARTDISMISS 0x%x: the Windows Start menu opened in seamless mode, where it is never shown (SeamlessStart=0) - "
-            "closed it with Escape so no invisible window takes input (foreground pid %lu)", start, fgPid);
+            "posted Escape TO THAT WINDOW so no invisible window takes input, and no other process can receive it (foreground pid %lu)",
+            start, fgPid);
     else
-        LogError("QGASTARTDISMISS 0x%x: SendInput(Escape) sent %u of 2 events (0x%x) - the hidden Start menu may stay open and take clicks",
-            start, sent, GetLastError());
+        LogError("QGASTARTDISMISS 0x%x: PostMessage(Escape) to the Start surface failed (0x%x) - the hidden Start menu may stay open and "
+            L"take clicks. NOT retried with a global inject: that could close another process's menu, which is the defect this replaced",
+            start, GetLastError());
     if (!g_StartDismissNotified)
     {
         g_StartDismissNotified = TRUE;
