@@ -49,6 +49,15 @@ volatile LONG g_CaptureThreadEnable = 0;
 // moment before leaving it to the process exit (docs/DESIGN-rest-zero-capture.md S4).
 static volatile BOOL g_CaptureExiting = FALSE;
 
+// HOW MANY IN-PLACE DUPLICATION RECOVERIES THIS PROCESS HAS DONE, and the rate above which one is
+// reported. An input-desktop switch (UAC prompt, lock screen, logon) loses the duplication and the
+// recovery keeps the windows, so a handful per process is the system working; the thing worth a
+// warning is the RATE, not the event. MEASURED on win11r-logvol 2026-10-08 over a whole day's agent
+// log: 10 recoveries in total, never more than 2 in any one agent process. 4 is double the highest
+// observed, and the margin is written down here rather than tuned until a run passes.
+#define QGA_DUP_RECREATE_WARN_AT 4u
+static ULONG g_DupRecreateCount = 0;
+
 // WHO CLEARS THE FLAG. A dead capture thread under a live capture pointer freezes dom0's desktop
 // while every log line says the agent is healthy, and the flag is the only thing that says the
 // thread left. There are four assignment sites and the log never said which one ran, so the
@@ -619,15 +628,44 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                     L"says this same path reports as recovered while the pixels stay stale: recovery returning true does "
                     L"NOT establish that the frames are fresh", attempt + 1);
             else
-                // WARNING, not Info, for the benign case too. Info would have put it below the
-                // level anything watches, so a RISE - the input-desktop flip starting to happen
-                // fifty times a boot instead of once - would have become invisible, and that is a
-                // loss of signal rather than a removal of noise. One line per recovery at WARNING
-                // keeps the rate visible while removing the four ERRORs and the FormatMessage
-                // fiction about a keyed mutex. NOTHING in this change is quieter than a warning.
-                LogWarning("duplication recreated in place after %u attempt(s) - windows kept (0x887a0026 "
-                    L"DXGI_ERROR_ACCESS_LOST at an input-desktop switch, geometry unchanged - the documented "
-                    L"stale-duplication signal, recovered in place)", attempt + 1);
+            {
+                // COUNTED, NOT REPEATED. The previous note here kept this at WARNING because Info
+                // "would have put it below the level anything watches, so a RISE - the input-desktop
+                // flip starting to happen fifty times a boot instead of once - would have become
+                // invisible". That reasoning was right about the SIGNAL and wrong about the VEHICLE:
+                // a per-occurrence warning is not how you watch a rate, a count is. Owner,
+                // 2026-10-08: "should we count and report on threshold instead of reporting every
+                // line?" - and for our own components, "no warnings on normal operation. warning
+                // means something is not quite normal, yet workable."
+                // MEASURED on win11r-logvol the same day, over a whole day's agent log: 10 of these
+                // in total, 9 benign and 1 geometry-changed, at roughly ONE PER AGENT INSTANCE and
+                // never more than 2 in any one instance. An input-desktop switch (UAC prompt, lock
+                // screen, logon) is ordinary, and recovering from it with the windows kept is the
+                // system working.
+                // So: the FIRST one in this process says so once at INFO, the rest are DEBUG detail,
+                // and crossing the threshold raises ONE warning that names the count - which is the
+                // rise the old note wanted to keep, reported as a rate instead of as noise. The
+                // threshold is 4: double the highest number ever observed in one instance, and the
+                // margin is stated here rather than tuned until it passes.
+                // The geometry-changed branch above is untouched and stays an ERROR per occurrence:
+                // it is the trigger of an open P2 and one of them matters.
+                g_DupRecreateCount++;
+                if (g_DupRecreateCount == 1)
+                    LogInfo("QGADDARECREATE duplication recreated in place after %u attempt(s) - windows kept "
+                        L"(0x887a0026 DXGI_ERROR_ACCESS_LOST at an input-desktop switch, geometry unchanged - "
+                        L"the documented stale-duplication signal, recovered in place). Further recoveries in "
+                        L"this process are logged at DEBUG; a warning follows if they exceed %u.",
+                        attempt + 1, (ULONG)QGA_DUP_RECREATE_WARN_AT);
+                else
+                    LogDebug("QGADDARECREATE duplication recreated in place after %u attempt(s) - windows kept "
+                        L"(n=%u in this process)", attempt + 1, g_DupRecreateCount);
+                if (g_DupRecreateCount == QGA_DUP_RECREATE_WARN_AT + 1)
+                    LogWarning("QGADDARECREATERATE the desktop duplication has been recreated %u times in this "
+                        L"agent process, above the expected %u - an input-desktop switch recovers in place and is "
+                        L"ordinary, but this rate is not: something is flipping the input desktop, or the "
+                        L"duplication is being lost for another reason. Each recovery is in the DEBUG log.",
+                        g_DupRecreateCount, (ULONG)QGA_DUP_RECREATE_WARN_AT);
+            }
             M0BlinkMark(L"recreate-done", attempt + 1);
             return TRUE;
         }
