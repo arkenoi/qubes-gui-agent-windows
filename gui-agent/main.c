@@ -3492,8 +3492,32 @@ static void BrokerSupervise(void)
     // fallback stays quiet ONLY when the operator asked for it.
     #define DESLICE_FIRST_WARN_MS 30000
     #define DESLICE_REWARN_MS 120000
+    // NOT WHILE THE INPUT DESKTOP IS SECURE. Nothing can be captured then - this agent freezes the
+    // frame path for exactly that reason - so a broker that is not running is not a fault, it is
+    // the consequence of a guest sitting at the sign-in or lock screen, and QGADESKSTUCK is already
+    // reporting THAT. Two dom0 notifications for one situation, saying different things, is the
+    // no-double-notification rule broken by our own two halves again.
+    // FIELD-REPORTED by GWeck on 4.3.35 (forum 42717 post 175, screenshot): his VM start showed BOTH
+    // "The guest is waiting at the sign-in or lock screen" AND "The notification and menu capture
+    // helper is not running - wgcbroker.exe is installed but has not been running for over 30 s on a
+    // system that needs it", in the same stack of notifications, on the same guest, about the same
+    // 30 seconds. Only the first is actionable. Jev, asked which of his unaddressed items to work
+    // first: i1-i2-helpers-not-running 0.72, and whether they report REAL faults: 0.66 - the real
+    // fault is the one QGADESKSTUCK names, and this one is its shadow.
+    // The clock is NOT reset: g_BrokerDownSince keeps running, so the moment the desktop is Default
+    // again a broker that is genuinely down is reported with its true duration, not a fresh one.
     if (!g_BrokerDownSince) { g_BrokerDownSince = now; g_BrokerNextWarn = now + DESLICE_FIRST_WARN_MS; }
-    if (now >= g_BrokerNextWarn)
+    // SKIP THE REPORT, NOT THE REST OF THE FUNCTION. An early return here would also skip the launch
+    // block below, and a secure desktop can be a passing UAC prompt on a guest whose shell is up -
+    // so the broker would stop being started for a reason that has nothing to do with it. (The
+    // launch block has its own GetShellWindow() guard, which is the condition that actually matters.)
+    if (g_OnSecureDesktop)
+    {
+        LogDebug("QGADESLICEDOWN not reported: the input desktop is secure, so nothing can capture "
+            L"and the broker cannot run - QGADESKSTUCK owns this condition (down %I64u s so far)",
+            (now - g_BrokerDownSince) / 1000);
+    }
+    else if (now >= g_BrokerNextWarn)
     {
         g_BrokerNextWarn = now + DESLICE_REWARN_MS;
         // Name the cause: a MISSING binary is the packaging gap (wgcbroker.exe not shipped);
