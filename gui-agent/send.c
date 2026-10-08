@@ -789,7 +789,10 @@ ULONG SendWindowUnmap(IN HWND window)
     if (!g_VchanClientConnected)
         return ERROR_SUCCESS;
 
-    LogInfo("Unmapping window 0x%x", window);
+    // ROUTINE: every window close. At DEBUG since 2026-10-08 (owner: "ok for debug but not for
+    // regular operation"). The MAP/UNMAP the daemon acts on is the protocol message below, not this
+    // line, and a failure to send it is still reported by the caller.
+    LogDebug("Unmapping window 0x%x", window);
 
     header.type = MSG_UNMAP;
 #pragma warning(suppress:4311)
@@ -812,8 +815,11 @@ ULONG SendWindowMap(IN const WINDOW_DATA *windowData OPTIONAL)
     if (!g_VchanClientConnected)
         return ERROR_SUCCESS;
 
+    // ROUTINE: every window open. At DEBUG since 2026-10-08 - this was the line that made an
+    // ordinary desktop session log per window. The desktop-window map stays at INFO: it happens
+    // once per non-seamless entry, not per window, and it is a mode change worth seeing.
     if (windowData)
-        LogInfo("Mapping window 0x%x", windowData->Handle);
+        LogDebug("Mapping window 0x%x", windowData->Handle);
     else
         LogInfo("Mapping desktop window");
 

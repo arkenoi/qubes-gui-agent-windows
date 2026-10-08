@@ -1070,6 +1070,14 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
     UNREFERENCED_PARAMETER(param);
     LogDebug("start");
     LogInfo("QGATHREAD role=hooks tid=%lu", GetCurrentThreadId());   // M1 instrument (restwatch's per-thread join)
+    // ROUTINE PER-WINDOW DETAIL IS AT DEBUG, not INFO (owner 2026-10-08: "ok for debug but not for
+    // regular operation"). Opening a window used to write several INFO lines - the broker slot it
+    // was given, that slot being kept, its slice-fed map, a deferred map, a caption helper - so an
+    // ordinary desktop session wrote lines per window per event. ANOMALIES KEEP THEIR LEVEL:
+    // QGABROKERDIED/HUNG/DIMS, QGAZERORECT, QGATOASTGAP, ZORDERINVALID and every error path. This
+    // line says so once, so a reader who expects the detail knows where it went: raise the level
+    // with guest/set-loglevel.ps1.
+    LogInfo("QGALOGPOLICY routine per-window detail is at DEBUG; raise LogLevel to see it");
     QgaNameThread(L"gui-agent: hooks");
 
     waitFor[0] = g_WindowEventStop;
@@ -4410,7 +4418,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     if (g_WgcCtl) SetEvent(g_WgcCtl);
     // At Info, with a tick: the gap from here to QGASLICECONTENT is the broker's first-frame
     // latency, which is what menu latency reduces to once nothing maps unpainted (2026-09-11).
-    LogInfo("QGABROKERREG hwnd=0x%x slot=%d %ux%u buf=%llu t=%llu",
+    LogDebug("QGABROKERREG hwnd=0x%x slot=%d %ux%u buf=%llu t=%llu",
             (DWORD)(ULONG_PTR)entry->Handle, slot,
             entry->Width, entry->Height, one, (ULONGLONG)GetTickCount64());
     return TRUE;
@@ -4559,7 +4567,7 @@ BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
     entry->PwDimsLogged = FALSE;   // re-arm the one-shot dims diagnostic for the new geometry
     entry->PwDimsSince = 0;
     entry->PwDimsStuck = FALSE;
-    LogInfo("QGABROKERKEEP hwnd=0x%x slot=%d %ux%u t=%llu (slot kept, session not recreated)",
+    LogDebug("QGABROKERKEEP hwnd=0x%x slot=%d %ux%u t=%llu (slot kept, session not recreated)",
             (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
             entry->Width, entry->Height, (ULONGLONG)GetTickCount64());
     return TRUE;
@@ -4760,7 +4768,7 @@ static void PwNoteSliceFedMap(IN OUT WINDOW_DATA* entry)
     // painted=0 with held_ms >= CROP_BEFORE_SHOW_TIMEOUT_MS is the bounded fail-open release
     // (mapped unpainted because nothing painted in time - the QGASLICEBLACK line before it
     // says a copy did land). held_ms=-1: the map was never deferred.
-    LogInfo("QGASLICEMAP hwnd=0x%x t=%llu content=%llu lead_ms=%lld painted=%d held_ms=%lld hold=%d",
+    LogDebug("QGASLICEMAP hwnd=0x%x t=%llu content=%llu lead_ms=%lld painted=%d held_ms=%lld hold=%d",
         (DWORD)(ULONG_PTR)entry->Handle, entry->PwSliceMapTick, entry->PwSliceContentTick,
         entry->PwSliceContentTick != 0 ?
             (LONGLONG)(entry->PwSliceMapTick - entry->PwSliceContentTick) : (LONGLONG)-1,
@@ -5206,7 +5214,7 @@ static void RestyleGuestCaption(IN WINDOW_DATA* entry, IN BOOL hide)
     entry->CaptionWasStripped = hide;   // only a real strip is restorable
     if (hide) CapStripRemember(entry->Handle);
     else      CapStripForget(entry->Handle);
-    LogInfo("0x%x: caption %s helper launched as the window's owner (inset %d)",
+    LogDebug("0x%x: caption %s helper launched as the window's owner (inset %d)",
         entry->Handle, hide ? L"strip" : L"restore", topInset);
 }
 
@@ -5430,7 +5438,7 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             // grows to its final one, the defer-time lookup necessarily misses and the window
             // waits for its own layout to settle - which would be the guest's time, not ours.
             // This line is what tells those two apart instead of guessing (2026-09-11).
-            LogInfo("QGAHELDDEFER hwnd=0x%x class=%s w=%u h=%u t=%llu slicefed=%d brokerslot=%d",
+            LogDebug("QGAHELDDEFER hwnd=0x%x class=%s w=%u h=%u t=%llu slicefed=%d brokerslot=%d",
                 (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height,
                 (ULONGLONG)entry->MapDeferSince, entry->PwSliceFed ? 1 : 0, entry->PwBrokerSlot);
             // Wake guarantee: arm the main loop so the CROP_BEFORE_SHOW_TIMEOUT_MS bound
@@ -8275,7 +8283,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 if (!windowData->PwDirectWaitLogged)
                 {
                     windowData->PwDirectWaitLogged = TRUE;
-                    LogInfo("QGADIRECTWAIT hwnd 0x%x (class %s, %ux%u) held: no painted frame yet "
+                    LogDebug("QGADIRECTWAIT hwnd 0x%x (class %s, %ux%u) held: no painted frame yet "
                         L"(brokerState=%d windowEligibleFor=%llu ms). This is the DEFINED young "
                         L"state, not a fault - the window is withheld rather than shown black, and "
                         L"maps as soon as its first painted frame arrives. If it never arrives, "
@@ -8391,7 +8399,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // reason=timeout means CROP_BEFORE_SHOW_TIMEOUT_MS expired and it mapped UNCROPPED.
                 // A rising share of timeout= is the regression to watch, and held_ms is the number
                 // any menu-latency work has to move.
-                LogInfo("QGAHELDMAP hwnd=0x%x class=%s w=%u h=%u held_ms=%llu reason=%s menu=%d toast=%d",
+                LogDebug("QGAHELDMAP hwnd=0x%x class=%s w=%u h=%u held_ms=%llu reason=%s menu=%d toast=%d",
                     (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
                     windowData->Width, windowData->Height,
                     (ULONGLONG)(GetTickCount64() - windowData->MapDeferSince),
@@ -9032,7 +9040,7 @@ static void PwNoteSliceContent(IN OUT WINDOW_DATA* entry)
         return;
     }
     entry->PwSliceContentTick = GetTickCount64();
-    LogInfo("QGASLICECONTENT hwnd=0x%x t=%llu map=%llu flash_ms=%lld nonblack=%lu/%lu hold=%d",
+    LogDebug("QGASLICECONTENT hwnd=0x%x t=%llu map=%llu flash_ms=%lld nonblack=%lu/%lu hold=%d",
         (DWORD)(ULONG_PTR)entry->Handle, entry->PwSliceContentTick, entry->PwSliceMapTick,
         entry->PwSliceMapTick != 0 ?
             (LONGLONG)(entry->PwSliceContentTick - entry->PwSliceMapTick) : (LONGLONG)-1,
@@ -10012,7 +10020,7 @@ static void PwLedgerAccount(IN OUT WINDOW_DATA* entry)
 void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason)
 {
     if (!entry || !entry->PwLedgerFramesSeen) return;
-    LogInfo("QGALEDGER\thwnd=0x%x\tclass=%d\treason=%S\tseen=%llu\tbrokerWgc=%llu\tbrokerPw=%llu"
+    LogDebug("QGALEDGER\thwnd=0x%x\tclass=%d\treason=%S\tseen=%llu\tbrokerWgc=%llu\tbrokerPw=%llu"
             "\tddaSlice=%llu\tddaOwned=%llu\tdragSlice=%llu"
             "\tsynth=%llu\tnone=%llu\tcopies=%llu\tengineFed=%d\tengineDamageTotal=%lld"
             "\tunattributed=%llu",
@@ -10069,7 +10077,7 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
         }
         if (firstBrokerFrame)
         {
-            LogInfo("BROKERFRAME first WGC frame consumed hwnd 0x%x slot %d %ux%u",
+            LogDebug("BROKERFRAME first WGC frame consumed hwnd 0x%x slot %d %ux%u",
                     (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
                     entry->PwWidth, entry->PwHeight);
             // ATTRIBUTION (ABI 2). Split this window's first-content latency into
