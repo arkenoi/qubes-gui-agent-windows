@@ -23,6 +23,7 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <tlhelp32.h>   // ProcessRunningByName: classify WHICH secure desktop we are stuck on
 #include <winsock2.h>
 #include <dwmapi.h>
 #include <Psapi.h>
@@ -3291,6 +3292,32 @@ static BOOL g_WgcBrokerHung = FALSE;
 // it has not acknowledged within WGCBRK_ACK_DEADLINE_MS (R1/R4). No heartbeat is read or written.
 static ULONGLONG g_BrokerReadyAt = 0;   // tick the current instance became ready: its run time in a death record
 static BOOL g_WgcLaunched = FALSE;      // the ONE launch this agent performs (HELPER LIFECYCLE above)
+// IS A PROCESS WITH THIS IMAGE NAME RUNNING? Used only to classify a SECURE DESKTOP we are stuck on
+// (owner, 2026-10-08: "if it sits on the uac prompt we need to know what path brought us there and
+// how to handle it properly"), because the desktop NAME is "Winlogon" for the sign-in screen, the
+// lock screen AND a UAC prompt alike, and those need different answers.
+// Called at most once per QGADESKSTUCK re-warn interval, so the snapshot cost is irrelevant; a
+// failure to snapshot returns FALSE, which degrades the message to "unclassified" rather than
+// asserting something it did not observe.
+static BOOL ProcessRunningByName(IN const WCHAR* imageName)
+{
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return FALSE;
+    PROCESSENTRY32W pe;
+    ZeroMemory(&pe, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    BOOL found = FALSE;
+    if (Process32FirstW(snap, &pe))
+    {
+        do {
+            if (_wcsicmp(pe.szExeFile, imageName) == 0) { found = TRUE; break; }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+    return found;
+}
+
 static void BrokerSupervise(void)
 {
     if (!g_WgcBroker || g_OsBuild < 26100 || !PwEnabled()) return;
@@ -10392,14 +10419,59 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         StringCchCopy(desktopName, RTL_NUMBER_OF(desktopName), L"?");
                 }
 
+                // WHICH PATH PUT US HERE. Owner, 2026-10-08: "if it sits on the uac prompt we need
+                // to know what path brought us there and how to handle it properly." The desktop
+                // NAME cannot tell them apart - a sign-in screen, a lock screen and a UAC prompt on
+                // the secure desktop are all "Winlogon" - and they need different answers:
+                //   consent.exe present -> A UAC PROMPT IS ON THE SECURE DESKTOP, which this agent
+                //     explicitly prevents (QGAUAC writes PromptOnSecureDesktop=0). If we are here
+                //     with consent.exe up, that setting was NOT honoured - a policy in the template
+                //     or an admin-approval-mode variant overrode it - and that is OUR defect to
+                //     report, not a sign-in screen to advise about. The current value is read back
+                //     and printed so the next reader does not have to guess which it was.
+                //   LogonUI.exe with a console user -> the session is LOCKED.
+                //   LogonUI.exe with no console user -> the SIGN-IN screen (autologon did not run).
+                const WCHAR* path = L"unclassified";
+                BOOL consent = ProcessRunningByName(L"consent.exe");
+                BOOL logonui = ProcessRunningByName(L"LogonUI.exe");
+                DWORD promptOnSecure = 0xFFFFFFFF;
+                {
+                    HKEY k;
+                    if (!RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+                            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                            0, KEY_READ, &k))
+                    {
+                        DWORD v = 0, cb = sizeof(v), type = 0;
+                        if (!RegQueryValueEx(k, L"PromptOnSecureDesktop", NULL, &type, (BYTE*)&v, &cb)
+                            && type == REG_DWORD)
+                            promptOnSecure = v;
+                        RegCloseKey(k);
+                    }
+                }
+                if (consent)
+                    path = L"a UAC consent prompt is on the SECURE desktop, which PromptOnSecureDesktop=0 is supposed to prevent";
+                else if (logonui)
+                    path = L"LogonUI is up: the sign-in or lock screen";
                 LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s - dom0 is being shown "
-                    L"NOTHING and will keep seeing nothing until this desktop goes away. A few seconds "
+                    L"NOTHING and will keep seeing nothing until this desktop goes away. PATH: %s "
+                    L"(consent.exe=%d LogonUI.exe=%d PromptOnSecureDesktop=%s). A few seconds "
                     L"of this at boot is normal (autologon). Persisting means the guest is waiting at "
                     L"the Windows sign-in or lock screen, which is not shown in SEAMLESS mode: arm "
                     L"autologon in the guest, or switch this qube to the windowed desktop "
                     L"(qvm-features <vm> service.gui-fullscreen 1, then qubes.SetGuiMode FULLSCREEN) "
                     L"where the sign-in screen IS shown inside the bounded window.",
-                    desktopName, (now - s_SecureSince) / 1000);
+                    desktopName, (now - s_SecureSince) / 1000, path, (int)consent, (int)logonui,
+                    promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"));
+                // A UAC PROMPT HERE IS A DEFECT OF OURS AND SAYS SO, SEPARATELY AND LOUDLY. It is
+                // not the sign-in screen the notification below describes, and telling the user to
+                // "arm autologon" would be wrong advice for it.
+                if (consent)
+                    LogError("QGAUACSECURE a UAC consent prompt is on the SECURE desktop while "
+                        L"PromptOnSecureDesktop=%s - this agent sets that value to 0 at start precisely so "
+                        L"elevation prompts are ordinary windows dom0 can show. Something is overriding it "
+                        L"(a template policy, or admin-approval-mode), so the prompt is invisible in seamless "
+                        L"mode and the guest cannot be answered. See QGAUAC for what this agent wrote.",
+                        promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"));
                 // Secondary route (ACTION: dom0 sees nothing and only a human can change that).
                 // This is the case the route is best at - a guest with zero windows and a live
                 // qrexec - so the notification is exactly what the log line cannot be: seen.
