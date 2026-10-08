@@ -3292,30 +3292,38 @@ static BOOL g_WgcBrokerHung = FALSE;
 // it has not acknowledged within WGCBRK_ACK_DEADLINE_MS (R1/R4). No heartbeat is read or written.
 static ULONGLONG g_BrokerReadyAt = 0;   // tick the current instance became ready: its run time in a death record
 static BOOL g_WgcLaunched = FALSE;      // the ONE launch this agent performs (HELPER LIFECYCLE above)
-// IS A PROCESS WITH THIS IMAGE NAME RUNNING? Used only to classify a SECURE DESKTOP we are stuck on
-// (owner, 2026-10-08: "if it sits on the uac prompt we need to know what path brought us there and
-// how to handle it properly"), because the desktop NAME is "Winlogon" for the sign-in screen, the
-// lock screen AND a UAC prompt alike, and those need different answers.
-// Called at most once per QGADESKSTUCK re-warn interval, so the snapshot cost is irrelevant; a
-// failure to snapshot returns FALSE, which degrades the message to "unclassified" rather than
-// asserting something it did not observe.
-static BOOL ProcessRunningByName(IN const WCHAR* imageName)
+// THE PID OF A PROCESS WITH THIS IMAGE NAME, or 0. Two callers, both about UAC:
+//   - classifying a SECURE DESKTOP we are stuck on (owner, 2026-10-08: "if it sits on the uac
+//     prompt we need to know what path brought us there and how to handle it properly"), because
+//     the desktop NAME is "Winlogon" for the sign-in screen, the lock screen AND a UAC prompt
+//     alike, and those need different answers (docs/ADR-uac.md section 5);
+//   - finding the windows of a consent prompt Windows did not raise (section 7), which needs the
+//     pid and not merely the fact.
+// A failure to snapshot returns 0, which degrades a message to "unclassified" rather than asserting
+// something it did not observe. Called at most once per QGADESKSTUCK re-warn interval, and once per
+// resync while a UAC stand-in window exists - never at rest.
+static DWORD ProcessPidByName(IN const WCHAR* imageName)
 {
     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
     if (snap == INVALID_HANDLE_VALUE)
-        return FALSE;
+        return 0;
     PROCESSENTRY32W pe;
     ZeroMemory(&pe, sizeof(pe));
     pe.dwSize = sizeof(pe);
-    BOOL found = FALSE;
+    DWORD pid = 0;
     if (Process32FirstW(snap, &pe))
     {
         do {
-            if (_wcsicmp(pe.szExeFile, imageName) == 0) { found = TRUE; break; }
+            if (_wcsicmp(pe.szExeFile, imageName) == 0) { pid = pe.th32ProcessID; break; }
         } while (Process32NextW(snap, &pe));
     }
     CloseHandle(snap);
-    return found;
+    return pid;
+}
+
+static BOOL ProcessRunningByName(IN const WCHAR* imageName)
+{
+    return ProcessPidByName(imageName) != 0;
 }
 
 static void BrokerSupervise(void)
@@ -6503,6 +6511,143 @@ static void EnsureOnInputDesktop(void)
 // This is the resync path: the watched list is normally maintained from window
 // events instead (see TrackWindows).
 // watched windows critical section must be entered
+// A UAC PROMPT WINDOWS DID NOT RAISE - docs/ADR-uac.md section 7.
+//
+// The agent writes PromptOnSecureDesktop=0 (QGAUAC, section 1) so consent is an ordinary window on
+// THIS desktop, and in the usual case that is the end of it: the prompt is tracked, bordered by
+// dom0 and answerable (owner-verified 2026-08-27). But when the program asking for rights is not
+// the one in front, Windows does not steal focus. It creates the contentless, often zero-sized
+// stand-in of class UAC_DUMMY_WINDOW_CLASS whose only job is to own a flashing taskbar button, and
+// leaves the real prompt unraised.
+//
+// GetWindowData hides that stand-in, which is RIGHT - mapped into dom0 it is an empty box, not a
+// prompt (section 6; Jev 0.92) - and sets g_ShowTaskbar so the button can be clicked. The taskbar
+// block below maps a taskbar that EXISTS: `if (g_TaskbarWindow)`, and g_TaskbarWindow is
+// FindWindow("Shell_TrayWnd", 0). BEFORE THE SHELL IS UP THERE IS NO TASKBAR, so during startup the
+// prompt is there, it blocks the program that asked, and nothing anywhere leads a user to it. The
+// register has carried that as an open P2 since 2026-08-28 ("UAC visibility is declared future
+// work") - it is not a regression (Jev never-closed 1.00); Jev on the mechanism:
+// placeholder-hidden-no-taskbar 0.69 at confidence 0.63, and on the handling:
+// map-the-real-consent-window 0.99 over four alternatives.
+//
+// So go to the prompt instead of to the taskbar. consent.exe's own top-level windows are on this
+// desktop, and whether Windows raised them says nothing about whether WE can announce them. Each is
+// put through the ORDINARY gate - ShouldAcceptWindow, so the Mode-1 boot/logon phase guard, the
+// override-redirect rule and the geometry rules all stay in force, and a fullscreen dimming
+// backdrop stays denied exactly as before. NOTHING IS ACTIVATED, CLICKED OR ANSWERED (section 8):
+// the user is given a window, the decision stays theirs.
+#define UAC_PENDING_GRACE_MS 6000   // consent.exe may still be creating its window; re-checked each resync
+
+typedef struct {
+    DWORD Pid;
+    UINT Seen;        // top-level windows of that pid, the stand-in excluded
+    UINT Announced;   // of those, in the watched list once this pass is done
+} UAC_CONSENT_SCAN;
+
+static BOOL CALLBACK UacConsentScanProc(HWND window, LPARAM param)
+{
+    UAC_CONSENT_SCAN* scan = (UAC_CONSENT_SCAN*)param;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    if (pid != scan->Pid)
+        return TRUE;
+
+    WCHAR cls[256] = { 0 };
+    GetClassName(window, cls, RTL_NUMBER_OF(cls));
+    if (0 == wcscmp(cls, UAC_DUMMY_WINDOW_CLASS))
+        return TRUE;   // the stand-in itself stays hidden - section 6
+
+    scan->Seen++;
+    if (FindWindowByHandle(window))
+    {
+        scan->Announced++;   // already tracked: Windows raised it, or an earlier pass did this
+        return TRUE;
+    }
+
+    // Not tracked. Interrogate it now and announce it if the gate accepts it - the same pattern the
+    // taskbar block below uses. The reject cache is evicted first: a signature cached while the
+    // prompt was unraised would keep it out, and the cheap signature does not change when Windows
+    // finally shows it.
+    EvictRejectedWindow(window);
+    WINDOW_DATA* data = NULL;
+    if (ERROR_SUCCESS != GetWindowData(window, &data) || !data)
+        return TRUE;
+    if (!ShouldAcceptWindow(data))
+    {
+        LogDebug("QGAUACPENDING 0x%x: consent window not acceptable (class %s, %ux%u, visible %d, "
+            L"iconic %d)", window, data->Class, data->Width, data->Height,
+            data->IsVisible ? 1 : 0, data->IsIconic ? 1 : 0);
+        free(data);
+        return TRUE;
+    }
+    // Copy what the log needs BEFORE AddWindow: it takes ownership and some paths free the entry.
+    WCHAR accepted[256];
+    StringCchCopy(accepted, RTL_NUMBER_OF(accepted), data->Class);
+    const UINT w = data->Width, h = data->Height;
+    if (ERROR_SUCCESS == AddWindow(data))
+    {
+        scan->Announced++;
+        LogWarning("QGAUACPENDING announced a consent window Windows did not raise (0x%x, class %s, "
+            L"%ux%u): a Windows permission prompt is waiting for an answer. It was reachable only "
+            L"through a taskbar button before this.", window, accepted, w, h);
+    }
+    return TRUE;
+}
+
+// Called from AddAllWindows while g_ShowTaskbar is set - which happens only when a UAC stand-in was
+// interrogated in that pass - so this costs nothing at rest and arms no timer.
+static void UacPendingPromptEnsureVisible(void)
+{
+    static ULONGLONG s_StandInSince = 0;
+    static BOOL s_Reported = FALSE;
+
+    const ULONGLONG now = GetTickCount64();
+    const DWORD pid = ProcessPidByName(L"consent.exe");
+    if (!pid)
+    {
+        // A stand-in with no consent process is a leftover: there is no prompt, so nothing is
+        // stuck and nothing is announced. findings/autologon.md records the inverse trap too - a
+        // RUNNING consent.exe is not by itself evidence that a prompt is shown.
+        if (s_StandInSince)
+            LogDebug("QGAUACPENDING a UAC stand-in window is present with no consent.exe running - "
+                L"a stale placeholder, nothing to announce");
+        s_StandInSince = 0;
+        s_Reported = FALSE;
+        return;
+    }
+    if (!s_StandInSince)
+        s_StandInSince = now;
+
+    UAC_CONSENT_SCAN scan = { 0 };
+    scan.Pid = pid;
+    EnumWindows(UacConsentScanProc, (LPARAM)&scan);
+
+    if (scan.Announced)
+    {
+        s_Reported = FALSE;   // reachable: a later prompt that is not may still report
+        return;
+    }
+    if (now - s_StandInSince < UAC_PENDING_GRACE_MS)
+        return;               // too early to call it stuck; the next resync re-checks
+    if (s_Reported)
+        return;               // once per stuck prompt, not once per resync
+
+    // NOTHING TO SHOW. The prompt exists - consent.exe is running and a stand-in was interrogated
+    // in this pass - and dom0 can be given no window for it. Say so loudly, with the two facts that
+    // decide what the user can do: the taskbar button Windows expects to be clicked does not exist
+    // without a shell.
+    s_Reported = TRUE;
+    LogError("QGAUACPENDING a Windows permission prompt has been waiting %I64u s and dom0 can be "
+        L"shown no window for it: consent.exe (pid %lu) owns %u top-level window(s), none of them "
+        L"announceable, and the stand-in window Windows offers instead carries no prompt. The "
+        L"program that asked for administrator rights stays blocked until this is answered. "
+        L"shell=%d taskbar=%d - the taskbar button Windows expects to be clicked does not exist "
+        L"without a shell. Switch this qube to the windowed desktop to answer it.",
+        (now - s_StandInSince) / 1000, pid, scan.Seen,
+        GetShellWindow() ? 1 : 0, g_TaskbarWindow ? 1 : 0);
+    QerrReportText(QerrTextFind("uac-pending"), NULL, NULL);
+}
+
 static ULONG AddAllWindows(IN OUT UINT* interrogated)
 {
     ADD_WINDOWS_CONTEXT context = { 0 };
@@ -6688,6 +6833,13 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
     }
 
     *interrogated += context.Interrogated;
+
+    // docs/ADR-uac.md section 7. g_ShowTaskbar is set by exactly one site - the UAC stand-in branch
+    // in GetWindowData - so this runs only when a prompt Windows did not raise exists, and never at
+    // rest. It is placed BEFORE the taskbar block on purpose: that block's own `goto end` on an
+    // already-tracked taskbar would otherwise skip it.
+    if (g_ShowTaskbar)
+        UacPendingPromptEnsureVisible();
 
     if (g_TaskbarWindow)
     {

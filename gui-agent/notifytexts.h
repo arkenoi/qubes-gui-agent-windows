@@ -106,6 +106,16 @@ static const QerrText QerrTexts[] = {
       "Cause: a secure desktop has been up for over 30 s, and seamless mode never maps one (log line QGADESKSTUCK).",
       QERR_GUI_AGENT_LOG ", line QGADESKSTUCK", NULL },
 
+    /* docs/ADR-uac.md section 7. Windows parks an elevation prompt it did not raise behind a
+     * flashing taskbar button, and the agent maps a taskbar only once the shell exists - so during
+     * startup the prompt blocks the program that asked and nothing leads the user to it. ACTION:
+     * only a human can answer a consent prompt, and nothing in the guest will resolve it. */
+    { "uac-pending", "gui-agent", "uac-pending", QERR_SEV_ACTION, "gui-agent.exe", NULL,
+      "A Windows permission prompt is waiting, unseen",
+      "The program that asked for administrator rights stays blocked until it is answered; switch this qube to the windowed desktop to see and answer it.",
+      "Cause: Windows did not raise the prompt and offers only a taskbar button, which does not exist before the guest's shell has started (log line QGAUACPENDING).",
+      QERR_GUI_AGENT_LOG ", line QGAUACPENDING", NULL },
+
     /* --- the notification bridge's own faults (notifhost.cpp ReportErrorSelf) --------------- */
     /* its exit codes are its own (BridgeMain): 2 = listener access denied, 3 = listener init threw */
     { "listener-denied", "notifhost", "listener-denied", QERR_SEV_ACTION, "notifhost.exe", QERR_TXT_LISTENER_DENIED_CODE,
