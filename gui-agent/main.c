@@ -3934,6 +3934,11 @@ static void NotifBridgeRestoreSweep(void)
 // THE BRIDGE SUPERVISOR - EVENT-DRIVEN since rest-zero S4c (docs/DESIGN-rest-zero-capture.md C), and since
 // 2026-10-07 NOT A RELAUNCHER (HELPER LIFECYCLE above). It runs on every main-loop wake, waits for nothing, and
 // arms no timer while the bridge runs. EXIT = the validated process handle in the wait array: a death, recorded
+// THE BRIDGE'S "ALREADY RUNNING" EXIT CODE. Mirrored from tools/notifhost/qtb_shared.h
+// (QTB_EXIT_ALREADY_RUNNING) because the two build separately; the contract is documented on both
+// sides and a change to one without the other is what this constant exists to make visible.
+#define QGA_NOTIFHOST_EXIT_ALREADY_RUNNING 4u
+
 // once (QGANOTIFBRIDGEEXIT + 4003) and left to Task Scheduler's restart-on-failure; READY = the pid an instance
 // publishes ONCE in its state file, read on the wake its ready event gives and accepted only from a file written
 // after the launch - or after the exit it replaces, which is how a scheduler-restarted instance is adopted. The
@@ -3968,11 +3973,31 @@ static void NotifBridgeSupervise(void)
             g_NotifBridgePid = 0;
             return;
         }
+        // ALREADY RUNNING IS NOT A DEATH, and it was the single biggest source of dom0 noise in the
+        // field. FIELD-REPORTED by GWeck on 4.3.35 (forum 42717 post 175, with a screenshot): "a lot
+        // of notifications pop up" when the VM starts, and FOUR of them read "The notification
+        // bridge exited unexpectedly ... Cause: a clean exit nobody asked for - exit code 0" -
+        // notifhost pids 8772, 6796, 10168 and 1232, each "ran 0:00:00", numbered death 1, 2, 4 and
+        // 6 of ONE boot. The cause is that exit 0 was overloaded: this comment itself used to say
+        // "0 = singleton held / agent gone / stop file / session changed", so the one case meaning
+        // "I am already running" arrived here looking exactly like "I finished", and every relaunch
+        // against a live bridge produced another notification.
+        // notifhost now returns QTB_EXIT_ALREADY_RUNNING (4) from both singleton guards, which is
+        // POSITIVE evidence the bridge is alive - so this adopts it instead of reporting a death,
+        // and does not arm another launch.
+        if (exitCode == QGA_NOTIFHOST_EXIT_ALREADY_RUNNING)
+        {
+            LogInfo("NOTIFBRIDGE the bridge pid %lu exited %lu - another instance already holds the singleton, "
+                L"so the bridge IS running. Not a death, and no relaunch is armed.", g_NotifBridgePid, exitCode);
+            g_NotifBridgePid = 0;
+            return;
+        }
         // A bridge exit is a FAILURE to report, not a supervision detail: the gate is ON (checked
-        // above), so nothing here asked it to stop. Its exit codes (notifhost.cpp BridgeMain):
-        // 0 = singleton held / agent gone / stop file / session changed, 2 = listener access
-        // denied (consent), 3 = listener init threw. ShowBanner is restored on every exit path,
-        // so the cost is dom0-native toasts, not lost ones - which does not make it benign.
+        // above), so nothing here asked it to stop. Its exit codes (notifhost.cpp, and
+        // tools/notifhost/qtb_shared.h documents the contract): 0 = it did its work and finished,
+        // 2 = listener access denied (consent), 3 = listener init threw, 4 = already running
+        // (handled above). ShowBanner is restored on every exit path, so the cost is dom0-native
+        // toasts, not lost ones - which does not make it benign.
         LogError("QGANOTIFBRIDGEEXIT notification bridge pid %lu EXITED (exit code %lu) - detected "
             L"by process wait. Guest toasts take the window path until Task Scheduler restarts it (its task is armed "
             L"to restart on failure, " HELPER_TASK_RESTART_INTERVAL L" x" HELPER_TASK_RESTART_COUNT L"; a clean exit 0 "
