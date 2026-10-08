@@ -62,6 +62,7 @@ static char g_QerrStateDir[512] = { 0 };
 
 /* --- platform layer ----------------------------------------------------------------------- */
 static void      PlatLog(const char* fmt, ...);
+static void      PlatLogInfo(const char* fmt, ...);
 static long long PlatBootStamp(void);
 static int       PlatEnsureDir(const char* dir);
 static int       PlatReadSmall(const char* path, char* buf, size_t cap);   /* 1 = read, 0 = absent/failed */
@@ -90,7 +91,7 @@ void QerrInit(int gateOn, const char* stateDirUtf8)
     } else {
         PlatDefaultStateDir(g_QerrStateDir, sizeof(g_QerrStateDir));
     }
-    PlatLog("NOTIFYERR gate: enabled=%d state=%s (secondary route: dom0 notification via "
+    PlatLogInfo("NOTIFYERR gate: enabled=%d state=%s (secondary route: dom0 notification via "
             "notifhost/qubes.Notifications; needs qrexec-agent; the log stays primary; when dom0 cannot be "
             "told - transport failed, or gate off - the error is shown as a window on the console session)",
             g_QerrGate, g_QerrStateDir);
@@ -293,6 +294,23 @@ static void PlatLog(const char* fmt, ...)
     LogWarning("%S", line);   /* WARNING: visible in the default log like QGADESLICEDOWN */
 }
 
+/* THE SAME CHANNEL AT INFO, for the lines that report CONFIGURATION rather than a fault. PlatLog
+ * put everything at WARNING, so the gate's own status line - what the gate is set to, printed once
+ * per agent instance - arrived as a warning: 6 of the ~20 agent warnings on a fully idle clean
+ * cycle, measured 2026-10-08. Owner the same day, for our own components: "no warnings on normal
+ * operation. warning means something is not quite normal, yet workable." Nothing a fault reports
+ * moves: the once-per-process failure line, the did-not-render line and QGAERRBOX all keep
+ * PlatLog. */
+static void PlatLogInfo(const char* fmt, ...)
+{
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    (void)StringCchVPrintfA(line, RTL_NUMBER_OF(line), fmt, ap);
+    va_end(ap);
+    LogInfo("%S", line);
+}
+
 /* An opaque token minted once per boot and identical for every process in that boot.
  *
  * A VOLATILE registry key is the OS's own per-boot object: the kernel discards it at shutdown, so
@@ -449,6 +467,18 @@ static int PlatShowErrorBox(const char* header, const char* text, unsigned long*
 /* --- plain-C test platform layer (offline suite only, any host) --------------------------- */
 
 static void PlatLog(const char* fmt, ...)
+{
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(line, sizeof(line), fmt, ap);
+    va_end(ap);
+    if (QerrTestLogHook) QerrTestLogHook(line); else fprintf(stderr, "%s\n", line);
+}
+
+/* The offline twin of PlatLogInfo. It goes through the SAME test hook, so the suite still sees the
+ * line and its assertions do not change - only the level the Win32 layer picks does. */
+static void PlatLogInfo(const char* fmt, ...)
 {
     char line[1024];
     va_list ap;
