@@ -10659,6 +10659,41 @@ static void BrokerConsumePass(void)
     LeaveCriticalSection(&g_csWatchedWindows);
 }
 
+// IS ANYBODY LOGGED ON TO THE CONSOLE SESSION? Used by the secure-desktop handling below to tell a
+// LOCKED session (LogonUI up with a console user) from the SIGN-IN screen (LogonUI up, nobody on).
+// WTSQuerySessionInformation returns an empty user name when nobody is logged on and logs nothing on
+// failure - unlike TaskUserId, whose WTSQueryUserToken failure path calls win_perror and would write
+// an error line every time this ran during a sign-in screen, i.e. add the noise it exists to remove.
+static BOOL ConsoleUserPresent(void)
+{
+    DWORD csid = WTSGetActiveConsoleSessionId();
+    LPWSTR nm = NULL;
+    DWORD nmcb = 0;
+    BOOL present = FALSE;
+    if (csid != 0xFFFFFFFF &&
+        WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, csid, WTSUserName, &nm, &nmcb))
+    {
+        present = (nm && nm[0]);
+        WTSFreeMemory(nm);
+    }
+    return present;
+}
+
+// IS THE SESSION LOCKED RIGHT NOW? Both facts a lock needs, with the throttle that keeps them off
+// the frame path. Ordered so the cheap test comes first: on a SIGN-IN screen ConsoleUserPresent() is
+// FALSE and ProcessRunningByName - a full process enumeration - is never reached.
+// A session that is ENDING is excluded: during shutdown the console user is still present while
+// LogonUI is up, and that is a teardown, not a lock.
+static BOOL SecureDesktopLockedNow(IN ULONGLONG now, IN BOOL reported, IN OUT ULONGLONG *nextCheck)
+{
+    if (reported || now < *nextCheck)
+        return FALSE;
+    *nextCheck = now + 1000;   // DDA can deliver frames while a secure desktop is up (a blinking
+                               // caret is damage), so this is not asked per frame. One second is
+                               // immediate for a human and keeps a syscall off the sign-in path.
+    return !LifecycleSessionEnding() && ConsoleUserPresent() && ProcessRunningByName(L"LogonUI.exe");
+}
+
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
     IN UINT fbWidth, IN UINT fbHeight)
 {
@@ -10744,6 +10779,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         #define SECURE_DESKTOP_NOTIFY_ARMED_MS 600000
         static ULONGLONG s_SecureSince = 0;
         static ULONGLONG s_SecureNextWarn = 0;
+        static BOOL s_LockReported = FALSE;   // one lock report per secure-desktop episode
+        static ULONGLONG s_LockCheckNext = 0;   // SecureDesktopLockedNow's throttle
         if (g_OnSecureDesktop)
         {
             ULONGLONG now = GetTickCount64();
@@ -10752,6 +10789,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 s_SecureSince = now;
                 s_SecureNextWarn = now + SECURE_DESKTOP_FIRST_WARN_MS;
                 s_ShownNonSeamless = FALSE;
+                s_LockReported = FALSE;   // a new episode may be a different cause
+                s_LockCheckNext = 0;      // check the first frame of it immediately
             }
             s_WasSecure = TRUE;
 
@@ -10765,6 +10804,26 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         L"(non-seamless, %lux%lu) - this is the way in for a guest that does not "
                         L"log itself in", g_ScreenWidth, g_ScreenHeight);
                 }
+            }
+            // A LOCK IS CONCLUSIVE THE MOMENT IT IS SEEN AND MUST NOT WAIT FOR A CLOCK. Owner,
+            // 2026-10-09: "no one will wait for 10 minutes at locked machine. if it is locked it
+            // should be detected fast." The previous version of this fix got the classification
+            // right but left it inside the 30 s warn point, so a lock was still reported 30 s late
+            // and, with autologon armed, could fall through to the 10 min backstop. Both facts a
+            // lock needs - LogonUI up AND a console user logged on - are available on the first
+            // secure frame, so they are read there and the report goes out immediately, once.
+            // A session that is ENDING is excluded: during shutdown the console user is still
+            // present while LogonUI is up, and that is a teardown, not a lock.
+            else if (SecureDesktopLockedNow(now, s_LockReported, &s_LockCheckNext))
+            {
+                s_LockReported = TRUE;
+                LogWarning("QGADESKSTUCK the session is LOCKED after %I64u s on the secure desktop "
+                    L"(LogonUI up with a console user logged on) - dom0 is shown NOTHING while it stays "
+                    L"locked. Reported at once rather than at the %u s warn point: a lock is a human "
+                    L"action and only a human clears it, so there is nothing to wait for.",
+                    (now - s_SecureSince) / 1000,
+                    (unsigned)(SECURE_DESKTOP_FIRST_WARN_MS / 1000));
+                QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
             }
             else if (now >= s_SecureNextWarn)
             {
@@ -10864,18 +10923,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // failure path calls win_perror - which would write an error line every time this
                 // probe ran during a sign-in screen, i.e. it would add the very noise this change
                 // exists to remove.
-                BOOL consoleUser = FALSE;
-                {
-                    DWORD csid = WTSGetActiveConsoleSessionId();
-                    LPWSTR nm = NULL;
-                    DWORD nmcb = 0;
-                    if (csid != 0xFFFFFFFF &&
-                        WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, csid, WTSUserName, &nm, &nmcb))
-                    {
-                        consoleUser = (nm && nm[0]);
-                        WTSFreeMemory(nm);
-                    }
-                }
+                const BOOL consoleUser = ConsoleUserPresent();
                 LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s - dom0 is being shown "
                     L"NOTHING and will keep seeing nothing until this desktop goes away. PATH: %s "
                     L"(consent.exe=%d LogonUI.exe=%d PromptOnSecureDesktop=%s autologon=%s "
@@ -10925,7 +10973,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // defect class this change is about - so it is named here rather than dressed up,
                 // and it is the only remaining instance. A positive signal for it would be a logon
                 // failure record, which this frame path is the wrong place to read.
-                if (!autoArmed || consoleUser ||
+                // consoleUser stays in this gate as a safety net for a lock the fast path above
+                // did not catch, guarded so an already-reported lock is not reported twice.
+                if (!autoArmed || (consoleUser && !s_LockReported) ||
                     (now - s_SecureSince) >= SECURE_DESKTOP_NOTIFY_ARMED_MS)
                     QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
                 else
