@@ -204,6 +204,12 @@ BOOL FiPrintWindowFail(void);
 // [FI_SLAB_DOUBLE_BIND] TRUE once per armed shot: PwSlabAcquire must return a slab that a
 // live window still holds, so the PWCOLLISION alarm can be seen to fire.
 BOOL FiSlabDoubleBind(void);
+// [FI_MON_STALE] TRUE once per armed shot: GetMonitorSettings must report
+// ERROR_INVALID_MONITOR_HANDLE, the display-change race that cost one window its measurement and
+// wrote TWO error lines for one condition. 1 shot: the re-acquire must succeed and the window must
+// still be measured (QGAMONSTALE counts it). 2 shots: both asks fail, and the run must carry
+// exactly ONE error line for it, naming GetMonitorInfo - never a second one from the caller.
+BOOL FiMonStale(void);
 
 // [FI_GATE_OFF] TRUE while this safeguard clause is bypassed for the run. Not a shot and not
 // subject to the arming delay: a gate bypass is a mode, and it cannot disturb the handshake
@@ -230,6 +236,7 @@ static __forceinline BOOL  FiShouldDupCreate(IN HWND window) { UNREFERENCED_PARA
 static __forceinline BOOL  FiShouldLegacySend(void) { return FALSE; }
 static __forceinline BOOL  FiPrintWindowFail(void) { return FALSE; }
 static __forceinline BOOL  FiSlabDoubleBind(void) { return FALSE; }
+static __forceinline BOOL  FiMonStale(void) { return FALSE; }
 static __forceinline BOOL  FiGateOff(IN DWORD gateBit) { UNREFERENCED_PARAMETER(gateBit); return FALSE; }
 
 #endif

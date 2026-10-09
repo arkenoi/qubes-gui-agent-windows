@@ -52,6 +52,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define REG_CONFIG_FAULT_GATE_OFF_VALUE     L"FaultGateOff"
 #define REG_CONFIG_FAULT_DAMAGE_DELAY_VALUE L"FaultDamageDelayMs"
 #define REG_CONFIG_FAULT_PUMP_LOSE_VALUE   L"FaultPumpStallLose"
+#define REG_CONFIG_FAULT_MON_STALE_VALUE   L"FaultMonStale"
 
 #define FAULT_DELAY_ENV_VALUE        L"QUBES_GUI_FAULT_DELAY"
 #define FAULT_NEG_CREATE_ENV_VALUE   L"QUBES_GUI_FAULT_NEG_CREATE"
@@ -67,6 +68,7 @@ const char g_FaultInjectionMarker[] = "QGA-FAULT-INJECTION:off";
 #define FAULT_GATE_OFF_ENV_VALUE     L"QUBES_GUI_FAULT_GATE_OFF"
 #define FAULT_DAMAGE_DELAY_ENV_VALUE L"QUBES_GUI_FAULT_DAMAGE_DELAY"
 #define FAULT_PUMP_LOSE_ENV_VALUE    L"QUBES_GUI_FAULT_PUMP_LOSE"
+#define FAULT_MON_STALE_ENV_VALUE    L"QUBES_GUI_FAULT_MON_STALE"
 
 // Seconds between FiInit() and the first fault that may fire. See faultinject.h: every
 // failure being reproduced is a failure of a CONNECTED agent, so a fault landing during
@@ -87,6 +89,10 @@ static volatile LONG g_FiCaptureExit = 0;
 static volatile LONG g_FiPumpStall   = 0;
 static volatile LONG g_FiPrintWindowFail = 0;
 static volatile LONG g_FiSlabDoubleBind  = 0;
+// [FI_MON_STALE] Shots of "the monitor handle went stale": GetMonitorSettings reports
+// ERROR_INVALID_MONITOR_HANDLE. 1 shot proves the re-acquire measures the window anyway;
+// 2 shots make BOTH asks fail, which is the path that must produce exactly one error line.
+static volatile LONG g_FiMonStale        = 0;
 
 // [FI_GATE_OFF] Bitmask of ShouldAcceptWindow safeguard clauses to BYPASS.
 //
@@ -203,6 +209,7 @@ void FiInit(void)
     g_FiCaptureExit = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_CAPTURE_EXIT_VALUE, FAULT_CAPTURE_EXIT_ENV_VALUE, 0);
     g_FiPrintWindowFail = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_PW_FAIL_VALUE, FAULT_PW_FAIL_ENV_VALUE, 0);
     g_FiSlabDoubleBind  = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_SLAB_BIND_VALUE, FAULT_SLAB_BIND_ENV_VALUE, 0);
+    g_FiMonStale        = (LONG)FiReadDword(moduleName, REG_CONFIG_FAULT_MON_STALE_VALUE, FAULT_MON_STALE_ENV_VALUE, 0);
     g_FiGateOff         = FiReadDword(moduleName, REG_CONFIG_FAULT_GATE_OFF_VALUE, FAULT_GATE_OFF_ENV_VALUE, 0);
     g_FiDamageDelayMs   = FiReadDword(moduleName, REG_CONFIG_FAULT_DAMAGE_DELAY_VALUE, FAULT_DAMAGE_DELAY_ENV_VALUE, 0);
     g_FiPumpStallLose   = FiReadDword(moduleName, REG_CONFIG_FAULT_PUMP_LOSE_VALUE, FAULT_PUMP_LOSE_ENV_VALUE, 0);
@@ -225,18 +232,19 @@ void FiInit(void)
     // cause is a measurement run attributed to the wrong build, so every log file from a
     // fault-capable binary has to say so on its first page whether or not anything is armed.
     LogWarning("QGAFAULT-INIT build=%S armdelay=%us negcreate=%d(hwnd=0x%x) ringstall=%us "
-        L"pumpstall=%us pumplose=%u captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d gateoff=0x%x damagedelay=%ums",
+        L"pumpstall=%us pumplose=%u captureexit=%d dupcreate=%d legacysend=%d rawcreate=%u pwfail=%d gateoff=0x%x damagedelay=%ums monstale=%d",
         g_FaultInjectionMarker,
         delaySec,
         g_FiNegCreate, g_FiNegCreateHwnd,
         ringStallSec,
         pumpStallSec, g_FiPumpStallLose,
         g_FiCaptureExit, g_FiDupCreate, g_FiLegacySend, g_FiRawCreate, g_FiPrintWindowFail,
-        g_FiGateOff, g_FiDamageDelayMs);
+        g_FiGateOff, g_FiDamageDelayMs, g_FiMonStale);
 
     if (g_FiNegCreate > 0 || g_FiDupCreate > 0 || g_FiLegacySend > 0 ||
         g_FiCaptureExit > 0 || g_FiPumpStall > 0 || g_FiRingStallArmed || g_FiRawCreate ||
-        g_FiPrintWindowFail > 0 || g_FiSlabDoubleBind > 0 || g_FiGateOff != 0 || g_FiDamageDelayMs != 0)
+        g_FiPrintWindowFail > 0 || g_FiSlabDoubleBind > 0 || g_FiGateOff != 0 || g_FiDamageDelayMs != 0 ||
+        g_FiMonStale > 0)
     {
         LogWarning("QGAFAULT-INIT FAULTS ARE ARMED - this agent will break itself on purpose "
             L"in %u s; results from this run describe the INJECTED defect, not the build", delaySec);
@@ -306,6 +314,21 @@ BOOL FiPrintWindowFail(void)
     LogWarning("QGAFAULT FI_PRINTWINDOW_FAIL firing: this capture reports PrintWindow "
         L"failure (%d shots left) - 5 consecutive on one channel must latch WCDEAD",
         g_FiPrintWindowFail);
+    return TRUE;
+}
+
+BOOL FiMonStale(void)
+{
+    if (g_FiMonStale <= 0)
+        return FALSE;
+
+    if (!FiTakeShot(&g_FiMonStale))
+        return FALSE;
+
+    LogWarning("QGAFAULT FI_MON_STALE firing: this GetMonitorSettings reports "
+        L"ERROR_INVALID_MONITOR_HANDLE (%d shots left) - with 1 shot the window must still be "
+        L"measured after a re-acquire; with 2 the failure must produce exactly ONE error line",
+        g_FiMonStale);
     return TRUE;
 }
 

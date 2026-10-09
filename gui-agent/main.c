@@ -1450,6 +1450,15 @@ static SRWLOCK g_MonCacheLock = SRWLOCK_INIT;
 
 static BOOL GetMonitorSettings(IN HMONITOR monitor, OUT MONITORINFOEX* monInfo, OUT DEVMODE* devMode)
 {
+    // [FI_MON_STALE] Before the cache, so a cached hit cannot serve the fault away. This is the
+    // only way to drive the display-change race on demand: the real one needs a topology change
+    // to land between MonitorFromWindow and GetMonitorInfo.
+    if (FiMonStale())
+    {
+        SetLastError(ERROR_INVALID_MONITOR_HANDLE);
+        return FALSE;
+    }
+
     static HMONITOR cachedMonitor = NULL; // all statics guarded by g_MonCacheLock
     static LONG cachedGen = 0;
     static DWORD cachedTick = 0;
@@ -1575,7 +1584,46 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
     MONITORINFOEX monInfo;
     DEVMODE devMode;
     if (!GetMonitorSettings(monitor, &monInfo, &devMode))
-        return win_perror("GetMonitorInfo failed");
+    {
+        // A STALE MONITOR HANDLE IS A DISPLAY-CHANGE RACE, AND RE-ASKING IS BOTH THE FIX AND THE
+        // PROOF. MonitorFromWindow hands back the monitor that existed a moment ago; if the
+        // topology changed in between - which on this product happens whenever the IDD is
+        // activated or a mode is applied - GetMonitorInfo answers ERROR_INVALID_MONITOR_HANDLE
+        // (0x5b5) for that handle. Measured on win10-acc 2026-10-09: ONE such failure reported
+        // TWICE, here as "GetMonitorInfo failed failed with error 0x5b5" (the doubled word is
+        // win_perror appending its own) and again by the caller as "GetRealWindowRect failed", for
+        // a window that was then simply not measured - so dom0 kept its stale geometry. If the
+        // second ask succeeds, the first failure WAS the race, demonstrated rather than assumed,
+        // and the window is measured after all.
+        const DWORD firstError = GetLastError();
+        monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
+        if (!GetMonitorSettings(monitor, &monInfo, &devMode))
+        {
+            // Twice in a row is not a race. ONE line, naming the call that actually failed and the
+            // window, and a status the caller already treats as "not measurable this pass" so the
+            // same condition is not reported a second time under a different function's name.
+            LogError("0x%x: GetMonitorInfo failed twice (0x%x, then 0x%x) - this window cannot be "
+                "measured this pass", window, firstError, GetLastError());
+            return ERROR_INVALID_DATA;
+        }
+        // The race itself is bounded and counted rather than logged per occurrence, the same shape
+        // as QGAZERORECT above: a display change can race many windows at once, and one line each
+        // would be the noise this replaces. A rising count with no display change IS a finding.
+        {
+            static volatile LONG s_staleMonCount = 0;
+            static ULONGLONG s_staleMonLastReport = 0;
+            const LONG n = _InterlockedIncrement(&s_staleMonCount);
+            const ULONGLONG now = GetTickCount64();
+            LogDebug("0x%x: monitor handle was stale (0x%x) and re-acquired", window, firstError);
+            if (now - s_staleMonLastReport > 300000)   // at most one line per 5 minutes
+            {
+                s_staleMonLastReport = now;
+                LogInfo("QGAMONSTALE %d window(s) measured after re-acquiring a stale monitor "
+                    "handle since start (routine during a display change; raise LogLevel to DEBUG "
+                    "for the per-window detail)", n);
+            }
+        }
+    }
 
     // adjust for DPI scaling
     double scale = (monInfo.rcMonitor.right - monInfo.rcMonitor.left) / (double)devMode.dmPelsWidth;
@@ -1773,7 +1821,10 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         // ULONG - /W4 with warnings-as-errors rejects the mixed-sign compare.
         // Neither of these is a fault, and both are already explained one frame down:
         // E_HANDLE is a window that died between enumeration and measurement, and
-        // ERROR_INVALID_DATA was just logged BY GetRealWindowRect with the offending rectangle.
+        // ERROR_INVALID_DATA was just logged BY GetRealWindowRect - with the offending rectangle
+        // for a zero/inverted geometry, or with the status pair for a monitor handle that failed
+        // twice. Either way the reason is in the log already, and a second line here would name
+        // this function instead of the call that actually failed.
         // Measured: fixing the swallow above turned 64 silent garbage announcements into 65 ERROR
         // lines per 40 s, which would simply move the noise rather than remove it.
         if (status == (ULONG)HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE) ||
