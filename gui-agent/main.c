@@ -10850,19 +10850,48 @@ static AutologonState AutologonEnsure(OUT WCHAR *user, IN size_t ucch,
     return AL_FIXED;
 }
 
-// IS THE SESSION LOCKED RIGHT NOW?// IS THE SESSION LOCKED RIGHT NOW? Both facts a lock needs, with the throttle that keeps them off
-// the frame path. Ordered so the cheap test comes first: on a SIGN-IN screen ConsoleUserPresent() is
-// FALSE and ProcessRunningByName - a full process enumeration - is never reached.
-// A session that is ENDING is excluded: during shutdown the console user is still present while
-// LogonUI is up, and that is a teardown, not a lock.
+// IS THE SESSION LOCKED RIGHT NOW?// IS THE SESSION LOCKED RIGHT NOW? ASKED, NOT INFERRED.
+// This first shipped as `ConsoleUserPresent() && ProcessRunningByName(L"LogonUI.exe")`, taken from
+// this file's own comment - "LogonUI.exe with a console user -> the session is LOCKED" - which I
+// adopted as established instead of checking it. IT IS NOT ESTABLISHED. That pair only says the
+// logon UI is up while a session exists, and several things produce that: a shutdown or logoff in
+// progress, a credential prompt after a session ended, and - the case that prompted this - the
+// secure desktop reappearing after autologon has ALREADY completed, e.g. around a mode change
+// (measured on win10-acc: `AttachToInputDesktop from=Winlogon,to=Winlogon` immediately after
+// `SetVideoModeExact: M0BLINK applied 5120x1440`). Reporting "the session is LOCKED" to dom0 AT
+// ONCE on that pair is an unestablished inference with an ACTION attached - the same error as the
+// 30 s clock this work started from, one layer up.
+// Windows publishes the fact: WTSSessionInfoEx -> WTSINFOEX_LEVEL1.SessionFlags is
+// WTS_SESSIONSTATE_LOCK or WTS_SESSIONSTATE_UNLOCK. That is what is asked now. If the query fails
+// or the level is not the one documented, the answer is NO - a report is owed only on a positive
+// fact, never on a failure to read one.
 static BOOL SecureDesktopLockedNow(IN ULONGLONG now, IN BOOL reported, IN OUT ULONGLONG *nextCheck)
 {
+    DWORD csid;
+    LPWSTR buf = NULL;
+    DWORD cb = 0;
+    BOOL locked = FALSE;
+
     if (reported || now < *nextCheck)
         return FALSE;
     *nextCheck = now + 1000;   // DDA can deliver frames while a secure desktop is up (a blinking
                                // caret is damage), so this is not asked per frame. One second is
                                // immediate for a human and keeps a syscall off the sign-in path.
-    return !LifecycleSessionEnding() && ConsoleUserPresent() && ProcessRunningByName(L"LogonUI.exe");
+    if (LifecycleSessionEnding())
+        return FALSE;          // a teardown is not a lock, whatever the session flags say
+    csid = WTSGetActiveConsoleSessionId();
+    if (csid == 0xFFFFFFFF)
+        return FALSE;
+    if (WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, csid, WTSSessionInfoEx, &buf, &cb)
+        && buf && cb >= sizeof(WTSINFOEX))
+    {
+        const WTSINFOEX* ix = (const WTSINFOEX*)buf;
+        if (ix->Level == 1)
+            locked = (ix->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK);
+    }
+    if (buf)
+        WTSFreeMemory(buf);
+    return locked;
 }
 
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
@@ -12550,7 +12579,33 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
     // Initialize capture interfaces, this also initializes framebuffer PFNs
     *capture = CaptureInitialize(newFrameEvent, captureErrorEvent);
     if (!(*capture))
-        return win_perror("CaptureInitialize");
+    {
+        // ACCESS_LOST/ACCESS_DENIED AT INIT IS THE ROUTINE STALE-DESKTOP SIGNAL, AND THE RETRY
+        // WRAPPER IS ITS SINGLE REPORTER - the fourth site of a class already fixed three times in
+        // capture.c (AcquireNextFrame, ReleaseFrame, the dirty-rects path), found by the error-family
+        // sweep's UNCLASSIFIED bucket on a clean boot of a provenance-verified build.
+        // MEASURED on win10-acc 2026-10-09, three consecutive lines:
+        //   .232509.435  SetVideoModeExact: M0BLINK applied 5120x1440
+        //   .232509.518  E  StartFrameProcessing: CaptureInitialize failed with error 0x887a0026
+        //   .232509.518  W  StartFrameProcessingWithRetry: A7RETRY transient capture init failure
+        //                   0x887a0026, attempt 1
+        // A resolution change 83 ms earlier invalidated the duplication; the NEXT line classifies
+        // the status as transient and the retry succeeds. So this reported an ERROR for a condition
+        // the caller immediately handles - and 0x887a0026 reads as "The keyed mutex was abandoned"
+        // because FormatMessage mis-renders DXGI_ERROR_ACCESS_LOST, which is why these lines keep
+        // being read as corruption (instrumentation/ACCESS-LOST-BUG.md).
+        // Nothing is silenced: the status still reaches the caller, the A7RETRY line still names it
+        // at WARNING, and a status that is NOT the stale-desktop signal is still reported here.
+        const DWORD gle = GetLastError();
+        if (gle == (DWORD)DXGI_ERROR_ACCESS_LOST || gle == (DWORD)DXGI_ERROR_ACCESS_DENIED)
+        {
+            LogDebug("CaptureInitialize: the desktop duplication went stale during init (0x%x) - "
+                L"StartFrameProcessingWithRetry reports and retries it", gle);
+            SetLastError(gle);
+            return gle;
+        }
+        return win_perror2(gle, "CaptureInitialize");
+    }
 
     ULONG status;
     // send whole screen window, needed even in seamless mode.
