@@ -1602,8 +1602,8 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
             // Twice in a row is not a race. ONE line, naming the call that actually failed and the
             // window, and a status the caller already treats as "not measurable this pass" so the
             // same condition is not reported a second time under a different function's name.
-            LogError("0x%x: GetMonitorInfo failed twice (0x%x, then 0x%x) - this window cannot be "
-                "measured this pass", window, firstError, GetLastError());
+            LogError("0x%x: GetMonitorInfo failed twice (0x%x, 0x%x); window not measured",
+                window, firstError, GetLastError());
             return ERROR_INVALID_DATA;
         }
         // The race itself is bounded and counted rather than logged per occurrence, the same shape
@@ -1614,13 +1614,12 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
             static ULONGLONG s_staleMonLastReport = 0;
             const LONG n = _InterlockedIncrement(&s_staleMonCount);
             const ULONGLONG now = GetTickCount64();
-            LogDebug("0x%x: monitor handle was stale (0x%x) and re-acquired", window, firstError);
+            LogDebug("0x%x: stale monitor handle (0x%x), re-acquired", window, firstError);
             if (now - s_staleMonLastReport > 300000)   // at most one line per 5 minutes
             {
                 s_staleMonLastReport = now;
-                LogInfo("QGAMONSTALE %d window(s) measured after re-acquiring a stale monitor "
-                    "handle since start (routine during a display change; raise LogLevel to DEBUG "
-                    "for the per-window detail)", n);
+                LogInfo("QGAMONSTALE %d window(s) measured after a stale monitor handle "
+                    "(display change; DEBUG for detail)", n);
             }
         }
     }

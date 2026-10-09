@@ -325,10 +325,8 @@ BOOL FiMonStale(void)
     if (!FiTakeShot(&g_FiMonStale))
         return FALSE;
 
-    LogWarning("QGAFAULT FI_MON_STALE firing: this GetMonitorSettings reports "
-        L"ERROR_INVALID_MONITOR_HANDLE (%d shots left) - with 1 shot the window must still be "
-        L"measured after a re-acquire; with 2 the failure must produce exactly ONE error line",
-        g_FiMonStale);
+    LogWarning("QGAFAULT FI_MON_STALE: GetMonitorSettings reports ERROR_INVALID_MONITOR_HANDLE "
+        L"(%d shots left)", g_FiMonStale);
     return TRUE;
 }
 
