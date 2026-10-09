@@ -2804,16 +2804,42 @@ static BOOL WgcCreateSection(void)
 
 // Run schtasks.exe with the given argument tail, as the agent's own (SYSTEM) token, no window,
 // and wait for it. Returns TRUE iff schtasks exited 0.
-static BOOL WgcRunSchtasks(const WCHAR* argtail)
+// `exitCode` and `out` are OUT params because the first version returned only `ec == 0` and
+// DISCARDED BOTH. Measured 2026-10-10 on win11r-up: `QGAHELPERTASK schtasks /create /xml failed for
+// Qubes-WgcBroker (resident=1) - the helper does not start`, with no exit code and no schtasks text
+// anywhere in the log, so WHY it failed is unknowable from the evidence. schtasks prints its reason
+// ("ERROR: ...") on its own streams, which CREATE_NO_WINDOW sent nowhere. A transient must never be
+// discarded silently (.claude/skills/experimenter rule 11).
+static BOOL WgcRunSchtasks(const WCHAR* argtail, OUT DWORD *exitCode, OUT WCHAR *out, IN size_t outCch)
 {
     WCHAR sys[MAX_PATH];
+    HANDLE rd = NULL, wr = NULL;
+    SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+    if (exitCode) *exitCode = (DWORD)-1;
+    if (out && outCch) out[0] = L'\0';
     if (!GetSystemDirectory(sys, RTL_NUMBER_OF(sys))) return FALSE;
     WCHAR cmd[2048];
     StringCchPrintf(cmd, RTL_NUMBER_OF(cmd), L"\"%s\\schtasks.exe\" %s", sys, argtail);
     STARTUPINFO si = { 0 }; PROCESS_INFORMATION pi = { 0 };
     si.cb = sizeof(si);
-    if (!CreateProcess(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
-    { win_perror("CreateProcess(schtasks)"); return FALSE; }
+    // Both streams into one pipe: schtasks writes its reason to stderr and its success to stdout,
+    // and the caller wants whichever arrived. A failed pipe is not fatal - the run still happens,
+    // only without its text.
+    if (CreatePipe(&rd, &wr, &sa, 8192))
+    {
+        SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
+        si.dwFlags |= STARTF_USESTDHANDLES;
+        si.hStdOutput = wr;
+        si.hStdError = wr;
+        si.hStdInput = NULL;
+    }
+    if (!CreateProcess(NULL, cmd, NULL, NULL, rd ? TRUE : FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
+    {
+        win_perror("CreateProcess(schtasks)");
+        if (rd) { CloseHandle(rd); CloseHandle(wr); }
+        return FALSE;
+    }
+    if (wr) { CloseHandle(wr); wr = NULL; }   // the child owns the write end now, or the read never ends
     CloseHandle(pi.hThread);
     // One bounded wait. It used to be taken in 1 s slices to keep the broker's AgentHeartbeat fresh
     // (a slow schtasks once starved a healthy broker to death, audit 2026-09-08); there is no
@@ -2823,6 +2849,27 @@ static BOOL WgcRunSchtasks(const WCHAR* argtail)
         LogWarning("schtasks did not finish within 15 s (%s) - treated as failed", argtail);
     DWORD ec = 1; GetExitCodeProcess(pi.hProcess, &ec);
     CloseHandle(pi.hProcess);
+    if (exitCode) *exitCode = ec;
+    // Read AFTER the wait: the output is at most a couple of lines and the pipe buffer is 8 KiB, so
+    // it cannot block the child, and reading first would need a second thread for no gain.
+    if (rd)
+    {
+        char buf[1024] = { 0 };
+        DWORD got = 0;
+        if (out && outCch && ReadFile(rd, buf, sizeof(buf) - 1, &got, NULL) && got)
+        {
+            WCHAR wide[1024];
+            const int n = MultiByteToWideChar(CP_OEMCP, 0, buf, (int)got, wide, RTL_NUMBER_OF(wide) - 1);
+            if (n > 0)
+            {
+                wide[n] = L'\0';
+                for (int i = 0; i < n; i++)          // one line: the log takes one line
+                    if (wide[i] == L'\r' || wide[i] == L'\n') wide[i] = L' ';
+                (void)StringCchCopy(out, outCch, wide);
+            }
+        }
+        CloseHandle(rd);
+    }
     return ec == 0;
 }
 
@@ -3008,11 +3055,33 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
         return FALSE;
     }
     StringCchPrintfW(cmd, RTL_NUMBER_OF(cmd), L"/create /tn %s /xml \"%s\" /f", taskName, file);
-    ok = WgcRunSchtasks(cmd);
+    DWORD rc = 0;
+    WCHAR why[512] = L"";
+    ok = WgcRunSchtasks(cmd, &rc, why, RTL_NUMBER_OF(why));
+    if (!ok)
+    {
+        // ONE BOUNDED RETRY, because this failure was MEASURED TRANSIENT and treating it as
+        // terminal costs the whole feature. 2026-10-10 on win11r-up during an install:
+        // `/create /xml` failed for Qubes-WgcBroker, and BrokerSupervise then said "the de-slice
+        // broker's one launch failed and is not retried ... until the next GUI agent start" - so
+        // per-window surfaces were withheld for the rest of the agent's life. Probed on that same
+        // guest afterwards: Task Scheduler Running, the task present and Status: Running, and a
+        // fresh `/create /xml` returning rc=0 SUCCESS. A momentary refusal cost the session.
+        // This is NOT a relaunch loop (owner 2026-10-07 forbids relaunching a helper that relaunches
+        // itself): it retries a REGISTRATION, which starts nothing by itself.
+        LogWarning("QGAHELPERTASK schtasks /create /xml failed for %s (rc=%lu: %s) - retrying once",
+            taskName, rc, why[0] ? why : L"schtasks said nothing");
+        Sleep(500);
+        ok = WgcRunSchtasks(cmd, &rc, why, RTL_NUMBER_OF(why));
+    }
     DeleteFileW(file);
     if (!ok)
-        LogError("QGAHELPERTASK schtasks /create /xml failed for %s (resident=%d) - the helper does not start",
-            taskName, resident);
+        // THE REASON IS IN THE LINE NOW. It used to carry neither the exit code nor schtasks' own
+        // text, because CREATE_NO_WINDOW sent both nowhere - so the one occurrence in the field
+        // could not be diagnosed from the evidence at all.
+        LogError("QGAHELPERTASK schtasks /create /xml failed TWICE for %s (resident=%d, rc=%lu: %s) - "
+            L"the helper does not start",
+            taskName, resident, rc, why[0] ? why : L"schtasks said nothing");
     else
         LogInfo("QGAHELPERTASK %s registered from XML and started by its registration trigger%s", taskName,
             resident ? L" (Task Scheduler restart-on-failure " HELPER_TASK_RESTART_INTERVAL L" x" HELPER_TASK_RESTART_COUNT L")"
@@ -3026,7 +3095,7 @@ static void HelperTaskDisarm(IN const WCHAR *taskName, IN const WCHAR *why)
 {
     WCHAR cmd[256];
     StringCchPrintfW(cmd, RTL_NUMBER_OF(cmd), L"/change /tn %s /disable", taskName);
-    if (WgcRunSchtasks(cmd))
+    if (WgcRunSchtasks(cmd, NULL, NULL, 0))
         LogInfo("QGAHELPERTASK %s disarmed before %s (restart-on-failure cannot fire)", taskName, why);
     else
         LogError("QGAHELPERTASK schtasks /change /disable failed for %s before %s - Task Scheduler may restart the "
@@ -3082,7 +3151,7 @@ static BOOL WgcLaunch(void)
     // Recreate the task fresh (idempotent): /delete ENDS an instance a previous agent left behind (measured,
     // notifhost.cpp) and drops any restart Task Scheduler still owed its definition; the registration then starts
     // the new one with its own restart-on-failure armed.
-    WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
+    WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f", NULL, NULL, 0);
     if (!HelperTaskRegister(WGC_TASK_NAME, longExe, args, userId, TRUE,
             L"QWT: the GUI agent's de-slice capture broker (re-created by the GUI agent at each of its starts; "
             L"restarted on failure by Task Scheduler, never by the agent)"))
@@ -3731,7 +3800,7 @@ static void BrokerShutdown(void)
         CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
         _InterlockedExchange(&g_WgcBrokerPidValidated, 0);
     }
-    WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f");
+    WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f", NULL, NULL, 0);
 }
 // ---- notification bridge launch/supervise (gate g_NotifBridge) ---------------------------
 #define NOTIF_TASK_NAME L"Qubes-NotifBridge"
@@ -3995,7 +4064,7 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL 
     // has no 261-character /tr limit (the 2026-10-06 "schtasks /create failed" was that limit).
     WCHAR args[2048];
     StringCchPrintf(args, RTL_NUMBER_OF(args), L"/delete /tn %s /f", taskName);
-    WgcRunSchtasks(args);
+    WgcRunSchtasks(args, NULL, NULL, 0);
     if (!HelperTaskRegister(taskName, longExe, exeArgs, userId, resident,
             resident ? L"QWT: the GUI agent's notification bridge (re-created by the GUI agent at each of its starts; "
                        L"restarted on failure by Task Scheduler, never by the agent)"
@@ -4405,7 +4474,7 @@ static void NotifBridgeShutdown(void)
         if (g_NotifBridgeProc && WaitForSingleObject(g_NotifBridgeProc, 3000) != WAIT_OBJECT_0)
             LogError("NOTIFBRIDGE the bridge did not leave within 3 s of the stop file - the task delete ends it "
                 L"without its banner-restore exit path");
-        WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
+        WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f", NULL, NULL, 0);
     }
     if (g_NotifBridgeProc) { CloseHandle(g_NotifBridgeProc); g_NotifBridgeProc = NULL; }
 }
@@ -14548,9 +14617,9 @@ static ULONG Init(void)
             // ORDER (R1): the task a previous gate-on agent left armed is DISABLED first (Task Scheduler must not
             // restart what is being stopped), the bridge is asked to leave through its stop file, then the definition
             // is deleted - which ends an instance that has not read the file yet (measured, notifhost.cpp).
-            WgcRunSchtasks(L"/change /tn " NOTIF_TASK_NAME L" /disable");
+            WgcRunSchtasks(L"/change /tn " NOTIF_TASK_NAME L" /disable", NULL, NULL, 0);
             NotifBridgeRequestStop();
-            WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f");
+            WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f", NULL, NULL, 0);
             g_NotifRestorePending = NotifMarkersPresent();
             if (g_NotifRestorePending)
                 LogInfo("NOTIFBRIDGE gate off with leftover banner markers - restore sweep armed");
