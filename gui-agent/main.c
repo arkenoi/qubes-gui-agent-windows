@@ -42,6 +42,8 @@
 #include <sddl.h>
 #include <wtsapi32.h>
 #pragma comment(lib, "wtsapi32.lib")   // WTSQuerySessionInformation for the broker's launch user
+#include <ntsecapi.h>                  // LsaRetrievePrivateData: is the autologon password still there
+#pragma comment(lib, "advapi32.lib")
 #include "wgcbroker_ipc.h"
 #include "wincapture.h"
 #include "vchan-handlers.h"
@@ -10679,7 +10681,176 @@ static BOOL ConsoleUserPresent(void)
     return present;
 }
 
-// IS THE SESSION LOCKED RIGHT NOW? Both facts a lock needs, with the throttle that keeps them off
+// AUTOLOGON: CHECK IT, FIX WHAT CAN BE FIXED WITHOUT CREDENTIALS, CONFIRM, AND DO IT NOW.
+// Owner, 2026-10-09: "you need to check if auto logon is on, arm it if it is off (and write about
+// this fact as warning because it is weird unless it is not the very first time), and confirm it is
+// armed, and do it all FAST WITH ZERO WAIT." Then, correctly: "why it was even disabled
+// historically? what causes that?"
+//
+// THE ANSWER IS MEASURED AND IS WHY THIS FUNCTION IS SHAPED THE WAY IT IS (guest/set-autologon.ps1
+// and guest/ensure-autologon.ps1 carry the full record):
+//   1. While AutoLogonCount is present, Windows CONSUMES DefaultPassword - it decrements the count
+//      and, when it runs out, DELETES the password and falls back to the sign-in screen. Its
+//      presence is the mechanism. Provisioning deletes it once to make autologon unlimited.
+//   2. A cumulative update REWRITES Winlogon values, which undoes that one-time fix. Measured
+//      2026-08-13 on win11-tpl: the guest sat at the sign-in screen, every qrexec call failed
+//      rc=117, and recovery took a root-volume revert.
+//
+// SO "ARM IT" CANNOT MEAN "WRITE AutoAdminLogon=1 AND REPORT SUCCESS". If the password has already
+// been consumed, that write makes the registry CLAIM autologon is armed while it cannot succeed, and
+// a confirmation of it would be a confirmation of a lie - the exact defect class this whole change
+// is about. guest/ensure-autologon.ps1 states the doctrine: "PREVENTION, NOT REPAIR. If
+// DefaultPassword has already been consumed there is nothing to restore - we do not know the
+// password and will not invent one."
+//
+// WHAT THIS DOES, THEREFORE: it removes the CAUSE where it can (delete AutoLogonCount, set
+// AutoAdminLogon=1 - neither needs a credential), it establishes whether a password still exists in
+// either store, and it reports to dom0 ONLY the states no code here can repair. It never says
+// "confirmed" without a password behind it. QubesAutologonGuard does the same prevention from a
+// BootTrigger at +30 s; this gets there first and costs one registry read on a path that only runs
+// while the input desktop is secure.
+typedef enum {
+    AL_OK = 0,           // armed, provisioned, count absent, password present - nothing to say
+    AL_FIXED,            // the cause was present and removed here, with a password still behind it
+    AL_PASSWORD_GONE,    // provisioned, but the password is in neither store: already consumed
+    AL_UNPROVISIONED,    // no DefaultUserName at all: nothing to log in as
+    AL_WRITE_FAILED,     // a fix did not take
+    AL_UNREADABLE        // the Winlogon key could not be opened
+} AutologonState;
+
+// Is the autologon password still in the LSA private store? That is where guest/set-autologon.ps1
+// puts it, precisely because an LSA secret is NOT consumed the way the registry value is. Without
+// this the agent cannot tell "the secret is there and all is well" from "the password was eaten",
+// and would have to guess - so it would have to stay silent or cry wolf.
+static BOOL AutologonLsaSecretPresent(void)
+{
+    LSA_OBJECT_ATTRIBUTES oa;
+    LSA_HANDLE pol = NULL;
+    LSA_UNICODE_STRING key;
+    PLSA_UNICODE_STRING val = NULL;
+    WCHAR name[] = L"DefaultPassword";
+    BOOL present = FALSE;
+
+    ZeroMemory(&oa, sizeof(oa));
+    oa.Length = sizeof(oa);
+    if (LsaOpenPolicy(NULL, &oa, POLICY_GET_PRIVATE_INFORMATION, &pol) != 0)
+        return FALSE;                     // not an answer either way; the caller treats it as absent
+    key.Buffer = name;
+    key.Length = (USHORT)(wcslen(name) * sizeof(WCHAR));
+    key.MaximumLength = (USHORT)(key.Length + sizeof(WCHAR));
+    if (LsaRetrievePrivateData(pol, &key, &val) == 0 && val && val->Length > 0)
+        present = TRUE;
+    if (val)
+        LsaFreeMemory(val);
+    LsaClose(pol);
+    return present;
+}
+
+// `err` takes the Win32 status of whichever call failed. It is an OUT param rather than something
+// the caller reads from GetLastError(): the Reg* functions RETURN their status and do not reliably
+// set the last error, and RegCloseKey between the failure and the caller would clobber it anyway.
+// `what` describes what was found and done, for the log line.
+static AutologonState AutologonEnsure(OUT WCHAR *user, IN size_t ucch,
+                                      OUT WCHAR *what, IN size_t wcch, OUT DWORD *err)
+{
+    static const WCHAR* KEY = L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon";
+    HKEY k = NULL;
+    LSTATUS st0;
+    WCHAR on[16] = L"", who[64] = L"";
+    DWORD cb, type;
+    BOOL armed = FALSE, countPresent = FALSE, regPw = FALSE;
+    BOOL removedCount = FALSE, setArmed = FALSE;
+
+    if (err) *err = 0;
+    if (user && ucch) user[0] = L'\0';
+    if (what && wcch) what[0] = L'\0';
+
+    st0 = RegOpenKeyEx(HKEY_LOCAL_MACHINE, KEY, 0, KEY_READ | KEY_SET_VALUE, &k);
+    if (st0) { if (err) *err = (DWORD)st0; return AL_UNREADABLE; }
+
+    cb = sizeof(on) - sizeof(WCHAR); type = 0;
+    if (!RegQueryValueEx(k, L"AutoAdminLogon", NULL, &type, (BYTE*)on, &cb)
+        && (type == REG_SZ || type == REG_EXPAND_SZ))
+    {
+        on[RTL_NUMBER_OF(on) - 1] = L'\0';
+        armed = (on[0] == L'1');
+    }
+    cb = sizeof(who) - sizeof(WCHAR); type = 0;
+    if (RegQueryValueEx(k, L"DefaultUserName", NULL, &type, (BYTE*)who, &cb)
+        || (type != REG_SZ && type != REG_EXPAND_SZ))
+        who[0] = L'\0';
+    who[RTL_NUMBER_OF(who) - 1] = L'\0';
+    if (user && ucch) (void)StringCchCopy(user, ucch, who);
+
+    // THE CAUSE. Its presence is what eats the password, whatever its type.
+    cb = 0; type = 0;
+    countPresent = (RegQueryValueEx(k, L"AutoLogonCount", NULL, &type, NULL, &cb) == ERROR_SUCCESS);
+    // A registry password is only one of the two stores, and only its SIZE is asked for - the value
+    // is never read, so it cannot end up in a log, a dump or a local. A fixed buffer here would have
+    // been a defect: any password longer than the buffer returns ERROR_MORE_DATA, the read would
+    // "fail", and a perfectly healthy guest would be reported as password-gone.
+    cb = 0; type = 0;
+    if (RegQueryValueEx(k, L"DefaultPassword", NULL, &type, NULL, &cb) == ERROR_SUCCESS
+        && (type == REG_SZ || type == REG_EXPAND_SZ))
+        regPw = (cb > sizeof(WCHAR));          // more than just the terminator
+
+    if (!who[0]) { RegCloseKey(k); return AL_UNPROVISIONED; }
+
+    // REMOVE THE CAUSE, then arm. Both are credential-free, so both are this agent's to do.
+    if (countPresent)
+    {
+        LSTATUS sd = RegDeleteValue(k, L"AutoLogonCount");
+        if (sd) { if (err) *err = (DWORD)sd; RegCloseKey(k); return AL_WRITE_FAILED; }
+        removedCount = TRUE;
+    }
+    if (!armed)
+    {
+        const WCHAR* one = L"1";
+        LSTATUS sw = RegSetValueEx(k, L"AutoAdminLogon", 0, REG_SZ,
+                                   (const BYTE*)one, (DWORD)((wcslen(one) + 1) * sizeof(WCHAR)));
+        if (sw) { if (err) *err = (DWORD)sw; RegCloseKey(k); return AL_WRITE_FAILED; }
+        setArmed = TRUE;
+    }
+    // CONFIRM, by reading back what was written rather than trusting the writes.
+    if (removedCount)
+    {
+        cb = 0; type = 0;
+        if (RegQueryValueEx(k, L"AutoLogonCount", NULL, &type, NULL, &cb) == ERROR_SUCCESS)
+        { RegCloseKey(k); return AL_WRITE_FAILED; }
+    }
+    if (setArmed)
+    {
+        WCHAR back[16] = L"";
+        cb = sizeof(back) - sizeof(WCHAR); type = 0;
+        if (RegQueryValueEx(k, L"AutoAdminLogon", NULL, &type, (BYTE*)back, &cb)
+            || (type != REG_SZ && type != REG_EXPAND_SZ))
+        { RegCloseKey(k); return AL_WRITE_FAILED; }
+        back[RTL_NUMBER_OF(back) - 1] = L'\0';
+        if (back[0] != L'1') { RegCloseKey(k); return AL_WRITE_FAILED; }
+    }
+    RegCloseKey(k);
+
+    // IS THERE STILL A PASSWORD? Without one, everything above is cosmetic: the registry will say
+    // armed and the guest will still stop at the sign-in screen.
+    if (!regPw && !AutologonLsaSecretPresent())
+    {
+        if (what && wcch)
+            (void)StringCchPrintf(what, wcch, L"AutoLogonCount was %s, AutoAdminLogon was %s",
+                                  countPresent ? L"PRESENT (the mechanism that eats the password)" : L"absent",
+                                  armed ? L"1" : L"0");
+        return AL_PASSWORD_GONE;
+    }
+    if (!removedCount && !setArmed)
+        return AL_OK;
+    if (what && wcch)
+        (void)StringCchPrintf(what, wcch, L"%s%s%s",
+                              removedCount ? L"deleted AutoLogonCount" : L"",
+                              (removedCount && setArmed) ? L" and " : L"",
+                              setArmed ? L"set AutoAdminLogon=1" : L"");
+    return AL_FIXED;
+}
+
+// IS THE SESSION LOCKED RIGHT NOW?// IS THE SESSION LOCKED RIGHT NOW? Both facts a lock needs, with the throttle that keeps them off
 // the frame path. Ordered so the cheap test comes first: on a SIGN-IN screen ConsoleUserPresent() is
 // FALSE and ProcessRunningByName - a full process enumeration - is never reached.
 // A session that is ENDING is excluded: during shutdown the console user is still present while
@@ -10770,17 +10941,22 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         // announces itself.
         #define SECURE_DESKTOP_FIRST_WARN_MS 30000
         #define SECURE_DESKTOP_REWARN_MS 120000
-        // WHEN AUTOLOGON IS ARMED, dom0 WAITS THIS LONG INSTEAD OF 30 s. The comment above says it
-        // already: autologon takes 15-17 s on this testbed and "a few seconds of this at boot is
-        // normal". 30 s is therefore not evidence of a fault, only of a slower boot - and a clean
-        // install's FIRST logon (profile creation, OOBE finishing) routinely exceeds it. Ten
-        // minutes is past any logon that is going to complete, so a guest still on the secure
-        // desktop then really is waiting and the notification's text is true.
+        // THE LAST RESORT, AND NOTHING ROUTINE REACHES IT ANY MORE. Autologon is now checked, armed
+        // and confirmed on the first frame of a secure-desktop episode (AutologonEnsure), and the two
+        // states a human must answer - not provisioned, re-arm failed - are reported there, at once,
+        // on the fact. A lock is reported at once too. So this bound is only reached by a guest that
+        // is armed, confirmed, unlocked, and STILL on the secure desktop: autologon that will never
+        // complete (wrong password, disabled or locked-out account). This agent has no positive
+        // signal for that one state, which is why a clock survives here and nowhere else in this
+        // block - the residual, named rather than dressed up. 30 s was the old gate and was wrong
+        // because autologon takes 15-17 s normally and a clean install's first logon exceeds it.
         #define SECURE_DESKTOP_NOTIFY_ARMED_MS 600000
         static ULONGLONG s_SecureSince = 0;
         static ULONGLONG s_SecureNextWarn = 0;
         static BOOL s_LockReported = FALSE;   // one lock report per secure-desktop episode
         static ULONGLONG s_LockCheckNext = 0;   // SecureDesktopLockedNow's throttle
+        static AutologonState s_Al = AL_OK;     // this episode's autologon verdict, decided on entry
+        static WCHAR s_AlUser[64] = L"";        // the account it is (or would be) armed for
         if (g_OnSecureDesktop)
         {
             ULONGLONG now = GetTickCount64();
@@ -10791,6 +10967,72 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 s_ShownNonSeamless = FALSE;
                 s_LockReported = FALSE;   // a new episode may be a different cause
                 s_LockCheckNext = 0;      // check the first frame of it immediately
+                // AUTOLOGON, ON THE FIRST FRAME OF THIS EPISODE, WITH NO WAIT. Nothing below
+                // this line waits to find out whether autologon works: it is read, the cause is
+                // removed where that needs no credential, the result is read back, and the two
+                // states nothing here can repair go to dom0 at once. See AutologonEnsure.
+                s_AlUser[0] = L'\0';
+                {
+                    WCHAR did[160] = L"";
+                    DWORD alErr = 0;
+                    s_Al = AutologonEnsure(s_AlUser, RTL_NUMBER_OF(s_AlUser),
+                                           did, RTL_NUMBER_OF(did), &alErr);
+                    switch (s_Al)
+                    {
+                    case AL_FIXED:
+                        // SILENTLY, AT INFO. Owner, 2026-10-09: "so we do it silently, no need to warn
+                        // user we had to re-enable." This started as a WARNING on the theory that
+                        // autologon turning itself off is weird - but the cause is now known and it is
+                        // ROUTINE: a cumulative update rewrites Winlogon values and brings
+                        // AutoLogonCount back (measured 2026-08-13 on win11-tpl). Routine maintenance
+                        // that this code performs and verifies is not something to tell anyone about,
+                        // and a warning on every post-update boot would be exactly the noise this
+                        // change exists to remove. The line stays at INFO so the history is still
+                        // readable when someone asks how often it happens.
+                        LogInfo("QGAAUTOLOGON autologon restored for '%s': %s, read back. Routine - "
+                            L"AutoLogonCount is what makes Windows consume DefaultPassword and fall back "
+                            L"to the sign-in screen, and a cumulative update rewriting Winlogon is how it "
+                            L"returns. Nothing is waiting on it and nobody is being told.", s_AlUser, did);
+                        break;
+                    case AL_PASSWORD_GONE:
+                        // NOT REPAIRABLE HERE, so dom0 is told AT ONCE, on the fact. Writing
+                        // AutoAdminLogon=1 with no password behind it would make the registry claim
+                        // autologon is armed while the guest still stops at the sign-in screen -
+                        // guest/ensure-autologon.ps1: "PREVENTION, NOT REPAIR ... we do not know the
+                        // password and will not invent one."
+                        LogError("QGAAUTOLOGON the autologon password for '%s' is GONE - it is in neither "
+                            L"the registry nor the LSA store, so autologon cannot succeed no matter what "
+                            L"AutoAdminLogon says (%s). This is the consumed-password end state: "
+                            L"AutoLogonCount was present at some point and Windows ate the password. Only a "
+                            L"human can put it back - run guest/set-autologon.ps1 in the guest, which "
+                            L"validates the credentials with LogonUser before storing them.",
+                            s_AlUser, did);
+                        QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
+                        break;
+                    case AL_UNPROVISIONED:
+                        LogError("QGAAUTOLOGON autologon is NOT provisioned: DefaultUserName is empty, so "
+                            L"there is no account to log in as and nothing this agent writes can change "
+                            L"that. dom0 is being shown nothing and only a human can fix it - run "
+                            L"guest/set-autologon.ps1, or switch this qube to the windowed desktop to sign "
+                            L"in by hand.");
+                        QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
+                        break;
+                    case AL_WRITE_FAILED:
+                        LogError("QGAAUTOLOGON autologon needed fixing for '%s' and the fix did NOT take "
+                            L"(err %lu): the write or its read-back failed, so this agent cannot recover "
+                            L"the guest's sign-in by itself.", s_AlUser, alErr);
+                        QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
+                        break;
+                    case AL_UNREADABLE:
+                        LogError("QGAAUTOLOGON the Winlogon key could not be opened (err %lu), so whether "
+                            L"autologon can work is unknown - which is itself what a reader needs to be "
+                            L"told.", alErr);
+                        break;
+                    case AL_OK:
+                    default:
+                        break;   // armed, provisioned, no count, password present: nothing to say
+                    }
+                }
             }
             s_WasSecure = TRUE;
 
@@ -10872,45 +11114,17 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     path = L"a UAC consent prompt is on the SECURE desktop, which PromptOnSecureDesktop=0 is supposed to prevent";
                 else if (logonui)
                     path = L"LogonUI is up: the sign-in or lock screen";
-                // IS AUTOLOGON ARMED? The notification below tells the reader to ARM AUTOLOGON, so
-                // it must only be sent when that is actually the fault. Measured 2026-10-09 on
-                // win10-acc during a clean-install first boot: autologon WAS armed (AutoAdminLogon=1,
-                // DefaultUserName set, the password held as the LSA secret, exactly as this project
-                // installs it) and the session came up moments later - a window appeared right
-                // after - yet dom0 had already been told "The guest is waiting at the sign-in or
-                // lock screen" at ACTION severity, advising a fix that was already in place. A
-                // false actionable message is worse than no message: it sends a reader to look at
-                // the one thing that is working.
-                BOOL autoArmed = FALSE;
-                WCHAR autoUser[64] = L"";
-                WCHAR autoDesc[96] = L"NOT ARMED";
+                // The description for the log line below, from this episode's verdict.
+                WCHAR autoDesc[96];
+                switch (s_Al)
                 {
-                    HKEY k;
-                    if (!RegOpenKeyEx(HKEY_LOCAL_MACHINE,
-                            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
-                            0, KEY_READ, &k))
-                    {
-                        WCHAR on[16] = L"";
-                        DWORD cb = sizeof(on) - sizeof(WCHAR), type = 0;
-                        BOOL flag = FALSE;
-                        if (!RegQueryValueEx(k, L"AutoAdminLogon", NULL, &type, (BYTE*)on, &cb)
-                            && (type == REG_SZ || type == REG_EXPAND_SZ))
-                        {
-                            on[RTL_NUMBER_OF(on) - 1] = L'\0';   // RegQueryValueEx need not terminate
-                            flag = (on[0] == L'1');
-                        }
-                        cb = sizeof(autoUser) - sizeof(WCHAR); type = 0;
-                        if (RegQueryValueEx(k, L"DefaultUserName", NULL, &type, (BYTE*)autoUser, &cb)
-                            || (type != REG_SZ && type != REG_EXPAND_SZ))
-                            autoUser[0] = L'\0';
-                        autoUser[RTL_NUMBER_OF(autoUser) - 1] = L'\0';
-                        // BOTH are required: AutoAdminLogon=1 with no user name logs nobody in.
-                        autoArmed = flag && autoUser[0];
-                        RegCloseKey(k);
-                    }
+                case AL_OK:            StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"armed for '%s'", s_AlUser); break;
+                case AL_FIXED:         StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"FIXED by this agent for '%s'", s_AlUser); break;
+                case AL_PASSWORD_GONE: StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"password GONE for '%s'", s_AlUser); break;
+                case AL_UNPROVISIONED: StringCchCopy(autoDesc, RTL_NUMBER_OF(autoDesc), L"NOT PROVISIONED (no DefaultUserName)"); break;
+                case AL_WRITE_FAILED:  StringCchCopy(autoDesc, RTL_NUMBER_OF(autoDesc), L"broken, and the fix FAILED"); break;
+                default:               StringCchCopy(autoDesc, RTL_NUMBER_OF(autoDesc), L"UNKNOWN (Winlogon unreadable)"); break;
                 }
-                if (autoArmed)
-                    StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"armed for '%s'", autoUser);
                 // IS ANYBODY LOGGED ON? This is the discriminator this block's own comment asks for
                 // ("LogonUI.exe with a console user -> the session is LOCKED. LogonUI.exe with no
                 // console user -> the SIGN-IN screen") and which neither the old code nor the first
@@ -10924,6 +11138,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // probe ran during a sign-in screen, i.e. it would add the very noise this change
                 // exists to remove.
                 const BOOL consoleUser = ConsoleUserPresent();
+                // The arming state was DECIDED AND ACTED ON when this episode began (see
+                // AutologonEnsure above), so it is not re-read here: by now autologon is either on,
+                // or it is one of the states already reported. AL_FIXED counts as armed - this
+                // agent armed it.
+                const BOOL autoArmed = (s_Al == AL_OK || s_Al == AL_FIXED);
                 LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s - dom0 is being shown "
                     L"NOTHING and will keep seeing nothing until this desktop goes away. PATH: %s "
                     L"(consent.exe=%d LogonUI.exe=%d PromptOnSecureDesktop=%s autologon=%s "
