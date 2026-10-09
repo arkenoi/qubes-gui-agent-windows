@@ -1479,7 +1479,16 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
     status = IDXGIOutputDuplication_GetFrameDirtyRects(ctx->duplication, dr_size, &temp_rect, &dr_size);
     if (FAILED(status) && status != DXGI_ERROR_MORE_DATA)
     {
-        win_perror2(status, "initial GetFrameDirtyRects");
+        // The SAME split the acquire and release sides already have, and this path was missed when
+        // they were fixed: ACCESS_LOST/ACCESS_DENIED here is the routine stale-duplication signal,
+        // and win_perror2 renders 0x887A0026 through FormatMessage as "The keyed mutex was
+        // abandoned" - a string about something not involved at all. Measured 2026-10-09: it was
+        // one of the five error lines a clean capture of a current build still carried. The
+        // recovery path stays the single reporter for the signal; every other HRESULT is an error.
+        if (status != DXGI_ERROR_ACCESS_LOST && status != DXGI_ERROR_ACCESS_DENIED)
+            win_perror2(status, "initial GetFrameDirtyRects");
+        else
+            LogDebug("duplication went stale at the initial GetFrameDirtyRects (0x%x)", status);
         goto fail4;
     }
 
