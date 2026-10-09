@@ -13607,7 +13607,12 @@ static ULONG WINAPI WatchForEvents(void)
                     capture = NULL;
                 }
                 captureRetryDue = GetTickCount64() + A7_DEGRADED_RETRY_MS;
-                if (GetTickCount64() - degradedLogLast >= A7_DEGRADED_LOG_MS)
+                // The first episode always reports. With the watermark at 0 this reads
+                // "uptime >= 60 s", so a degraded episode in the first minute was never logged -
+                // and the first minute is when capture is starting up, which is when degradation
+                // is most likely. Third instance of this defect found on 2026-10-09; the other two
+                // (QGAZERORECT, QGAMONSTALE) were found by driving one of them under FI_MON_STALE.
+                if (degradedLogLast == 0 || GetTickCount64() - degradedLogLast >= A7_DEGRADED_LOG_MS)
                 {
                     degradedLogLast = GetTickCount64();
                     LogWarning("A7DEGRADED capture unavailable, retrying");
