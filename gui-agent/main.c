@@ -1562,7 +1562,11 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
                 LogDebug("0x%x: zero DWM bounds and no usable GetWindowRect - rejecting "
                     "(zero-geometry window, e.g. IME/DDE/tooltip host)", window);
                 const ULONGLONG now = GetTickCount64();
-                if (now - s_zeroRectLastReport > 300000)   // at most one line per 5 minutes
+                // Same defect as QGAMONSTALE below, found by measuring that one: with the
+                // watermark at 0 this reads `now > 300000`, so nothing is reported for the first
+                // five minutes of uptime - and zero-geometry windows (IME/DDE/tooltip hosts) are
+                // most likely exactly then, at shell startup. This line has probably never fired.
+                if (s_zeroRectLastReport == 0 || now - s_zeroRectLastReport > 300000)   // then at most one line per 5 min
                 {
                     s_zeroRectLastReport = now;
                     LogInfo("QGAZERORECT %d window(s) rejected for zero geometry since start "
@@ -1615,7 +1619,13 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
             const LONG n = _InterlockedIncrement(&s_staleMonCount);
             const ULONGLONG now = GetTickCount64();
             LogDebug("0x%x: stale monitor handle (0x%x), re-acquired", window, firstError);
-            if (now - s_staleMonLastReport > 300000)   // at most one line per 5 minutes
+            // THE FIRST ONE ALWAYS REPORTS. With the watermark starting at 0 the test is
+            // `now > 300000`, so nothing is reported until the guest has been up five minutes - and
+            // a display change happens at boot, when the IddCx driver is activated. Measured
+            // 2026-10-09 by FI_MON_STALE: the fault fired, the re-acquire worked (no error line),
+            // and QGAMONSTALE was 0 because the window opened ~75 s into the boot. An event that
+            // only ever happens in the first five minutes would never be logged at all.
+            if (s_staleMonLastReport == 0 || now - s_staleMonLastReport > 300000)   // then at most one line per 5 min
             {
                 s_staleMonLastReport = now;
                 LogInfo("QGAMONSTALE %d window(s) measured after a stale monitor handle "
