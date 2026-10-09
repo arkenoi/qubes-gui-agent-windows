@@ -10735,6 +10735,13 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         // announces itself.
         #define SECURE_DESKTOP_FIRST_WARN_MS 30000
         #define SECURE_DESKTOP_REWARN_MS 120000
+        // WHEN AUTOLOGON IS ARMED, dom0 WAITS THIS LONG INSTEAD OF 30 s. The comment above says it
+        // already: autologon takes 15-17 s on this testbed and "a few seconds of this at boot is
+        // normal". 30 s is therefore not evidence of a fault, only of a slower boot - and a clean
+        // install's FIRST logon (profile creation, OOBE finishing) routinely exceeds it. Ten
+        // minutes is past any logon that is going to complete, so a guest still on the secure
+        // desktop then really is waiting and the notification's text is true.
+        #define SECURE_DESKTOP_NOTIFY_ARMED_MS 600000
         static ULONGLONG s_SecureSince = 0;
         static ULONGLONG s_SecureNextWarn = 0;
         if (g_OnSecureDesktop)
@@ -10806,16 +10813,81 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     path = L"a UAC consent prompt is on the SECURE desktop, which PromptOnSecureDesktop=0 is supposed to prevent";
                 else if (logonui)
                     path = L"LogonUI is up: the sign-in or lock screen";
+                // IS AUTOLOGON ARMED? The notification below tells the reader to ARM AUTOLOGON, so
+                // it must only be sent when that is actually the fault. Measured 2026-10-09 on
+                // win10-acc during a clean-install first boot: autologon WAS armed (AutoAdminLogon=1,
+                // DefaultUserName set, the password held as the LSA secret, exactly as this project
+                // installs it) and the session came up moments later - a window appeared right
+                // after - yet dom0 had already been told "The guest is waiting at the sign-in or
+                // lock screen" at ACTION severity, advising a fix that was already in place. A
+                // false actionable message is worse than no message: it sends a reader to look at
+                // the one thing that is working.
+                BOOL autoArmed = FALSE;
+                WCHAR autoUser[64] = L"";
+                WCHAR autoDesc[96] = L"NOT ARMED";
+                {
+                    HKEY k;
+                    if (!RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+                            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+                            0, KEY_READ, &k))
+                    {
+                        WCHAR on[16] = L"";
+                        DWORD cb = sizeof(on) - sizeof(WCHAR), type = 0;
+                        BOOL flag = FALSE;
+                        if (!RegQueryValueEx(k, L"AutoAdminLogon", NULL, &type, (BYTE*)on, &cb)
+                            && (type == REG_SZ || type == REG_EXPAND_SZ))
+                        {
+                            on[RTL_NUMBER_OF(on) - 1] = L'\0';   // RegQueryValueEx need not terminate
+                            flag = (on[0] == L'1');
+                        }
+                        cb = sizeof(autoUser) - sizeof(WCHAR); type = 0;
+                        if (RegQueryValueEx(k, L"DefaultUserName", NULL, &type, (BYTE*)autoUser, &cb)
+                            || (type != REG_SZ && type != REG_EXPAND_SZ))
+                            autoUser[0] = L'\0';
+                        autoUser[RTL_NUMBER_OF(autoUser) - 1] = L'\0';
+                        // BOTH are required: AutoAdminLogon=1 with no user name logs nobody in.
+                        autoArmed = flag && autoUser[0];
+                        RegCloseKey(k);
+                    }
+                }
+                if (autoArmed)
+                    StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"armed for '%s'", autoUser);
+                // IS ANYBODY LOGGED ON? This is the discriminator this block's own comment asks for
+                // ("LogonUI.exe with a console user -> the session is LOCKED. LogonUI.exe with no
+                // console user -> the SIGN-IN screen") and which neither the old code nor the first
+                // version of this fix acted on. It matters because the two need opposite handling:
+                // a LOCKED session was locked by a human and only a human clears it, so dom0 should
+                // hear about it at once; a sign-in screen with autologon armed is a logon still in
+                // progress and dom0 should hear nothing.
+                // WTSQuerySessionInformation is used rather than TaskUserId above: it returns an
+                // EMPTY user name when nobody is logged on, where TaskUserId's WTSQueryUserToken
+                // failure path calls win_perror - which would write an error line every time this
+                // probe ran during a sign-in screen, i.e. it would add the very noise this change
+                // exists to remove.
+                BOOL consoleUser = FALSE;
+                {
+                    DWORD csid = WTSGetActiveConsoleSessionId();
+                    LPWSTR nm = NULL;
+                    DWORD nmcb = 0;
+                    if (csid != 0xFFFFFFFF &&
+                        WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, csid, WTSUserName, &nm, &nmcb))
+                    {
+                        consoleUser = (nm && nm[0]);
+                        WTSFreeMemory(nm);
+                    }
+                }
                 LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s - dom0 is being shown "
                     L"NOTHING and will keep seeing nothing until this desktop goes away. PATH: %s "
-                    L"(consent.exe=%d LogonUI.exe=%d PromptOnSecureDesktop=%s). A few seconds "
+                    L"(consent.exe=%d LogonUI.exe=%d PromptOnSecureDesktop=%s autologon=%s "
+                    L"console-user=%d). A few seconds "
                     L"of this at boot is normal (autologon). Persisting means the guest is waiting at "
                     L"the Windows sign-in or lock screen, which is not shown in SEAMLESS mode: arm "
                     L"autologon in the guest, or switch this qube to the windowed desktop "
                     L"(qvm-features <vm> service.gui-fullscreen 1, then qubes.SetGuiMode FULLSCREEN) "
                     L"where the sign-in screen IS shown inside the bounded window.",
                     desktopName, (now - s_SecureSince) / 1000, path, (int)consent, (int)logonui,
-                    promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"));
+                    promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"), autoDesc,
+                    (int)consoleUser);
                 // A UAC PROMPT HERE IS A DEFECT OF OURS AND SAYS SO, SEPARATELY AND LOUDLY. It is
                 // not the sign-in screen the notification below describes, and telling the user to
                 // "arm autologon" would be wrong advice for it.
@@ -10830,7 +10902,39 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // This is the case the route is best at - a guest with zero windows and a live
                 // qrexec - so the notification is exactly what the log line cannot be: seen.
                 // The desktop name is not included: the fixed text is all a reader needs.
-                QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
+                //
+                // BUT IT GOES OUT ONLY ON POSITIVE EVIDENCE OF THE FAULT IT NAMES, never on
+                // elapsed time alone. Unarmed autologon at 30 s is conclusive and is the case this
+                // route was built for - the two field reports ("absolutely nothing is visible",
+                // forum posts 98/101) where nothing in any log named the state and only a human
+                // could act. Armed autologon at 30 s is an ordinary boot, so dom0 is not told; if
+                // the desktop is STILL up at SECURE_DESKTOP_NOTIFY_ARMED_MS the guest really is
+                // waiting - armed autologon that never completes is its own fault - and the same
+                // notification goes out late rather than never. The log line above is unconditional
+                // either way: the original sin here was silence, and that does not come back.
+                // THE FACTS DECIDE, IN THIS ORDER, and only the last case is left to a clock:
+                //   autologon NOT armed            -> the guest will sit at the sign-in screen for
+                //                                     ever. Conclusive at 30 s, and it is the case
+                //                                     this route was built for. Notify.
+                //   armed + a console user present -> the session is LOCKED: a human locked it and
+                //                                     only a human clears it. Notify.
+                //   armed + nobody logged on       -> a logon is in progress. Say nothing to dom0.
+                // The bound is a BACKSTOP for the one state this agent has NO positive signal for:
+                // autologon that is armed but will never complete (wrong password, disabled or
+                // locked-out account). That case is still decided by elapsed time, which is the
+                // defect class this change is about - so it is named here rather than dressed up,
+                // and it is the only remaining instance. A positive signal for it would be a logon
+                // failure record, which this frame path is the wrong place to read.
+                if (!autoArmed || consoleUser ||
+                    (now - s_SecureSince) >= SECURE_DESKTOP_NOTIFY_ARMED_MS)
+                    QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
+                else
+                    LogInfo("QGADESKSTUCK dom0 NOT notified: autologon is %s and nobody is logged on "
+                        L"yet, so a secure desktop at %I64u s is a logon in progress, not the fault that "
+                        L"notification names. It is sent if this desktop is still up at %u s - the "
+                        L"backstop for autologon that is armed but never completes.",
+                        autoDesc, (now - s_SecureSince) / 1000,
+                        (unsigned)(SECURE_DESKTOP_NOTIFY_ARMED_MS / 1000));
             }
 
             // Seamless: nothing may flow while this desktop is up. Non-seamless falls through
