@@ -236,6 +236,49 @@ static __inline QGA_HELPER_EXIT_DECISION QgaDecideHelperExit(IN BOOL disarmed, I
     return QGA_HELPER_DEATH;   // DEFECT knob: the system's own kill falls through to here and is written up as a death
 }
 
+// ---- THE GRADE ON A HELPER'S BOUNDED STOP WAIT (agent side: BrokerShutdown, NotifBridgeShutdown) ---------------
+// On its way out the agent asks each resident helper to leave (the broker: its shutdown flag + ctl event; the bridge:
+// its stop file), waits a bounded time on the helper's validated process handle, then deletes the helper's task -
+// which ENDS an instance that did not leave. The wait is a failure detector: a helper that ignores its stop while
+// the session is fine is an ERROR. Pure like the decisions above; the offline suite holds the rows.
+//
+// THE DEFECT THIS CLOSES (measured 2026-10-10 on win10-acc, agent instance 3936, 4.3.36.915):
+//   10:49:13.652  QGAENDSESSION: Windows is ending this session -> HelpersDisarm -> the service acknowledges -> the
+//                 agent leaves with QGA_EXIT_SESSION_END
+//   10:49:14.141  HelperTaskDisarm, then "NOTIFBRIDGE stop file written"
+//   10:49:17.166  ERROR "the bridge did not leave within 3 s of the stop file"
+// and bridge.log for that instance stops at 10:49:13 with no stop-file line and no exit line: the stop file was
+// written into a user-session process Windows was already tearing down, which was never in a position to act on
+// it. Nothing was wrong, and an ERROR sent the next reader hunting. The bridge's own stop loop is correct for the
+// normal case (stale-stop delete, directory watch, read at the loop top, delete on exit) and is not touched.
+//   LEFT      the wait was satisfied: the helper left on our request. Nothing to say.
+//   TEARDOWN  the wait EXPIRED while the session is ending: Windows ends the helper, not us. INFO naming the
+//             teardown, with the facts (the wait result, the elapsed ms, the helper's pid, the flag).
+//   EXPIRED   the wait expired with no teardown, or the wait itself FAILED: ERROR, exactly as before - the task
+//             delete ends the helper. A failed wait (WAIT_FAILED: a bad handle) is a defect of ours and is never
+//             excused by a teardown.
+// The next start's restore sweep already owns the banner markers a bridge ended this way leaves; no recovery here.
+// The knob QGA_LIFECYCLE_DEFECT_HELPERSTOPTEARDOWN restores the measured defect and must make the suite FAIL.
+typedef enum _QGA_HELPER_STOP_OUTCOME
+{
+    QGA_HELPER_STOP_LEFT = 0,   // WAIT_OBJECT_0: the helper left on request
+    QGA_HELPER_STOP_TEARDOWN,   // WAIT_TIMEOUT while the session is ending: INFO
+    QGA_HELPER_STOP_EXPIRED     // WAIT_TIMEOUT with no teardown, or a failed wait: ERROR
+} QGA_HELPER_STOP_OUTCOME;
+
+static __inline QGA_HELPER_STOP_OUTCOME QgaHelperStopOutcome(IN BOOL sessionEnding, IN DWORD waitResult)
+{
+    if (waitResult == WAIT_OBJECT_0)
+        return QGA_HELPER_STOP_LEFT;
+#ifndef QGA_LIFECYCLE_DEFECT_HELPERSTOPTEARDOWN
+    if (waitResult == WAIT_TIMEOUT && sessionEnding)
+        return QGA_HELPER_STOP_TEARDOWN;
+#else
+    (void)sessionEnding;   /* the knob drops the one fact that tells a teardown from a miss: that IS the defect */
+#endif
+    return QGA_HELPER_STOP_EXPIRED;   // DEFECT knob: a teardown falls through to here and is written up as a miss
+}
+
 // ---- THE AGENT'S OWN READING OF ITS EXIT CODE (WinMain) ------------------------------------------------------
 // An expected exit - requested, session end, reconnect, no GUI domain - is logged at INFO naming the reason; anything
 // else is a failure, logged at ERROR with the code that caused it. "WinMain: WatchForEvents failed with error 0xb7"

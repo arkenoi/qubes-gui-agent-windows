@@ -3808,10 +3808,30 @@ static void BrokerShutdown(void)
     if (g_WgcCtl) SetEvent(g_WgcCtl);                      // ...read when it wakes: it has no timer any more
     if (g_WgcBrokerProc)
     {
-        // BOUNDED: a failure detector. The broker leaves within milliseconds of the flag; expiry is an ERROR and the
-        // task delete below ends it anyway.
-        if (WaitForSingleObject(g_WgcBrokerProc, 2000) != WAIT_OBJECT_0)
-            LogError("WGCBROKER the broker did not leave within 2 s of the shutdown flag - the task delete ends it");
+        // BOUNDED: a failure detector, graded by QgaHelperStopOutcome (qga-lifecycle.h holds the arms, the offline
+        // suite the rows). The broker leaves within milliseconds of the flag. An expiry while the SESSION IS ENDING
+        // is not a miss: Windows is ending the session's processes in an order we do not control, and a helper
+        // being torn down cannot act on a flag (measured 2026-10-10 on the bridge, this function's sibling), so
+        // that arm is INFO naming the teardown. Outside one an expiry stays the ERROR it was. The task delete
+        // below ends the broker either way.
+        const DWORD pid = (DWORD)g_WgcBrokerPidValidated;
+        const ULONGLONG waitFrom = GetTickCount64();
+        const DWORD wait = WaitForSingleObject(g_WgcBrokerProc, 2000);
+        const ULONGLONG waited = GetTickCount64() - waitFrom;
+        const BOOL ending = LifecycleSessionEnding();
+        switch (QgaHelperStopOutcome(ending, wait))
+        {
+        case QGA_HELPER_STOP_LEFT:
+            break;
+        case QGA_HELPER_STOP_TEARDOWN:
+            LogInfo("WGCBROKER the broker pid %lu did not leave on the shutdown flag - Windows ends it with the "
+                L"session; wait=0x%lx elapsed=%I64u ms session-ending=1", pid, wait, waited);
+            break;
+        default:
+            LogError("WGCBROKER the broker pid %lu did not leave within 2 s of the shutdown flag - the task delete "
+                L"ends it; wait=0x%lx elapsed=%I64u ms session-ending=%d", pid, wait, waited, (int)ending);
+            break;
+        }
         CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
         _InterlockedExchange(&g_WgcBrokerPidValidated, 0);
     }
@@ -4498,11 +4518,35 @@ static void NotifBridgeShutdown(void)
         if (g_NotifLaunched)
             HelperTaskDisarm(NOTIF_TASK_NAME, L"the agent's exit");
         NotifBridgeRequestStop();
-        // BOUNDED: a failure detector. Expiry is an ERROR - the delete then ends the bridge without its banner-restore
-        // exit path, and the gate-off sweep at the next start restores the markers it left.
-        if (g_NotifBridgeProc && WaitForSingleObject(g_NotifBridgeProc, 3000) != WAIT_OBJECT_0)
-            LogError("NOTIFBRIDGE the bridge did not leave within 3 s of the stop file - the task delete ends it "
-                L"without its banner-restore exit path");
+        // BOUNDED: a failure detector, graded by QgaHelperStopOutcome (qga-lifecycle.h holds the arms, the offline
+        // suite the rows). MEASURED 2026-10-10 (instance 3936, 4.3.36.915): QGAENDSESSION at 10:49:13.652, the stop
+        // file written at :14.141, this site's ERROR at :17.166 - and bridge.log for that instance stops at :13
+        // with no stop-file line and no exit line. The file went to a user-session process Windows was already
+        // tearing down, which was never in a position to act on it: nothing was wrong. So an expiry while the
+        // session is ending is INFO naming the teardown; outside one it stays the ERROR it was - the delete then
+        // ends the bridge without its banner-restore exit path, and the gate-off sweep at the next start restores
+        // the markers it left (that sweep exists already; nothing is added here).
+        if (g_NotifBridgeProc)
+        {
+            const ULONGLONG waitFrom = GetTickCount64();
+            const DWORD wait = WaitForSingleObject(g_NotifBridgeProc, 3000);
+            const ULONGLONG waited = GetTickCount64() - waitFrom;
+            const BOOL ending = LifecycleSessionEnding();
+            switch (QgaHelperStopOutcome(ending, wait))
+            {
+            case QGA_HELPER_STOP_LEFT:
+                break;
+            case QGA_HELPER_STOP_TEARDOWN:
+                LogInfo("NOTIFBRIDGE the bridge pid %lu did not leave on the stop file - Windows ends it with the "
+                    L"session; wait=0x%lx elapsed=%I64u ms session-ending=1", g_NotifBridgePid, wait, waited);
+                break;
+            default:
+                LogError("NOTIFBRIDGE the bridge pid %lu did not leave within 3 s of the stop file - the task delete "
+                    L"ends it; wait=0x%lx elapsed=%I64u ms session-ending=%d banner-restore=skipped",
+                    g_NotifBridgePid, wait, waited, (int)ending);
+                break;
+            }
+        }
         WgcRunSchtasks(L"/delete /tn " NOTIF_TASK_NAME L" /f", NULL, NULL, 0);
     }
     if (g_NotifBridgeProc) { CloseHandle(g_NotifBridgeProc); g_NotifBridgeProc = NULL; }

@@ -13,6 +13,9 @@
  *   RECONNECTDEATH    a reconnect exit writes a death record
  *   REQUESTEDDEATH    a requested exit is a death
  *   REQUESTEDERROR    the agent logs an expected exit as a failure (the stale-GetLastError ERROR line)
+ *   HELPERSYSKILLDEATH  a helper the system killed (0x40010004) is written up as a death
+ *   HELPERSTOPTEARDOWN  a helper's stop wait expiring during the session's teardown is graded an ERROR miss (the
+ *                       measured 2026-10-10 defect: "did not leave within 3 s of the stop file" at every shutdown)
  * Prints "ok <case>" / "FAIL <case>" lines; exit 0 iff no FAIL.
  */
 #include <stdio.h>
@@ -111,6 +114,25 @@ int main(void)
     check("no other session-end code excuses a helper: only the system's own kill does",
           QgaDecideHelperExit(FALSE, TRUE, QGA_EXIT_SESSION_END) == QGA_HELPER_DEATH &&
           QgaDecideHelperExit(FALSE, TRUE, QGA_EXIT_RECONNECT) == QGA_HELPER_DEATH);
+
+    /* ---- 2c. THE HELPER'S BOUNDED STOP WAIT (QgaHelperStopOutcome) --------------------------------------
+       On its way out the agent asks each resident helper to leave and waits a bounded time on its handle;
+       an expiry was an ERROR unconditionally. MEASURED 2026-10-10 (instance 3936, 4.3.36.915): QGAENDSESSION
+       at 10:49:13.652, the bridge's stop file written at :14.141, "did not leave within 3 s" at :17.166, and
+       bridge.log stops at :13 with no stop-file line - the file went to a process Windows was already tearing
+       down. Nothing was wrong. */
+    check("stop wait satisfied: the helper left - nothing to say, teardown or not",
+          QgaHelperStopOutcome(FALSE, WAIT_OBJECT_0) == QGA_HELPER_STOP_LEFT &&
+          QgaHelperStopOutcome(TRUE, WAIT_OBJECT_0) == QGA_HELPER_STOP_LEFT);
+    check("stop wait EXPIRED while the session is ending: a teardown, INFO - the measured 3 s case",
+          QgaHelperStopOutcome(TRUE, WAIT_TIMEOUT) == QGA_HELPER_STOP_TEARDOWN);
+    check("stop wait expired with no teardown: the helper ignored its stop - ERROR, exactly as before",
+          QgaHelperStopOutcome(FALSE, WAIT_TIMEOUT) == QGA_HELPER_STOP_EXPIRED);
+    check("a FAILED wait is never excused by a teardown: a bad handle is a defect of ours",
+          QgaHelperStopOutcome(TRUE, WAIT_FAILED) == QGA_HELPER_STOP_EXPIRED &&
+          QgaHelperStopOutcome(FALSE, WAIT_FAILED) == QGA_HELPER_STOP_EXPIRED);
+    check("the teardown arm is SEPARATE from the satisfied one: it is still said (INFO), not swallowed",
+          QgaHelperStopOutcome(TRUE, WAIT_TIMEOUT) != QGA_HELPER_STOP_LEFT);
 
     /* ---- 3. deaths: every undefined code, crash or not ---------------------------------------------------- */
     for (i = 0; i < RTL_NUMBER_OF(crashes); i++)
