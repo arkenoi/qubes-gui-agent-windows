@@ -101,12 +101,42 @@ int main(void)
        session is ending. MEASURED on win10-acc that day: two Application 4003 records for notifhost.exe,
        killed 27 s after boot by an ordinary shutdown, each escalated into a dom0 "exited unexpectedly ...
        this is a major error" notification. The exit code settles it without the race. */
-    check("helper, launches disarmed: expected, no record - whatever the code",
+    /* CORRECTED 2026-10-10. This row used to end "whatever the code" and asserted that a disarmed
+       access violation is expected - which is the hole the owner closed: "yet, a REAL abnormal
+       termination should be always reported loudly". The disarm now excuses only the two ends that ARE
+       the shutdown; the crash clause moved to the rows below, where it expects a DEATH. */
+    check("helper, launches disarmed: expected, no record - for the shutdown's own ends",
           QgaDecideHelperExit(TRUE, TRUE, 0) == QGA_HELPER_EXPECTED_DISARMED &&
-          QgaDecideHelperExit(TRUE, TRUE, 0xC0000005UL) == QGA_HELPER_EXPECTED_DISARMED &&
+          QgaDecideHelperExit(TRUE, TRUE, QGA_EXIT_SYSTEM_TERMINATED) == QGA_HELPER_EXPECTED_DISARMED &&
           QgaDecideHelperExit(TRUE, FALSE, QGA_EXIT_SYSTEM_TERMINATED) == QGA_HELPER_EXPECTED_DISARMED);
     check("helper killed by the system BEFORE the agent was told: expected, no record - the measured 4003 case",
           QgaDecideHelperExit(FALSE, TRUE, QGA_EXIT_SYSTEM_TERMINATED) == QGA_HELPER_EXPECTED_SYSKILL);
+
+    // A REAL ABNORMAL TERMINATION IS ALWAYS LOUD (owner 2026-10-10), so the disarm excuses only the two
+    // ends that ARE the shutdown. Before this, `if (disarmed) return EXPECTED` read no exit code at all
+    // and a crash mid-shutdown was silent (Jev: hides_a_real_kill 0.70 then, crash_must_be_loud 0.95 now).
+    check("disarmed + an access violation: a DEATH - the disarm never excuses a crash",
+          QgaDecideHelperExit(TRUE, TRUE, 0xC0000005UL) == QGA_HELPER_DEATH);
+    check("disarmed + a fast-fail abort: a DEATH",
+          QgaDecideHelperExit(TRUE, TRUE, 0xC0000409UL) == QGA_HELPER_DEATH);
+    check("disarmed + heap corruption, a stack overflow, an illegal instruction: all DEATHS",
+          QgaDecideHelperExit(TRUE, TRUE, 0xC0000374UL) == QGA_HELPER_DEATH &&
+          QgaDecideHelperExit(TRUE, TRUE, 0xC00000FDUL) == QGA_HELPER_DEATH &&
+          QgaDecideHelperExit(TRUE, TRUE, 0xC000001DUL) == QGA_HELPER_DEATH);
+    check("disarmed + an unhandled C++ or .NET exception: a DEATH (customer-flagged, same severity test)",
+          QgaDecideHelperExit(TRUE, TRUE, 0xE06D7363UL) == QGA_HELPER_DEATH &&
+          QgaDecideHelperExit(TRUE, TRUE, 0xE0434352UL) == QGA_HELPER_DEATH);
+    check("disarmed + its own failure exit (2): a DEATH, not excused by the shutdown",
+          QgaDecideHelperExit(TRUE, TRUE, 2UL) == QGA_HELPER_DEATH);
+    check("disarmed + Windows' teardown code: still EXPECTED - the shutdown case stays silent",
+          QgaDecideHelperExit(TRUE, TRUE, QGA_EXIT_SYSTEM_TERMINATED) == QGA_HELPER_EXPECTED_DISARMED);
+    check("disarmed + a clean exit 0: EXPECTED - a helper leaving tidily as we go down",
+          QgaDecideHelperExit(TRUE, TRUE, 0UL) == QGA_HELPER_EXPECTED_DISARMED);
+    check("disarmed + it never exited (a hang, no code to read): EXPECTED here - the stop-wait decision owns that",
+          QgaDecideHelperExit(TRUE, FALSE, 0UL) == QGA_HELPER_EXPECTED_DISARMED);
+    check("the severity test is the predicate: 0x40010004 is severity 1 and not a crash, 0xC0000005 is",
+          !QgaExitIsCrash(QGA_EXIT_SYSTEM_TERMINATED) && QgaExitIsCrash(0xC0000005UL) &&
+          !QgaExitIsCrash(0UL) && !QgaExitIsCrash(2UL));
     check("that arm is SEPARATE from the disarmed one, so it can be logged louder and found in a sweep",
           QgaDecideHelperExit(FALSE, TRUE, QGA_EXIT_SYSTEM_TERMINATED) !=
           QgaDecideHelperExit(TRUE, TRUE, QGA_EXIT_SYSTEM_TERMINATED));

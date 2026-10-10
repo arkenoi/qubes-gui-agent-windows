@@ -223,8 +223,45 @@ typedef enum _QGA_HELPER_EXIT_DECISION
 } QGA_HELPER_EXIT_DECISION;
 
 // `exited` is FALSE for the broker's hang arm, where no exit code exists to read - a hang is never excused here.
+// AN NTSTATUS ERROR-SEVERITY CODE IS A CRASH, whatever else was happening. The top two bits of an
+// NTSTATUS are its severity, and 3 (0xC.......) is STATUS_SEVERITY_ERROR: the whole crash family lands
+// there - 0xC0000005 an access violation, 0xC0000409 a fast-fail abort, 0xC0000374 heap corruption,
+// 0xC00000FD a stack overflow, 0xC000001D an illegal instruction - and so do the codes nobody has
+// enumerated yet, which is why this is a severity test and not a list (Jev: ntstatus-severity 0.69 over
+// an explicit list). 0xE06D7363 (C++) and 0xE0434352 (.NET) are customer-flagged and caught by the same
+// test. QGA_EXIT_SYSTEM_TERMINATED (0x40010004) is severity 1, so it is NOT a crash by this test, which
+// is the whole point: Windows' own teardown code must stay excusable while a crash never is.
+static __inline BOOL QgaExitIsCrash(IN DWORD exitCode)
+{
+    return (BOOL)(((exitCode >> 30) & 3u) == 3u);
+}
+
+// A REAL ABNORMAL TERMINATION IS ALWAYS LOUD - owner, 2026-10-10: "yet, a REAL abnormal termination
+// should be always reported loudly", after "if we shut down the guest, none of its components should
+// complain about the fact". Both halves live here: the disarm (the session is ending, so we expect our
+// helpers to go) excuses only the two ends that ARE the shutdown - Windows' teardown code, and a clean
+// exit 0 - and excuses nothing else. A helper that takes an access violation while the guest is going
+// down is a defect of ours and is reported like any other death.
+// THE DEFECT THIS CLOSES, and it was flagged when the disarm landed: `if (disarmed) return EXPECTED`
+// returned BEFORE the exit code was read, so from the first moment of a shutdown every helper exit was
+// expected - a crash included. Jev scored that `hides_a_real_kill` 0.70 at the time and
+// `crash_must_be_loud` 0.95 now; it is a NARROWING of the excuse, not a reversal of it
+// (`reverses_cd73a56` 0.26) - the teardown case this file exists for stays silent.
+// WHAT IS NOT SETTLED, recorded rather than decided quietly: for a clean exit 0 during the disarm Jev
+// split warn 0.48 / silent 0.47, and for an arbitrary nonzero it leaned loud at only 0.53. Exit 0 is
+// treated as expected (it is normal for a teardown) and any other nonzero as a death (his rule's plain
+// reading). The sweep now counts both, which is the data a later round needs.
 static __inline QGA_HELPER_EXIT_DECISION QgaDecideHelperExit(IN BOOL disarmed, IN BOOL exited, IN DWORD exitCode)
 {
+#ifndef QGA_LIFECYCLE_DEFECT_DISARMHIDESCRASH
+    // BOTH of these are the narrowing, so the knob has to drop BOTH - with only the first one guarded
+    // the second still caught the crash and the knob changed nothing, which the suite reported as
+    // "that guard is decoration". A knob that cannot restore the defect proves nothing.
+    if (disarmed && exited && QgaExitIsCrash(exitCode))
+        return QGA_HELPER_DEATH;   // the disarm never excuses a crash
+    if (disarmed && exited && exitCode != QGA_EXIT_SYSTEM_TERMINATED && exitCode != 0)
+        return QGA_HELPER_DEATH;   // its own failure exit, or an external kill: still a death
+#endif
     if (disarmed)
         return QGA_HELPER_EXPECTED_DISARMED;
 #ifndef QGA_LIFECYCLE_DEFECT_HELPERSYSKILLDEATH
