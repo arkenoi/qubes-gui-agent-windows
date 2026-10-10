@@ -7804,52 +7804,19 @@ static BOOL StartOrSearchHoldsForeground(OUT DWORD* fgPid)
 
 // Escape already sent in this opening and Start/Search still holds the foreground: the menu is closing (a debug line) until
 // START_DISMISS_SETTLE_MS after the Escape, stuck after it (one LOUD line per opening).
-// ONE TARGETED TOGGLE BEFORE CALLING IT STUCK. Measured 2026-10-11 on win11-app: the Start surface
-// ignored the posted Escape and was still open 2859 ms later, holding the foreground, with the agent's
-// own line saying "clicks go to a menu the user cannot see". The second step must stay as targeted as
-// the first - a global SendInput is what this code was moved away from, because it is dequeued by
-// whatever holds the foreground and routinely that is a third-party menu (race_is_real 0.96). The
-// taskbar's own SC_TASKLIST toggle is posted to ONE window and cannot be dequeued by anybody else.
-// It TOGGLES, so it is only ever sent while Start still holds the foreground - the caller established
-// that - and only once per opening. No taskbar window (a replaced shell) means nothing to post to and
-// the loud report stands, which is QgaStartDismissStep's QGA_START_STUCK arm.
-static BOOL g_StartToggleSent = FALSE;
-
 static void StartDismissCheckStuck(IN HWND start, IN DWORD fgPid)
 {
     const ULONGLONG since = GetTickCount64() - g_StartDismissSentAt;
-    // FindWindow is per-DESKTOP, like GetShellWindow: this runs on the window-event path, which is
-    // attached to the input desktop. A NULL here is simply "no taskbar to ask", and the predicate
-    // turns that into the loud report rather than into silence.
-    const HWND tray = FindWindow(L"Shell_TrayWnd", NULL);
-    switch (QgaStartDismissStep(TRUE, since, (unsigned long long)START_DISMISS_SETTLE_MS,
-                                tray != NULL, g_StartToggleSent))
+    if (since < START_DISMISS_SETTLE_MS)
     {
-    case QGA_START_WAIT:
         LogDebug("QGASTARTDISMISS 0x%x: Start still closing %llu ms after Escape (foreground pid %lu)", start, since, fgPid);
         return;
-
-    case QGA_START_TOGGLE:
-        g_StartToggleSent = TRUE;
-        if (PostMessage(tray, WM_SYSCOMMAND, (WPARAM)SC_TASKLIST, 0))
-            LogInfo("QGASTARTDISMISS 0x%x: Escape ignored %llu ms, posting the shell's own SC_TASKLIST toggle to "
-                "the taskbar 0x%x - one message, to one window, never a global inject (foreground pid %lu)",
-                start, since, (DWORD)(ULONG_PTR)tray, fgPid);
-        else
-            LogWarning("QGASTARTDISMISS 0x%x: the taskbar toggle could not be posted (error %lu); the menu stays open",
-                start, GetLastError());
-        return;
-
-    case QGA_START_STUCK:
-    default:
-        if (!g_StartDismissStuckLogged)
-        {
-            g_StartDismissStuckLogged = TRUE;
-            LogWarning("QGASTARTDISMISS 0x%x: the hidden Start menu is STILL open %llu ms after Escape and after the "
-                "taskbar toggle (tried=%d, taskbar=%d, foreground pid %lu) - clicks go to a menu the user cannot see",
-                start, since, g_StartToggleSent ? 1 : 0, tray != NULL ? 1 : 0, fgPid);
-        }
-        return;
+    }
+    if (!g_StartDismissStuckLogged)
+    {
+        g_StartDismissStuckLogged = TRUE;
+        LogWarning("QGASTARTDISMISS 0x%x: the hidden Start menu is STILL open %llu ms after Escape (foreground pid %lu) - clicks go to a menu the user cannot see",
+            start, since, fgPid);
     }
 }
 
@@ -7866,7 +7833,6 @@ static void StartDismissMaybeRearm(void)
     {
         g_StartDismissSent = FALSE;
         g_StartDismissStuckLogged = FALSE;
-        g_StartToggleSent = FALSE;
         return;
     }
     // Still Start/Search in front: once the settle time is over, ANY window event is the evidence for a Start the Escape did not
@@ -7884,7 +7850,6 @@ static void DismissHiddenStartSurface(IN HWND start)
         // Start is not holding input (or not open yet - a later event of this opening looks again): nothing to close.
         g_StartDismissSent = FALSE;
         g_StartDismissStuckLogged = FALSE;
-        g_StartToggleSent = FALSE;
         return;
     }
     if (g_StartDismissSent)
