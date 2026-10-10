@@ -11168,7 +11168,7 @@ static void SecureDesktopFactsRead(OUT SECURE_DESKTOP_FACTS *f)
 // The image name from HKLM Winlogon\Shell: first token (the value can carry arguments), basename
 // only (it can carry a path), quotes stripped. Empty on any failure, which is not a narrowing -
 // QgaIsSessionShellImage still accepts explorer.exe.
-static void ShellImageConfigured(OUT WCHAR *image, IN DWORD cch)
+static void ShellImageConfigured(OUT WCHAR *image, IN size_t cch)
 {
     HKEY k;
     WCHAR raw[MAX_PATH] = { 0 };
