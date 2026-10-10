@@ -3776,7 +3776,11 @@ static void BrokerSupervise(void)
         LogDebug("QGADESLICEDOWN not reported on the secure desktop (down %I64u s so far)",
             (now - g_BrokerDownSince) / 1000);
     }
-    else if (now >= g_BrokerNextWarn)
+    // A ZEROED CLOCK IS NOT ARMED (QgaDesliceWarnDue). The hold above zeroes both values while the
+    // broker could not have been launched, and `now >= 0` made that hold FIRE the report instead of
+    // deferring it - one false dom0 toast per cold boot, with the agent's uptime printed as the
+    // outage. Measured 2026-10-11; the predicate is tested offline with its own defect knob.
+    else if (QgaDesliceWarnDue(g_BrokerDownSince, g_BrokerNextWarn, now))
     {
         g_BrokerNextWarn = now + DESLICE_REWARN_MS;
         // Name the cause: a MISSING binary is the packaging gap (wgcbroker.exe not shipped);

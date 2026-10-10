@@ -435,3 +435,36 @@ static __inline const WCHAR *QgaExitReasonName(IN DWORD code)
     default:                         return L"a failure (a Win32 error, or a code no path defines)";
     }
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * IS THE "DE-SLICE BROKER DOWN" REPORT DUE?  (QGADESLICEDOWN, and the dom0 toast that rides it)
+ *
+ * THE DEFECT THIS EXISTS TO END, measured 2026-10-11 on win11-app, two cold boots:
+ *     00:25:43.341  agent starts, System uptime: 46.250 seconds
+ *     00:25:43.811  QGADESLICEDOWN "not running for 46 s" -> toast sent to dom0 (#1 this boot)
+ *     00:25:43-44   the same line 29 more times, 28 of them "not sent: suppressed:duplicate"
+ *     00:25:59.623  QGAHELPERTASK Qubes-WgcBroker registered and started  <- 16 s AFTER the complaint
+ * The broker had not failed; it had not been launched yet. 8168655 (2026-10-08) added a hold for
+ * exactly that window - it zeroes both the down-clock and the next-warn tick - but the firing test
+ * was `now >= g_BrokerNextWarn`, and zero is in the past, so the hold GUARANTEED the report instead
+ * of deferring it. The duration printed was `now - 0`: the system uptime, not an outage. Then the
+ * hold re-zeroed on the next pass, so hold and fire ping-ponged and the loop stayed awake through it.
+ * The dom0 text was "The notification and menu capture helper is not running ... has not run for over
+ * 30 s", which was false on every count, and it also wrote DesliceBrokerDown=1 - the flag
+ * health-check and acceptance FAIL on - onto healthy guests.
+ *
+ * A ZEROED CLOCK MEANS NOT ARMED, NEVER "DUE NOW". A broker that genuinely never becomes ready is
+ * still reported: the clock is armed at the launch (g_WgcLastLaunch), so its duration is true, and a
+ * guest with no shell at all is QGADESKSTUCK's condition, not this one.
+ */
+static __inline BOOL QgaDesliceWarnDue(IN unsigned long long downSince, IN unsigned long long nextWarn,
+                                       IN unsigned long long now)
+{
+#ifdef QGA_LIFECYCLE_DEFECT_ZERODUE
+    (void)downSince;     /* DEFECT: a zeroed clock reads as "due now" - the false toast per cold boot */
+#else
+    if (downSince == 0 || nextWarn == 0)
+        return FALSE;    /* held: the broker could not have been launched yet - nothing to report */
+#endif
+    return (BOOL)(now >= nextWarn);
+}

@@ -300,6 +300,22 @@ int main(void)
               QGA_ENDSESSION_ACK_WAIT_MS < 5000 && QGA_ENDSESSION_EXIT_WAIT_MS < 20000);
     }
 
+    /* ---- QGADESLICEDOWN: a zeroed clock is NOT ARMED (the 2026-10-11 false-toast defect) ---- */
+    /* The exact state measured on win11-app: the hold zeroed both values, the agent had been up 46 s,
+     * and the old test `now >= nextWarn` fired because zero is in the past. */
+    check("deslice: held clock (both zero) is NOT due, however long the agent has been up",
+          QgaDesliceWarnDue(0, 0, 46250) == FALSE);
+    check("deslice: a down-clock with no warn tick is NOT due",
+          QgaDesliceWarnDue(1000, 0, 999999) == FALSE);
+    check("deslice: a warn tick with no down-clock is NOT due",
+          QgaDesliceWarnDue(0, 30000, 999999) == FALSE);
+    check("deslice: armed and BEFORE the deadline is not due",
+          QgaDesliceWarnDue(1000, 31000, 30999) == FALSE);
+    check("deslice: armed and AT the deadline is due - a real outage is still reported",
+          QgaDesliceWarnDue(1000, 31000, 31000) == TRUE);
+    check("deslice: armed and past the deadline is due",
+          QgaDesliceWarnDue(1000, 31000, 120000) == TRUE);
+
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }
