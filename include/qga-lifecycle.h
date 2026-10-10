@@ -468,3 +468,48 @@ static __inline BOOL QgaDesliceWarnDue(IN unsigned long long downSince, IN unsig
 #endif
     return (BOOL)(now >= nextWarn);
 }
+/* ---------------------------------------------------------------------------------------------
+ * IS THIS RUNNING IMAGE THE SESSION'S SHELL?
+ *
+ * Owner, 2026-10-11: "can you just match 'it is our shell', not by the name?" The shell fact used to
+ * compare against the literal explorer.exe, which is Winlogon's DEFAULT Shell value and not a fact
+ * about this guest: a kiosk guest (Shell Launcher / assigned access sets Winlogon\Shell to a single
+ * app) runs a shell that is not explorer, read as ABSENT, and the window-hold report would then blame
+ * a missing desktop for a real display fault. Open-Shell is NOT this case - it only adds a Start
+ * menu and explorer keeps running.
+ *
+ * So the test is "the image is the CONFIGURED shell, or it is explorer". Both, deliberately: the
+ * configured value can be empty, unreadable, or carry arguments and a quoted path, and on a stock
+ * guest explorer IS the shell - so the default must keep matching rather than depending on a registry
+ * read succeeding. A failed read therefore narrows nothing and can never mute a report.
+ *
+ * Case-insensitive the portable way: Windows file names are case-insensitive, and this header is
+ * compiled by MSVC for the agent and by gcc for the offline suite, where _wcsicmp does not exist.
+ */
+static __inline int QgaWcsIEqAscii(IN const wchar_t *a, IN const wchar_t *b)
+{
+    if (!a || !b)
+        return 0;
+    for (; *a && *b; a++, b++)
+    {
+        wchar_t ca = *a, cb = *b;
+        if (ca >= L'A' && ca <= L'Z') ca = (wchar_t)(ca - L'A' + L'a');
+        if (cb >= L'A' && cb <= L'Z') cb = (wchar_t)(cb - L'A' + L'a');
+        if (ca != cb)
+            return 0;
+    }
+    return *a == 0 && *b == 0;
+}
+
+/* `image` is a running process's image name (no path); `configured` is the basename of the session's
+ * Winlogon\Shell value, or NULL/empty when it could not be read. */
+static __inline BOOL QgaIsSessionShellImage(IN const wchar_t *image, IN const wchar_t *configured)
+{
+#ifndef QGA_LIFECYCLE_DEFECT_SHELLBYNAME
+    if (configured && configured[0] && QgaWcsIEqAscii(image, configured))
+        return TRUE;                       /* the shell this guest is CONFIGURED to run */
+#else
+    (void)configured;   /* DEFECT: only the literal default counts, so a kiosk guest reads ABSENT */
+#endif
+    return (BOOL)QgaWcsIEqAscii(image, L"explorer.exe");   /* the default shell, always still a shell */
+}

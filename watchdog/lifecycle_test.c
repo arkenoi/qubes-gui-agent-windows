@@ -316,6 +316,18 @@ int main(void)
     check("deslice: armed and past the deadline is due",
           QgaDesliceWarnDue(1000, 31000, 120000) == TRUE);
 
+    /* ---- "it is our shell", not a hardcoded name (owner 2026-10-11) ---- */
+    check("shell: explorer is always a shell, even with no configured value read",
+          QgaIsSessionShellImage(L"explorer.exe", L"") == TRUE);
+    check("shell: explorer matches case-insensitively, as Windows file names do",
+          QgaIsSessionShellImage(L"EXPLORER.EXE", NULL) == TRUE);
+    check("shell: a KIOSK guest's configured shell counts as the shell",
+          QgaIsSessionShellImage(L"kioskapp.exe", L"kioskapp.exe") == TRUE);
+    check("shell: some other process is not the shell",
+          QgaIsSessionShellImage(L"notepad.exe", L"kioskapp.exe") == FALSE);
+    check("shell: an unreadable configured value never narrows - explorer still matches",
+          QgaIsSessionShellImage(L"explorer.exe", L"kioskapp.exe") == TRUE);
+
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

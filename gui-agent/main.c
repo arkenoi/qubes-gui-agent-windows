@@ -11165,6 +11165,35 @@ static void SecureDesktopFactsRead(OUT SECURE_DESKTOP_FACTS *f)
 // console session by ProcessIdToSessionId so another session's shell does not count. The shell is explorer.exe
 // (Winlogon's default Shell value; nothing of ours changes it). Tri-state: a list that could not be read is said
 // as UNREAD with the error, never as "no shell" - the verdict turns that into NO_FACT at WARNING.
+// The image name from HKLM Winlogon\Shell: first token (the value can carry arguments), basename
+// only (it can carry a path), quotes stripped. Empty on any failure, which is not a narrowing -
+// QgaIsSessionShellImage still accepts explorer.exe.
+static void ShellImageConfigured(OUT WCHAR *image, IN DWORD cch)
+{
+    HKEY k;
+    WCHAR raw[MAX_PATH] = { 0 };
+    DWORD type = 0, cb = sizeof(raw) - sizeof(WCHAR);
+    image[0] = 0;
+    if (RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+                     L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+                     0, KEY_QUERY_VALUE, &k) != ERROR_SUCCESS)
+        return;
+    if (RegQueryValueEx(k, L"Shell", NULL, &type, (BYTE*)raw, &cb) != ERROR_SUCCESS ||
+        (type != REG_SZ && type != REG_EXPAND_SZ))
+    {
+        RegCloseKey(k);
+        return;
+    }
+    RegCloseKey(k);
+    WCHAR *p = raw, *end;
+    while (*p == L' ' || *p == L'"') p++;
+    end = p;
+    while (*end && *end != L',' && *end != L'"' && !(*end == L' ' && end > p)) end++;
+    *end = 0;
+    WCHAR *sl = wcsrchr(p, L'\\');
+    StringCchCopy(image, cch, sl ? sl + 1 : p);
+}
+
 static QGA_SHELL_PROCESS ShellProcessInConsoleSession(OUT DWORD *err)
 {
     const DWORD csid = WTSGetActiveConsoleSessionId();
@@ -11183,6 +11212,14 @@ static QGA_SHELL_PROCESS ShellProcessInConsoleSession(OUT DWORD *err)
         *err = GetLastError();
         return QGA_SHELLPROC_UNREAD;
     }
+    // WHAT THIS GUEST IS CONFIGURED TO RUN AS ITS SHELL, not the literal explorer.exe (owner
+    // 2026-10-11: "can you just match 'it is our shell', not by the name?"). A kiosk guest - Shell
+    // Launcher / assigned access - sets Winlogon\Shell to one app, so explorer never runs and the
+    // fact read ABSENT on a guest that HAS a desktop, which would make the lock verdict say
+    // "no session" about a running one. An unreadable value narrows nothing: QgaIsSessionShellImage
+    // still matches explorer, the documented default.
+    WCHAR configured[MAX_PATH] = { 0 };
+    ShellImageConfigured(configured, RTL_NUMBER_OF(configured));
     ZeroMemory(&pe, sizeof(pe));
     pe.dwSize = sizeof(pe);
     if (!Process32FirstW(snap, &pe))
@@ -11193,7 +11230,7 @@ static QGA_SHELL_PROCESS ShellProcessInConsoleSession(OUT DWORD *err)
     }
     do {
         DWORD psid = 0;
-        if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0 &&
+        if (QgaIsSessionShellImage(pe.szExeFile, configured) &&
             ProcessIdToSessionId(pe.th32ProcessID, &psid) && psid == csid)
         {
             found = QGA_SHELLPROC_PRESENT;
