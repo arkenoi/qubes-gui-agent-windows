@@ -88,6 +88,30 @@ int main(void)
           !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, FALSE, FALSE).RelaunchNow && !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, FALSE, FALSE).FailService &&
           !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE, FALSE).RelaunchNow && !QgaDecideAgentExit(QGA_EXIT_SYSTEM_TERMINATED, TRUE, FALSE).FailService);
 
+    /* ---- 2b. THE HELPER EXITS (QgaDecideHelperExit) ------------------------------------------------------
+       The agent supervises the broker, the notification bridge and the ETW proxy, and until 2026-10-10 all
+       three asked only "are helper launches disarmed?" - true only once Windows has told the AGENT its
+       session is ending. MEASURED on win10-acc that day: two Application 4003 records for notifhost.exe,
+       killed 27 s after boot by an ordinary shutdown, each escalated into a dom0 "exited unexpectedly ...
+       this is a major error" notification. The exit code settles it without the race. */
+    check("helper, launches disarmed: expected, no record - whatever the code",
+          QgaDecideHelperExit(TRUE, TRUE, 0) == QGA_HELPER_EXPECTED_DISARMED &&
+          QgaDecideHelperExit(TRUE, TRUE, 0xC0000005UL) == QGA_HELPER_EXPECTED_DISARMED &&
+          QgaDecideHelperExit(TRUE, FALSE, QGA_EXIT_SYSTEM_TERMINATED) == QGA_HELPER_EXPECTED_DISARMED);
+    check("helper killed by the system BEFORE the agent was told: expected, no record - the measured 4003 case",
+          QgaDecideHelperExit(FALSE, TRUE, QGA_EXIT_SYSTEM_TERMINATED) == QGA_HELPER_EXPECTED_SYSKILL);
+    check("that arm is SEPARATE from the disarmed one, so it can be logged louder and found in a sweep",
+          QgaDecideHelperExit(FALSE, TRUE, QGA_EXIT_SYSTEM_TERMINATED) !=
+          QgaDecideHelperExit(TRUE, TRUE, QGA_EXIT_SYSTEM_TERMINATED));
+    check("a HANG is never excused: no exit code exists to read, so it stays a death",
+          QgaDecideHelperExit(FALSE, FALSE, QGA_EXIT_SYSTEM_TERMINATED) == QGA_HELPER_DEATH);
+    check("a crash is a death", QgaDecideHelperExit(FALSE, TRUE, 0xC0000005UL) == QGA_HELPER_DEATH);
+    check("a clean exit nobody asked for is STILL a death (exit 0 is not an excuse)",
+          QgaDecideHelperExit(FALSE, TRUE, 0) == QGA_HELPER_DEATH);
+    check("no other session-end code excuses a helper: only the system's own kill does",
+          QgaDecideHelperExit(FALSE, TRUE, QGA_EXIT_SESSION_END) == QGA_HELPER_DEATH &&
+          QgaDecideHelperExit(FALSE, TRUE, QGA_EXIT_RECONNECT) == QGA_HELPER_DEATH);
+
     /* ---- 3. deaths: every undefined code, crash or not ---------------------------------------------------- */
     for (i = 0; i < RTL_NUMBER_OF(crashes); i++)
     {

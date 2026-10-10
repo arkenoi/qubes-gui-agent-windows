@@ -3555,12 +3555,27 @@ static void BrokerSupervise(void)
     // (restart-on-failure), or nothing does, and the record below is what says it happened.
     if (_InterlockedExchange(&g_BrokerReady, 0) != 0)
     {
-        if (HelpersDisarmed())
+        // qga-lifecycle.h holds the decision and the offline suite holds its rows; `brokerExited` is FALSE on the
+        // hang arm, where there is no exit code to read and nothing is excused.
+        const QGA_HELPER_EXIT_DECISION brokerVerdict =
+            QgaDecideHelperExit(HelpersDisarmed(), brokerExited, brokerExitCode);
+        if (brokerVerdict != QGA_HELPER_DEATH)
         {
-            // EXPECTED (R5): helper launches are disarmed - the session is ending or this agent is leaving - and the
-            // broker went with it. Not a death: INFO, no record, nothing comes back (and nothing should).
-            LogInfo("WGCBROKER the broker %s (code %lu) while helper launches are disarmed (session ending / agent "
-                L"exiting) - expected, not a death", brokerExited ? L"exited" : L"stopped answering", brokerExitCode);
+            if (brokerVerdict == QGA_HELPER_EXPECTED_DISARMED)
+                LogInfo("WGCBROKER the broker %s (code %lu) while helper launches are disarmed (session ending / "
+                    L"agent exiting) - expected, not a death. No death record and nothing relaunches it",
+                    brokerExited ? L"exited" : L"stopped answering", brokerExitCode);
+            else
+            {
+                LogWarning("WGCBROKERSYSKILL the system terminated the broker (0x40010004) before this agent was "
+                    L"told its session was ending - recorded as a teardown, not a death. If no shutdown was in "
+                    L"progress, this is an ordering anomaly worth finding");
+                // DURABLE, AND NOT ESCALATED: 4012 instead of 4002. The Application log keeps it whatever happens
+                // to our own log files; the dom0 reporter reads only 4001-4004, so no notification goes out.
+                DeathEventReportTeardown(DEATHEVENT_ID_WGCBROKER, L"wgcbroker.exe", (DWORD)pidBefore,
+                    brokerExitCode, g_BrokerReadyAt != 0 ? now - g_BrokerReadyAt : DEATHEVENT_RAN_UNKNOWN,
+                    L"Windows ended it with the session. gui-agent log line WGCBROKERSYSKILL.");
+            }
             if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
                                    _InterlockedExchange(&g_WgcBrokerPidValidated, 0); }
             return;
@@ -4207,12 +4222,26 @@ static void NotifBridgeSupervise(void)
         bridgeExited = TRUE;
         g_NotifBridgeExitedAt = now;
         ToastHoldSetBridgeUp(FALSE);   // every held banner fails open now: no verdict can arrive any more
-        if (HelpersDisarmed())
+        const QGA_HELPER_EXIT_DECISION bridgeVerdict =
+            QgaDecideHelperExit(HelpersDisarmed(), TRUE, exitCode);
+        if (bridgeVerdict != QGA_HELPER_DEATH)
         {
-            // EXPECTED (R5): helper launches are disarmed - the session is ending or this agent is leaving - and the
-            // bridge went with it. Not a death: INFO, no record, nothing comes back (and nothing should).
-            LogInfo("NOTIFBRIDGE the bridge pid %lu exited (code %lu) while helper launches are disarmed (session "
-                L"ending / agent exiting) - expected, not a death", g_NotifBridgePid, exitCode);
+            if (bridgeVerdict == QGA_HELPER_EXPECTED_DISARMED)
+                LogInfo("NOTIFBRIDGE the bridge pid %lu exited (code %lu) while helper launches are disarmed "
+                    L"(session ending / agent exiting) - expected, not a death. No death record",
+                    g_NotifBridgePid, exitCode);
+            else
+            {
+                LogWarning("NOTIFBRIDGESYSKILL the system terminated the bridge pid %lu (0x40010004) before this "
+                    L"agent was told its session was ending - recorded as a teardown, not a death. If no shutdown "
+                    L"was in progress, this is an ordering anomaly worth finding", g_NotifBridgePid);
+                // 4013, not 4003: durable in the Application log, and not read by the dom0 reporter. This is the
+                // site measured firing twice on 2026-10-10, each time as a "major error" toast on the owner's desk.
+                DeathEventReportTeardown(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", g_NotifBridgePid, exitCode,
+                    g_NotifLastLaunch != 0 ? now - g_NotifLastLaunch : DEATHEVENT_RAN_UNKNOWN,
+                    L"Windows ended it with the session. gui-agent log line NOTIFBRIDGESYSKILL; bridge.log in "
+                    L"Qubes Logs has its own record.");
+            }
             g_NotifBridgePid = 0;
             return;
         }

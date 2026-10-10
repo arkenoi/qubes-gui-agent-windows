@@ -106,6 +106,7 @@
 #include <evntcons.h>    // EventAccessControl / EventSecuritySetDACL|AddDACL
 #include <strsafe.h>
 
+#include "qga-lifecycle.h"   // QgaDecideHelperExit: the system's own kill is not a death
 #include "etwproxy.h"
 #include "deathevent.h"
 
@@ -910,12 +911,22 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
     CloseHandle(g_Job);   // process already gone; KILL_ON_JOB_CLOSE has nothing left to kill
     g_Job = NULL;
 
-    if (g_Disarmed)
+    const QGA_HELPER_EXIT_DECISION proxyVerdict = QgaDecideHelperExit(g_Disarmed, TRUE, rc);
+    if (proxyVerdict != QGA_HELPER_DEATH)
     {
-        // EXPECTED (R5): helper launches are disarmed because the session is ending, and the proxy went with it
-        // (Windows ends every process of the session). Not a death: INFO, no record, nothing comes back.
-        LogInfo("ETWPROXYSUP proxy exited rc=%lu after %llu ms while the session is ending - expected, not a death",
-                rc, uptimeMs);
+        if (proxyVerdict == QGA_HELPER_EXPECTED_DISARMED)
+            /* the phrase below is asserted verbatim by tools/tests/lifecycle-selftest.sh - keep it on one line */
+            LogInfo("ETWPROXYSUP proxy exited rc=%lu after %llu ms while the session is ending - expected, not a death",
+                    rc, uptimeMs);
+        else
+        {
+            LogWarning("ETWPROXYSYSKILL the system terminated the proxy (0x40010004) after %llu ms, before this "
+                    L"agent was told its session was ending - recorded as a teardown, not a death. If no shutdown "
+                    L"was in progress, this is an ordering anomaly worth finding", uptimeMs);
+            // 4014, not 4004: durable, and not read by the dom0 reporter.
+            DeathEventReportTeardown(DEATHEVENT_ID_ETWPROXY, L"etwproxy.exe", pid, rc, uptimeMs,
+                L"Windows ended it with the session. gui-agent log line ETWPROXYSYSKILL; etw-proxy.log has its own.");
+        }
         EtwProxySessionStopLocked();
         g_State = EPS_DEAD;
         LeaveCriticalSection(&g_Lock);

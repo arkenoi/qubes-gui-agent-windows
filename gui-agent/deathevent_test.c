@@ -20,6 +20,7 @@
 #include <stdarg.h>
 
 #include "deathevent.h"
+#include "qga-exitcodes.h"   /* QGA_EXIT_SYSTEM_TERMINATED: the teardown rows use the real constant */
 
 /* --- stubs: what the writer hands to Win32 ----------------------------------------------- */
 static int g_registerCalls, g_reportCalls, g_deregisterCalls, g_perrorCalls;
@@ -178,6 +179,42 @@ int main(void)
     check("report: %2..%5 structured", wcscmp(g_strings[1], L"notifhost.exe") == 0 && wcscmp(g_strings[2], L"4321") == 0 &&
           wcscmp(g_strings[3], L"0xC0000005") == 0 && wcscmp(g_strings[4], L"60000") == 0);
     check("report: no perror on success", g_perrorCalls == 0);
+
+    /* 5b. THE TEARDOWN RECORD (4011-4014): durable, informational, and NOT a death.
+       Measured 2026-10-10 on win10-acc: two 4003 records for notifhost.exe killed 27 s after boot by an
+       ordinary shutdown, each escalated by guest/qwt-report-death.ps1 into "a Qubes Windows Tools
+       component died; this is a major error" on the owner's desktop. The record must survive (our own
+       log directory loses files to the sweep's file cap) while not being read as a death, so it goes
+       out under a separate id the reporter does not select on. */
+    reset();
+    check("teardown: the id is the child's + 10, and is recognised as a teardown",
+          DEATHEVENT_ID_TEARDOWN(DEATHEVENT_ID_NOTIFBRIDGE) == 4013 &&
+          DEATHEVENT_ID_IS_TEARDOWN(4013) &&
+          DEATHEVENT_ID_TEARDOWN_BASE(4013) == DEATHEVENT_ID_NOTIFBRIDGE);
+    check("teardown: a DEATH id is never mistaken for a teardown",
+          !DEATHEVENT_ID_IS_TEARDOWN(DEATHEVENT_ID_GUI_AGENT) &&
+          !DEATHEVENT_ID_IS_TEARDOWN(DEATHEVENT_ID_ETWPROXY));
+    check("teardown: the writer returns TRUE and reports under the teardown id",
+          DeathEventReportTeardown(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", 4321,
+                                   QGA_EXIT_SYSTEM_TERMINATED, 27734ULL,
+                                   L"Windows ended it with the session.") == TRUE &&
+          g_eventId == DEATHEVENT_ID_TEARDOWN(DEATHEVENT_ID_NOTIFBRIDGE));
+    check("teardown: INFORMATION, not ERROR - an ordinary shutdown must not paint the log red",
+          g_type == EVENTLOG_INFORMATION_TYPE);
+    check("teardown: it still names the child, the exe, the pid and the code",
+          has(g_strings[0], L"The notification bridge") && has(g_strings[0], L"notifhost.exe") &&
+          has(g_strings[0], L"PID 4321") && has(g_strings[0], L"0x40010004"));
+    check("teardown: the text says Windows ended it with the session",
+          has(g_strings[0], L"was ended by Windows when the session was torn down"));
+    check("teardown: and it NEVER claims anything died or is a major error",
+          !has(g_strings[0], L"died") && !has(g_strings[0], L"major error") &&
+          !has(g_strings[0], L"without being asked to"));
+    check("teardown: the six structured strings are still there, in order",
+          g_numStrings == DEATHEVENT_STRINGS && wcscmp(g_strings[1], L"notifhost.exe") == 0 &&
+          wcscmp(g_strings[2], L"4321") == 0 && wcscmp(g_strings[3], L"0x40010004") == 0 &&
+          wcscmp(g_strings[4], L"27734") == 0);
+    check("teardown: register -> report -> deregister, once each, no perror",
+          g_registerCalls == 1 && g_reportCalls == 1 && g_deregisterCalls == 1 && g_perrorCalls == 0);
 
     reset(); g_registerFails = 1;
     check("report: RegisterEventSource failure -> FALSE, one perror, nothing reported",

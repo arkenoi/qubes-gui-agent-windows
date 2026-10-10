@@ -66,6 +66,24 @@
 #define DEATHEVENT_ID_NOTIFBRIDGE   4003    // gui-agent: the notification bridge exited unasked
 #define DEATHEVENT_ID_ETWPROXY      4004    // gui-agent: the ETW signal proxy exited unasked
 
+// THE SAME CHILDREN, ENDED BY THE SYSTEM RATHER THAN DYING: 4011-4014, each 4001-4004 + 10.
+// A record under these ids is DURABLE (the Application log keeps it independently of our own log
+// files, which a sweep's file cap can drop) and is NOT a death, so guest/qwt-report-death.ps1 - which
+// selects on the explicit set 4001-4004 - never turns one into a dom0 notification. That is the single
+// error path with escalation as a separate decision: everything is recorded, only faults are escalated.
+//
+// WHY THEY EXIST (measured 2026-10-10, win10-acc): Windows ends a session's processes in an order we do
+// not control, so a helper can be gone before the agent is told its session is ending. Two 4003 records
+// for notifhost.exe killed 27 s after boot by an ordinary shutdown were each escalated into "a Qubes
+// Windows Tools component died; this is a major error" on the owner's desktop. The exit code
+// QGA_EXIT_SYSTEM_TERMINATED (0x40010004) is what separates that from a death, and suppressing the
+// record entirely would have left our own log line as the only trace - which is not durable enough.
+#define DEATHEVENT_ID_TEARDOWN_OFFSET   10
+#define DEATHEVENT_ID_TEARDOWN(baseId)  ((baseId) + DEATHEVENT_ID_TEARDOWN_OFFSET)
+#define DEATHEVENT_ID_IS_TEARDOWN(id)   ((id) >= DEATHEVENT_ID_TEARDOWN(DEATHEVENT_ID_GUI_AGENT) && \
+                                         (id) <= DEATHEVENT_ID_TEARDOWN(DEATHEVENT_ID_ETWPROXY))
+#define DEATHEVENT_ID_TEARDOWN_BASE(id) ((id) - DEATHEVENT_ID_TEARDOWN_OFFSET)
+
 // "I do not know": a supervisor that found a child gone without observing its exit has no exit
 // code; one that found it gone without a launch stamp has no run time. Both are written as the
 // word "unknown", never as 0.
@@ -86,12 +104,17 @@ static const WCHAR *DeathEventHumanName(IN DWORD eventId)
     case DEATHEVENT_ID_WGCBROKER:   return L"The notification and menu capture helper";
     case DEATHEVENT_ID_NOTIFBRIDGE: return L"The notification bridge";
     case DEATHEVENT_ID_ETWPROXY:    return L"The ETW signal proxy";
-    default:                        return L"A component";
+    default:
+        // A teardown id names the same child; resolve it rather than falling through to "A component".
+        if (DEATHEVENT_ID_IS_TEARDOWN(eventId))
+            return DeathEventHumanName(DEATHEVENT_ID_TEARDOWN_BASE(eventId));
+        return L"A component";
     }
 }
 static const WCHAR *DeathEventSupervisorName(IN DWORD eventId)
 {
-    return eventId == DEATHEVENT_ID_GUI_AGENT ? L"the GUI agent watchdog" : L"the GUI agent";
+    const DWORD id = DEATHEVENT_ID_IS_TEARDOWN(eventId) ? DEATHEVENT_ID_TEARDOWN_BASE(eventId) : eventId;
+    return id == DEATHEVENT_ID_GUI_AGENT ? L"the GUI agent watchdog" : L"the GUI agent";
 }
 
 // Insertion strings: %1 renders; 2..6 are the reporter's structured fields, in this fixed order.
@@ -136,7 +159,9 @@ static WORD DeathEventCompose(
 #ifdef DEATHEVENT_DEFECT_WARNING
     ev->Type = EVENTLOG_WARNING_TYPE;            // DEFECT: "it is not fucking warning! it is a major error!"
 #else
-    ev->Type = EVENTLOG_ERROR_TYPE;
+    // A death is an ERROR (owner 2026-10-03: not a warning, a major error). A teardown is not a death
+    // and must not paint the Application log red on every ordinary shutdown: INFORMATION.
+    ev->Type = DEATHEVENT_ID_IS_TEARDOWN(ev->EventId) ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_ERROR_TYPE;
 #endif
     StringCchCopyW(ev->Exe, RTL_NUMBER_OF(ev->Exe), (exeName && *exeName) ? exeName : L"?");
     StringCchPrintfW(ev->Pid, RTL_NUMBER_OF(ev->Pid), L"%lu", (unsigned long)pid);
@@ -166,7 +191,13 @@ static WORD DeathEventCompose(
             (unsigned int)((ranMs / 1000ULL) % 60ULL), (unsigned long long)ranMs);
     }
     StringCchCopyW(ev->Detail, RTL_NUMBER_OF(ev->Detail), detail ? detail : L"");
-    if (exitCode == DEATHEVENT_EXIT_HUNG)
+    if (DEATHEVENT_ID_IS_TEARDOWN(ev->EventId))
+        StringCchPrintfW(ev->Text, RTL_NUMBER_OF(ev->Text),
+            L"%s (%s, PID %s) was ended by Windows when the session was torn down - exit code %s - after "
+            L"running %s. An ordinary session end, not a failure; recorded so the end stays visible if our "
+            L"own log does not. %s",
+            DeathEventHumanName(ev->EventId), ev->Exe, ev->Pid, ev->ExitCode, ran, ev->Detail);
+    else if (exitCode == DEATHEVENT_EXIT_HUNG)
         StringCchPrintfW(ev->Text, RTL_NUMBER_OF(ev->Text),
             L"%s (%s, PID %s) stopped answering and was ended by %s - a hang, so there is no exit code - "
             L"after running %s. A Qubes Windows Tools component died; this is a major error. %s",
@@ -190,6 +221,22 @@ static WORD DeathEventCompose(
 // and nothing else - the caller has already logged the death at ERROR and must not be derailed by the
 // reporting path. Fire-and-forget: RegisterEventSource/ReportEvent are local RPC calls to the Event
 // Log service, bounded by that service, with no dependency on qrexec or on any session.
+// A TEARDOWN, NOT A DEATH: the same record under the 4011-4014 id, INFORMATION, which the dom0 reporter
+// does not read. Call it where a supervisor can PROVE the system ended its child (the exit code
+// QGA_EXIT_SYSTEM_TERMINATED) rather than the child failing. Everything is recorded; only faults escalate.
+static BOOL DeathEventReport(IN DWORD eventId, IN const WCHAR *exeName, IN DWORD pid, IN DWORD exitCode,
+                             IN ULONGLONG ranMs, IN const WCHAR *detail OPTIONAL);
+static BOOL DeathEventReportTeardown(
+    IN DWORD baseEventId,
+    IN const WCHAR *exeName,
+    IN DWORD pid,
+    IN DWORD exitCode,
+    IN ULONGLONG ranMs,
+    IN const WCHAR *detail OPTIONAL)
+{
+    return DeathEventReport(DEATHEVENT_ID_TEARDOWN(baseEventId), exeName, pid, exitCode, ranMs, detail);
+}
+
 static BOOL DeathEventReport(
     IN DWORD eventId,
     IN const WCHAR *exeName,

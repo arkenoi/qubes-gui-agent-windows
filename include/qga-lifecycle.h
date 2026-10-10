@@ -193,6 +193,49 @@ static __inline QGA_EXIT_VERDICT QgaDecideAgentExit(IN DWORD exitCode, IN BOOL n
     return QgaExitVerdicts[RTL_NUMBER_OF(QgaExitVerdicts) - 1];   // unreachable: every decision has a row
 }
 
+// ---- THE DECISION ON A HELPER EXIT (agent side: the broker, the notification bridge, the ETW proxy) ----------
+// The agent supervises three helpers, and the SAME question arises for each: was this exit a death to report, or the
+// session going away underneath it? Pure and table-shaped for the same reason QgaDecideAgentExit is - the offline
+// suite holds every row.
+//
+// THE DEFECT THIS CLOSES (measured 2026-10-10 on win10-acc). All three sites tested only HelpersDisarmed(), which
+// becomes true once Windows has told the AGENT its session is ending. Windows ends a session's processes in an order
+// we do not control, so a helper can be gone BEFORE that notice arrives. Two Application-log 4003 records for
+// notifhost.exe, killed 27 s after boot by an ordinary shutdown, each escalated by guest/qwt-report-death.ps1 into a
+// dom0 notification reading "exited unexpectedly ... this is a major error". The agent's own exit already had the
+// rule - every 0x40010004 row of QgaDecideAgentExit writes no death record - and the helpers never got it.
+//
+// QGA_EXIT_SYSTEM_TERMINATED (0x40010004, DBG_TERMINATE_PROCESS) is the fact that settles it without the race: no
+// program returns it for itself; the system or a debugger imposes it.
+//
+// THE TWO EXPECTED ARMS ARE NOT THE SAME and must not collapse into one line - that is what would hide a kill:
+//   DISARMED  the agent knew first. Routine teardown: INFO.
+//   SYSKILL   the system killed the helper before the agent was told. That ordering is itself the anomaly, and an
+//             unexplained system kill with no shutdown in progress lands here too, so: WARNING, with its own grep
+//             tag per helper (WGCBROKERSYSKILL / NOTIFBRIDGESYSKILL / ETWPROXYSYSKILL).
+// Neither arm writes an Event Log death record, so neither reaches dom0 as a death.
+// The knob QGA_LIFECYCLE_DEFECT_HELPERSYSKILLDEATH restores the measured defect and must make the suite FAIL.
+typedef enum _QGA_HELPER_EXIT_DECISION
+{
+    QGA_HELPER_EXPECTED_DISARMED = 0,   // launches disarmed: the session is ending or the agent is leaving. INFO, no record.
+    QGA_HELPER_EXPECTED_SYSKILL,        // the system imposed 0x40010004 before the agent was told. WARNING, no record.
+    QGA_HELPER_DEATH                    // anything else: a death. ERROR + one Event Log record (the dom0 route's input).
+} QGA_HELPER_EXIT_DECISION;
+
+// `exited` is FALSE for the broker's hang arm, where no exit code exists to read - a hang is never excused here.
+static __inline QGA_HELPER_EXIT_DECISION QgaDecideHelperExit(IN BOOL disarmed, IN BOOL exited, IN DWORD exitCode)
+{
+    if (disarmed)
+        return QGA_HELPER_EXPECTED_DISARMED;
+#ifndef QGA_LIFECYCLE_DEFECT_HELPERSYSKILLDEATH
+    if (exited && exitCode == QGA_EXIT_SYSTEM_TERMINATED)
+        return QGA_HELPER_EXPECTED_SYSKILL;
+#else
+    (void)exited; (void)exitCode;   /* the knob drops both facts: that IS the defect */
+#endif
+    return QGA_HELPER_DEATH;   // DEFECT knob: the system's own kill falls through to here and is written up as a death
+}
+
 // ---- THE AGENT'S OWN READING OF ITS EXIT CODE (WinMain) ------------------------------------------------------
 // An expected exit - requested, session end, reconnect, no GUI domain - is logged at INFO naming the reason; anything
 // else is a failure, logged at ERROR with the code that caused it. "WinMain: WatchForEvents failed with error 0xb7"
