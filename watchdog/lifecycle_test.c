@@ -328,6 +328,18 @@ int main(void)
     check("shell: an unreadable configured value never narrows - explorer still matches",
           QgaIsSessionShellImage(L"explorer.exe", L"kioskapp.exe") == TRUE);
 
+    /* ---- the hidden Start menu: one targeted toggle before calling it stuck (2026-10-11) ---- */
+    check("start: inside the settle time, keep waiting",
+          QgaStartDismissStep(TRUE, 500, 2500, TRUE, FALSE) == QGA_START_WAIT);
+    check("start: it let go of the foreground - nothing of ours to close",
+          QgaStartDismissStep(FALSE, 9000, 2500, TRUE, FALSE) == QGA_START_WAIT);
+    check("start: settled, still open, taskbar present -> ONE targeted toggle",
+          QgaStartDismissStep(TRUE, 2900, 2500, TRUE, FALSE) == QGA_START_TOGGLE);
+    check("start: the toggle is spent -> say it is stuck, never toggle twice",
+          QgaStartDismissStep(TRUE, 9000, 2500, TRUE, TRUE) == QGA_START_STUCK);
+    check("start: no taskbar window (a replaced shell) -> straight to the loud report",
+          QgaStartDismissStep(TRUE, 9000, 2500, FALSE, FALSE) == QGA_START_STUCK);
+
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }
