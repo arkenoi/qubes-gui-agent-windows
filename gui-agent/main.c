@@ -3698,9 +3698,10 @@ static void BrokerSupervise(void)
     // on eligible system", "silent fallbacks with no diag" is the exact worry). We are here only
     // when the WgcBroker gate is ON and the build is >= 26100 - i.e. de-slice is EXPECTED. The
     // renderer still falls back to the retained DDA slice so the desktop is never black, but that
-    // fallback must never be SILENT: the moment the broker is expected-but-absent, say so at
-    // WARNING level (visible in the default log, like QGADESKSTUCK) AND publish a machine-readable
-    // flag the health-check / acceptance harness fails on. A deliberate opt-out (WgcBroker=0)
+    // fallback must never be SILENT: the moment the broker is expected-but-absent, say so at ERROR
+    // level - matching the QERR_SEV_ACTION row it sends to dom0, because one condition cannot be
+    // "act now" on screen and "workable" in the log - AND publish a machine-readable flag the
+    // health-check / acceptance harness fails on. A deliberate opt-out (WgcBroker=0)
     // never reaches here - g_WgcBroker is false and BrokerSupervise returns at the top - so a quiet
     // fallback stays quiet ONLY when the operator asked for it.
     #define DESLICE_FIRST_WARN_MS 30000
@@ -3801,7 +3802,13 @@ static void BrokerSupervise(void)
         // wgcbroker and agent logs); a MISSING one is the PACKAGING GAP finding of 2026-09-04 (the helper was built in CI but
         // never staged into the installable package; it must ship next to gui-agent.exe). DesliceBrokerDown is the
         // flag under the Qubes Tools config key: 1 = present, 2 = missing.
-        LogWarning("QGADESLICEDOWN de-slice broker EXPECTED but not running for %I64u s on an eligible system "
+        // ERROR, NOT WARNING. The dom0 row this sends is QERR_SEV_ACTION ("Menus, modern apps and
+        // notifications do not appear in dom0 until it is back") while the log line said WARNING, which
+        // by the owner's 2026-10-08 rule means "not quite normal, yet workable". One condition cannot be
+        // both, and the mismatch is why every sweep let this line pass: it counted as one of our warnings
+        // and Jev graded it expected 0.57. Windows are being withheld with no fallback and nothing here
+        // recovers it - that is an error, and the level now says so.
+        LogError("QGADESLICEDOWN de-slice broker EXPECTED but not running for %I64u s on an eligible system "
             L"(build %lu, WgcBroker gate ON): wgcbroker.exe %s - toasts, menus and WinUI windows hold their last "
             L"content until it returns (no composite fallback)%s, DesliceBrokerDown=%u",
             (now - g_BrokerDownSince) / 1000, g_OsBuild,
