@@ -513,3 +513,57 @@ static __inline BOOL QgaIsSessionShellImage(IN const wchar_t *image, IN const wc
 #endif
     return (BOOL)QgaWcsIEqAscii(image, L"explorer.exe");   /* the default shell, always still a shell */
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * WOULD MAPPING THIS WINDOW SHOW BLACK?  (the broker-start race)
+ *
+ * GOAL, owner 2026-10-11: "broker-start race is fixed, without qrexec delay penalty on boot", and
+ * "acceptance criteria includes absence of notification noise".
+ *
+ * MEASURED on win11-app, three cold boots: the agent starts at system uptime 46-51 s, the shell
+ * appears 14-16 s later, the broker is REGISTERED 1.4-2.4 s after the shell and READY 10.8-11.6 s
+ * after it. So there is an ~11 s window on every AppVM cold boot (about 2 s on a StandaloneVM whose
+ * shell beats the agent) in which a window can appear with no broker.
+ *
+ * WHY THE HOLD MISSED EXACTLY THAT WINDOW. The old reading was:
+ *     SliceContentReady:    !g_SliceMapHold || !PwSliceFed  ->  TRUE   ("content is ready")
+ *     DirectWouldShowBlack: DirectRequired() && PwSliceFed && !SliceContentReady(...)
+ * and PwSliceFed is assigned at ONE site, gated on WgcBrokerActive(). So while the broker is not
+ * active NO window is slice-fed, every window is declared content-ready, the hold never engages -
+ * and on a direct-required guest "ready" means mapping a window that has no pixels at all, because
+ * (main.c, rest-zero S2) "on a direct-required guest in seamless mode no window takes pixels from
+ * the desktop image - each is broker-fed, held when it has no frame". Jev on the code: held_until_
+ * broker 0.15, worst_weird_thing black-card 0.64.
+ *
+ * THE RULE HERE: on a direct-required seamless guest a window that has not PAINTED would show
+ * black, whether or not it has been registered with a broker that does not exist yet. Registration
+ * is not the question; pixels are. Everything else is unchanged - a painted window is ready, a
+ * guest that does not require the direct path is ready, the hold being off means ready - so this
+ * can only ever withhold a window that would have been mapped EMPTY.
+ *
+ * NO BOOT PENALTY (Jev: no_boot_penalty 0.92): this refuses a MAP, nothing else. qrexec, the vchan
+ * and the agent's start order are untouched. The cost is that a window raised inside the race
+ * appears when it has pixels instead of appearing black - Jev calls that regression certain
+ * (late-windows 1.00), and it is the trade the product rule already takes: a black window is never
+ * acceptable. The release paths are unchanged and frame-driven.
+ */
+static __inline BOOL QgaWouldShowBlack(IN BOOL directRequired, IN BOOL seamless, IN BOOL holdEnabled,
+                                       IN BOOL sliceFed, IN BOOL hasPaintedContent,
+                                       IN unsigned long brokerFrames, IN unsigned long darkFrames)
+{
+    if (!holdEnabled || !directRequired || !seamless)
+        return FALSE;                       /* not a guest or a mode where this can happen */
+    if (hasPaintedContent)
+        return FALSE;                       /* it has pixels: map it */
+    if (brokerFrames >= darkFrames)
+        return FALSE;                       /* the feed works and the surface itself is dark */
+#ifdef QGA_LIFECYCLE_DEFECT_PRESLICEREADY
+    /* DEFECT: registration decides instead of pixels, so during the whole pre-broker window every
+     * window reads as ready and is mapped empty - the race this exists to close. */
+    if (!sliceFed)
+        return FALSE;
+#else
+    (void)sliceFed;                         /* registration is NOT the question - pixels are */
+#endif
+    return TRUE;
+}

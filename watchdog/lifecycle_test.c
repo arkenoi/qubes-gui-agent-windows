@@ -328,6 +328,24 @@ int main(void)
     check("shell: an unreadable configured value never narrows - explorer still matches",
           QgaIsSessionShellImage(L"explorer.exe", L"kioskapp.exe") == TRUE);
 
+    /* ---- the broker-start race: pixels decide, not registration (2026-10-11) ---- */
+    /* THE RACE ITSELF: before the broker is active nothing is slice-fed, and the window has no
+     * painted content - the old reading called that "ready" and mapped it empty. */
+    check("black: not slice-fed and unpainted on a direct-required seamless guest -> would show black",
+          QgaWouldShowBlack(TRUE, TRUE, TRUE, FALSE, FALSE, 0, 2) == TRUE);
+    check("black: slice-fed and unpainted -> would show black, as before",
+          QgaWouldShowBlack(TRUE, TRUE, TRUE, TRUE, FALSE, 0, 2) == TRUE);
+    check("black: PAINTED is ready, registered or not",
+          QgaWouldShowBlack(TRUE, TRUE, TRUE, FALSE, TRUE, 0, 2) == FALSE);
+    check("black: the dark escape still maps a surface the feed has delivered twice",
+          QgaWouldShowBlack(TRUE, TRUE, TRUE, TRUE, FALSE, 2, 2) == FALSE);
+    check("black: a guest that does not require the direct path is never held",
+          QgaWouldShowBlack(FALSE, TRUE, TRUE, FALSE, FALSE, 0, 2) == FALSE);
+    check("black: non-seamless is never held here (window 0 has its own path)",
+          QgaWouldShowBlack(TRUE, FALSE, TRUE, FALSE, FALSE, 0, 2) == FALSE);
+    check("black: the hold switched off is the pre-gate behaviour, unchanged",
+          QgaWouldShowBlack(TRUE, TRUE, FALSE, FALSE, FALSE, 0, 2) == FALSE);
+
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

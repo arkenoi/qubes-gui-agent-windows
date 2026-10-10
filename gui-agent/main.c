@@ -5410,10 +5410,17 @@ static BOOL SliceChromeContentReady(IN const WINDOW_DATA* entry)
 // nothing about a held window. A new toast IS the foreground, so it sailed straight past the
 // guard. Every map site now asks this question.
 static BOOL SliceContentReady(IN const WINDOW_DATA* entry);
+// THE BROKER-START RACE (QgaWouldShowBlack, tested offline with the PRESLICEREADY knob). This used
+// to require entry->PwSliceFed, and PwSliceFed is set at one site gated on WgcBrokerActive() - so for
+// the 11 s between the shell appearing and the broker being ready (measured on three win11-app cold
+// boots) NO window was slice-fed, every window read as content-ready, and the hold never engaged. On
+// a direct-required guest that means mapping a window with no pixels at all, because no window takes
+// pixels from the desktop image there. Registration is not the question; PIXELS are.
 static BOOL DirectWouldShowBlack(IN const WINDOW_DATA* entry)
 {
-    return DirectRequired() && entry->PwSliceFed && !SliceContentReady(entry) &&
-           entry->PwBrokerFrames < DIRECT_DARK_FRAMES;
+    return QgaWouldShowBlack(DirectRequired(), g_SeamlessMode, g_SliceMapHold,
+                             entry->PwSliceFed, entry->PwSliceContentTick != 0,
+                             (unsigned long)entry->PwBrokerFrames, (unsigned long)DIRECT_DARK_FRAMES);
 }
 
 // IS THIS TOAST BANNER WITHHELD BY THE BRIDGE VERDICT? (docs/ADR-toasts.md 10; toasthold.c.) TRUE while the
