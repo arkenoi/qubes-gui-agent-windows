@@ -529,7 +529,7 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
             // park/ack-revoke machinery above has nothing to do for the screen path.
             // Keep the refs: the re-dump after recovery is a pure header refresh over
             // the same grant, and the next frame refills the buffer (full copy below).
-            LogInfo("STAGING dormant-park-path (screen grant kept across duplication recreate)");
+            LogInfo("STAGING screen grant kept across the duplication recreate");
         }
         else
             ParkStaleScreenGrant(ctx);
@@ -634,9 +634,13 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                 // the anomaly is still reported exactly once, at the place that owns it.
                 // WHY THE WAIT EXPIRED IS UNRESOLVED (Jev: root_cause insufficient-evidence 0.70,
                 // chain_established 0.24) and this line does not pretend otherwise.
-                LogInfo("RecreateDuplication: the %ux%u mode this agent gave up waiting for %I64u ms ago has gone live, and the "
-                    L"duplication adopted it in place after %u attempt(s) - windows kept. This geometry change is OURS: see the "
-                    L"RESKEEP deadline line above. NOT the P2 resolution-change trigger.",
+                // THE LINE NAMES THE MODE AS OURS AND STOPS THERE. Its cross-reference (the RESWAIT deadline
+                // line that expired for this exact size, resolution.c) and its disclaimer (this is not the
+                // trigger of the open P2, the resolution-change capture freeze - that is the ERROR branch
+                // below) live here and in the register, not in every occurrence of the line. (The desktop
+                // duplication is recreated in place here exactly as in the branches below.)
+                LogInfo("RecreateDuplication: own late mode %ux%u is live (its RESWAIT expired %I64u ms ago); "
+                    L"recreated in place after %u attempt(s), windows kept",
                     ctx->width, ctx->height, waitAgo, attempt + 1);
             else if (geometryChanged)
                 LogError("duplication recreated in place after %u attempt(s) - windows kept - BUT THE GEOMETRY CHANGED, "
@@ -667,20 +671,22 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                 // it is the trigger of an open P2 and one of them matters.
                 g_DupRecreateCount++;
                 if (g_DupRecreateCount == 1)
-                    LogInfo("QGADDARECREATE duplication recreated in place after %u attempt(s) - windows kept "
-                        L"(0x887a0026 DXGI_ERROR_ACCESS_LOST at an input-desktop switch, geometry unchanged - "
-                        L"the documented stale-duplication signal, recovered in place). Further recoveries in "
-                        L"this process are logged at DEBUG; a warning follows if they exceed %u.",
+                    // What the parenthetical used to spell out: ACCESS_LOST with the geometry unchanged is the
+                    // documented stale-duplication signal, measured here only at an input-desktop switch, and
+                    // recovering in place is the designed response. The line keeps the code and the geometry fact;
+                    // further recoveries in this process go to DEBUG until the rate warning below.
+                    LogInfo("QGADDARECREATE duplication recreated in place after %u attempt(s), windows kept: "
+                        L"0x887a0026 DXGI_ERROR_ACCESS_LOST, geometry unchanged; warning above %u",
                         attempt + 1, (ULONG)QGA_DUP_RECREATE_WARN_AT);
                 else
                     LogDebug("QGADDARECREATE duplication recreated in place after %u attempt(s) - windows kept "
                         L"(n=%u in this process)", attempt + 1, g_DupRecreateCount);
                 if (g_DupRecreateCount == QGA_DUP_RECREATE_WARN_AT + 1)
-                    LogWarning("QGADDARECREATERATE the desktop duplication has been recreated %u times in this "
-                        L"agent process, above the expected %u - an input-desktop switch recovers in place and is "
-                        L"ordinary, but this rate is not: something is flipping the input desktop, or the "
-                        L"duplication is being lost for another reason. Each recovery is in the DEBUG log.",
-                        g_DupRecreateCount, (ULONG)QGA_DUP_RECREATE_WARN_AT);
+                    // An input-desktop switch recovers in place and is ordinary; this rate is not: something is
+                    // flipping the input desktop, or the duplication is being lost for another reason. Each
+                    // recovery is in the DEBUG log.
+                    LogWarning("QGADDARECREATERATE desktop duplication recreated %u times in this agent process, "
+                        L"above the expected %u", g_DupRecreateCount, (ULONG)QGA_DUP_RECREATE_WARN_AT);
             }
             M0BlinkMark(L"recreate-done", attempt + 1);
             return TRUE;
@@ -832,8 +838,9 @@ void CaptureDesktopImageWanted(void)
         return;
     g_StagingPresentAsked = TRUE;
     const BOOL ok = RedrawWindow(NULL, NULL, NULL, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
-    LogInfo("QGADESKCOPY window 0 wants the desktop image and the staging copy is stale: asked every window to "
-        L"repaint so the next frame refills it (RedrawWindow %s)", ok ? L"ok" : L"FAILED");
+    // Window 0 wants the desktop image. The repaint is what makes the next frame refill the stale copy (the
+    // capture thread, above); the line says what was asked and whether the ask took, not why.
+    LogInfo("QGADESKCOPY staging copy stale, every window asked to repaint (RedrawWindow %s)", ok ? L"ok" : L"FAILED");
 }
 
 BOOL CaptureFrameRegionSig(IN const CAPTURE_FRAME* frame, IN const RECT* r, OUT UINT64* sig)
@@ -917,8 +924,8 @@ static BOOL StagingEnsure(void)
         // direction is deliberately NOT done here: revoking a LIVE grant mid-life, under a
         // daemon that may still map it, is the unsafe ordering, so an unplugged monitor leaves
         // the grant in place until the process exits.
-        LogInfo("STAGING ungranted buffer released so the desktop grant can be made "
-            L"(monitor plugged, %lu pages)", (ULONG)g_Staging.page_count);
+        LogInfo("STAGING ungranted buffer released for a granted one (monitor plugged, %lu pages)",
+            (ULONG)g_Staging.page_count);
         free(g_Staging.refs);
         VirtualFree(g_Staging.buffer, 0, MEM_RELEASE);
         ZeroMemory(&g_Staging, sizeof(g_Staging));
@@ -1204,13 +1211,13 @@ void CaptureTeardown(IN OUT CAPTURE_CONTEXT* ctx)
         }
     }
 
-    // A6: last chance for any parked grants (the capture thread is already joined).
-    // Failures here mean dom0 still maps the pages; mirror perwindow.c's shutdown and
-    // leak them loudly rather than free bookkeeping for a live grant.
+    // A6: last chance for any parked (superseded, still un-revoked) grants - the capture thread
+    // is already joined. Failures here mean dom0 still maps the pages; mirror perwindow.c's
+    // shutdown and leak them loudly rather than free bookkeeping for a live grant.
     if (ctx->xc)
         StaleGrantSweep(ctx, TRUE, L"teardown");
     if (ctx->stale_grants)
-        LogWarning("A6LEAK leaking un-revoked superseded screen grant(s) at capture teardown");
+        LogWarning("A6LEAK screen grant(s) left unrevoked at capture teardown, dom0 still maps them");
 
     ReleaseFrame(ctx);
 
@@ -1264,17 +1271,17 @@ void CaptureStop(IN OUT CAPTURE_CONTEXT* ctx)
         // may sit in an acquire with no timeout, HOLDING ctx->frame.lock, and a terminated owner would leave that lock
         // held for ever. Every mid-run caller follows the thread's own acquire error, so it has already left the acquire
         // and this wait returns at once; at exit (CaptureSetExiting) it gets only a moment. A thread still parked is
-        // ABANDONED: its generation's stop flag makes it let go of its frame and leave when it next wakes, and
-        // CaptureTeardown leaves this context alone.
+        // ABANDONED - never terminated, by design: its generation's stop flag makes it let go of its frame and leave
+        // when it next wakes, and CaptureTeardown leaves this context alone.
         const DWORD waitMs = g_CaptureExiting ? 100 : 2 * FRAME_TIMEOUT;
         if (WaitForSingleObject(ctx->thread, waitMs) != WAIT_OBJECT_0)
         {
             ctx->thread_abandoned = TRUE;
             if (g_CaptureExiting)
-                LogInfo("capture thread left in its acquire at exit (no timeout by design); the exit ends it");
+                LogInfo("capture thread still in its acquire at exit; the exit ends it");
             else
-                LogWarning("CAPTUREABANDON capture thread still in its acquire %lu ms after stop - abandoned, not "
-                           L"terminated; it leaves at the next desktop change", waitMs);
+                LogWarning("CAPTUREABANDON capture thread still in its acquire %lu ms after stop, abandoned; "
+                           L"it leaves at the next desktop change", waitMs);
         }
     }
     ctx->thread = NULL;
@@ -1550,8 +1557,8 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
             if (!g_StagingStale)
             {
                 g_StagingPresentAsked = FALSE;   // a new stale episode begins
-                LogInfo("QGADESKCOPY off: nothing is copied out of the desktop image - every window is broker-fed "
-                    L"(26100+, seamless), desktop frames are a damage signal only (frames copied %ld, skipped %ld)",
+                LogInfo("QGADESKCOPY off: no desktop-image copy, every window broker-fed (26100+, seamless), "
+                    L"frames a damage signal only (copied %ld, skipped %ld)",
                     g_DeskCopied, g_DeskSkipped);
             }
             g_StagingStale = TRUE;
@@ -1776,10 +1783,11 @@ static DWORD WINAPI CaptureThread(void* param)
         }
 
         // THIS generation was stopped while the thread sat in its acquire (CaptureStop gave up waiting and marked it
-        // abandoned): the main loop now serves a newer generation, so this frame must not reach it. Let go and leave.
+        // abandoned): the main loop now serves a newer generation, so this frame must not reach it. Let go and exit
+        // the thread.
         if (capture->stop)
         {
-            LogInfo("abandoned capture generation woke; releasing its frame and exiting");
+            LogInfo("abandoned capture generation woke; releasing its frame and leaving");
             ReleaseFrame(capture);
             goto exit_thread;
         }

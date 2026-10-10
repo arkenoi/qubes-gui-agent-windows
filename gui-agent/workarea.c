@@ -240,8 +240,8 @@ void WorkAreaApply(void)
         // looking for a broken API instead of a bad rectangle.
         // Latched: `changed` is computed against g_WaLastApplied, which a refusal leaves alone,
         // so every later pass re-attempts the same rect and would re-log it forever. Say it once
-        // per distinct rectangle, and say what actually happens next - NOT "giving up", because
-        // the retry does continue.
+        // per distinct rectangle, and say what actually happens next - the guest keeps the work
+        // area Windows already had, and the retry does continue - NOT "giving up".
         DWORD err = GetLastError();
         BOOL sayIt;
         EnterCriticalSection(&g_WaLock);
@@ -249,8 +249,8 @@ void WorkAreaApply(void)
         g_WaLastRefused = target;
         LeaveCriticalSection(&g_WaLock);
         if (sayIt)
-            LogWarning("SPI_SETWORKAREA refused (%d,%d)-(%d,%d) on a %dx%d desktop, error 0x%x - "
-                L"the guest keeps the work area Windows already had; this rect will be retried",
+            LogWarning("SPI_SETWORKAREA refused (%d,%d)-(%d,%d) on a %dx%d desktop, error 0x%x; "
+                L"the old work area stays, this rect is retried",
                 target.left, target.top, target.right, target.bottom,
                 screen.right, screen.bottom, err);
         return;
@@ -541,8 +541,10 @@ void WorkAreaEnsureApplied(void)
     if (lostInARow >= WA_LOST_FIGHT_TRIES && !backoffLogged)
     {
         backoffLogged = TRUE;
-        LogWarning("work area reverted %u checks in a row (OS insists on (%d,%d)-(%d,%d)); "
-            "backing off re-assert to %u ms",
+        // Lost the fight WA_LOST_FIGHT_TRIES times: back off the re-assert to WA_DRIFT_BACKOFF_MS so the
+        // agent and the OS stop trading the work area at full rate.
+        LogWarning("work area reverted %u checks in a row, Windows insists on (%d,%d)-(%d,%d); "
+            "re-asserting every %u ms now",
             lostInARow, current.left, current.top, current.right, current.bottom,
             (unsigned)WA_DRIFT_BACKOFF_MS);
     }
@@ -564,11 +566,11 @@ void WorkAreaCreateListener(void)
     wc.lpszClassName = cls;
 
     // Never let WaWndProc become reachable with g_WaLock uninitialized (its
-    // re-assert path enters it). Init() calls WorkAreaLockInit before starting the
+    // re-assert path enters it). Init() calls WorkAreaLockInit first, before starting the
     // window-event thread, so this cannot trigger; it guards future reordering.
     if (!g_WaLockInit)
     {
-        LogError("workarea lock not initialized - listener not created (call WorkAreaLockInit first)");
+        LogError("workarea lock not initialized, listener not created");
         return;
     }
 
@@ -599,11 +601,12 @@ void WorkAreaDestroyListener(void)
         return;
     if (!DestroyWindow(g_WaListener))
     {
-        // Loud on purpose: the thread would still own a window, so every subsequent
-        // SetThreadDesktop rearm fails and window tracking silently degrades to the
-        // periodic resync. Should be unreachable (same-thread destroy of a valid
-        // window); clearing the handle anyway keeps create/destroy re-runnable.
-        LogError("DestroyWindow(workarea listener %p) FAILED - window-event thread may no longer be able to switch desktops", g_WaListener);
+        // Loud on purpose: the window-event thread would still own a window, so every later
+        // SetThreadDesktop re-arm fails - it is no longer able to switch desktops - and
+        // window tracking silently degrades to the periodic resync. Should be unreachable
+        // (same-thread destroy of a valid window); clearing the handle anyway keeps
+        // create/destroy re-runnable.
+        LogError("DestroyWindow(workarea listener %p) FAILED; window tracking may degrade from here", g_WaListener);
         win_perror("DestroyWindow(workarea listener)");
     }
     g_WaListener = NULL;

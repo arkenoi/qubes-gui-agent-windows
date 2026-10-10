@@ -142,19 +142,25 @@ void ToastHoldInit(IN BOOL bridgeGate)
     // Logged unconditionally and in one shape: a captured log must state which condition produced
     // it. INERT with the gate ON is the state the owner must never find silently - every bridged
     // toast then shows twice - so that case is an ERROR, not an Info.
+    // toast-hold-grade.py keys on 'QGATOASTHOLD gate:', 'gate: ACTIVE', 'gate: OFF' and 'QGATOASTHOLD INERT'; what
+    // each line used to explain is in the comment beside it.
     if (g_ThActive)
-        LogInfo("QGATOASTHOLD gate: ACTIVE (bridge gate on, ToastHoldDisable=0, UIA worker up, IPC up) - a toast banner "
-            L"is mapped only after its verdict: bridge=never, window=at once, no verdict within %u ms=mapped+reported",
+        // ACTIVE: a banner is mapped only after its verdict - a bridge verdict never maps it, a window verdict maps it
+        // at once, and no verdict within TH_HOLD_BOUND_MS maps it and reports the fail-open (QGATOASTHOLDLATE).
+        LogInfo("QGATOASTHOLD gate: ACTIVE (bridge gate on, ToastHoldDisable=0, UIA worker up, IPC up): banners held "
+            L"for their verdict, bound %u ms",
             (unsigned)TH_HOLD_BOUND_MS);
     else if (!g_ThGate)
-        LogInfo("QGATOASTHOLD gate: inactive (bridge gate off) - toast banners map as before");
+        LogInfo("QGATOASTHOLD gate: inactive (bridge gate off), banners map as before");
     else if (g_ThKnobOff)
-        LogWarning("QGATOASTHOLD gate: OFF by ToastHoldDisable=1 - a bridged toast shows TWICE (guest banner + dom0 "
-            L"notification); this is the escape hatch, not a configuration");
+        // OFF: ToastHoldDisable=1 is the escape hatch, not a configuration (toasthold.h); the double is the guest
+        // banner plus the dom0 notification.
+        LogWarning("QGATOASTHOLD gate: OFF by ToastHoldDisable=1, every bridged toast shows TWICE");
     else
-        LogError("QGATOASTHOLD INERT with the bridge gate ON: uiaWorker=%d ipc=%d - every bridged toast will show "
-            L"TWICE on this run. uiaWorker=0 means ToastCropDisable/forced insets or a failed worker thread; ipc=0 "
-            L"means the shared section or verdict event could not be created (see QGANOTIFIPC).",
+        // INERT: uiaWorker=0 is ToastCropDisable, forced insets or a worker thread that did not start; ipc=0 is the
+        // shared section or the verdict event failing to create (QGANOTIFIPC says which). The double lasts for
+        // this run.
+        LogError("QGATOASTHOLD INERT with the bridge gate ON (uiaWorker=%d ipc=%d): every bridged toast shows TWICE",
             worker, ipc);
 }
 
@@ -467,11 +473,13 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     const unsigned long long hs = (unsigned long long)identForLog.Sender;
     const unsigned long long ht = (unsigned long long)identForLog.Title;
     const unsigned long long hm = (unsigned long long)identForLog.Message;
+    // A PARTIAL match means the bridge's text and the banner's text are spelled differently for this
+    // toast; it is accepted only as the sole candidate carrying that sender+title (toastident.h), and
+    // the way to diagnose one is to compare s/t/m here with the bridge's HOLD line for this id.
+    // toast-hold-grade.py keys on 'PARTIAL match'.
     if (logPartial)
-        LogWarning("QGATOASTIDENT hwnd=0x%x PARTIAL match: the banner's message differs from the record's (same sender+title, "
-            L"unique candidate) ident=%016llx s=%016llx t=%016llx m=%016llx id=%lu - the bridge's text and the banner's text "
-            L"are spelled differently for this toast (compare with the bridge's HOLD line for this id); the match is taken "
-            L"because nothing else fits", hw, hc, hs, ht, hm, (ULONG)notifForLog);
+        LogWarning("QGATOASTIDENT hwnd=0x%x PARTIAL match taken (same sender+title, message differs); "
+            L"ident=%016llx s=%016llx t=%016llx m=%016llx id=%lu", hw, hc, hs, ht, hm, (ULONG)notifForLog);
 
     switch (out.Event)
     {
@@ -491,11 +499,12 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             hw, hc, (ULONG)notifForLog, out.HeldMs);
         break;
     case ThEvShowCorrected:
-        LogWarning("QGATOASTHOLD hwnd=0x%x state=show reason=record-turned-window ident=%016llx id=%lu after %llu ms suppressed: "
-            L"the bridge could not forward this toast after all (forward failed for good, or dom0 was unreachable), or a "
-            L"dom0 action on it could not be carried out in the guest (the bridge's ACTION lines) - the banner is shown now, "
-            L"late, and the record carries the agent's shown mark; if the banner has already timed out in the guest the toast "
-            L"is in its Notification Center only", hw, hc, (ULONG)notifForLog, out.HeldMs);
+        // The record turned window after the banner was suppressed: the bridge could not forward the toast after
+        // all (the forward failed for good, or dom0 was unreachable), or a dom0 action on it could not be carried
+        // out in the guest (the bridge's ACTION lines). The record carries the agent's shown mark; a banner that
+        // has already timed out in the guest survives in its Notification Center only.
+        LogWarning("QGATOASTHOLD hwnd=0x%x state=show reason=record-turned-window ident=%016llx id=%lu after %llu ms suppressed; "
+            L"the bridge could not forward it, the banner is shown late", hw, hc, (ULONG)notifForLog, out.HeldMs);
         break;
     case ThEvShowNoBridge:
         LogInfo("QGATOASTHOLD hwnd=0x%x state=show reason=bridge-down ident=%016llx (no bridge running: window path at once, by design)",
@@ -508,15 +517,15 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         break;
     case ThEvFailOpen:
         // The anomaly this module exists to make visible: a hold that ended by its bound or by the bridge
-        // dying is mapped - possibly as the second copy of a forwarded toast (the owner's double).
+        // dying is mapped without a verdict - possibly as the second copy of a forwarded toast (the owner's double).
+        // reason= decoder (ThReason, toasthold-core.h; the grader keys on 'QGATOASTHOLDLATE hwnd=' and 'after N ms'):
+        //   no-identity = the card's Title/TitleText block never read within the bound (a banner tree this build
+        //   does not know); no-record = the bridge listed no matching notification in time (compare s/t/m with its
+        //   HOLD lines); verdict-pending = a record matched, the classifier gave no answer in time; bridge-exited =
+        //   the bridge died mid-hold or before dom0 acknowledged the forward; forward-unconfirmed = suppressed, but
+        //   no dom0 acknowledgement within the forward bound (the bridge's own failure paths outlast a banner's life).
         LogWarning("QGATOASTHOLDLATE hwnd=0x%x mapped FAIL-OPEN after %llu ms: reason=%s ident=%016llx s=%016llx t=%016llx "
-            L"m=%016llx id=%lu lastRead=%s bridgeUp=%d records=%d - the banner is shown without a verdict; if the bridge "
-            L"forwarded this toast it now shows TWICE. reason=no-identity: the card's Title/TitleText block was not "
-            L"readable (a build whose banner tree differs?); no-record: the bridge never listed a matching notification "
-            L"in time (compare s/t/m with its HOLD lines); verdict-pending: the classifier did not answer in time; "
-            L"bridge-exited: the bridge died mid-hold or before dom0 acknowledged the forward; forward-unconfirmed: "
-            L"suppressed, but dom0 did not acknowledge the forward within the bound (the bridge's own failure paths "
-            L"are slower than a banner's life)",
+            L"m=%016llx id=%lu lastRead=%s bridgeUp=%d records=%d; shown TWICE if the bridge forwarded it",
             hw, out.HeldMs, ThReasonName(out.Reason), hc, hs, ht, hm, (ULONG)notifForLog,
             ThReadStatusName(readStatus), in.BridgeUp, nrec);
         break;
@@ -525,10 +534,13 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             L"for its own verdict (the window stays unmapped until then)", hw, hc, hs, ht, hm);
         break;
     case ThEvPreemptStart:
+        // The pre-empted banner is not lost to the user: it stays in the guest's Notification Center, and the
+        // window is re-mapped once the queued toast resolves to window or its deadline passes. The first 220
+        // normalized characters of this line are a log-sweep baseline key (log-sweep-baseline.json,
+        // log-sweep.py normalize()), so only its tail is reworded here.
         LogWarning("QGATOASTPREEMPT hwnd=0x%x unmapped: a bridge-bound or still-pending toast (id=%lu) is queued behind the displayed "
             L"banner and would paint into this window in place; the displayed window-path banner loses the rest of its dom0 "
-            L"display (it stays in the guest's Notification Center). Bounded: re-mapped if the queued toast resolves to "
-            L"window, or at its deadline", hw, (ULONG)preemptNotif);
+            L"display, shown again when the queued toast resolves or at its deadline", hw, (ULONG)preemptNotif);
         break;
     case ThEvPreemptEnd:
         LogInfo("QGATOASTPREEMPT hwnd=0x%x re-mapped after %llu ms: the queued toast resolved to window (or its window passed)",

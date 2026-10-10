@@ -68,6 +68,7 @@
  *   NOTIFYERR_DEFECT_FAILOPEN  - transport failures are logged on every call (notifyerr.c)
  *   NOTIFYERR_DEFECT_NOBOX     - the error window is never shown (dom0 unreachable = silence)
  *   NOTIFYERR_DEFECT_BOXSTORM  - the gated window skips the dedupe and the cap (notifyerr.c)
+ *   NOTIFYERR_DEFECT_NOBUILD   - the technical line does not name the build that produced it
  */
 #ifndef QWT_NOTIFYERR_H
 #define QWT_NOTIFYERR_H
@@ -335,9 +336,13 @@ static inline QerrDecision QerrDecide(int sev, const char* component, const char
  *            no product prefix (dom0 shows the source qube itself); at most ~60 characters.
  *   line 1   what it means for the user and what the system does next; what the user can do, only
  *            when there is something.
- *   line 2   the cause in words WITH the code (omitted when there is no cause to state).
+ *   line 2   the cause in words (omitted when there is no cause to state). The CODE is not here:
+ *            the technical line carries it, and a fact appears once (owner 2026-10-10, "too much
+ *            prose": one short clause for the condition, one for the consequence, then the facts;
+ *            cause, reassurance and explanation belong in the source comment, never in the text).
  *   line 3   ONE technical line, QerrFormatTechLine below: the executable, pid, code, how long it
- *            ran, "death n this boot" or "reported once per boot", and where the evidence is.
+ *            ran, "death n this boot" or "reported once per boot", the build that produced it, and
+ *            ONE pointer to where the detail is.
  * The code's MEANING comes from the table of the code's SOURCE (a process exit or exception code,
  * a Win32 error the SCM reports, a service-specific code, a task result) - never the process table
  * for the others. A CR or LF inside a part would move text into the wrong line unnoticed, so each
@@ -380,11 +385,15 @@ static inline size_t QerrComposeNotifyText(char* out, size_t cap, const char* he
     return at;
 }
 
-/* The technical line: "<subject>[ pid <n>][; <code>][; ran <h:mm:ss>]; <count>. Evidence: <where>."
+/* The technical line:
+ *   "<subject>[ pid <n>][; <code>][; ran <h:mm:ss>]; <count>; build <m.m.p.b>. Evidence: <where>."
  * subject = the executable or task; code = "exit code 2" / "exception 0xC0000409" / ... already
  * phrased by the source's table, or NULL; ran = "0:12:34" or NULL; count = "death 3 this boot" or
- * "reported once per boot"; evidence = the log path, WER folder prefix, event log + id. Returns the
- * byte length, or 0 when a required part is missing or it did not fit. */
+ * "reported once per boot"; build = the sender's own image version as modver.h reads it (the same
+ * four numbers LogInit prints as "Module version"), NULL or "" when it could not be read - the line
+ * then says "build unknown", never an empty field, because a notice a reader cannot date is exactly
+ * when the build is needed; evidence = ONE pointer to where the detail is (the deaths log, the
+ * sender's log). Returns the byte length, or 0 when a required part is missing or it did not fit. */
 static inline int QerrPutUl_(char* out, size_t cap, size_t* at, unsigned long v)
 {
     char num[24];
@@ -393,7 +402,7 @@ static inline int QerrPutUl_(char* out, size_t cap, size_t* at, unsigned long v)
 }
 static inline size_t QerrFormatTechLine(char* out, size_t cap, const char* subject, unsigned long pid,
                                         const char* code, const char* ran, const char* count,
-                                        const char* evidence)
+                                        const char* evidence, const char* build)
 {
     size_t at = 0;
     if (!out || cap == 0) return 0;
@@ -403,8 +412,15 @@ static inline size_t QerrFormatTechLine(char* out, size_t cap, const char* subje
     if (pid && (!QerrPut_(out, cap, &at, " pid ", 0) || !QerrPutUl_(out, cap, &at, pid))) return 0;
     if (code && *code && (!QerrPut_(out, cap, &at, "; ", 0) || !QerrPut_(out, cap, &at, code, 1))) return 0;
     if (ran && *ran && (!QerrPut_(out, cap, &at, "; ran ", 0) || !QerrPut_(out, cap, &at, ran, 1))) return 0;
-    if (!QerrPut_(out, cap, &at, "; ", 0) || !QerrPut_(out, cap, &at, count, 1) ||
-        !QerrPut_(out, cap, &at, ". Evidence: ", 0) || !QerrPut_(out, cap, &at, evidence, 1) ||
+    if (!QerrPut_(out, cap, &at, "; ", 0) || !QerrPut_(out, cap, &at, count, 1)) return 0;
+#ifndef NOTIFYERR_DEFECT_NOBUILD
+    if (!QerrPut_(out, cap, &at, "; build ", 0) ||
+        !QerrPut_(out, cap, &at, (build && *build) ? build : "unknown", 1))
+        return 0;
+#else
+    (void)build;   /* DEFECT: the line does not name the build that produced it */
+#endif
+    if (!QerrPut_(out, cap, &at, ". Evidence: ", 0) || !QerrPut_(out, cap, &at, evidence, 1) ||
         !QerrPut_(out, cap, &at, ".", 0))
         return 0;
     return at;
@@ -453,22 +469,23 @@ static inline int QerrFormatHeader(char* out, size_t cap, const char* header, co
 }
 
 /* Pure: renders one row into the complete notify-file text. headerArg fills the header's %s;
- * pid is the sender's own. Returns the byte length, or 0 when it could not be rendered. */
+ * pid and build are the sender's own (build NULL/"" renders "build unknown"). Returns the byte
+ * length, or 0 when it could not be rendered. */
 static inline size_t QerrRenderText(char* out, size_t cap, const QerrText* t, const char* headerArg,
-                                    unsigned long pid)
+                                    unsigned long pid, const char* build)
 {
     char header[200];
     if (!t) return 0;
     if (!QerrFormatHeader(header, sizeof(header), t->header, headerArg)) return 0;
 #ifdef NOTIFYERR_DEFECT_NOTECH
     /* DEFECT (render test): the technical line is dropped - the cause takes its place */
-    (void)pid;
+    (void)pid; (void)build;
     return QerrComposeNotifyText(out, cap, header, t->next, NULL, t->cause ? t->cause : "-");
 #else
     {
         char tech[400];
         if (!QerrFormatTechLine(tech, sizeof(tech), t->subject, pid, t->code, NULL,
-                                t->count ? t->count : "reported once per boot", t->evidence))
+                                t->count ? t->count : "reported once per boot", t->evidence, build))
             return 0;
         return QerrComposeNotifyText(out, cap, header, t->next, t->cause, tech);
     }
@@ -495,7 +512,7 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
                         const char* next, const char* cause, const char* tech);
 /* Report one of the agent's own texts (notifytexts.h). idOverride: a per-instance id in place of
  * the row's (NULL = the row's); headerArg: fills the header's %s (NULL when it has none). The
- * technical line is composed here from the row and this process's pid. */
+ * technical line is composed here from the row, this process's pid and the build read at QerrInit. */
 QerrDecision QerrReportText(const QerrText* t, const char* idOverride, const char* headerArg);
 #ifdef __cplusplus
 }

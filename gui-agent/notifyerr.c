@@ -45,6 +45,7 @@
 #include <strsafe.h>
 #include <log.h>
 #include "errbox.h"
+#include "modver.h"
 #else
 #include <sys/stat.h>
 #include <errno.h>
@@ -59,6 +60,10 @@
 
 static int  g_QerrGate = 0;
 static char g_QerrStateDir[512] = { 0 };
+/* THE BUILD THAT PRODUCED THE NOTIFICATION (modver.h), read ONCE at QerrInit like every other start-time fact,
+ * so a report names the image that is running, not whatever file is on disk by then; "" = not readable, and the
+ * technical line then says "build unknown". */
+static char g_QerrBuild[32] = { 0 };
 
 /* --- platform layer ----------------------------------------------------------------------- */
 static void      PlatLog(const char* fmt, ...);
@@ -72,6 +77,7 @@ static int       PlatSpawnNotify(const char* notifyPath, int* exeMissing);
 static int       PlatShowErrorBox(const char* header, const char* text, unsigned long* error);   /* 1 = shown */
 static void      PlatDefaultStateDir(char* out, size_t cap);
 static unsigned long PlatPid(void);                                       /* this process, for the technical line */
+static void      PlatBuild(char* out, size_t cap);                        /* this image's version, "" if unreadable */
 
 #ifndef QERR_AGENT_LAYER
 /* Test hooks (notifyerr_test.c): the spawn outcome, the box and the log sink are the test's. */
@@ -80,6 +86,7 @@ int  (*QerrTestBoxHook)(const char* header, const char* text) = NULL;   /* NULL 
 void (*QerrTestLogHook)(const char* line) = NULL;
 long long QerrTestBootStamp = 0;                              /* 0 = wall clock (the suite always pins it) */
 unsigned long QerrTestPid = 4242;                             /* the pid the technical line shows under test */
+const char* QerrTestBuild = "4.3.36.915";                     /* the build the technical line shows; NULL = unreadable */
 #endif
 
 /* --- API ---------------------------------------------------------------------------------- */
@@ -91,10 +98,11 @@ void QerrInit(int gateOn, const char* stateDirUtf8)
     } else {
         PlatDefaultStateDir(g_QerrStateDir, sizeof(g_QerrStateDir));
     }
-    PlatLogInfo("NOTIFYERR gate: enabled=%d state=%s (secondary route: dom0 notification via "
+    PlatBuild(g_QerrBuild, sizeof(g_QerrBuild));
+    PlatLogInfo("NOTIFYERR gate: enabled=%d state=%s build=%s (secondary route: dom0 notification via "
             "notifhost/qubes.Notifications; needs qrexec-agent; the log stays primary; when dom0 cannot be "
             "told - transport failed, or gate off - the error is shown as a window on the console session)",
-            g_QerrGate, g_QerrStateDir);
+            g_QerrGate, g_QerrStateDir, g_QerrBuild[0] ? g_QerrBuild : "unknown");
 }
 
 /* Once-per-process failure logging. Under NOTIFYERR_DEFECT_FAILOPEN every call logs, which is
@@ -243,34 +251,37 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
     }
     if (!PlatSpawnNotify(notifyPath, &exeMissing)) {
         if (exeMissing)
-            LogOnce(&s_LoggedNoExe, "NOTIFYERR notifhost.exe is NOT PRESENT next to gui-agent.exe - "
-                    "dom0 notifications cannot be sent (PACKAGING GAP in the reporting path; the "
-                    "log remains the record)");
+            /* A packaging gap in the reporting path: the helper ships beside gui-agent.exe and is
+             * absent, so nothing can reach dom0 and this log stays the only record. */
+            LogOnce(&s_LoggedNoExe, "NOTIFYERR notifhost.exe not present next to gui-agent.exe: "
+                    "no dom0 notification can be sent");
         else
-            LogOnce(&s_LoggedSpawn, "NOTIFYERR CreateProcess(notifhost --notify-file) failed - "
-                    "notification not sent (the log remains the record)");
+            /* CreateProcess(notifhost --notify-file) failed: nothing reaches dom0, this log remains the record. */
+            LogOnce(&s_LoggedSpawn, "NOTIFYERR notifhost could not be started - notification not sent");
         ShowWindowFallback(QERR_FAIL_TRANSPORT, component, id, header, text,
                            exeMissing ? "notifhost.exe is missing" : "notifhost could not be started");
         return QERR_FAIL_TRANSPORT;
     }
-    PlatLog("NOTIFYERR %s.%s sent to dom0 (#%u this boot; delivery is notifhost's to log)",
-            component, id, newCount);
+    /* Delivery is notifhost's to log; this records the hand-off only. */
+    PlatLog("NOTIFYERR %s.%s sent to dom0 (#%u this boot)", component, id, newCount);
     return QERR_SEND;
 }
 
 /* One of the agent's own texts (notifytexts.h), rendered the way the offline render test renders
- * it: the header's %s filled, the technical line composed from the row and this process's pid. */
+ * it: the header's %s filled, the technical line composed from the row, this process's pid and the
+ * build read at QerrInit. */
 QerrDecision QerrReportText(const QerrText* t, const char* idOverride, const char* headerArg)
 {
     char header[200], tech[400];
     if (!t) {
-        PlatLog("QGANOTIFYERR a notification text row is missing (a bug of ours: the key a call "
-                "site asked for is not in notifytexts.h) - nothing sent");
+        /* A bug of ours, not a guest condition: the key a call site asked for is not a row in
+         * notifytexts.h, so there is no text to render and nothing is sent. */
+        PlatLog("QGANOTIFYERR notification text row missing: nothing sent");
         return QERR_REJECT_NAME;
     }
     if (!QerrFormatHeader(header, sizeof(header), t->header, headerArg) ||
         !QerrFormatTechLine(tech, sizeof(tech), t->subject, PlatPid(), t->code, NULL,
-                            t->count ? t->count : "reported once per boot", t->evidence))
+                            t->count ? t->count : "reported once per boot", t->evidence, g_QerrBuild))
     {
         PlatLog("NOTIFYERR %s.%s not sent: the header or the technical line did not render",
                 t->component, idOverride ? idOverride : t->id);
@@ -381,6 +392,12 @@ static void PlatDefaultStateDir(char* out, size_t cap)
 static unsigned long PlatPid(void)
 {
     return (unsigned long)GetCurrentProcessId();
+}
+
+/* The running image's file version, spelled as LogInit's "Module version" line (modver.h). */
+static void PlatBuild(char* out, size_t cap)
+{
+    if (!QerrModuleVersion(out, cap)) out[0] = 0;
 }
 
 static int PlatEnsureDir(const char* dir)
@@ -507,6 +524,11 @@ static void PlatDefaultStateDir(char* out, size_t cap)
 static unsigned long PlatPid(void)
 {
     return QerrTestPid;   /* pinned: the suite compares rendered text byte for byte */
+}
+
+static void PlatBuild(char* out, size_t cap)
+{
+    snprintf(out, cap, "%s", QerrTestBuild ? QerrTestBuild : "");   /* pinned; NULL = not readable */
 }
 
 static int PlatEnsureDir(const char* dir)

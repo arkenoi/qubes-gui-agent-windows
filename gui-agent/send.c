@@ -94,7 +94,7 @@ static void LogGeometryRefused(IN OUT ULONG *counter, IN HWND window,
     // so a stuck path cannot turn the log file into the next problem.
     if (count <= 20 || (count % 1000) == 0)
     {
-        LogWarning("GEOMDROP msg=%s hwnd=0x%x rule=%s x=%d y=%d w=%d h=%d - message not sent; "
+        LogWarning("GEOMDROP msg=%s hwnd=0x%x rule=%s x=%d y=%d w=%d h=%d not sent; "
             "%u such drops so far", messageName, window, rule, x, y, width, height, count);
     }
 }
@@ -146,8 +146,10 @@ static BOOL SanitizeWireGeometry(IN HWND window, IN const WCHAR *messageName,
         ULONG count = ++g_GeomClamps;
         if (count <= 20 || (count % 1000) == 0)
         {
+            // dom0's clamp is gui-daemon's (xside.c:2939-2946 when this was written): a reference for
+            // the reader of the line, not a thing to print on every occurrence.
             LogWarning("GEOMCLAMP msg=%s hwnd=0x%x (%d,%d) %dx%d -> (%d,%d) %dx%d "
-                "(dom0 clamps to %dx%d, xside.c:2939-2946); %u so far",
+                "(limit %dx%d); %u so far",
                 messageName, window, *x, *y, (int)*width, (int)*height,
                 cx, cy, w, h, MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT, count);
         }
@@ -430,13 +432,13 @@ static BOOL MaySendForWindowLocked(IN HWND window, IN const WCHAR *messageName)
     if (!window || IsWindowCreatedLocked(window))
         return TRUE;
 
-    // A window in this state is already broken; log enough to find the bug without
-    // flooding the file at frame rate when it repeats.
+    // A window in this state is already broken, and sending the message would make gui-daemon
+    // exit and take down the qube's GUI; log enough to find the bug without flooding the file
+    // at frame rate when it repeats.
     g_GateDrops++;
     if (g_GateDrops <= 20 || (g_GateDrops % 1000) == 0)
     {
-        LogWarning("dropping %s for 0x%x: no CREATE was sent for this window "
-            "(agent bug - sending it would make gui-daemon exit and take down the qube's GUI); "
+        LogWarning("dropping %s for 0x%x: no CREATE was sent for this window (agent bug); "
             "%I64u such drops so far", messageName, window, g_GateDrops);
     }
     return FALSE;
@@ -560,9 +562,10 @@ static ULONG SendWindowCreateInternal(IN const WINDOW_DATA *windowData, IN BOOL 
         ULONG count = ++g_DupCreates;
         if (count <= 20 || (count % 1000) == 0)
         {
-            LogWarning("CREATEDUP suppressing a second MSG_CREATE for 0x%x ((%d,%d) %ux%u): "
-                "dom0 exits on a CREATE for an id it already tracks; sending MSG_CONFIGURE "
-                "instead; %u suppressed so far",
+            // dom0 exits on a CREATE for an id it already tracks, so the second one is answered by
+            // sending MSG_CONFIGURE instead.
+            LogWarning("CREATEDUP second MSG_CREATE for 0x%x ((%d,%d) %ux%u) sent as MSG_CONFIGURE; "
+                "%u suppressed so far",
                 window, createMsg.x, createMsg.y, createMsg.width, createMsg.height, count);
         }
 

@@ -325,8 +325,9 @@ static void SimRunOnce(void)
     {
         // MISSING DATA FAILS. A run that sampled nothing must not print a zero-reversal line
         // that reads as a pass - that is the exact failure this file exists to stop repeating.
-        LogWarning("QGADRAGSIM NO DATA - samples=%u usable_steps=%u. The run produced nothing "
-            L"to score; this is a FAILED run, not a clean one.", sampleCount, steps);
+        // The line carries the verdict and the counts. The reasoning lives here: a run that produced
+        // nothing to score is a failed run, never a clean one.
+        LogWarning("QGADRAGSIM NO DATA: run FAILED; samples=%u usable_steps=%u", sampleCount, steps);
         return;
     }
 

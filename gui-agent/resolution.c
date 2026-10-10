@@ -303,8 +303,8 @@ ULONG EnsureQubesIddSolo(void)
     if (!iddName[0])
     {
         // No IDD present. This is the Basic Display Adapter configuration, which is a
-        // supported way to run - say so once and leave the topology alone.
-        LogDebug("IDD solo: no Qubes IDD adapter present, leaving display topology untouched");
+        // supported way to run - say so once, leaving the topology alone.
+        LogDebug("IDD solo: no Qubes IDD adapter present, display topology untouched");
         return ERROR_SUCCESS;
     }
 
@@ -402,7 +402,10 @@ ULONG EnsureQubesIddSolo(void)
     // failure that still leaves a visible display is left alone deliberately.
     if (!iddAttached && othersStillAttached == 0 && fault == 2)
     {
-        LogError("IDD solo: NO display is attached and SoloFaultInject=2 SUPPRESSES the rollback - this is the pre-fix behaviour, the guest now has no display. Recover with deactivate-idd.ps1 over qrexec.");
+        // The pre-fix behaviour on demand: SoloFaultInject=2 suppresses the rollback, for the test that must see this
+        // guard fail. The way out is guest/deactivate-idd.ps1 over qrexec - the dom0 command is at the ROLLBACK FAILED
+        // line below.
+        LogError("IDD solo: NO display attached and no rollback (SoloFaultInject=2); the guest has no display");
     }
     else if (!iddAttached && othersStillAttached == 0)
     {
@@ -427,14 +430,17 @@ ULONG EnsureQubesIddSolo(void)
         DWORD nowAttached = CountAttachedDisplays();
         if (nowAttached > 0)
         {
-            LogWarning("IDD solo: rolled back - %lu display(s) attached again (restored=%lu, commit=%ld). The guest keeps its previous display; the IDD did not activate.",
+            LogWarning("IDD solo: rolled back, %lu display(s) attached again (restored=%lu, commit=%ld); the IDD did not activate",
                 nowAttached, restored, rcommit);
         }
         else
         {
-            // Nothing left to try from here. Say exactly what a user has to do, because from
-            // dom0 this looks like a black unresponsive window with no other clue.
-            LogError("IDD solo: ROLLBACK FAILED - the desktop has NO attached display (restored=%lu, commit=%ld). Recover from dom0 with: qvm-run -u SYSTEM <vm> \"powershell -ExecutionPolicy Bypass -File C:\\qwt-improved-setup\\deactivate-idd.ps1\" then restart the qube.",
+            // Nothing left to try from here: the desktop has no attached display, and from dom0 this looks like a
+            // black, unresponsive window with no other clue, so the way out is here rather than in the line: from
+            // dom0 run
+            //     qvm-run -u SYSTEM <vm> "powershell -ExecutionPolicy Bypass -File C:\qwt-improved-setup\deactivate-idd.ps1"
+            // then restart the qube (guest/deactivate-idd.ps1 over qrexec).
+            LogError("IDD solo: ROLLBACK FAILED, NO display attached (restored=%lu, commit=%ld); recover from dom0",
                 restored, rcommit);
         }
     }
@@ -1710,13 +1716,15 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
             // The M0BLINK stamps are deliberately NOT cleared - a repaint IS expected if the apply
             // works - and $g_ExactInFlight stays held until the common exit below.
             RecordExactWaitExpiry(width, height);
+            // Both lines end at "applying anyway": that the pre-flight is a query which cannot veto the
+            // apply, and that an apply which fails reports its own status (the apply-failed path below),
+            // is the reasoning above, not something to repeat per occurrence. At agent start no current
+            // mode is recorded yet, which is the first line's case.
             if (g_ScreenWidth == 0 || g_ScreenHeight == 0)
-                LogWarning("RESWAIT %lux%lu not offered within %u ms (deadline; %lu polls) - no current mode is recorded yet. "
-                    L"Attempting the apply anyway: CDS_TEST is a query, not a veto, and a failure there reports its own status.",
+                LogWarning("RESWAIT %lux%lu not offered within %u ms (deadline; %lu polls), no current mode yet, applying anyway",
                     width, height, (unsigned)EXACT_MODE_WAIT_TIMEOUT_MS, polls);
             else
-                LogWarning("RESWAIT %lux%lu not offered within %u ms (deadline; %lu polls) - current mode is %lux%lu. "
-                    L"Attempting the apply anyway: CDS_TEST is a query, not a veto, and a failure there reports its own status.",
+                LogWarning("RESWAIT %lux%lu not offered within %u ms (deadline; %lu polls), mode now %lux%lu, applying anyway",
                     width, height, (unsigned)EXACT_MODE_WAIT_TIMEOUT_MS, polls, g_ScreenWidth, g_ScreenHeight);
         }
         else
@@ -1747,7 +1755,8 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
     appliedMode.dmSize = sizeof(appliedMode);
     if (!EnumDisplaySettings(NULL, ENUM_CURRENT_SETTINGS, &appliedMode))
     {
-        LogWarning("EnumDisplaySettings(ENUM_CURRENT_SETTINGS) failed, cannot verify applied resolution");
+        // Without the current settings there is nothing to verify the applied resolution against.
+        LogWarning("EnumDisplaySettings(ENUM_CURRENT_SETTINGS) failed; applied resolution unverified");
     }
     else if (appliedMode.dmPelsWidth != width || appliedMode.dmPelsHeight != height)
     {
@@ -1880,8 +1889,9 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
         return SetVideoModeExact(width, height, TRUE);
 
     if (snapFault)
-        LogWarning("ModeSnapFaultInject=%lu - taking the LEGACY snap path on purpose; a size the "
-            L"driver does not offer yet will be downgraded and the downgrade published", snapFault);
+        // A size the driver does not offer yet is downgraded and the downgrade published (RESSNAP ... SNAPPED, M6SET).
+        LogWarning("ModeSnapFaultInject=%lu - taking the LEGACY snap path on purpose: an unoffered size is downgraded",
+            snapFault);
 
     DWORD mode = SelectSupportedMode(width, height);
 
@@ -1938,7 +1948,9 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
         }
         else
         {
-            LogWarning("EnumDisplaySettings(ENUM_CURRENT_SETTINGS) failed, cannot verify applied resolution");
+            // Without the current settings there is nothing to verify the applied resolution against; the requested
+            // one is adopted.
+            LogWarning("EnumDisplaySettings(ENUM_CURRENT_SETTINGS) failed; applied resolution unverified");
         }
 
         HideCursors(); // mode change reloads the cursor scheme - re-blank (see exact path)

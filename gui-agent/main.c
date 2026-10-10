@@ -1080,7 +1080,8 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
     // QGABROKERDIED/HUNG/DIMS, QGAZERORECT, QGATOASTGAP, ZORDERINVALID and every error path. This
     // line says so once, so a reader who expects the detail knows where it went: raise the level
     // with guest/set-loglevel.ps1.
-    LogInfo("QGALOGPOLICY routine per-window detail is at DEBUG; raise LogLevel to see it");
+    // To see it, raise LogLevel (guest/set-loglevel.ps1).
+    LogInfo("QGALOGPOLICY routine per-window detail is at DEBUG only");
     QgaNameThread(L"gui-agent: hooks");
 
     waitFor[0] = g_WindowEventStop;
@@ -1224,13 +1225,14 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
     // back to a short resync so behaviour degrades to roughly the old code instead.
     // AN EXIT THE AGENT ASKED FOR IS NOT A FALLBACK: this line was ERROR on every clean exit ("tracking falls back to
     // periodic resync" - a fallback that does not happen in a process that is leaving; measured 2026-10-07). It stays
-    // ERROR only when the thread dies while the agent keeps running - a real fallback, diagnosed as one.
+    // ERROR only when the thread dies while the agent keeps running - a real fallback, diagnosed as one. The failure
+    // itself is in the lines above: a wait or hook call that failed, or a WM_QUIT delivered to this thread.
     if (stopRequested)
         LogInfo("window event thread exiting on request - the agent is leaving");   // QGA_WINEVT_EXPECTED
     else
-        LogError("QGAWINEVTDEAD window event thread exiting while the agent keeps running - tracking falls back to the "
-            L"periodic resync (a FALLBACK: window moves are seen at 0.5 Hz until the agent restarts; the lines above "
-            L"name the failure - a wait or hook call that failed, or a WM_QUIT on this thread)");
+        // The fallback: with the thread gone while the agent keeps running, window tracking falls back to the
+        // 0.5 Hz resync sweep until the agent restarts.
+        LogError("QGAWINEVTDEAD window event thread died unexpectedly, using fallback");
     InterlockedExchange(&g_WindowEventThreadDead, 1);
 
     LogDebug("end");
@@ -1571,9 +1573,9 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
                 if (s_zeroRectLastReport == 0 || now - s_zeroRectLastReport > 300000)   // then at most one line per 5 min
                 {
                     s_zeroRectLastReport = now;
-                    LogInfo("QGAZERORECT %d window(s) rejected for zero geometry since start "
-                        "(routine: IME/DDE/tooltip/DWM-listener windows; raise LogLevel to "
-                        "DEBUG for the per-window detail)", n);
+                    // Routine: IME/DDE/tooltip/DWM-listener windows open with no geometry. The per-window detail is at
+                    // DEBUG; raise LogLevel to see it.
+                    LogInfo("QGAZERORECT %d window(s) rejected for zero geometry since start (routine)", n);
                 }
             }
             else
@@ -1608,7 +1610,7 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
             // Twice in a row is not a race. ONE line, naming the call that actually failed and the
             // window, and a status the caller already treats as "not measurable this pass" so the
             // same condition is not reported a second time under a different function's name.
-            LogError("0x%x: GetMonitorInfo failed twice (0x%x, 0x%x); window not measured",
+            LogError("0x%x: GetMonitorInfo failed twice (0x%x, 0x%x), not measured",
                 window, firstError, GetLastError());
             return ERROR_INVALID_DATA;
         }
@@ -1630,8 +1632,8 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
             if (s_staleMonLastReport == 0 || now - s_staleMonLastReport > 300000)   // then at most one line per 5 min
             {
                 s_staleMonLastReport = now;
-                LogInfo("QGAMONSTALE %d window(s) measured after a stale monitor handle "
-                    "(display change; DEBUG for detail)", n);
+                // Measured after a stale monitor handle was re-acquired; the per-window detail is at DEBUG.
+                LogInfo("QGAMONSTALE %d window(s) re-measured after a display change", n);
             }
         }
     }
@@ -2904,15 +2906,16 @@ BOOL HelpersDisarmed(void)
 }
 void HelpersDisarm(IN const WCHAR *why)
 {
+    // A helper's exit after this point is the session's teardown or our own stop: graded INFO, never a death (R1 above).
     if (InterlockedExchange(&g_HelpersDisarmed, 1) == 0)
-        LogInfo("QGAHELPERSDISARM helper launches disarmed (%s): no helper is launched into this session from here on, "
-            L"and a helper's exit from now is expected, not a death", why);
+        LogInfo("QGAHELPERSDISARM helper launches disarmed (%s): no helper is launched into this session from here on", why);
     EtwProxyDisarm();
 }
 void HelpersRearm(void)
 {
     if (InterlockedExchange(&g_HelpersDisarmed, 0) != 0)
-        LogInfo("QGAHELPERSREARM helper launches re-armed (the end of the session was cancelled)");
+        // Helper launches are allowed again: the end of the session was cancelled.
+        LogInfo("QGAHELPERSREARM helpers re-armed, the session end was cancelled");
     EtwProxyRearm();
 }
 
@@ -2931,7 +2934,8 @@ static HWND ShellWindowNow(void)
 {
     const HWND shell = GetShellWindow();
     if (shell && !g_ShellSeen && InterlockedExchange(&g_ShellSeen, 1) == 0)
-        LogInfo("QGASHELLSEEN the shell window is up - a lock can be asserted from here on; hwnd=0x%p", shell);
+        // From here on a lock can be asserted: the session has reached a shell this instance has seen.
+        LogInfo("QGASHELLSEEN shell window is up, hwnd=0x%p", shell);
     return shell;
 }
 static BOOL ShellSeenSinceStart(void)
@@ -3152,11 +3156,10 @@ static BOOL WgcLaunch(void)
     // broker inert on every clean install because wgcbroker.exe was never staged into the MSI.
     if (GetFileAttributes(longExe) == INVALID_FILE_ATTRIBUTES)
     {
-        LogError("QGABROKERMISSING wgcbroker.exe is NOT PRESENT at %s - the de-slice broker cannot "
-            L"start, so on this eligible guest toasts, menus and WinUI surfaces will be WITHHELD "
-            L"(there is no composite fallback). This is a PACKAGING GAP: the helper was built but "
-            L"never staged next to gui-agent.exe. It is a major failure of the install, not a "
-            L"runtime condition to tolerate.", longExe);
+        // A PACKAGING GAP - the helper was built but never staged next to gui-agent.exe - and a major failure of the
+        // install, not a runtime condition to tolerate: an eligible guest has no composite fallback for those surfaces.
+        LogError("QGABROKERMISSING wgcbroker.exe is not present at %s: the de-slice broker cannot start - toasts, "
+            L"menus and WinUI surfaces are withheld (no composite fallback)", longExe);
         // Secondary route (ACTION: will not recover by itself; a reinstall is the fix). The log
         // line above stays the record; this is the courtesy copy, once per boot. The text is the
         // "broker-missing" row of notifytexts.h.
@@ -3179,13 +3182,15 @@ static BOOL WgcLaunch(void)
             L"QWT: the GUI agent's de-slice capture broker (re-created by the GUI agent at each of its starts; "
             L"restarted on failure by Task Scheduler, never by the agent)"))
     {
-        LogError("QGABROKERLAUNCHFAIL registering/starting the de-slice broker's task FAILED - it cannot start, "
-            L"so per-window surfaces will be withheld. Check that Task Scheduler is running and that the task "
-            L"XML was accepted (a schtasks error is logged above).");
+        // Task Scheduler not running, or the task XML refused: the schtasks error is logged above (HelperTaskRegister).
+        // The de-slice broker task was not registered or started, so the broker is not running and every
+        // per-window surface (toasts, menus, WinUI) is withheld from dom0 until the next agent start.
+        LogError("QGABROKERLAUNCHFAIL broker not started, menus and toasts are not shown");
         return FALSE;
     }
-    LogInfo("WGCBROKER launched via Task Scheduler (user session %lu; restart-on-failure " HELPER_TASK_RESTART_INTERVAL
-        L" x" HELPER_TASK_RESTART_COUNT L" is the scheduler's, not this agent's)", sid);
+    // The restart-on-failure interval x count is the scheduler's, not this agent's (it relaunches nothing).
+    LogInfo("WGCBROKER launched via Task Scheduler, user session %lu, restart-on-failure " HELPER_TASK_RESTART_INTERVAL
+        L" x" HELPER_TASK_RESTART_COUNT, sid);
     return TRUE;
 }
 // Open a helper process published by pid for SYNCHRONIZE/TERMINATE - VALIDATED first. The pid
@@ -3394,9 +3399,10 @@ static void BrokerReportDeaf(void)
         if (qr != g_SlotQuietSeen[i])
         {
             if (s->Hwnd != 0 && qr > g_SlotQuietSeen[i])
-                LogWarning("QGAWGCRECREATE hwnd 0x%llx slot %d: the broker recreated its WGC session after a poke from a "
-                    L"key or click went unanswered for %u ms (quiet reroutes %ld, sessions opened %ld). A key whose change "
-                    L"WGC did not deliver, or a session that stopped delivering.",
+                // The broker recreated its WGC session after a poke went unanswered: either a key whose change WGC did not
+                // deliver, or a session that stopped delivering.
+                LogWarning("QGAWGCRECREATE hwnd 0x%llx slot %d: capture session recreated, a key or click got no frame "
+                    L"for %u ms (quiet reroutes %ld, sessions opened %ld)",
                     (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, qr, s->ChanOpens);
             g_SlotQuietSeen[i] = qr;
         }
@@ -3407,8 +3413,9 @@ static void BrokerReportDeaf(void)
         if (ic != g_SlotClosedSeen[i])
         {
             if (s->Hwnd != 0 && ic > g_SlotClosedSeen[i])
-                LogWarning("QGAWGCITEMCLOSED hwnd 0x%llx slot %d: Windows closed the window's capture item (closures %ld); "
-                    L"the broker reopens its session at once (sessions opened %ld).",
+                // The window's capture item was closed by Windows; the broker reopens its session on its own.
+                LogWarning("QGAWGCITEMCLOSED hwnd 0x%llx slot %d: Windows closed the capture item, reopened at once "
+                    L"(closures %ld, sessions opened %ld)",
                     (ULONGLONG)s->Hwnd, i, ic, s->ChanOpens);
             g_SlotClosedSeen[i] = ic;
         }
@@ -3419,10 +3426,10 @@ static void BrokerReportDeaf(void)
             continue;
         g_SlotDeafSaid[i] = seq;
         (void)CfgWriteDword(NULL, REG_CONFIG_WGC_DEAF_VALUE, ++g_WgcDeafCount, NULL);
-        LogError("QGAWGCDEAF hwnd 0x%llx slot %d: its WGC session delivered nothing for a first frame or an own-change "
-            L"poke within %u ms, was recreated once and was silent again. The broker holds it FAILED (deaf holds %ld); "
-            L"the window keeps its last content until it is registered again - there is no PrintWindow fallback. "
-            L"WgcDeaf=%lu published under the Qubes Tools config key.",
+        // There is no PrintWindow fallback for a deaf slot; WgcDeaf is the counter under the Qubes Tools config key.
+        LogError("QGAWGCDEAF hwnd 0x%llx slot %d: WGC delivered no first frame or own-change poke within %u ms, "
+            L"recreated once, silent again: held FAILED by the broker, the window keeps its last content until "
+            L"re-registered (deaf holds %ld, WgcDeaf=%lu)",
             (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, s->DeafHolds, g_WgcDeafCount);
         // NO SILENT REGRESSIONS (owner 2026-10-02: "fail loudly (including user facing message) if capture really goes
         // deaf someday"). A deaf hold is the product not delivering a window, and nothing here recovers it: the user is told
@@ -3523,9 +3530,9 @@ static void BrokerSupervise(void)
             else
             {
                 g_WgcBrokerPidRejected = pid;
-                LogWarning("QGABROKERPID BrokerPid %ld published in the shared section is not a "
-                    L"running wgcbroker.exe from the install dir in session %lu - ignored (the field "
-                    L"is user-writable). The broker is not treated as ready until a pid validates.", pid, sid);
+                // BrokerPid in the shared section is user-writable: a pid that is not a running wgcbroker.exe from the
+                // install dir is rejected, and the broker is not treated as ready until a pid validates.
+                LogWarning("QGABROKERPID published pid %ld is not a running broker in session %lu, ignored, broker not ready", pid, sid);
             }
         }
     }
@@ -3551,9 +3558,10 @@ static void BrokerSupervise(void)
             // only record that it happened is this line plus BrokerDeaths and the 4002 already written.
             if (g_BrokerDiedAt)
             {
-                LogWarning("QGABROKERBACK de-slice broker is BACK after %I64u ms down (deaths=%lu) - Task Scheduler "
-                    L"restarted it. A broker death is a real failure - windows withheld during the outage were never "
-                    L"shown. Collect the wgcbroker log for the crash.",
+                // Task Scheduler restarted it (this agent relaunches nothing); a death is a real failure, and the
+                // crash itself is in the wgcbroker log - collect it.
+                LogWarning("QGABROKERBACK de-slice broker is BACK after %I64u ms down (deaths=%lu): windows withheld "
+                    L"during the outage were never shown",
                     GetTickCount64() - g_BrokerDiedAt, g_BrokerDeaths);
                 g_BrokerDiedAt = 0;
             }
@@ -3585,14 +3593,15 @@ static void BrokerSupervise(void)
         if (brokerVerdict != QGA_HELPER_DEATH)
         {
             if (brokerVerdict == QGA_HELPER_EXPECTED_DISARMED)
-                LogInfo("WGCBROKER the broker %s (code %lu) while helper launches are disarmed (session ending / "
-                    L"agent exiting) - expected, not a death. No death record and nothing relaunches it",
+                // Helper launches are disarmed (session ending / agent exiting): an exit or a stopped heartbeat now is
+                // expected, no death record is written and nothing relaunches it.
+                LogInfo("WGCBROKER broker %s during teardown (code %lu), not a death",
                     brokerExited ? L"exited" : L"stopped answering", brokerExitCode);
             else
             {
-                LogWarning("WGCBROKERSYSKILL the system terminated the broker (0x40010004) before this agent was "
-                    L"told its session was ending - recorded as a teardown, not a death. If no shutdown was in "
-                    L"progress, this is an ordering anomaly worth finding");
+                // The system terminated the broker before this agent was told its session was ending: recorded as a
+                // teardown, not a death. If no shutdown was in progress this is an ordering anomaly worth finding.
+                LogWarning("WGCBROKERSYSKILL broker killed by Windows (0x40010004) before session end was announced, a teardown");
                 // DURABLE, AND NOT ESCALATED: 4012 instead of 4002. The Application log keeps it whatever happens
                 // to our own log files; the dom0 reporter reads only 4001-4004, so no notification goes out.
                 DeathEventReportTeardown(DEATHEVENT_ID_WGCBROKER, L"wgcbroker.exe", (DWORD)pidBefore,
@@ -3621,23 +3630,23 @@ static void BrokerSupervise(void)
                 L"republish", L"sign", L"close-lock", L"close-reap" };
             const LONG stg = WGCBRK_HDR(g_WgcBase)->BrokerStage;
             const LONG code = stg >= 0 ? (stg >> 8) : -1;
-            LogError("QGABROKERHUNG de-slice broker process is still RUNNING but has not acknowledged the "
-                L"request on slot %d for %I64u ms (CtlAck %ld, wanted %ld) - a hang, not a crash; it is "
-                L"blocked in stage=%s (%ld) slot=%ld.", hungSlot, hungMs,
+            // A hang, not a crash: the de-slice broker process is still RUNNING but has not acknowledged the request.
+            LogError("QGABROKERHUNG de-slice broker process is still RUNNING, no answer on slot %d for %I64u ms "
+                L"(CtlAck %ld, wanted %ld), blocked in stage=%s (%ld) slot=%ld", hungSlot, hungMs,
                 (long)WGCBRK_SLOTS(g_WgcBase)[hungSlot].CtlAck, (long)g_SlotCtlWant[hungSlot],
                 (code >= 0 && code < (LONG)(sizeof(stgName) / sizeof(stgName[0]))) ? stgName[code] : L"unknown",
                 code, stg >= 0 ? (stg & 0xFF) : -1L);
         }
-        LogError("QGABROKERDIED de-slice broker STOPPED SERVING after being ready (death #%lu, "
-            L"pid was %ld). This is a MAJOR FAILURE, not a hiccup: while it is gone there is NO "
-            L"composite fallback on an eligible guest, so toasts, menus and WinUI surfaces are "
-            L"WITHHELD rather than drawn. This agent relaunches nothing (owner, 2026-10-07): %s. "
-            L"BrokerDeaths=%lu is published under the Qubes Tools config key.",
+        // A MAJOR FAILURE, not a hiccup: an eligible guest has no composite fallback while the broker is gone. This
+        // agent relaunches nothing (owner, 2026-10-07); BrokerDeaths is the counter under the Qubes Tools config key.
+        // After being ready, the broker stopped serving: toasts, menus and WinUI surfaces are withheld (no composite
+        // fallback). A hung instance is ended with its task disarmed first and nothing brings it back before the
+        // next agent start; a clean exit 0 is not restarted by Task Scheduler.
+        LogError("QGABROKERDIED de-slice broker STOPPED SERVING, no menus or toasts (death #%lu, pid was %ld), %s, BrokerDeaths=%lu",
             g_BrokerDeaths, (long)pidBefore,
-            hung ? L"the hung instance is ended (its task disarmed first) and nothing brings it back before the "
-                   L"next agent start"
-                 : L"Task Scheduler restarts it on failure (its task is armed: " HELPER_TASK_RESTART_INTERVAL L" x"
-                   HELPER_TASK_RESTART_COUNT L"); a clean exit 0 is not restarted",
+            hung ? L"hung instance ended, not restarted"
+                 : L"Task Scheduler restarts it on failure (" HELPER_TASK_RESTART_INTERVAL L" x"
+                   HELPER_TASK_RESTART_COUNT L")",
             g_BrokerDeaths);
         // Secondary route, DEGRADED - deliberately BELOW the route's ACTION threshold, so this is
         // rejected and stays in the log; if the scheduler's restart does not take, QGADESLICEDOWN below
@@ -3742,11 +3751,12 @@ static void BrokerSupervise(void)
     //     therefore behave exactly as before; only this report's deadline moves.
     if (!ShellWindowNow() && !g_WgcLaunched)
     {
-        // Not a fault and not a grace period: there is no session to run it in. The guest having no
-        // shell is its own condition and QGADESKSTUCK owns reporting it.
+        // Not a fault and not a grace period: there is no session to run it in (the broker is launched into the
+        // user's session, so its absence before a shell exists is no fault). The guest having no shell is its own
+        // condition and QGADESKSTUCK owns reporting it.
         if (g_BrokerDownSince)
-            LogDebug("QGADESLICEDOWN clock held: no shell window yet, so the broker cannot be launched "
-                L"and its absence is not a fault (it is launched into the user's session)");
+            // The down-clock is held: the broker cannot be launched without a shell to run it under.
+            LogDebug("QGADESLICEDOWN down time not counted before the shell window is up");
         g_BrokerDownSince = 0; g_BrokerNextWarn = 0;
     }
     else if (!g_BrokerDownSince)
@@ -3761,8 +3771,9 @@ static void BrokerSupervise(void)
     // launch block has its own GetShellWindow() guard, which is the condition that actually matters.)
     if (g_OnSecureDesktop)
     {
-        LogDebug("QGADESLICEDOWN not reported: the input desktop is secure, so nothing can capture "
-            L"and the broker cannot run - QGADESKSTUCK owns this condition (down %I64u s so far)",
+        // Nothing can capture while the input desktop is secure; QGADESKSTUCK owns that condition.
+        // The input desktop is secure, so the broker cannot run and the report would name the wrong fault.
+        LogDebug("QGADESLICEDOWN not reported on the secure desktop (down %I64u s so far)",
             (now - g_BrokerDownSince) / 1000);
     }
     else if (now >= g_BrokerNextWarn)
@@ -3780,19 +3791,18 @@ static void BrokerSupervise(void)
             binPresent = (GetFileAttributes(exe) != INVALID_FILE_ATTRIBUTES);
         }
         (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, binPresent ? 1u : 2u, NULL);
-        LogWarning("QGADESLICEDOWN de-slice broker EXPECTED but not running for %I64u s on an "
-            L"eligible system (build %lu, WgcBroker gate ON): wgcbroker.exe %s. There is NO "
-            L"composite fallback on an eligible guest (owner 2026-09-06): NRB/UWP surfaces "
-            L"(toasts, menus, WinUI windows) HOLD their last content until the broker returns - "
-            L"they are not sliced out of the whole-desktop framebuffer. Fix the broker; do not "
-            L"expect degraded-but-working rendering. %s "
-            L"DesliceBrokerDown=%u published under the Qubes Tools config key.",
+        // No composite fallback on an eligible guest (owner 2026-09-06): NRB/UWP surfaces are not sliced out of the
+        // whole-desktop framebuffer, so they hold their last content until the broker returns - fix the broker, do
+        // not expect degraded-but-working rendering. A PRESENT binary is a launch/capture failure (collect the
+        // wgcbroker and agent logs); a MISSING one is the PACKAGING GAP finding of 2026-09-04 (the helper was built in CI but
+        // never staged into the installable package; it must ship next to gui-agent.exe). DesliceBrokerDown is the
+        // flag under the Qubes Tools config key: 1 = present, 2 = missing.
+        LogWarning("QGADESLICEDOWN de-slice broker EXPECTED but not running for %I64u s on an eligible system "
+            L"(build %lu, WgcBroker gate ON): wgcbroker.exe %s - toasts, menus and WinUI windows hold their last "
+            L"content until it returns (no composite fallback)%s, DesliceBrokerDown=%u",
             (now - g_BrokerDownSince) / 1000, g_OsBuild,
-            binPresent ? L"IS PRESENT (launch/capture failure - collect wgcbroker + agent logs)"
-                       : L"IS MISSING from the install dir (PACKAGING GAP - the helper was built in "
-                         L"CI but never staged into the installable package; it must ship next to "
-                         L"gui-agent.exe)",
-            binPresent ? L"" : L"This is the 2026-09-04 packaging finding.",
+            binPresent ? L"is present" : L"is missing from the install dir",
+            binPresent ? L"" : L", packaging gap",
             binPresent ? 1u : 2u);
         // Secondary route (ACTION: windows are being withheld and nothing here recovers it). Once
         // per boot regardless of the 120 s re-warn cadence above; the text names the cause the same
@@ -3813,9 +3823,11 @@ static void BrokerSupervise(void)
         WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
         for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
             if (g_SlotCtlSince[i]) g_SlotCtlSince[i] = now;
+        // A failed launch is not retried - no relaunch loop (owner 2026-10-07); QGADESLICEDOWN keeps saying so.
         if (WgcLaunch()) g_WgcSession = sid;
-        else LogError("QGABROKERLAUNCHFAIL the de-slice broker's one launch failed and is not retried (no relaunch "
-                      L"loop, owner 2026-10-07) - QGADESLICEDOWN says so until the next GUI agent start");
+        // The de-slice broker's one launch failed and is not retried; QGADESLICEDOWN says so until the next GUI
+        // agent start.
+        else LogError("QGABROKERLAUNCHFAIL launch failed, no menus or toasts until restart");
     }
 }
 
@@ -3847,12 +3859,15 @@ static void BrokerShutdown(void)
         case QGA_HELPER_STOP_LEFT:
             break;
         case QGA_HELPER_STOP_TEARDOWN:
-            LogInfo("WGCBROKER the broker pid %lu did not leave on the shutdown flag - Windows ends it with the "
-                L"session; wait=0x%lx elapsed=%I64u ms session-ending=1", pid, wait, waited);
+            // The shutdown flag was set but the broker did not leave before the session's teardown: Windows ends it
+            // with the session.
+            LogInfo("WGCBROKER broker pid %lu still up at session end, Windows ends it: "
+                L"wait=0x%lx elapsed=%I64u ms session-ending=1", pid, wait, waited);
             break;
         default:
-            LogError("WGCBROKER the broker pid %lu did not leave within 2 s of the shutdown flag - the task delete "
-                L"ends it; wait=0x%lx elapsed=%I64u ms session-ending=%d", pid, wait, waited, (int)ending);
+            // The shutdown flag was ignored for 2 s and the broker did not leave, so the task delete ends it.
+            LogError("WGCBROKER broker pid %lu did not stop within 2 s, ending it by task delete: "
+                L"wait=0x%lx elapsed=%I64u ms session-ending=%d", pid, wait, waited, (int)ending);
             break;
         }
         CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
@@ -3951,8 +3966,9 @@ static void DirectSuppressNotifyUser(IN DWORD count)
     PROCESS_INFORMATION pi; ZeroMemory(&pi, sizeof(pi));
     if (GetFileAttributes(exe) == INVALID_FILE_ATTRIBUTES)
     {
-        LogError("QGADIRECTSUPPRESS: notifhost.exe is NOT PRESENT at %s - the user cannot be told "
-            L"that %lu window(s) were withheld. PACKAGING GAP in the error-reporting path itself.",
+        // notifhost.exe NOT PRESENT: the user cannot be told about the withheld windows. A PACKAGING GAP in the
+        // error-reporting path itself.
+        LogError("QGADIRECTSUPPRESS: notifhost.exe is missing at %s, %lu withheld window(s) go unreported",
             exe, count);
     }
     else if (CreateProcess(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
@@ -4028,7 +4044,9 @@ static BOOL NotifIpcEnsure(void)
     {
         if (m) CloseHandle(m);
         if (e) CloseHandle(e);
-        LogError("QGANOTIFIPC could not create the bridge's liveness mutex / ready event - the bridge is not launched");
+        // The bridge's liveness mutex or ready event could not be created, so the notification bridge is not
+        // launched.
+        LogError("QGANOTIFIPC bridge setup failed, toasts show as guest windows");
         return FALSE;
     }
     g_NotifAlive = m; g_NotifReadyEvt = e;
@@ -4218,7 +4236,8 @@ static void NotifBridgeRestoreSweep(void)
     if (WTSGetActiveConsoleSessionId() == 0xFFFFFFFF || !ShellWindowNow()) return;
     if (NotifRunInSession(NOTIF_RESTORE_TASK_NAME, L"--restore-banners", FALSE))
     {
-        LogInfo("NOTIFBRIDGE gate-off restore sweep launched (crash-leftover banner markers)");
+        // Gate-off restore: the bridge is off this run and a crash may have left banner markers behind.
+        LogInfo("NOTIFBRIDGE restore sweep launched, leftover banner markers cleared");
         g_NotifRestorePending = FALSE;
     }
 }
@@ -4270,14 +4289,16 @@ static void NotifBridgeSupervise(void)
         if (bridgeVerdict != QGA_HELPER_DEATH)
         {
             if (bridgeVerdict == QGA_HELPER_EXPECTED_DISARMED)
-                LogInfo("NOTIFBRIDGE the bridge pid %lu exited (code %lu) while helper launches are disarmed "
-                    L"(session ending / agent exiting) - expected, not a death. No death record",
+                // Helper launches are disarmed (session ending / agent exiting): an exit now is expected and no death
+                // record is written.
+                LogInfo("NOTIFBRIDGE bridge pid %lu exited during teardown (code %lu), not a death",
                     g_NotifBridgePid, exitCode);
             else
             {
-                LogWarning("NOTIFBRIDGESYSKILL the system terminated the bridge pid %lu (0x40010004) before this "
-                    L"agent was told its session was ending - recorded as a teardown, not a death. If no shutdown "
-                    L"was in progress, this is an ordering anomaly worth finding", g_NotifBridgePid);
+                // The system terminated the bridge before this agent was told its session was ending: recorded as a
+                // teardown, not a death. If no shutdown was in progress this is an ordering anomaly worth finding.
+                LogWarning("NOTIFBRIDGESYSKILL Windows killed the bridge pid %lu before announcing session end, a teardown "
+                    L"(0x40010004)", g_NotifBridgePid);
                 // 4013, not 4003: durable in the Application log, and not read by the dom0 reporter. This is the
                 // site measured firing twice on 2026-10-10, each time as a "major error" toast on the owner's desk.
                 DeathEventReportTeardown(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", g_NotifBridgePid, exitCode,
@@ -4302,8 +4323,9 @@ static void NotifBridgeSupervise(void)
         // and does not arm another launch.
         if (exitCode == QGA_NOTIFHOST_EXIT_ALREADY_RUNNING)
         {
-            LogInfo("NOTIFBRIDGE the bridge pid %lu exited %lu - another instance already holds the singleton, "
-                L"so the bridge IS running. Not a death, and no relaunch is armed.", g_NotifBridgePid, exitCode);
+            // So the bridge IS running: not a death, and no relaunch is armed.
+            LogInfo("NOTIFBRIDGE bridge pid %lu exited with code %lu, another instance already holds the singleton",
+                g_NotifBridgePid, exitCode);
             g_NotifBridgePid = 0;
             return;
         }
@@ -4373,27 +4395,28 @@ static void NotifBridgeSupervise(void)
                 const DWORD curSession = WTSGetActiveConsoleSessionId();
                 if (0 == wcscmp(reason, L"session-changed"))
                 {
-                    LogError("QGANOTIFSESSION the bridge pid %lu left because the console session "
-                        L"changed (%lu -> %lu). On this guest - one built-in user, autologon - the "
-                        L"session is not expected to change at all, so this is an anomaly to find, "
-                        L"not a condition to work around. Nothing is relaunched (owner 2026-10-08: "
-                        L"\"now we make sure session stays\"); guest toasts take the plain window "
-                        L"path until the agent starts again, so nothing is lost meanwhile.",
+                    // The premise "one built-in user, autologon, the session is not expected to change at all" is
+                    // broken when this fires: an anomaly to find, not a condition to work around, and nothing is
+                    // relaunched into the new session (owner 2026-10-08: "now we make sure session stays").
+                    LogError("QGANOTIFSESSION the bridge pid %lu left: the console session changed (%lu -> %lu), "
+                        L"not relaunched, guest toasts take the window path until the next agent start",
                         g_NotifBridgePid, g_NotifLaunchedSession, curSession);
                     QerrReportText(QerrTextFind("session-changed"), NULL, NULL);
                 }
                 else
-                    LogInfo("NOTIFBRIDGE the bridge pid %lu left on purpose (%s) and said so - an intended "
-                        L"departure, not a death. Nothing is relaunched and nothing is reported to dom0.",
+                    // It said so in its exit-reason file: not a death. Nothing is relaunched and nothing is reported
+                    // to dom0.
+                    LogInfo("NOTIFBRIDGE bridge pid %lu left on purpose (%s), an intended departure",
                         g_NotifBridgePid, reason);
                 DeleteFile(reasonPath);   // consumed: it may not excuse the next exit
                 g_NotifBridgePid = 0;
                 return;
             }
             if (reason[0])
-                LogWarning("NOTIFBRIDGE an exit reason is present (%s) but it names pid %lu, not the "
-                    L"bridge that just exited (%lu) - a leftover from an earlier instance, ignored. "
-                    L"This exit is reported as a death.", reason, reasonPid, g_NotifBridgePid);
+                // An exit reason left over from an earlier instance is present but names another pid: ignored, and
+                // this exit is reported as a death.
+                LogWarning("NOTIFBRIDGE stale exit reason (%s) from pid %lu, not the exited bridge (%lu), so this exit is a death",
+                    reason, reasonPid, g_NotifBridgePid);
         }
         // A bridge exit is a FAILURE to report, not a supervision detail: the gate is ON (checked
         // above), so nothing here asked it to stop. Its exit codes (notifhost.cpp, and
@@ -4401,10 +4424,10 @@ static void NotifBridgeSupervise(void)
         // 2 = listener access denied (consent), 3 = listener init threw, 4 = already running
         // (handled above). ShowBanner is restored on every exit path, so the cost is dom0-native
         // toasts, not lost ones - which does not make it benign.
-        LogError("QGANOTIFBRIDGEEXIT notification bridge pid %lu EXITED (exit code %lu) - detected "
-            L"by process wait. Guest toasts take the window path until Task Scheduler restarts it (its task is armed "
-            L"to restart on failure, " HELPER_TASK_RESTART_INTERVAL L" x" HELPER_TASK_RESTART_COUNT L"; a clean exit 0 "
-            L"is not restarted); this agent relaunches nothing (owner, 2026-10-07). bridge.log names the reason.",
+        // Detected by process wait. This agent relaunches nothing (owner, 2026-10-07); the reason is in bridge.log.
+        LogError("QGANOTIFBRIDGEEXIT notification bridge pid %lu EXITED (exit code %lu): guest toasts take the "
+            L"window path until Task Scheduler restarts it (restart-on-failure " HELPER_TASK_RESTART_INTERVAL L" x"
+            HELPER_TASK_RESTART_COUNT L", a clean exit 0 is not restarted)",
             g_NotifBridgePid, exitCode);
         // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo): a crash
         // is in Windows Error Reporting already, a clean unasked exit is visible only here. ONE Event Log
@@ -4473,8 +4496,8 @@ static void NotifBridgeSupervise(void)
                 // them apart by asking whether the pid exists AT ALL first.
                 HANDLE probe = OpenProcess(SYNCHRONIZE, FALSE, hbPid);
                 if (!probe)
-                    LogWarning("NOTIFBRIDGE published pid %lu is gone - the bridge exited right after starting (a "
-                        L"crash, not a forged pid); Task Scheduler restarts it only if it exited with a failure.", hbPid);
+                    // A crash, not a forged pid; Task Scheduler restarts it only if it exited with a failure.
+                    LogWarning("NOTIFBRIDGE published pid %lu is gone, the bridge crashed right after starting", hbPid);
                 else
                 {
                     CloseHandle(probe);
@@ -4486,8 +4509,9 @@ static void NotifBridgeSupervise(void)
             else if (hbPid == 0 && !g_NotifNoPidLogged)
             {
                 g_NotifNoPidLogged = TRUE;
-                LogWarning("QGANOTIFNOPID the bridge published a tick but no pid - the running notifhost.exe "
-                    L"predates this agent (mixed install); its exit cannot be waited on.");
+                // A tick without a pid: the running notifhost.exe predates this agent (mixed install), so its exit
+                // cannot be waited on.
+                LogWarning("QGANOTIFNOPID older bridge gave no pid, its exit cannot be watched");
             }
         }
         // Not published yet: its ready event wakes this loop. Past 60 s (BridgeNextDue arms that one deadline) it is
@@ -4496,9 +4520,10 @@ static void NotifBridgeSupervise(void)
         if (now - g_NotifLastLaunch >= 60000 && !g_NotifNotReadyLogged)
         {
             g_NotifNotReadyLogged = TRUE;
-            LogError("QGANOTIFNOTREADY no notification bridge instance published its pid within %I64u ms of the %s - "
-                L"not relaunched (no relaunch loop, owner 2026-10-07); guest toasts take the window path. bridge.log "
-                L"says whether it started; Task Scheduler's history (task " NOTIF_TASK_NAME L") whether it was restarted.",
+            // No relaunch loop (owner 2026-10-07). bridge.log says whether it started; Task Scheduler's history for
+            // the task says whether it was restarted.
+            LogError("QGANOTIFNOTREADY no notification bridge instance published its pid within %I64u ms of the %s: "
+                L"not relaunched, guest toasts take the window path (task " NOTIF_TASK_NAME L")",
                 now - g_NotifLastLaunch, g_NotifBridgeExitedAt != 0 ? L"exit it should have replaced" : L"launch");
         }
         return;
@@ -4510,9 +4535,11 @@ static void NotifBridgeSupervise(void)
     g_NotifLastLaunch = now;
     g_NotifBridgeExitedAt = 0;
     g_NotifLaunchPending = NotifBridgeLaunch();
+    // The one launch per agent life is not retried - no relaunch loop (owner 2026-10-07).
     if (!g_NotifLaunchPending)
-        LogError("QGANOTIFLAUNCHFAIL the notification bridge's one launch failed and is not retried (no relaunch loop, "
-            L"owner 2026-10-07) - guest toasts take the window path until the next GUI agent start");
+        // Not retried: the notification bridge is down and guest toasts take the window path until the next
+        // agent start.
+        LogError("QGANOTIFLAUNCHFAIL bridge launch failed, toasts show as guest windows");
 }
 
 // The earliest moment the bridge's supervision needs the main loop awake; 0 = nothing armed (the rest state). Bridge
@@ -4564,8 +4591,9 @@ static void NotifBridgeShutdown(void)
                     L"session; wait=0x%lx elapsed=%I64u ms session-ending=1", g_NotifBridgePid, wait, waited);
                 break;
             default:
-                LogError("NOTIFBRIDGE the bridge pid %lu did not leave within 3 s of the stop file - the task delete "
-                    L"ends it; wait=0x%lx elapsed=%I64u ms session-ending=%d banner-restore=skipped",
+                // The stop file was ignored for 3 s and the bridge did not leave, so the task delete ends it.
+                LogError("NOTIFBRIDGE bridge pid %lu did not stop within 3 s, ending it by task delete: "
+                    L"wait=0x%lx elapsed=%I64u ms session-ending=%d banner-restore=skipped",
                     g_NotifBridgePid, wait, waited, (int)ending);
                 break;
             }
@@ -5500,8 +5528,9 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
     // that never becomes usable leaves guest shadows on in seamless mode for the whole session, a
     // visible defect, and Info would have said so for ever with nothing escalating. Jev 0.06.
     // A bounded retry with a loud final failure would justify Info; until it exists, this stays.
-    LogWarning("no usable interactive session yet (token/profile/helper); cannot %s guest shadows (will retry)",
-               enable ? L"restore" : L"disable");
+    // No session token, no profile or no helper yet.
+    LogWarning("no usable interactive session yet, cannot %s guest shadows (will retry)",
+        enable ? L"restore" : L"disable");
     return FALSE;
 }
 
@@ -5860,9 +5889,9 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
         {
             ULONG pwStatus = PwAttachWindow(entry);
             if (pwStatus != ERROR_SUCCESS && DirectRequired())
-                LogWarning("QGADIRECTLEGACY hwnd 0x%x per-window attach failed (0x%x) on a "
-                    L"direct-required guest - it will be composited from the whole-desktop grant. "
-                    L"Investigate: no window on an eligible guest should need that path",
+                // Per-window attach failed on a direct-required guest, so dom0 composites it from the whole-desktop
+                // grant. Investigate: no window on an eligible guest should need that path.
+                LogWarning("QGADIRECTLEGACY hwnd 0x%x attach failed (0x%x), shown from the desktop image instead",
                     (DWORD)(ULONG_PTR)entry->Handle, pwStatus);
         }
 
@@ -6403,10 +6432,11 @@ void DaemonSettleSweep(void)
         if (g_SeamlessShadowsDone)
             g_ShadowAttempts = 0;
         else if (++g_ShadowAttempts >= SHADOW_APPLY_MAX_ATTEMPTS)
-            LogError("QGASHADOWGIVEUP could not disable guest window shadows after %u attempts - "
-                L"NOT retrying. Seamless windows keep their DWM drop shadows, which dom0 renders as "
-                L"a grey border artefact. The session helper never exited 0; see the 'session helper' "
-                L"lines above for its exit code.", (unsigned)SHADOW_APPLY_MAX_ATTEMPTS);
+            // dom0 renders the remaining DWM drop shadows as a grey border artefact; the helper's exit code is in the
+            // 'session helper' lines above.
+            LogError("QGASHADOWGIVEUP guest window shadows not disabled after %u attempts, not retrying: seamless "
+                L"windows keep their DWM drop shadows, the session helper never exited 0",
+                (unsigned)SHADOW_APPLY_MAX_ATTEMPTS);
     }
 
     if (g_InputDragWindow && g_InputDragLastEventTick != 0 &&
@@ -6566,12 +6596,11 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
         entry->PwSliceFed && !SliceContentReady(entry))
     {
         (void)CfgWriteDword(NULL, REG_CONFIG_DIRECT_SUPPRESSED_VALUE, ++g_DirectSuppressed, NULL);
-        LogError("QGADIRECTSUPPRESS hwnd 0x%x (class %s, %ux%u) CLOSED WHILE WITHHELD: it was held "
-            L"for want of a painted frame and was destroyed before it ever got one, so it was "
-            L"never shown (brokerState=%d sliceFed=1 brokerSourced=%d frames=%lu). This IS a "
-            L"display fault - a short-lived surface such as a toast can die inside the per-window "
-            L"grace, and it must not vanish unreported. Check QGADESLICEDOWN/DesliceBrokerDown for "
-            L"the broker and BROKERDIMS/BROKERREREG for a capture desync. DirectSuppressed=%lu.",
+        // A display fault: a short-lived surface such as a toast can die inside the per-window grace and must not
+        // vanish unreported. For the broker see QGADESLICEDOWN/DesliceBrokerDown; for a capture desync
+        // BROKERDIMS/BROKERREREG.
+        LogError("QGADIRECTSUPPRESS hwnd 0x%x (class %s, %ux%u) CLOSED WHILE WITHHELD: destroyed before its first "
+            L"painted frame, never shown (brokerState=%d sliceFed=1 brokerSourced=%d frames=%lu DirectSuppressed=%lu)",
             (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height,
             (int)BrokerState(), entry->PwBrokerSourced, entry->PwBrokerFrames, g_DirectSuppressed);
         DirectSuppressNotifyUser(g_DirectSuppressed);
@@ -6956,9 +6985,9 @@ static BOOL CALLBACK UacConsentScanProc(HWND window, LPARAM param)
     if (ERROR_SUCCESS == AddWindow(data))
     {
         scan->Announced++;
+        // Before this it was reachable only through a taskbar button.
         LogWarning("QGAUACPENDING announced a consent window Windows did not raise (0x%x, class %s, "
-            L"%ux%u): a Windows permission prompt is waiting for an answer. It was reachable only "
-            L"through a taskbar button before this.", window, accepted, w, h);
+            L"%ux%u), a permission prompt is waiting for an answer", window, accepted, w, h);
     }
     return TRUE;
 }
@@ -6978,8 +7007,8 @@ static void UacPendingPromptEnsureVisible(void)
         // stuck and nothing is announced. findings/autologon.md records the inverse trap too - a
         // RUNNING consent.exe is not by itself evidence that a prompt is shown.
         if (s_StandInSince)
-            LogDebug("QGAUACPENDING a UAC stand-in window is present with no consent.exe running - "
-                L"a stale placeholder, nothing to announce");
+            // A stale placeholder window.
+            LogDebug("QGAUACPENDING UAC placeholder with no consent.exe, nothing to announce");
         s_StandInSince = 0;
         s_Reported = FALSE;
         return;
@@ -7004,14 +7033,12 @@ static void UacPendingPromptEnsureVisible(void)
     // NOTHING TO SHOW. The prompt exists - consent.exe is running and a stand-in was interrogated
     // in this pass - and dom0 can be given no window for it. Say so loudly, with the two facts that
     // decide what the user can do: the taskbar button Windows expects to be clicked does not exist
-    // without a shell.
+    // without a shell. The way out is to switch this qube to the windowed desktop (qubes.SetGuiMode),
+    // where the prompt can be answered - the program that asked for administrator rights is blocked until then.
     s_Reported = TRUE;
-    LogError("QGAUACPENDING a Windows permission prompt has been waiting %I64u s and dom0 can be "
-        L"shown no window for it: consent.exe (pid %lu) owns %u top-level window(s), none of them "
-        L"announceable, and the stand-in window Windows offers instead carries no prompt. The "
-        L"program that asked for administrator rights stays blocked until this is answered. "
-        L"shell=%d taskbar=%d - the taskbar button Windows expects to be clicked does not exist "
-        L"without a shell. Switch this qube to the windowed desktop to answer it.",
+    LogError("QGAUACPENDING a UAC prompt has waited %I64u s with no window dom0 can be shown: consent.exe (pid %lu) "
+        L"owns %u top-level window(s), none announceable, the stand-in carries no prompt - the elevating program "
+        L"stays blocked until it is answered (shell=%d taskbar=%d)",
         (now - s_StandInSince) / 1000, pid, scan.Seen,
         ShellWindowNow() ? 1 : 0, g_TaskbarWindow ? 1 : 0);
     QerrReportText(QerrTextFind("uac-pending"), NULL, NULL);
@@ -7345,9 +7372,9 @@ static void ApplyUacPromptPolicy(void)
     if (rc != ERROR_SUCCESS)
         LogWarning("QGAUAC writing PromptOnSecureDesktop failed 0x%x", rc);
     else
-        LogInfo("QGAUAC PromptOnSecureDesktop=0: elevation prompts are ordinary windows on the "
-            L"normal desktop (standalone in dom0 when seamless, inside the desktop window when "
-            L"not); the secure desktop is never shown");
+        // Seamless: each prompt is a standalone dom0 window; non-seamless: it sits inside the desktop window.
+        // Elevation prompts are ordinary windows on the normal desktop, never on the secure desktop.
+        LogInfo("QGAUAC PromptOnSecureDesktop=0 written: UAC prompts are plain windows");
 }
 
 ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
@@ -7358,7 +7385,7 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     // changed their mind while the shrink was in flight.
     if (seamlessMode && g_NonSeamlessPending)
     {
-        LogInfo("QGAFSFLASH deferred non-seamless switch cancelled - seamless requested again");
+        LogInfo("QGAFSFLASH non-seamless switch cancelled, seamless requested again");
         g_NonSeamlessPending = FALSE;
         g_NonSeamlessWait = FS_WAIT_NONE;
     }
@@ -7397,15 +7424,15 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
             if (CaptureStagingGrantNow())
             {
                 g_DesktopDumpNeeded = TRUE;   // dom0 has no refs yet; the main loop sends them
-                LogInfo("QGAFSFLASH desktop monitor plugged in place - no capture replug; "
-                    L"dom0's refs go out on the next pass");
+                // No capture replug; dom0's refs go out on the next pass.
+                LogInfo("QGAFSFLASH desktop monitor plugged in place, capture keeps running");
             }
             else
             {
                 // No buffer yet (capture has not initialised), so a restart IS the only way to
                 // get one - and that restart is the normal startup path, not a forced replug.
-                LogInfo("QGAFSFLASH no staging buffer to grant yet - deferring the switch until "
-                    L"capture has one");
+                // Nothing to grant yet: the switch is deferred until capture has a buffer.
+                LogInfo("QGAFSFLASH no staging buffer yet, the switch waits for capture");
                 g_NonSeamlessPending = TRUE;
                 g_NonSeamlessWait = FS_WAIT_GRANT;
                 g_NonSeamlessPendingSince = GetTickCount64();
@@ -7478,9 +7505,10 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
             ww = WINDOWED_DEFAULT_WIDTH;
             wh = WINDOWED_DEFAULT_HEIGHT;
         }
-        LogInfo("QGAFSFLASH non-seamless requested while the desktop is host-sized (%ux%u): "
-            L"shrinking to %ux%u first so window 0 cannot cover the screen; the switch completes "
-            L"when the new mode lands", g_ScreenWidth, g_ScreenHeight, ww, wh);
+        // The desktop is host-sized: shrink first so window 0 cannot cover the screen; the switch completes
+        // when the new mode lands.
+        LogInfo("QGAFSFLASH non-seamless requested at host size (%ux%u), shrinking to %ux%u first",
+            g_ScreenWidth, g_ScreenHeight, ww, wh);
         g_NonSeamlessPending = TRUE;
         g_NonSeamlessWait = FS_WAIT_SHRINK;
         g_NonSeamlessPendingSince = GetTickCount64();
@@ -7509,7 +7537,8 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     {
         g_SeamlessMode = seamlessMode;
         NotifHoldPublishMode();
-        LogWarning("NEVEREXIT seamless mode %d recorded only (screen window not announced); applied on capture (re)start",
+        // The screen window is not announced yet, so the mode is applied on the capture (re)start.
+        LogWarning("NEVEREXIT seamless mode %d recorded only, applied when capture starts",
             seamlessMode);
         status = ERROR_SUCCESS;
         goto end;
@@ -7588,8 +7617,9 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
         {
             g_DesktopGrantWanted = FALSE;
             g_DesktopDumpSent = FALSE;   // dom0 unmaps window 0; its copy of the image is gone
-            LogInfo("QGAFSFLASH seamless restored - desktop monitor unplugged (window 0 unmapped; "
-                L"the existing grant is kept, revoking it mid-life is unsafe)");
+            // The existing grant is kept: revoking it mid-life, under a daemon that may still map it, is unsafe (above).
+            // Window 0 is unmapped by dom0 and the desktop grant is kept.
+            LogInfo("QGAFSFLASH seamless restored, desktop monitor unplugged");
         }
     }
 
@@ -7843,8 +7873,9 @@ static void DismissHiddenStartSurface(IN HWND start)
             "posted Escape TO THAT WINDOW so no invisible window takes input, and no other process can receive it (foreground pid %lu)",
             start, fgPid);
     else
-        LogError("QGASTARTDISMISS 0x%x: PostMessage(Escape) to the Start surface failed (0x%x) - the hidden Start menu may stay open and "
-            L"take clicks. NOT retried with a global inject: that could close another process's menu, which is the defect this replaced",
+        // PostMessage(Escape) to the Start surface failed. NOT retried with a global inject: that could close
+        // another process's menu, which is the defect this replaced; the hidden Start menu may stay open.
+        LogError("QGASTARTDISMISS 0x%x: Escape to the Start menu failed (0x%x), it may stay open and take clicks",
             start, GetLastError());
     if (!g_StartDismissNotified)
     {
@@ -8100,7 +8131,8 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // even if it's really invisible/transparent
     if (g_StartVisible && data->Handle == g_SearchWindow)
     {
-        LogDebug("rejecting Search because Start is visible");
+        // Rejected because Start is up: Search reads visible even when it is not.
+        LogDebug("rejecting Search while Start is visible");
         return FALSE;
     }
 
@@ -8689,9 +8721,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             // We cannot un-fail the rebuild from this arm, but it must never be a DEBUG line
             // nobody reads: name it so a rig log shows the escalation instead of a window that
             // merely looks slightly wrong.
-            LogWarning("QGADIRECTLEGACY hwnd 0x%x per-window rebuild FAILED on a direct-required "
-                L"guest - dom0 now composites it from the whole-desktop grant. This is the "
-                L"fallback we do not accept: investigate the attach failure above",
+            // The per-window rebuild FAILED on a direct-required guest: dom0 now composites it from the
+            // whole-desktop grant, the fallback we do not accept. Investigate the attach failure above.
+            LogWarning("QGADIRECTLEGACY hwnd 0x%x rebuild failed, shown from the desktop image instead",
                 (DWORD)(ULONG_PTR)windowData->Handle);
         }
         else
@@ -8893,12 +8925,12 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 if (!windowData->PwDirectWaitLogged)
                 {
                     windowData->PwDirectWaitLogged = TRUE;
-                    LogDebug("QGADIRECTWAIT hwnd 0x%x (class %s, %ux%u) held: no painted frame yet "
-                        L"(brokerState=%d windowEligibleFor=%llu ms). This is the DEFINED young "
-                        L"state, not a fault - the window is withheld rather than shown black, and "
-                        L"maps as soon as its first painted frame arrives. If it never arrives, "
-                        L"QGADIRECTSUPPRESS follows once the broker (%lu ms) and window (%lu ms) "
-                        L"graces have both expired.",
+                    // The DEFINED young state, not a fault: withheld rather than shown black, and mapped the
+                    // moment its first painted frame arrives; the two graces delay only the declaration of a
+                    // fault (above).
+                    LogDebug("QGADIRECTWAIT hwnd 0x%x (class %s, %ux%u) withheld: no painted frame yet "
+                        L"(brokerState=%d windowEligibleFor=%llu ms), QGADIRECTSUPPRESS follows if none arrives "
+                        L"within the broker (%lu ms) and window (%lu ms) graces",
                         (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
                         windowData->Width, windowData->Height, (int)BrokerState(),
                         (ULONGLONG)(dsince ? (GetTickCount64() - dsince) : 0),
@@ -8910,14 +8942,12 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 windowData->PwDirectSuppressed = TRUE;
                 (void)CfgWriteDword(NULL, REG_CONFIG_DIRECT_SUPPRESSED_VALUE,
                                     ++g_DirectSuppressed, NULL);
-                LogError("QGADIRECTSUPPRESS hwnd 0x%x (class %s, %ux%u) NOT SHOWN: the direct "
-                    L"per-window path is required on this guest and this window has never "
-                    L"received a frame (sliceFed=1 brokerSourced=%d slot=%d brokerActive=%d). "
-                    L"There is no composite fallback, so mapping it would show a BLACK window - "
-                    L"it is suppressed instead. THIS IS A BUG TO FIX, not a degraded mode: check "
-                    L"QGADESLICEDOWN/DesliceBrokerDown for the broker, and BROKERDIMS/BROKERREREG "
-                    L"for a capture desync. DirectSuppressed=%lu published under the Qubes Tools "
-                    L"config key.",
+                // No composite fallback: mapping it would show a BLACK window. A BUG TO FIX, not a degraded mode -
+                // QGADESLICEDOWN/DesliceBrokerDown for the broker, BROKERDIMS/BROKERREREG for a capture desync;
+                // DirectSuppressed is the counter under the Qubes Tools config key.
+                LogError("QGADIRECTSUPPRESS hwnd 0x%x (class %s, %ux%u) NOT SHOWN: never received a frame on the "
+                    L"required direct per-window path, suppressed instead of mapped black (sliceFed=1 "
+                    L"brokerSourced=%d slot=%d brokerActive=%d DirectSuppressed=%lu)",
                     (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
                     windowData->Width, windowData->Height,
                     windowData->PwBrokerSourced, windowData->PwBrokerSlot,
@@ -8934,18 +8964,18 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             // only held_ms in QGASLICEMAP encoded it, implicitly. A fallback that fires silently is
             // the anomaly this project's own rule forbids, so grep QGACROPLATE for it.
             if (timedOut && !cropReady)
-                LogWarning("QGACROPLATE hwnd 0x%x (class %s) mapped UNCROPPED: the shadow-crop did "
-                    L"not resolve within %lu ms, so the window is shown at its full rect and will "
-                    L"snap when the measurement lands. This is the line to quote for a toast/menu "
-                    L"that appears with its shadow strip",
+                // The shadow-crop did not resolve within the timeout, so the window is shown at its full rect and
+                // will snap when the measurement lands. This is the line to quote for a toast/menu that appears with
+                // its shadow strip.
+                LogWarning("QGACROPLATE hwnd 0x%x (class %s) mapped uncropped after %lu ms, shadow strip visible until cropped",
                     (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
                     (ULONG)CROP_BEFORE_SHOW_TIMEOUT_MS);
             if (timedOut && !cropReady && DirectRequired() && windowData->PwSliceFed &&
                 !SliceContentReady(windowData))
-                LogWarning("QGADIRECTDARK hwnd 0x%x (class %s) mapped UNPAINTED after %lu broker "
-                    L"frame(s): the per-window feed is delivering, so the surface itself is dark - "
-                    L"not a display fault. If it looks like a black window, this is the line to "
-                    L"quote", (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
+                // The per-window feed is delivering, so a dark surface is the app's own, not a display fault. If it
+                // looks like a black window, this is the line to quote.
+                LogWarning("QGADIRECTDARK hwnd 0x%x (class %s) mapped unpainted after %lu broker frame(s), "
+                    L"the app's surface itself is dark", (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
                     windowData->PwBrokerFrames);
             windowData->MapDeferred = FALSE;
             windowData->PwDirectSuppressed = FALSE;
@@ -8981,8 +9011,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                         LogInfo("QGATOASTHOLD hwnd=0x%x re-announced its buffer before the re-map", (DWORD)(ULONG_PTR)windowData->Handle);
                     }
                     else
-                        LogWarning("QGATOASTHOLD hwnd=0x%x could not re-announce its buffer before the re-map (%lu) - the banner "
-                            L"may show without its image; retried at the next map attempt", (DWORD)(ULONG_PTR)windowData->Handle, rs);
+                        // Before the re-map; retried at the next map attempt.
+                        LogWarning("QGATOASTHOLD hwnd=0x%x could not re-announce its buffer (%lu), the banner may show without its image",
+                            (DWORD)(ULONG_PTR)windowData->Handle, rs);
                 }
             }
             MenuFillNearBlack(windowData);
@@ -9394,7 +9425,7 @@ static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)
         if (now - lastComplaint > 5000)
         {
             lastComplaint = now;
-            win_perror("EnumWindows (z-order); damage clipping disabled for now");
+            win_perror("EnumWindows (z-order), damage clipping disabled for now");
         }
     }
 
@@ -10617,11 +10648,11 @@ static void PwLedgerAccount(IN OUT WINDOW_DATA* entry)
     if (!entry->PwLedgerUnattributedLogged)
     {
         entry->PwLedgerUnattributedLogged = TRUE;
-        LogWarning("QGALEDGERGAP hwnd=0x%x class=%d copies=%llu attributed=%llu unattributed=%llu "
-                   "- a pixel copy site is NOT instrumented; stage 1 cannot be accepted while this "
-                   "fires, and the gap names the window class to go and find it in",
-                   (DWORD)(ULONG_PTR)entry->Handle, (int)entry->PwLedgerClass,
-                   entry->PwLedgerCopies, attributed, entry->PwLedgerUnattributed);
+        // Stage 1 cannot be accepted while this fires; the gap names the window class to go and find it in.
+        LogWarning("QGALEDGERGAP hwnd=0x%x class=%d copies=%llu attributed=%llu unattributed=%llu, "
+            "a pixel copy site is not instrumented",
+            (DWORD)(ULONG_PTR)entry->Handle, (int)entry->PwLedgerClass,
+            entry->PwLedgerCopies, attributed, entry->PwLedgerUnattributed);
     }
 }
 
@@ -11217,13 +11248,15 @@ static BOOL SecureDesktopLockedNow(IN ULONGLONG now, IN BOOL reported, IN OUT UL
         // lock that is real is reported here only when a shell is SEEN (the window) or FOUND (the process).
         SECURE_DESKTOP_FACTS f;
         SecureDesktopFactsRead(&f);
-        LogInfo("QGADESKPRESHELL LOCK read with no shell in the session yet - not reported; "
+        // LOCK read with no shell in the session yet.
+        LogInfo("QGADESKPRESHELL lock read before any shell, not reported: "
             L"wts-flags=%lu level=%lu input-desktop=%s LogonUI.exe=%d consent.exe=%d",
             r->SessionFlags, r->Level, f.InputDesktop, (int)f.LogonUi, (int)f.Consent);
         break;
     }
     case QGA_LOCK_NO_FACT:
-        LogWarning("QGADESKLOCKREAD a fact the lock verdict needs could not be read - no lock is asserted; "
+        // A fact the lock verdict needs could not be read, so no lock is asserted.
+        LogWarning("QGADESKLOCKREAD lock state unreadable, no lock asserted: "
             L"wts-query=%d wts-err=%lu level=%lu wts-flags=0x%lx shell-seen=%d shell-process=%s shell-process-err=%lu",
             (int)r->QueryOk, r->QueryError, r->Level, r->SessionFlags, (int)shellSeen,
             ShellProcessName(r->ShellProcess), r->ShellProcessError);
@@ -11233,7 +11266,8 @@ static BOOL SecureDesktopLockedNow(IN ULONGLONG now, IN BOOL reported, IN OUT UL
             r->SessionFlags, r->Level);
         break;
     default:   // QGA_LOCK_UNLOCKED
-        LogDebug("QGADESKLOCK the session reads UNLOCK - not a lock; level=%lu shell-seen=%d", r->Level, (int)shellSeen);
+        // UNLOCK read: the session is not locked.
+        LogDebug("QGADESKLOCK session reads unlocked: level=%lu shell-seen=%d", r->Level, (int)shellSeen);
         break;
     }
     return FALSE;
@@ -11367,33 +11401,32 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // that this code performs and verifies is not something to tell anyone about,
                         // and a warning on every post-update boot would be exactly the noise this
                         // change exists to remove. The line stays at INFO so the history is still
-                        // readable when someone asks how often it happens.
-                        LogInfo("QGAAUTOLOGON autologon restored for '%s': %s, read back. Routine - "
-                            L"AutoLogonCount is what makes Windows consume DefaultPassword and fall back "
-                            L"to the sign-in screen, and a cumulative update rewriting Winlogon is how it "
-                            L"returns. Nothing is waiting on it and nobody is being told.", s_AlUser, did);
+                        // readable when someone asks how often it happens. The mechanism: AutoLogonCount
+                        // makes Windows consume DefaultPassword and fall back to the sign-in screen, and a
+                        // cumulative update rewriting Winlogon is how it returns. Nothing waits on this and
+                        // nobody is told.
+                        LogInfo("QGAAUTOLOGON autologon restored for '%s': %s, read back", s_AlUser, did);
                         break;
                     case AL_PASSWORD_GONE:
                         // NOT REPAIRABLE HERE, so dom0 is told AT ONCE, on the fact. Writing
                         // AutoAdminLogon=1 with no password behind it would make the registry claim
                         // autologon is armed while the guest still stops at the sign-in screen -
                         // guest/ensure-autologon.ps1: "PREVENTION, NOT REPAIR ... we do not know the
-                        // password and will not invent one."
-                        LogError("QGAAUTOLOGON the autologon password for '%s' is GONE - it is in neither "
-                            L"the registry nor the LSA store, so autologon cannot succeed no matter what "
-                            L"AutoAdminLogon says (%s). This is the consumed-password end state: "
-                            L"AutoLogonCount was present at some point and Windows ate the password. Only a "
-                            L"human can put it back - run guest/set-autologon.ps1 in the guest, which "
-                            L"validates the credentials with LogonUser before storing them.",
-                            s_AlUser, did);
+                        // password and will not invent one." This is the consumed-password end state:
+                        // AutoLogonCount was present at some point and Windows ate the password. Only a
+                        // human can put it back - guest/set-autologon.ps1 validates the credentials with
+                        // LogonUser before storing them.
+                        LogError("QGAAUTOLOGON the autologon password for '%s' is GONE from both the registry and "
+                            L"the LSA store: autologon cannot succeed whatever AutoAdminLogon says (%s), only a "
+                            L"human can restore it", s_AlUser, did);
                         QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
                         break;
                     case AL_UNPROVISIONED:
-                        LogError("QGAAUTOLOGON autologon is NOT provisioned: DefaultUserName is empty, so "
-                            L"there is no account to log in as and nothing this agent writes can change "
-                            L"that. dom0 is being shown nothing and only a human can fix it - run "
-                            L"guest/set-autologon.ps1, or switch this qube to the windowed desktop to sign "
-                            L"in by hand.");
+                        // Nothing this agent writes can change it; only a human can - guest/set-autologon.ps1,
+                        // or switch the qube to the windowed desktop and sign in by hand.
+                        // NOT provisioned: DefaultUserName is empty, so there is no account to log in as and dom0 is shown
+                        // nothing until a human acts.
+                        LogError("QGAAUTOLOGON autologon is OFF, seamless mode is inactive until user logs in");
                         QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
                         break;
                     case AL_WRITE_FAILED:
@@ -11421,9 +11454,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 if (!s_ShownNonSeamless)
                 {
                     s_ShownNonSeamless = TRUE;
-                    LogInfo("QGADESK secure desktop shown inside the bounded desktop window "
-                        L"(non-seamless, %lux%lu) - this is the way in for a guest that does not "
-                        L"log itself in", g_ScreenWidth, g_ScreenHeight);
+                    // The bounded desktop window is the way in for a guest that does not log itself in.
+                    LogInfo("QGADESK secure desktop shown inside the desktop window (non-seamless, %lux%lu)",
+                        g_ScreenWidth, g_ScreenHeight);
                 }
             }
             // A LOCK IS CONCLUSIVE THE MOMENT IT IS SEEN AND MUST NOT WAIT FOR A CLOCK. Owner,
@@ -11450,7 +11483,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // shell-by says which fact established the shell: "window" (seen on Default by this
                 // instance) or "process" (explorer.exe found in the console session from the Winlogon
                 // desktop - a real lock met by a fresh agent). A reader can tell the two paths apart.
-                LogWarning("QGADESKSTUCK the session is LOCKED - dom0 is shown nothing; shell-by=%s secure-for=%I64u s "
+                // dom0 is shown nothing while the session is locked.
+                LogWarning("QGADESKSTUCK session LOCKED, seamless inactive until unlocked: shell-by=%s secure-for=%I64u s "
                     L"wts-flags=%lu level=%lu input-desktop=%s LogonUI.exe=%d consent.exe=%d",
                     lockRead.ShellSeen ? L"window" : L"process", (now - s_SecureSince) / 1000,
                     lockRead.SessionFlags, lockRead.Level, f.InputDesktop, (int)f.LogonUi, (int)f.Consent);
@@ -11539,27 +11573,24 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // or it is one of the states already reported. AL_FIXED counts as armed - this
                 // agent armed it.
                 const BOOL autoArmed = (s_Al == AL_OK || s_Al == AL_FIXED);
-                LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s - dom0 is being shown "
-                    L"NOTHING and will keep seeing nothing until this desktop goes away. PATH: %s "
-                    L"(consent.exe=%d LogonUI.exe=%d PromptOnSecureDesktop=%s autologon=%s "
-                    L"console-user=%d shell-seen=%d). A few seconds "
-                    L"of this at boot is normal (autologon). Persisting means the guest is waiting at "
-                    L"the Windows sign-in or lock screen, which is not shown in SEAMLESS mode: arm "
-                    L"autologon in the guest, or switch this qube to the windowed desktop "
-                    L"(qvm-features <vm> service.gui-fullscreen 1, then qubes.SetGuiMode FULLSCREEN) "
-                    L"where the sign-in screen IS shown inside the bounded window.",
+                // A few seconds of this at boot is normal (autologon). Persisting means the guest waits at the
+                // Windows sign-in or lock screen, which SEAMLESS mode never shows: arm autologon in the guest, or
+                // switch the qube to the windowed desktop (qvm-features <vm> service.gui-fullscreen 1, then
+                // qubes.SetGuiMode FULLSCREEN), where the sign-in screen is shown inside the bounded window.
+                // dom0 is shown nothing until the secure desktop goes away.
+                LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s, nothing shown until it goes away, PATH: %s "
+                    L"(consent.exe=%d LogonUI.exe=%d PromptOnSecureDesktop=%s autologon=%s console-user=%d shell-seen=%d)",
                     desktopName, (now - s_SecureSince) / 1000, path, (int)consent, (int)logonui,
                     promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"), autoDesc,
                     (int)consoleUser, (int)shellSeen);
                 // A UAC PROMPT HERE IS A DEFECT OF OURS AND SAYS SO, SEPARATELY AND LOUDLY. It is
                 // not the sign-in screen the notification below describes, and telling the user to
-                // "arm autologon" would be wrong advice for it.
+                // "arm autologon" would be wrong advice for it. This agent writes PromptOnSecureDesktop=0
+                // at start (QGAUAC says what it wrote) precisely so elevation prompts are ordinary windows
+                // dom0 can show; something is overriding it - a template policy, or admin-approval-mode.
                 if (consent)
-                    LogError("QGAUACSECURE a UAC consent prompt is on the SECURE desktop while "
-                        L"PromptOnSecureDesktop=%s - this agent sets that value to 0 at start precisely so "
-                        L"elevation prompts are ordinary windows dom0 can show. Something is overriding it "
-                        L"(a template policy, or admin-approval-mode), so the prompt is invisible in seamless "
-                        L"mode and the guest cannot be answered. See QGAUAC for what this agent wrote.",
+                    // A consent prompt on the SECURE desktop is invisible in seamless mode.
+                    LogError("QGAUACSECURE PromptOnSecureDesktop=%s, a UAC prompt is on the secure desktop and cannot be answered",
                         promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"));
                 // Secondary route (ACTION: dom0 sees nothing and only a human can change that).
                 // This is the case the route is best at - a guest with zero windows and a live
@@ -11594,10 +11625,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     (now - s_SecureSince) >= SECURE_DESKTOP_NOTIFY_ARMED_MS)
                     QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
                 else
-                    LogInfo("QGADESKSTUCK dom0 NOT notified: autologon is %s and nobody is logged on "
-                        L"yet, so a secure desktop at %I64u s is a logon in progress, not the fault that "
-                        L"notification names. It is sent if this desktop is still up at %u s - the "
-                        L"backstop for autologon that is armed but never completes.",
+                    // Nobody is logged on yet, so a secure desktop now is a logon in progress, not the fault that
+                    // notification names. The later deadline is the backstop for autologon that is armed but never
+                    // completes.
+                    LogInfo("QGADESKSTUCK dom0 not notified, autologon is %s and a logon is in progress at %I64u s, "
+                        L"notified if still up at %u s",
                         autoDesc, (now - s_SecureSince) / 1000,
                         (unsigned)(SECURE_DESKTOP_NOTIFY_ARMED_MS / 1000));
             }
@@ -13408,7 +13440,8 @@ static ULONG WINAPI WatchForEvents(void)
                 const BOOL fiLose = FiPumpStallLose();
                 if (fiLose && g_WgcFrame)
                     (void)WaitForSingleObject(g_WgcFrame, 0);
-                LogWarning("QGAFAULT FI_PUMP_STALL ended: the broker published %lld frame(s) during it%s; still signalled: "
+                // The broker's frame publications during the stall are counted from the slot FrameIds.
+                LogWarning("QGAFAULT FI_PUMP_STALL ended: %lld frame(s) published during it%s, still signalled: "
                     L"desktopFrame=%d windowEvent=%d brokerFrame=%d", fiPub1 - fiPub0,
                     fiLose ? L" (FaultPumpStallLose: its event consumed on purpose)" : L"",
                     FiEventSignalled(newFrameEvent), FiEventSignalled(g_WindowEventSignal), FiEventSignalled(g_WgcFrame));
@@ -13565,9 +13598,9 @@ static ULONG WINAPI WatchForEvents(void)
             if (captureGateReasserts < CAPTURE_GATE_MAX_REASSERTS)
             {
                 captureGateReasserts++;
-                LogWarning("CAPTUREGATE no confirm from the gui daemon in %lu ms - re-sending the "
-                    L"screen destroy (attempt %lu of %lu). Until this clears, no window can be "
-                    L"announced to dom0.", CAPTURE_GATE_WAIT_MS, captureGateReasserts,
+                // No confirm from the gui daemon: until this clears, no window can be announced to dom0.
+                LogWarning("CAPTUREGATE gui daemon did not confirm in %lu ms, screen destroy re-sent "
+                    L"(attempt %lu of %lu), windows on hold", CAPTURE_GATE_WAIT_MS, captureGateReasserts,
                     (DWORD)CAPTURE_GATE_MAX_REASSERTS);
                 EnterCriticalSection(&g_VchanCriticalSection);
                 (void)SendWindowUnmap(NULL);
@@ -13582,9 +13615,9 @@ static ULONG WINAPI WatchForEvents(void)
                 // get the qube its GUI back - and it is exactly what a user does by hand when
                 // they restart a qube that "shows nothing". The watchdog backs off if this
                 // repeats, so a permanently wedged daemon cannot turn into a restart storm.
-                LogError("CAPTUREGATE the gui daemon never confirmed the screen destroy after %lu "
-                    L"re-sends - window tracking has been frozen for %lu ms and nothing can reach "
-                    L"dom0. Exiting so the watchdog respawns the agent and the session is rebuilt.",
+                // The screen destroy was never confirmed: window tracking has been frozen and nothing can reach dom0,
+                // so the watchdog respawns the agent and the session is rebuilt.
+                LogError("CAPTUREGATE gui daemon never confirmed after %lu re-sends, windows frozen for %lu ms, restarting the agent",
                     (DWORD)CAPTURE_GATE_MAX_REASSERTS,
                     (DWORD)(CAPTURE_GATE_WAIT_MS * (CAPTURE_GATE_MAX_REASSERTS + 1)));
                 status = ERROR_TIMEOUT;
@@ -13609,11 +13642,15 @@ static ULONG WINAPI WatchForEvents(void)
                 // so a conditional expression there does not compile.
                 DWORD hadClientEarly = 0;
                 (void)CfgReadDword(NULL, REG_CONFIG_HAD_CLIENT_VALUE, &hadClientEarly, NULL);
+                // had-client set: a LOST session, not a first boot - dom0's gui-daemon for this qube most likely
+                // exited (a hedge, which is why it lives here and not in the line).
                 if (hadClientEarly)
-                    LogError("no gui-daemon client in %lu ms - exiting so the watchdog respawns the agent (attempt %lu of %lu). This guest HAS had a daemon before, so this is a LOST session, not a first boot: dom0's gui-daemon for this qube most likely exited.",
+                    LogError("no gui-daemon client in %lu ms, this guest has had one before: exiting so the watchdog respawns the agent (attempt %lu of %lu)",
                         VCHAN_FIRST_CLIENT_WAIT_MS, restarts + 1, (DWORD)VCHAN_FIRST_CLIENT_MAX_RESTARTS);
                 else
-                    LogError("no gui-daemon client in %lu ms and none ever connected - exiting so the watchdog respawns the agent (attempt %lu of %lu). This is the first-boot AppVM case: the qube has qrexec but no windows.",
+                    // The first-boot case: the qube has qrexec but no windows; the agent exits and the watchdog
+                    // respawns it.
+                    LogError("no gui-daemon client in %lu ms and none ever connected (first-boot AppVM), restarting the agent (attempt %lu of %lu)",
                         VCHAN_FIRST_CLIENT_WAIT_MS, restarts + 1, (DWORD)VCHAN_FIRST_CLIENT_MAX_RESTARTS);
                 status = ERROR_TIMEOUT;
                 LifecycleLatchExit(QGA_EXIT_RECONNECT);   // a fresh agent re-announces: the service's one relaunch
@@ -13623,10 +13660,14 @@ static ULONG WINAPI WatchForEvents(void)
             DWORD hadClient = 0;
             (void)CfgReadDword(NULL, REG_CONFIG_HAD_CLIENT_VALUE, &hadClient, NULL);
             if (hadClient)
-                LogError("no gui-daemon client in %lu ms after %lu restarts, but this guest HAS had one before - dom0's gui-daemon for this qube is gone and is not coming back on its own. The qube keeps running (qrexec works) and will show no windows until it is restarted.",
+                // had-client set: dom0's gui-daemon for this qube is not coming back on its own. The qube keeps running
+                // (qrexec works) and shows no windows until it is restarted.
+                LogError("no gui-daemon client in %lu ms after %lu restarts but this guest had one before, dom0's gui-daemon is gone, no windows until the qube is restarted",
                     VCHAN_FIRST_CLIENT_WAIT_MS, restarts);
             else
-                LogError("no gui-daemon client in %lu ms after %lu restarts and none ever connected - staying up without one. If this qube is meant to have a GUI, check that its gui feature is set and that a gui-daemon runs for it in dom0.",
+                // Staying up without one. If this qube is meant to have a GUI, check that its gui feature is set and
+                // that a gui-daemon runs for it in dom0.
+                LogError("no gui-daemon client in %lu ms after %lu restarts and none ever connected, staying up with no windows",
                     VCHAN_FIRST_CLIENT_WAIT_MS, restarts);
             vchanNoClientDeadline = 0; // said once; do not spin
         }
@@ -13846,7 +13887,8 @@ static ULONG WINAPI WatchForEvents(void)
                         win_perror2(grantStatus, "SendScreenGrants (after recreate)");
                     else
                     {
-                        LogInfo("framebuffer re-granted after duplication recovery, MSG_WINDOW_DUMP re-sent");
+                        // MSG_WINDOW_DUMP (the window dump) is re-sent with the new refs.
+                        LogInfo("framebuffer re-granted after duplication recovery, display resumes");
                         {
                             // M0BLINK: the dump is on the wire. Everything after this
                             // point until repaint-first is local send cost only.
@@ -14026,8 +14068,9 @@ static ULONG WINAPI WatchForEvents(void)
                 // agent is the only state from which the handshake is well defined.
                 if (VchanSendWedged())
                 {
-                    LogError("vchan send gave up on this connection (see VCHANWEDGE) - "
-                        "refusing to re-run the handshake, exiting for a clean respawn");
+                    // This connection is wedged; the handshake is not re-run in-process (above), the agent exits for a
+                    // clean respawn.
+                    LogError("vchan send gave up (see VCHANWEDGE), restarting the agent");
                     LifecycleLatchExit(QGA_EXIT_RECONNECT);
                     exitLoop = TRUE;
                     break;
@@ -14184,7 +14227,8 @@ static ULONG WINAPI WatchForEvents(void)
                 // Both edges of this state were below the default log level, so a shipped
                 // guest recorded NOTHING when capture stopped or restarted - the one
                 // question a "my qube is frozen" report needs answered.
-                LogInfo("CAPTUREGATE gui daemon confirms screen destruction - restarting capture");
+                // The confirm lets capture restart.
+                LogInfo("CAPTUREGATE gui daemon confirms screen destruction, capture resumes");
                 captureGateDeadline = 0;
                 captureGateReasserts = 0;
                 // NEVEREXIT: capture is NULL if this confirm arrives while already in
@@ -14212,8 +14256,9 @@ static ULONG WINAPI WatchForEvents(void)
             break;
 
         case 5: // capture error, can be due to a desktop switch or resolution change
-            LogWarning("CAPTUREGATE capture error - screen window destroyed, waiting for the "
-                L"gui-daemon confirm before capture can restart");
+            // The screen window is destroyed; capture waits and can restart only after the gui-daemon confirm
+            // arrives.
+            LogWarning("CAPTUREGATE capture error, display frozen until gui daemon confirms");
 
             // NEVEREXIT: a stale error event from a torn-down capture generation can
             // fire while degraded (capture == NULL); StopFrameProcessing dereferences
@@ -14338,9 +14383,10 @@ static ULONG WINAPI WatchForEvents(void)
             if (!cEnabled && !capDeadReported)
             {
                 capDeadReported = TRUE;
-                LogWarning("QGACAPDEAD capture thread has left (enabled=0) while a capture "
-                    L"context is live - loops=%d, last loop %I64d ms ago, inside=%d. dom0's "
-                    L"desktop image is frozen; forcing the capture-error recovery path ONCE.",
+                // The capture thread has left (enabled=0) while a capture context is live: dom0's desktop image is
+                // frozen, so capture-error recovery is forced once.
+                LogWarning("QGACAPDEAD capture thread died, desktop image frozen (loops=%d, last loop %I64d ms ago, "
+                    L"inside=%d), recovery forced once",
                     cLoops, cAge, cInside);
                 if (g_CaptureErrorEvent)
                     SetEvent(g_CaptureErrorEvent);
@@ -14506,10 +14552,10 @@ static ULONG WINAPI WatchForEvents(void)
         // WARNING, deliberately, and NOT lowered to Info: moved to Info 2026-10-07 on the
         // grounds that the text says "by design", then reverted the same day - Jev 0.07. The
         // identifier is A6LEAK and the action is "skipping all revokes": this path leaves grants
-        // unrevoked ON PURPOSE to dodge the xenbus revoke-vs-unmap race, nothing bounds how many,
-        // and anyone auditing grant lifetime needs to see it at the default level.
-        LogWarning("A6LEAK exit by design: daemon still alive and mapping - skipping all revokes "
-            "(xenbus revoke-vs-unmap race; see FINDINGS 2026-08-05 cont 9)");
+        // unrevoked ON PURPOSE to dodge the xenbus revoke-vs-unmap race (FINDINGS 2026-08-05 cont 9),
+        // nothing bounds how many, and anyone auditing grant lifetime needs to see it at the default level.
+        // An exit by design, see above.
+        LogWarning("A6LEAK daemon still alive and mapping, skipping all revokes");
     }
 
     PwShutdown();
@@ -14530,7 +14576,9 @@ static ULONG WINAPI WatchForEvents(void)
         // window connects to the dead ring - the leading candidate for dom0's "outdated protocol (0:0)" dialog (Jev 0.87, chain
         // NOT established 0.11). libvchan_cleanup only removes the entry and is idempotent; the ring's resources go with the process.
         libvchan_cleanup(g_Vchan);
-        LogInfo("VCHAN no client ever connected - the vchan announcement is withdrawn before exit");
+        // Withdrawn before the exit (libvchan_cleanup above), so a daemon starting later cannot connect to a
+        // dead ring.
+        LogInfo("VCHAN no client ever connected, the announcement is withdrawn");
     }
     LeaveCriticalSection(&g_VchanCriticalSection);
 
@@ -14566,8 +14614,9 @@ static ULONG WINAPI WatchForEvents(void)
         if (code == 0)
         {
             code = (status != ERROR_SUCCESS) ? status : ERROR_GEN_FAILURE;
-            LogError("QGAEXITCODE the main loop ended without a defined exit reason (status 0x%x) - exiting with 0x%x, "
-                L"which the service treats as a death", status, code);
+            // No defined exit reason was latched; the service treats this exit code as a death.
+            LogError("QGAEXITCODE main loop ended without an exit reason (status 0x%x), exiting with 0x%x as a death",
+                status, code);
         }
         return code;
     }
@@ -14622,8 +14671,8 @@ static DWORD GetGuiDomainId(OUT USHORT* gid)
         // succeeded) and the key dom0 writes at VM start for a qube with a GUI domain is absent (guivm is ''). The agent exits with
         // QGA_EXIT_NO_GUI_DOMAIN and its watchdog does not relaunch it before the next boot. A qubesdb that cannot be opened stays a
         // failure (above), with the watchdog's respawn.
-        LogInfo("QGANOGUIDOMAIN this qube has no GUI domain this boot (qubesdb /qubes-gui-domain-xid is absent: guivm is ''); "
-            L"the GUI agent does not run, and its watchdog does not relaunch it before the next boot");
+        // /qubes-gui-domain-xid is absent; the agent exits and is not relaunched before the next boot.
+        LogInfo("QGANOGUIDOMAIN no GUI domain this boot, agent exits until next boot");
         status = QGA_EXIT_NO_GUI_DOMAIN;
         goto cleanup;
     }
@@ -14667,10 +14716,11 @@ static char *ReadServiceGate(qdb_handle_t q, char *key, BOOL *readFailed)
     char *probe = qdb_read(q, "/name", NULL);
     if (probe) { free(probe); return NULL; }   // transport answers: the key is genuinely absent
     *readFailed = TRUE;
-    LogError("QGAQDBGATE qubesdb read of %S FAILED (errno %d, and /name is unreadable on the same "
-        L"connection) - a transport error, NOT an absent key. A dropped dom0 override cannot be "
-        L"told from its opposite here, so Init aborts for a watchdog respawn instead of acting on "
-        L"the registry base.", key, err);
+    // The read FAILED and /name is unreadable on the same connection: a transport error, NOT an absent key.
+    // A dropped dom0 override cannot be told from its opposite here, so Init aborts for a watchdog
+    // respawn instead of acting on the registry base.
+    LogError("QGAQDBGATE qubesdb read of %S failed (errno %d), a transport error, restarting the agent",
+        key, err);
     return NULL;
 }
 
@@ -14704,9 +14754,9 @@ static ULONG Init(void)
             DWORD wait = WaitForSingleObject(instanceMutex, 0);
             if (wait != WAIT_OBJECT_0 && wait != WAIT_ABANDONED)
             {
-                LogWarning("another gui-agent instance is already running (mutex wait %lu) - "
-                    L"exiting so it keeps the vchan; two instances fight for it and the loser "
-                    L"dies with a pipe error, leaving the qube without a GUI", wait);
+                // Exiting so the other instance keeps the vchan: two instances fight for it and the loser dies with
+                // a pipe error, leaving the qube without a GUI.
+                LogWarning("another gui-agent instance is already running (mutex wait %lu), exiting so it keeps the GUI", wait);
                 CloseHandle(instanceMutex);
                 return ERROR_ALREADY_EXISTS;
             }
@@ -14837,7 +14887,8 @@ static ULONG Init(void)
     if (DirectRequired())
     {
         WcShutdown();
-        LogInfo("QGAENGINEOFF the PrintWindow engine is stopped: every window on this guest is broker-fed");
+        // On this guest every window is broker-fed (above).
+        LogInfo("QGAENGINEOFF PrintWindow engine stopped, every window is broker-fed");
     }
     {
         // Slice-content map-hold gate (DEFAULT ON since 2026-09-06, owner-directed + rig-validated
@@ -14854,8 +14905,8 @@ static ULONG Init(void)
         DWORD smhc = g_SliceMapHoldChrome;
         (void)CfgReadDword(moduleName, REG_CONFIG_SLICE_MAP_HOLD_CHROME_VALUE, &smhc, NULL);
         g_SliceMapHoldChrome = (smhc <= 2) ? smhc : 1;
-        LogInfo("SLICEMAPHOLD gate: enabled=%d chrome_scope=%lu (default ON; hold bounded by %u ms; "
-                "wake-guaranteed via MapDeferWakeSweep)",
+        // The hold is wake-guaranteed via MapDeferWakeSweep; default ON (above).
+        LogInfo("SLICEMAPHOLD gate: enabled=%d chrome_scope=%lu, hold bounded by %u ms",
                 g_SliceMapHold, g_SliceMapHoldChrome, CROP_BEFORE_SHOW_TIMEOUT_MS);
     }
     {
@@ -14893,7 +14944,8 @@ static ULONG Init(void)
         if (legacyToasts && g_NotifBridge)
         {
             g_NotifBridge = FALSE;
-            LogInfo("NOTIFBRIDGE forced OFF by legacy_toasts - override-redirect toasts (window path)");
+            // legacy_toasts: toasts take the window path as override-redirect windows.
+            LogInfo("NOTIFBRIDGE forced OFF by legacy_toasts, toasts show as guest windows");
         }
         LogInfo("NOTIFBRIDGE gate: enabled=%d source=%s legacy_toasts=%d", g_NotifBridge, nbSrc, legacyToasts);
         // The toast hold (docs/ADR-toasts.md 10) is a capability of THIS run, settled here with the gate: the IPC
@@ -14946,8 +14998,9 @@ static ULONG Init(void)
         v = ReadServiceGate(gateQdb, "/qubes-service/notify-errors", &gateReadFailed);
         if (v) { g_NotifyErrors = (v[0] != '0'); free(v); neSrc = L"qubesdb"; }
         if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
-        LogInfo("NOTIFYERR gate: enabled=%d source=%s (ACTION faults also go to dom0 as a "
-                "notification via notifhost/qubes.Notifications; needs qrexec-agent; log stays primary)",
+        // The route needs qrexec-agent; the log stays the primary record either way.
+        LogInfo("NOTIFYERR gate: enabled=%d source=%s (ACTION faults also go to dom0 as a notification via "
+                L"notifhost/qubes.Notifications)",
                 g_NotifyErrors, neSrc);
         QerrInit(g_NotifyErrors, NULL);
     }
@@ -15041,9 +15094,9 @@ static ULONG Init(void)
         {
             char *cls = qdb_read(gateQdb, "/type", NULL);
             if (cls && strcmp(cls, "TemplateVM") != 0 && strcmp(cls, "StandaloneVM") != 0)
-                LogWarning("QGAUAC service.uac-disable is set on a %S, whose C: is reset from its "
-                    L"template at every boot - EnableLUA is read at boot, so this can NEVER take "
-                    L"effect here. Set the feature on the TEMPLATE instead.", cls);
+                // An AppVM's C: is reset from its template at every boot and EnableLUA is read at boot, so the feature
+                // can NEVER take effect here.
+                LogWarning("QGAUAC service.uac-disable set on a %S has no effect, set it on the TEMPLATE instead", cls);
             if (cls) free(cls);
         }
 
@@ -15077,10 +15130,11 @@ static ULONG Init(void)
                     LogInfo("QGAUAC service.uac-disable=%S -> EnableLUA already %lu",
                         uacOff ? uacOff : "absent", cur);
                 }
+                // The Windows equivalent of passwordless sudo, and the surface facing the hypervisor:
+                // said at WARNING at every start the feature is in force.
                 if (wantDisable)
-                    LogWarning("QGAUAC UAC DISABLED by dom0 policy - the Windows equivalent of "
-                        L"passwordless sudo: anything in this qube reaches admin/kernel without "
-                        L"being asked, and that is the surface facing the hypervisor");
+                    // Every program in this qube reaches admin and the kernel without being asked.
+                    LogWarning("QGAUAC UAC DISABLED by dom0 policy, every program gets admin unasked");
                 RegCloseKey(polKey);
                 (void)CfgWriteDword(moduleName, L"UacDisabledByFeature", wantDisable ? 1 : 0, NULL);
             }
@@ -15136,12 +15190,14 @@ static ULONG Init(void)
     // g_DesktopGrantWanted): suppressed while seamless, made when the desktop monitor is
     // plugged. So a fullscreen-capable guest starts seamless WITHOUT the grant too, and gains it
     // on the switch - which is the point.
+    // The grant is no longer held from start even with the feature on - it follows the mode (above). "Active"
+    // means a seamless-only guest, where dom0 renders exclusively from per-window grants.
     if (g_NoScreenGrant && g_ShowFullscreenScreen)
-        LogInfo("P2NOGRANT stays armed although service.gui-fullscreen is on: the desktop grant "
-            L"is now made when the monitor is plugged, not held from start");
+        // It stays armed with service.gui-fullscreen on: the desktop grant is made when the monitor is plugged.
+        LogInfo("P2NOGRANT armed, desktop shared only once the monitor is plugged");
     if (g_NoScreenGrant)
-        LogInfo("P2NOGRANT active: desktop framebuffer stays ungranted, window-0 dump suppressed "
-            L"(seamless-only guest; dom0 renders exclusively from per-window grants)");
+        // dom0 gets per-window grants only; the window-0 dump is suppressed too.
+        LogInfo("P2NOGRANT active, desktop framebuffer stays ungranted, windows only");
     else
         LogInfo("P2NOGRANT off: the whole desktop is granted to dom0");
 

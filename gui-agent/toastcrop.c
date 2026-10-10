@@ -344,11 +344,12 @@ static BOOL WINAPI TcInitOnceCallback(PINIT_ONCE initOnce, PVOID parameter, PVOI
     else
         LogInfo("QGATOASTCROP on, measuring with UIA (toast rule=raw-largest, menu rule=control-union)");
 
-    // WARNING, not Info: a run with this on is deliberately shipping the overcrop defect, and
-    // the log must say so before any toast geometry in it is read as the product's.
+    // WARNING, not Info: a run with this on is deliberately shipping the overcrop defect (the
+    // 2026-09-03 overcrop - the menu rule's control view + union applied to toasts - re-introduced
+    // on purpose by the knob), and the log must say so before any toast geometry in it is read as
+    // the product's.
     if (g_TcToastUnionDefect)
-        LogWarning("QGATOASTCROP DEFECT ToastCropToastUnion=1: toasts measured with the MENU rule "
-            L"(control view + union) - the 2026-09-03 overcrop re-introduced on purpose");
+        LogWarning("QGATOASTCROP DEFECT ToastCropToastUnion=1: toasts measured with the MENU rule");
 
     // The async measurement worker. If it cannot start, lookups fall back to the inline
     // synchronous query - the crop still works, only with the old stall risk, and the log

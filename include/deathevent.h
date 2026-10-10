@@ -193,20 +193,21 @@ static WORD DeathEventCompose(
     StringCchCopyW(ev->Detail, RTL_NUMBER_OF(ev->Detail), detail ? detail : L"");
     if (DEATHEVENT_ID_IS_TEARDOWN(ev->EventId))
         StringCchPrintfW(ev->Text, RTL_NUMBER_OF(ev->Text),
-            L"%s (%s, PID %s) was ended by Windows when the session was torn down - exit code %s - after "
-            L"running %s. An ordinary session end, not a failure; recorded so the end stays visible if our "
-            L"own log does not. %s",
+            // Recorded at INFO so the end stays visible even if our own log does not survive; an ordinary
+            // session end is not a failure, which is why this id is 4011-4014 and not 4001-4004.
+            L"%s (%s, PID %s) ended by Windows with the session - exit code %s - after %s. %s",
             DeathEventHumanName(ev->EventId), ev->Exe, ev->Pid, ev->ExitCode, ran, ev->Detail);
     else if (exitCode == DEATHEVENT_EXIT_HUNG)
         StringCchPrintfW(ev->Text, RTL_NUMBER_OF(ev->Text),
-            L"%s (%s, PID %s) stopped answering and was ended by %s - a hang, so there is no exit code - "
-            L"after running %s. A Qubes Windows Tools component died; this is a major error. %s",
+            // A hang leaves no exit code, which is why this branch has none to print. The record's ERROR
+            // level is what says this is a major error; the sentence saying so again is gone.
+            L"%s (%s, PID %s) stopped answering and was ended by %s - no exit code, a hang - after %s. %s",
             DeathEventHumanName(ev->EventId), ev->Exe, ev->Pid, DeathEventSupervisorName(ev->EventId),
             ran, ev->Detail);
     else
         StringCchPrintfW(ev->Text, RTL_NUMBER_OF(ev->Text),
-            L"%s (%s, PID %s) exited without being asked to - exit code %s - after running %s. "
-            L"A Qubes Windows Tools component died; this is a major error. %s",
+            // The ERROR level carries the verdict; the record carries the facts.
+            L"%s (%s, PID %s) exited without being asked to - exit code %s - after %s. %s",
             DeathEventHumanName(ev->EventId), ev->Exe, ev->Pid, ev->ExitCode, ran, ev->Detail);
     ev->Strings[0] = ev->Text;
     ev->Strings[1] = ev->Exe;

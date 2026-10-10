@@ -26,6 +26,9 @@
  *   the window NOTIFYERR_DEFECT_NOBOX     - dom0 not told (failed:transport, gated) -> the error window
  *                                           is shown; never on send / duplicate / cap / rejection
  *   no storm   NOTIFYERR_DEFECT_BOXSTORM  - the window shares the per-boot dedupe and the cap
+ *   the build  NOTIFYERR_DEFECT_NOBUILD   - the technical line names the build that produced it (owner
+ *                                           2026-10-10: a toast with no build cannot be told from a
+ *                                           control run's), "build unknown" when it cannot be read
  * Plus the gate (off -> nothing goes to dom0, the window is shown), the notify-file text shape (header / line 1 /
  * cause / technical line, rz39), the row glue QerrReportText, and the marker file contract shared
  * with guest/qwt-notify-error.ps1. The texts themselves are held to the rules by
@@ -51,6 +54,7 @@ extern int  (*QerrTestBoxHook)(const char* header, const char* text);
 extern void (*QerrTestLogHook)(const char* line);
 extern long long QerrTestBootStamp;
 extern unsigned long QerrTestPid;
+extern const char* QerrTestBuild;
 
 static unsigned g_run = 0, g_fail = 0;
 static char g_base[256];
@@ -140,7 +144,7 @@ int main(void)
 #if defined(NOTIFYERR_DEFECT_SEVERITY) || defined(NOTIFYERR_DEFECT_RATELIMIT) || \
     defined(NOTIFYERR_DEFECT_CAP) || defined(NOTIFYERR_DEFECT_REDACT) || \
     defined(NOTIFYERR_DEFECT_FAILOPEN) || defined(NOTIFYERR_DEFECT_CLOSEREBOOT) || \
-    defined(NOTIFYERR_DEFECT_NOBOX) || defined(NOTIFYERR_DEFECT_BOXSTORM)
+    defined(NOTIFYERR_DEFECT_NOBOX) || defined(NOTIFYERR_DEFECT_BOXSTORM) || defined(NOTIFYERR_DEFECT_NOBUILD)
     const int defectBuild = 1;
     printf("NOTE: a NOTIFYERR_DEFECT_* switch is compiled in - this suite MUST fail now.\n");
 #else
@@ -173,8 +177,8 @@ int main(void)
     {
         const char* clean = "The notification and menu capture helper is not running\r\n"
                             "Menus, modern app windows and notification windows do not appear in dom0 until it is back; collect the gui-agent and wgcbroker logs.\r\n"
-                            "Cause: wgcbroker.exe is installed but has not been running for over 30 s (log line QGADESLICEDOWN).\r\n"
-                            "gui-agent.exe pid 4242; reported once per boot. Evidence: C:\\Qubes Logs\\gui-agent-20260909-101010.log, line QGADESLICEDOWN.";
+                            "Cause: wgcbroker.exe is installed but has not run for over 30 s.\r\n"
+                            "gui-agent.exe pid 4242; reported once per boot; build 4.3.36.915. Evidence: C:\\Qubes Logs\\gui-agent-20260909-101010.log, line QGADESLICEDOWN.";
         Check("redact: templated text with a log path is clean", QerrRedactReason(clean) == NULL);
         Check("redact: 'password=' refused",       QerrRedactReason("agent failed: password=hunter2") != NULL);
         Check("redact: 'DefaultPassword' refused", QerrRedactReason("LSA DefaultPassword missing") != NULL);
@@ -240,18 +244,28 @@ int main(void)
         Check("compose: an empty line 1 is refused", QerrComposeNotifyText(buf, sizeof(buf), "H", "", NULL, "T") == 0);
         Check("compose: an empty technical line is refused", QerrComposeNotifyText(buf, sizeof(buf), "H", "N", NULL, "") == 0);
         Check("compose: a text that does not fit is refused, not truncated", QerrComposeNotifyText(buf, 8, "Header", "N", NULL, "T") == 0 && buf[0] == 0);
-        Check("tech: every part, in order",
+        Check("tech: every part, in order - the build after the count, before the one pointer",
               QerrFormatTechLine(tech, sizeof(tech), "gui-agent.exe", 6100, "exception 0xC0000409", "0:12:34", "death 1 this boot",
-                                 "C:\\ProgramData\\Qubes\\qwt-deaths.log; WER folder AppCrash_gui-agent.exe_*; Application log event 1000") > 0 &&
-              strcmp(tech, "gui-agent.exe pid 6100; exception 0xC0000409; ran 0:12:34; death 1 this boot. "
-                           "Evidence: C:\\ProgramData\\Qubes\\qwt-deaths.log; WER folder AppCrash_gui-agent.exe_*; Application log event 1000.") == 0);
-        Check("tech: no pid, no code, no run time -> subject, count and evidence only",
-              QerrFormatTechLine(tech, sizeof(tech), "activate-idd.ps1", 0, NULL, NULL, "reported once per boot", "C:\\qwt-idd-activate.log") > 0 &&
-              strcmp(tech, "activate-idd.ps1; reported once per boot. Evidence: C:\\qwt-idd-activate.log.") == 0);
+                                 "C:\\ProgramData\\Qubes\\qwt-deaths.log", "4.3.36.915") > 0 &&
+              strcmp(tech, "gui-agent.exe pid 6100; exception 0xC0000409; ran 0:12:34; death 1 this boot; build 4.3.36.915. "
+                           "Evidence: C:\\ProgramData\\Qubes\\qwt-deaths.log.") == 0);
+        Check("tech: no pid, no code, no run time -> subject, count, build and evidence only",
+              QerrFormatTechLine(tech, sizeof(tech), "activate-idd.ps1", 0, NULL, NULL, "reported once per boot", "C:\\qwt-idd-activate.log", "4.3.36.915") > 0 &&
+              strcmp(tech, "activate-idd.ps1; reported once per boot; build 4.3.36.915. Evidence: C:\\qwt-idd-activate.log.") == 0);
+        /* THE BUILD (owner 2026-10-10: "i cannot figure out if it is a botched fix or control reproduction run"):
+         * the line names it, and when the image's version cannot be read it SAYS so - "build unknown" - rather
+         * than printing an empty field, because a notice that cannot be dated is exactly when the build matters. */
+        Check("tech: the line names the build that produced it", strstr(tech, "; build 4.3.36.915. Evidence: ") != NULL);
+        Check("tech: no build readable (NULL) -> 'build unknown', never an empty field",
+              QerrFormatTechLine(tech, sizeof(tech), "activate-idd.ps1", 0, NULL, NULL, "reported once per boot", "C:\\x.log", NULL) > 0 &&
+              strcmp(tech, "activate-idd.ps1; reported once per boot; build unknown. Evidence: C:\\x.log.") == 0);
+        Check("tech: no build readable (empty) -> 'build unknown' as well",
+              QerrFormatTechLine(tech, sizeof(tech), "activate-idd.ps1", 0, NULL, NULL, "reported once per boot", "C:\\x.log", "") > 0 &&
+              strstr(tech, "; build unknown. Evidence: ") != NULL && strstr(tech, "build . ") == NULL);
         Check("tech: a missing subject, count or evidence is refused",
-              QerrFormatTechLine(tech, sizeof(tech), "", 1, NULL, NULL, "x", "y") == 0 &&
-              QerrFormatTechLine(tech, sizeof(tech), "a", 1, NULL, NULL, NULL, "y") == 0 &&
-              QerrFormatTechLine(tech, sizeof(tech), "a", 1, NULL, NULL, "x", "") == 0);
+              QerrFormatTechLine(tech, sizeof(tech), "", 1, NULL, NULL, "x", "y", "1.0.0.1") == 0 &&
+              QerrFormatTechLine(tech, sizeof(tech), "a", 1, NULL, NULL, NULL, "y", "1.0.0.1") == 0 &&
+              QerrFormatTechLine(tech, sizeof(tech), "a", 1, NULL, NULL, "x", "", "1.0.0.1") == 0);
         Check("header: the one %s takes the per-instance name", QerrFormatHeader(hdr, sizeof(hdr), "A %s window stopped updating", "chrome") &&
               strcmp(hdr, "A chrome window stopped updating") == 0);
         Check("header: no %s -> a plain copy", QerrFormatHeader(hdr, sizeof(hdr), "The GUI agent crashed", "ignored") && strcmp(hdr, "The GUI agent crashed") == 0);
@@ -261,7 +275,7 @@ int main(void)
     /* ---- 3. pure decision: severity threshold ------------------------------------------- */
     {
         unsigned nc = 0;
-        const char* t = "The GUI agent crashed\r\nx\r\ngui-agent.exe; reported once per boot. Evidence: z.";
+        const char* t = "The GUI agent crashed\r\nx\r\ngui-agent.exe; reported once per boot; build 4.3.36.915. Evidence: z.";
         CheckDecision("decide: INFO rejected by severity",
             QerrDecide(QERR_SEV_INFO, "gui-agent", "y", t, 0, 0, 0, 0, 0, BOOT, &nc), QERR_REJECT_SEVERITY);
         CheckDecision("decide: DEGRADED rejected by severity",
@@ -324,18 +338,18 @@ int main(void)
     QerrInit(1, g_dir);
     CheckDecision("send: first ACTION report sends",
         QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "The notification and menu capture helper is not running",
-                   "Menus, modern app windows and notification windows do not appear in dom0 until it is back.",
-                   "Cause: wgcbroker.exe has not been running for over 30 s (log line QGADESLICEDOWN).",
-                   "gui-agent.exe pid 4242; reported once per boot. Evidence: C:\\Qubes Logs\\gui-agent.log, line QGADESLICEDOWN."), QERR_SEND);
+                   "Menus, modern apps and notifications do not appear in dom0 until it is back.",
+                   "Cause: wgcbroker.exe is installed but has not run for over 30 s.",
+                   "gui-agent.exe pid 4242; reported once per boot; build 4.3.36.915. Evidence: C:\\Qubes Logs\\gui-agent.log, line QGADESLICEDOWN."), QERR_SEND);
     Check("send: notifhost spawned once with a file", g_spawned == 1);
     Check("send: dom0 was told, so NO window", g_boxes == 0);
     Check("send: notify text line 1 is the header, alone",
           strncmp(g_lastNotify, "The notification and menu capture helper is not running\r\n", strlen("The notification and menu capture helper is not running\r\n")) == 0);
     Check("send: notify text body is line 1, the cause and the technical line",
           strcmp(g_lastNotify, "The notification and menu capture helper is not running\r\n"
-                               "Menus, modern app windows and notification windows do not appear in dom0 until it is back.\r\n"
-                               "Cause: wgcbroker.exe has not been running for over 30 s (log line QGADESLICEDOWN).\r\n"
-                               "gui-agent.exe pid 4242; reported once per boot. Evidence: C:\\Qubes Logs\\gui-agent.log, line QGADESLICEDOWN.") == 0);
+                               "Menus, modern apps and notifications do not appear in dom0 until it is back.\r\n"
+                               "Cause: wgcbroker.exe is installed but has not run for over 30 s.\r\n"
+                               "gui-agent.exe pid 4242; reported once per boot; build 4.3.36.915. Evidence: C:\\Qubes Logs\\gui-agent.log, line QGADESLICEDOWN.") == 0);
     Check("send: marker and count files written", FileExists("gui-agent.deslicedown") && FileExists(".count"));
     CheckDecision("dedupe: the same error again this boot is suppressed",
         QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "The de-slice broker is not running", "y", NULL, "z"), QERR_SUPPRESS_DUP);
@@ -378,9 +392,9 @@ int main(void)
         CheckDecision("row send: a row sends under its own component and id", QerrReportText(row, NULL, NULL), QERR_SEND);
         Check("row send: the marker is the row's component.id", FileExists("gui-agent.deslice-down"));
         Check("row send: the notify text is byte-identical to the render test's rendering",
-              QerrRenderText(want, sizeof(want), row, NULL, QerrTestPid) > 0 && strcmp(g_lastNotify, want) == 0);
-        Check("row send: the technical line carries this process's pid",
-              strstr(g_lastNotify, "\r\ngui-agent.exe pid 4242; reported once per boot. Evidence: ") != NULL);
+              QerrRenderText(want, sizeof(want), row, NULL, QerrTestPid, QerrTestBuild) > 0 && strcmp(g_lastNotify, want) == 0);
+        Check("row send: the technical line carries this process's pid and the build read at QerrInit",
+              strstr(g_lastNotify, "\r\ngui-agent.exe pid 4242; reported once per boot; build 4.3.36.915. Evidence: ") != NULL);
         CheckDecision("row send: a per-instance id and header name (the deaf app) are used",
             QerrReportText(deaf, "capture-deaf-chrome", "chrome"), QERR_SEND);
         Check("row send: the deaf header names the app, the marker carries the per-instance id",
@@ -388,6 +402,16 @@ int main(void)
         g_logN = 0;
         CheckDecision("row send: a missing row is refused, never dereferenced", QerrReportText(NULL, NULL, NULL), QERR_REJECT_NAME);
         Check("row send: the missing row is logged as a bug of ours", LogCount("notifytexts.h") == 1);
+        /* the image's version unreadable at Init: the row still sends, and the line says the build is unknown */
+        QerrTestBuild = NULL;
+        QerrInit(1, g_dir);
+        Check("row send: the gate line names the build as unknown when it could not be read", LogCount("build=unknown") == 1);
+        CheckDecision("row send: no build readable -> the row still sends", QerrReportText(row, "deslice-down-nobuild", NULL), QERR_SEND);
+        Check("row send: ... and its technical line says 'build unknown', never an empty field",
+              strstr(g_lastNotify, "; reported once per boot; build unknown. Evidence: ") != NULL);
+        QerrTestBuild = "4.3.36.915";
+        QerrInit(1, g_dir);
+        Check("row send: the gate line names the build when it was read", LogCount("build=4.3.36.915") >= 1);
     }
 
     /* ---- 6. glue end-to-end: redaction refuses ----------------------------------------- */

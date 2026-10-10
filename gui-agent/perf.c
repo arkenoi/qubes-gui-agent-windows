@@ -521,8 +521,10 @@ void PerfInit(void)
     {
         // Off is the shipping default since 4.3.10 (per-frame lines were 91% of a
         // field log's bytes). One self-describing line so a field log still says how
-        // to turn the instrument on.
-        LogInfo("QGAPERF off (enable ALL diagnostics from dom0: qvm-features <vm> service.gui-agent-debug 1; or registry DWORD PerfLog=1, PerfEveryN throttles)");
+        // to turn the instrument on: the dom0 switch, which enables ALL diagnostics at
+        // once. The per-install registry route - DWORD PerfLog=1, PerfEveryN to
+        // throttle - is documented in perf.h and stays out of the line.
+        LogInfo("QGAPERF off; on with qvm-features <vm> service.gui-agent-debug 1");
         return;
     }
 

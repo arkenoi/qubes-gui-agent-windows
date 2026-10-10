@@ -803,12 +803,13 @@ void WcMarkDirty(HWND hwnd)
                     if (next > WC_ECHO_PAUSE_MAX_MS) next = WC_ECHO_PAUSE_MAX_MS;
                     ch->echoPauseMs.store(next);
                     ch->echoPauseUntil.store(now + next);
-                    // After a pause that passed quietly, one echo is enough to pause again (longer).
+                    // After a pause that passed quietly, one echo is enough to pause again (longer). The damage
+                    // following our own captures is the echo; any change the window makes while we are not
+                    // rendering it ends the pause early.
                     ch->echoStreak.store(WC_ECHO_STREAK - 1);
                     if (next != prev)   // one line per escalation step, not per pause
-                        LogInfo("WCECHO 0x%x: its damage keeps following our own captures (%ld echoes dropped so far) - "
-                                "pausing captures for %lu ms; any change it makes while we are NOT rendering it ends the pause",
-                                ch->hwnd, (long)ch->echoDropped.load(), next);
+                        LogInfo("WCECHO 0x%x: its damage keeps echoing our own captures (%ld echoes dropped so far); "
+                                "captures paused for %lu ms", ch->hwnd, (long)ch->echoDropped.load(), next);
                     ch->echoDropped.fetch_add(1);
                     break;
                 }

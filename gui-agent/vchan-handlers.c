@@ -68,7 +68,9 @@ static DWORD InjectInput(IN INPUT* inputEvent, IN const char* what)
 
     DWORD status = GetLastError();
     UNREFERENCED_PARAMETER(what);
-    LogWarning("SendInput failed with error 0x%x - dropping input event (likely secure desktop), re-attaching input desktop", status);
+    // The usual cause is the secure desktop owning input (the measured case above); the code does not
+    // establish it per event, so the line does not claim it.
+    LogWarning("SendInput failed with error 0x%x: input event dropped, re-attaching input desktop", status);
     AttachToInputDesktop(); // best effort - failure means we retry on a later event
     return ERROR_SUCCESS; // deliberately never fatal
 }
@@ -1171,8 +1173,8 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                     geometryDriven = TRUE;
                     data->DaemonOwnsPos = TRUE;
 
-                    LogDebug("0x%x cropped by %d/%d/%d/%d: dom0 placed it at (%d,%d); "
-                        "keeping guest anchor (%d,%d), dom0 owns position",
+                    // dom0 owns the position from here; the guest goes on keeping its anchor.
+                    LogDebug("0x%x cropped by %d/%d/%d/%d: dom0 placed it at (%d,%d), guest anchor stays (%d,%d)",
                         window, data->CropLeft, data->CropTop, data->CropRight, data->CropBottom,
                         configureMsg.x, configureMsg.y, data->X, data->Y);
 
@@ -1204,14 +1206,14 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                         data->RestartPlacementTick = 0;   // decided: this configure answers it (or the window outlived it)
                     if (fresh && noSize && !noMove && replyToMessages)
                     {
-                        // The answer goes out AFTER the ACK below: while the daemon awaits the ACK of its own configure it
+                        // The answer - the guest saying its own position - goes out AFTER the ACK below: while the daemon
+                        // awaits the ACK of its own configure it
                         // ignores any other geometry and re-sends its own (xside.c handle_configure_from_vm,
                         // have_queued_configure); once acked, an agent configure is applied with the frame extents
                         // subtracted (moveresize_vm_window), i.e. the CLIENT lands where the guest says. The create itself
                         // carries no frame compensation (mkwindow: PSize only), which is where the offset came from.
-                        LogInfo("QGAPLACEKEEP hwnd=0x%x: dom0 placed the re-created window at (%d,%d); the guest keeps (%d,%d) "
-                            L"and says so after the ack", (uint32_t)(ULONG_PTR)window, configureMsg.x, configureMsg.y,
-                            data->X, data->Y);
+                        LogInfo("QGAPLACEKEEP hwnd=0x%x: dom0 placed the re-created window at (%d,%d), the guest keeps (%d,%d)",
+                            (uint32_t)(ULONG_PTR)window, configureMsg.x, configureMsg.y, data->X, data->Y);
                         reassertPlacement = TRUE;
                         data->CfgSentValid = TRUE;
                         data->LastCfgX = data->X;

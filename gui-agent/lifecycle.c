@@ -107,21 +107,23 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 // BOUNDED: a failure detector, not a fix. The service answers from its wait loop within milliseconds;
                 // expiry means the service is stuck or gone, and the end is allowed anyway so a stuck service can
                 // never stall the shutdown (the handshake-deadlock risk). The service then decides on the exit code
-                // alone, with the notice it did see (it is manual-reset: it stays signalled for the service's wait).
+                // alone, with the end-session notice it did see and holds (it is manual-reset: it stays signalled
+                // for the service's wait).
                 const DWORD w = g_Ack ? WaitForSingleObject(g_Ack, QGA_ENDSESSION_ACK_WAIT_MS) : WAIT_FAILED;
                 if (w == WAIT_OBJECT_0)
-                    LogInfo("QGAENDSESSION the service acknowledged the notice: no agent is launched into this session again");
+                    LogInfo("QGAENDSESSION session end acknowledged, no agent is launched into it again");
                 else
-                    LogError("QGAENDSESSION the service did NOT acknowledge the end-session notice within %u ms (wait 0x%x) - "
-                        L"the end is allowed anyway; the service decides on the exit code and the notice it holds",
-                        QGA_ENDSESSION_ACK_WAIT_MS, w);
+                    LogError("QGAENDSESSION the service did not acknowledge the session end within %u ms (wait 0x%x); "
+                        L"the session ends anyway", QGA_ENDSESSION_ACK_WAIT_MS, w);
             }
         }
         else
         {
-            LogError("QGAENDSESSION no lifecycle channel to the QubesGuiWatchdog service (this agent was not started by "
-                L"it, or the channel could not be opened) - the end is allowed without a notice; the service, if any, "
-                L"will see this instance's exit without one");
+            // No lifecycle channel to the QubesGuiWatchdog service: either the service did not start this agent,
+            // or the channel could not be opened (LifecycleStart said which, at QGALIFECYCLE). The end is allowed
+            // without a notice; a service, if one exists, sees this instance's exit with no notice ahead of it.
+            // The code here establishes neither cause, so the line names none.
+            LogError("QGAENDSESSION session ending; no channel to the watchdog service, it is not told");
         }
         return TRUE;
     }
@@ -135,7 +137,7 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             // ends the process ITSELF - returning first would hand Windows the exit (0x40010004, as measured).
             DWORD w;
             LifecycleLatchExit(QGA_EXIT_SESSION_END);
-            LogInfo("QGAENDSESSION the session is ending: leaving through the orderly exit with QGA_EXIT_SESSION_END");
+            LogInfo("QGAENDSESSION the session is ending, taking the orderly exit (QGA_EXIT_SESSION_END)");
             if (g_ShutdownEvent)
                 SetEvent(g_ShutdownEvent);
             w = g_ExitDone ? WaitForSingleObject(g_ExitDone, QGA_ENDSESSION_EXIT_WAIT_MS) : WAIT_FAILED;
@@ -148,18 +150,18 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
                 LogFlush();
                 ExitProcess(QGA_EXIT_SESSION_END);
             }
-            // BOUNDED: expiry is a loud ERROR, and the end is allowed. The service will see 0x40010004 after an
-            // acknowledged notice (QGA_DECIDE_SESSION_END_FORCED) and launch nothing into this session.
-            LogError("QGAENDSESSION the orderly exit did not complete within %u ms (wait 0x%x) - Windows ends this "
-                L"process; the service sees the system's termination status after the acknowledged notice",
+            // BOUNDED: expiry is a loud ERROR, and the end is allowed although the orderly exit did not complete:
+            // Windows ends this process, and the service sees the system's termination status 0x40010004 after an
+            // acknowledged notice (QGA_DECIDE_SESSION_END_FORCED) and launches nothing into this session.
+            LogError("QGAENDSESSION the orderly exit did not finish within %u ms (wait 0x%x); Windows ends the agent now",
                 QGA_ENDSESSION_EXIT_WAIT_MS, w);
             LogFlush();
             return 0;
         }
-        // The end was cancelled by another application's veto: the session continues, with everything re-armed.
+        // The end was cancelled by another application's veto: the session continues, with everything re-armed
+        // (the helper launches), telling the service so through the continue event.
         InterlockedExchange(&g_SessionEnding, 0);
-        LogWarning("QGAENDSESSION the end of the session was CANCELLED - helper launches re-armed; telling the service "
-            L"the session continues");
+        LogWarning("QGAENDSESSION session end CANCELLED, the session continues; helpers re-armed");
         HelpersRearm();
         if (g_Continue && !SetEvent(g_Continue))
             win_perror("SetEvent(lifecycle continue)");
@@ -229,9 +231,11 @@ void LifecycleStart(void)
         LogInfo("QGALIFECYCLE channel to the QubesGuiWatchdog service open (" QGA_LIFECYCLE_NAME_FMT L")", pid, L"*");
     else
     {
-        LogWarning("QGALIFECYCLE no channel to the QubesGuiWatchdog service (notice=%d ack=%d continue=%d, error 0x%x) - "
-            L"this agent was not started by the service, or an older service started it; a session end is handled "
-            L"locally (helpers disarmed, orderly exit, QGA_EXIT_SESSION_END) with no notice to a service",
+        // No channel: this agent was not started by the QubesGuiWatchdog service, or an older service started it.
+        // A session end is then handled locally - helpers disarmed, the orderly exit, QGA_EXIT_SESSION_END - with
+        // no notice to any service.
+        LogWarning("QGALIFECYCLE no channel to the watchdog service (notice=%d ack=%d continue=%d, error 0x%x); "
+            L"a session end is handled locally, no notice",
             g_Notice != NULL, g_Ack != NULL, g_Continue != NULL, GetLastError());
         if (g_Notice) { CloseHandle(g_Notice); g_Notice = NULL; }
         if (g_Ack) { CloseHandle(g_Ack); g_Ack = NULL; }
@@ -241,24 +245,25 @@ void LifecycleStart(void)
     if (!g_ExitDone || !g_WindowReady)
     {
         win_perror("CreateEvent(lifecycle)");
-        LogError("QGALIFECYCLE the end-session window is NOT created - a session end will terminate this agent without "
-            L"its orderly exit (the service sees 0x40010004 without a notice)");
+        // Without the window, a session end terminates the agent outright (Windows will terminate every process in
+        // the session): the service sees 0x40010004 and no notice.
+        LogError("QGALIFECYCLE end-session window not created; a session end kills this agent without its orderly exit");
         return;
     }
     thread = CreateThread(NULL, 0, LifecycleWindowThread, NULL, 0, NULL);
     if (!thread)
     {
         win_perror("CreateThread(lifecycle window)");
-        LogError("QGALIFECYCLE the end-session window thread did not start - a session end will terminate this agent "
-            L"without its orderly exit");
+        LogError("QGALIFECYCLE end-session window thread did not start; a session end skips the orderly exit");
         return;
     }
     CloseHandle(thread);   // runs for the life of the process
-    // BOUNDED: the window must exist before Init starts opening the vchan, or the first-act promise is empty;
-    // expiry is an ERROR and Init proceeds (the agent is then no worse than before this change).
+    // BOUNDED: the window must exist before Init starts opening the vchan, or the first-act promise is empty
+    // (with it up a session end runs the orderly exit; without it a session end may terminate this agent); expiry
+    // is an ERROR and Init proceeds (the agent is then no worse than before this change).
     if (WaitForSingleObject(g_WindowReady, QGA_LIFECYCLE_WINDOW_WAIT_MS) != WAIT_OBJECT_0 || !g_Window)
-        LogError("QGALIFECYCLE the end-session window is not up after %u ms (window %p) - a session end may terminate "
-            L"this agent without its orderly exit", QGA_LIFECYCLE_WINDOW_WAIT_MS, g_Window);
+        LogError("QGALIFECYCLE the end-session window is not up after %u ms (window %p); a session end may skip the orderly exit",
+            QGA_LIFECYCLE_WINDOW_WAIT_MS, g_Window);
     else
-        LogInfo("QGALIFECYCLE end-session window %p up before Init - a session end runs the orderly exit", g_Window);
+        LogInfo("QGALIFECYCLE end-session window %p up before Init; a session end takes the orderly exit", g_Window);
 }

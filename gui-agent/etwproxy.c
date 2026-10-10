@@ -403,13 +403,14 @@ static void EtwProxyParkLocked(const char* reason, DWORD code)
 
 // ---- dead for this agent's life: the ETW tier stays down until the next GUI agent start. This replaced the
 // backoff relaunch timer (owner, 2026-10-07: no relaunch loops; a death is a major failure, recorded once). The
-// session is stopped (a session nobody consumes only accumulates loss counters). Callers hold g_Lock.
+// session is stopped (a session nobody consumes only accumulates loss counters). The bridge degrades to its
+// listener/DB rungs (fail-open), so notifications still reach dom0 without the ETW tier. Callers hold g_Lock.
 static void EtwProxyDeadLocked(const char* reason, DWORD code)
 {
     EtwProxySessionStopLocked();
     g_State = EPS_DEAD;
-    LogError("ETWPROXYSUP DOWN for this agent's life: %S (code %lu) - not relaunched (no relaunch loop, owner "
-             "2026-10-07); the bridge degrades to listener/DB (fail-open) until the next GUI agent start", reason, code);
+    LogError("ETWPROXYSUP DOWN for this agent's life: %S (code %lu); not relaunched, notifications still reach dom0",
+             reason, code);
 }
 
 // ---- credentials: generate + set + prove, all in memory (the in-memory creds contract) -
@@ -567,13 +568,15 @@ static BOOL EtwProxyCensusAndSid(HANDLE token, BYTE* sidBuf, DWORD sidBufBytes, 
                 profilePresent);
     }
     *drifted = (pluPresent || profilePresent || adminPresent);
+    // Why a drifted token is refused rather than trimmed: the capability-grant split needs a
+    // bare account (no Performance Log Users, no SeSystemProfilePrivilege, no Administrators);
+    // any of those hands the untrusted decode machine-wide trace capability, and group SIDs
+    // cannot be shed from a token. Remedy: re-run guest/provision-etwproxy-account.ps1
+    // from the current package. The ETW gate greps the log for 'PROVISIONING DRIFT' and
+    // 'parked for this boot' (p3a-etw-gate.sh), so both stay in the line.
     if (*drifted)
-        LogWarning("ETWPROXYSUP PROVISIONING DRIFT: consumer token holds %S%S%S- the "
-                   "capability-grant split requires a bare account (no Performance Log Users, "
-                   "no SeSystemProfilePrivilege); a drifted token has machine-wide trace "
-                   "capability the untrusted decode must never hold, and group SIDs cannot "
-                   "be shed. REFUSING the launch (ETW tier parked for this boot, fail-open). "
-                   "Re-run guest/provision-etwproxy-account.ps1 from the current package",
+        LogWarning("ETWPROXYSUP PROVISIONING DRIFT: consumer token holds %S%S%S- launch REFUSED, ETW tier "
+                   "parked for this boot (fail-open)",
                    pluPresent ? "Performance-Log-Users " : "",
                    profilePresent ? "SeSystemProfilePrivilege " : "",
                    adminPresent ? "Administrators " : "");
@@ -920,9 +923,10 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
                     rc, uptimeMs);
         else
         {
-            LogWarning("ETWPROXYSYSKILL the system terminated the proxy (0x40010004) after %llu ms, before this "
-                    L"agent was told its session was ending - recorded as a teardown, not a death. If no shutdown "
-                    L"was in progress, this is an ordering anomaly worth finding", uptimeMs);
+            // Ordinarily the system terminates the proxy with the session before this agent is told; one with
+            // no shutdown in progress is an ordering anomaly worth finding.
+            LogWarning("ETWPROXYSYSKILL Windows ended the proxy (0x40010004) after %llu ms before this agent heard "
+                    L"the session was ending; recorded as a teardown, not a death", uptimeMs);
             // 4014, not 4004: durable, and not read by the dom0 reporter.
             DeathEventReportTeardown(DEATHEVENT_ID_ETWPROXY, L"etwproxy.exe", pid, rc, uptimeMs,
                 L"Windows ended it with the session. gui-agent log line ETWPROXYSYSKILL; etw-proxy.log has its own.");
@@ -1002,13 +1006,13 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
     }
     else
     {
-        // NOT a code the proxy can return (0/5/7/8/9) NOR the force-kill code (1): an
-        // uncommanded crash. A fallback firing silently is how defects hide - log the anomaly
-        // loudly and machine-readably (the datum must not vanish into a routine line).
-        LogError("ETWPROXYSUP proxy exited rc=%lu after %llu ms - ANOMALY "
-                 "EtwProxyUnknownExit (0x%lX): not an ETWPROXY_EXIT_* code (0/5/7/8/9) and "
-                 "not the force-kill code 1 - the proxy binary has no such return path, so "
-                 "it CRASHED (check etw-proxy.log for a CRASH line). Not relaunched (no relaunch loop)",
+        // NOT a code the proxy can return (0/5/7/8/9, the ETWPROXY_EXIT_* set) NOR the force-kill
+        // code (1): an uncommanded crash - the proxy binary has no such return path; check
+        // etw-proxy.log for its own CRASH line. No relaunch loop (owner 2026-10-07). A fallback
+        // firing silently is how defects hide - log the anomaly loudly and machine-readably (the
+        // datum must not vanish into a routine line).
+        LogError("ETWPROXYSUP proxy exited rc=%lu after %llu ms - ANOMALY EtwProxyUnknownExit (0x%lX): "
+                 "no proxy return path has this code, so it crashed; not relaunched",
                  rc, uptimeMs, rc);
     }
     EtwProxyDeadLocked("the proxy exited", rc);   // stops the session; the tier is down until the next agent start
@@ -1024,8 +1028,9 @@ void EtwProxyInit(BOOL bridgeEnabled)
     g_Enabled = bridgeEnabled;
     g_State = bridgeEnabled ? EPS_IDLE : EPS_DISABLED;
     if (bridgeEnabled)
-        LogInfo("ETWPROXYSUP armed (gate on): etwproxy.exe launches once a console "
-                "user session exists (agent = session controller, proxy = pure consumer)");
+        // Roles, for the reader of the line: the agent is the session controller, the proxy a
+        // pure consumer of the session it controls.
+        LogInfo("ETWPROXYSUP armed (gate on): etwproxy.exe launches once a console user session exists");
     // Gate off: fully inert. No account access, no session, no logs, no timers.
 }
 
@@ -1049,16 +1054,16 @@ void EtwProxyPoke(void)
             // Console user changed: the pipe DACL admits exactly the launched SID, so a proxy serving
             // the OLD user is useless to the NEW user's bridge. This used to kill the job and relaunch
             // with the fresh SID - a spawn-again-on-exit path, removed 2026-10-07 (no relaunch loops).
-            // These guests run one autologon user, so this is said once, at ERROR, and the tier serves
-            // the previous user until the next agent start.
+            // These guests run one autologon user, so this is said once, at ERROR, and the running proxy is
+            // left to serve the previous user until the next GUI agent start launches one for the current
+            // user (owner 2026-10-07).
             static BOOL s_UserChangeSaid = FALSE;
             WCHAR sid[RTL_NUMBER_OF(g_ClientSid)];
             if (!s_UserChangeSaid && EtwProxyClientSid(sid, RTL_NUMBER_OF(sid)) && wcscmp(sid, g_ClientSid) != 0)
             {
                 s_UserChangeSaid = TRUE;
-                LogError("ETWPROXYSUP console user changed (%s -> %s) - the running proxy serves the previous user "
-                         "and is NOT restarted (no relaunch loop, owner 2026-10-07); the next GUI agent start "
-                         "launches it for the current user", g_ClientSid, sid);
+                LogError("ETWPROXYSUP console user changed (%s -> %s); the proxy still serves the previous user, "
+                         "not restarted", g_ClientSid, sid);
             }
         }
     }

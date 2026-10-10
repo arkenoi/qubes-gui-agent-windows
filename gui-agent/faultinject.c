@@ -246,8 +246,9 @@ void FiInit(void)
         g_FiPrintWindowFail > 0 || g_FiSlabDoubleBind > 0 || g_FiGateOff != 0 || g_FiDamageDelayMs != 0 ||
         g_FiMonStale > 0)
     {
-        LogWarning("QGAFAULT-INIT FAULTS ARE ARMED - this agent will break itself on purpose "
-            L"in %u s; results from this run describe the INJECTED defect, not the build", delaySec);
+        // Armed on purpose: every result from this run describes the injected defect, not the build.
+        LogWarning("QGAFAULT-INIT FAULTS ARE ARMED - this agent will break itself in %u s; "
+            L"results describe the injected defect, not the build", delaySec);
     }
 }
 
@@ -256,13 +257,12 @@ BOOL FiGateOff(IN DWORD gateBit)
     if ((g_FiGateOff & gateBit) == 0)
         return FALSE;
 
-    // Announce each bypassed clause exactly once. A red run that cannot show the bypass was
-    // actually in force is not a proof - it is a run that happened to fail.
+    // Announce each bypassed ShouldAcceptWindow clause exactly once, for this run. A red run that
+    // cannot show the bypass was actually in force is not a proof - it is a run that happened to fail.
     if ((InterlockedOr(&g_FiGateLogged, (LONG)gateBit) & (LONG)gateBit) == 0)
     {
-        LogWarning("QGAFAULT FI_GATE_OFF bit 0x%x is set: a ShouldAcceptWindow safeguard is "
-            L"BYPASSED for this run. What this build maps is NOT what the release maps.",
-            gateBit);
+        LogWarning("QGAFAULT FI_GATE_OFF bit 0x%x is set: a window safeguard is bypassed, this build maps "
+            L"what the release refuses", gateBit);
     }
 
     return TRUE;
@@ -282,9 +282,11 @@ BOOL FiShouldNegCreate(IN HWND window)
     if (!FiTakeShot(&g_FiNegCreate))
         return FALSE;
 
-    LogWarning("QGAFAULT FI_NEG_CREATE firing for hwnd 0x%x: the CREATE about to go out "
-        L"carries an INVERTED rect (dom0 xside.c:2937 must reject it; the agent-side "
-        L"sanitizer must stop it first). %d shots left", window, g_FiNegCreate);
+    // What the shot proves: the next CREATE carries an inverted rect, and the agent-side sanitizer has to
+    // stop it before it leaves; if it does not, gui-daemon's own check (xside.c:2937) rejects it and raises
+    // its invalid-request dialog.
+    LogWarning("QGAFAULT FI_NEG_CREATE firing for hwnd 0x%x: next CREATE gets an inverted rect; "
+        L"%d shots left", window, g_FiNegCreate);
     return TRUE;
 }
 
@@ -346,8 +348,9 @@ BOOL FiSlabDoubleBind(void)
     if (!FiTakeShot(&g_FiSlabDoubleBind))
         return FALSE;
 
-    LogWarning("QGAFAULT FI_SLAB_DOUBLE_BIND firing: this attach takes a slab that a live "
-        L"window still holds (%d shots left) - PWCOLLISION must name both windows",
+    // What the shot proves: a live window still holds the slab this attach takes, so the PWCOLLISION
+    // alarm must name both windows.
+    LogWarning("QGAFAULT FI_SLAB_DOUBLE_BIND firing: two windows now share one slab (%d shots left)",
         g_FiSlabDoubleBind);
     return TRUE;
 }
@@ -430,8 +433,10 @@ BOOL FiShouldCaptureExit(void)
     // death" it had detected from the injector announcing itself - a self-referential red that
     // proves nothing. An injector that trips the very check it is meant to validate is worse
     // than no injector: it manufactures the evidence.
-    LogWarning("QGAFAULT FI_CAPTURE_EXIT firing: the DDA worker returns WITHOUT signalling "
-        L"error_event - the main loop will never be told duplication stopped");
+    // What the fault does downstream, kept out of the line: the DDA worker returns without signalling
+    // error_event, so the main loop is never told that duplication stopped - the silent-death shape the
+    // resolution harness counts.
+    LogWarning("QGAFAULT FI_CAPTURE_EXIT firing: the duplication worker quits without telling the main loop");
     return TRUE;
 }
 
@@ -450,8 +455,10 @@ BOOL FiShouldLegacySend(void)
     if (!FiTakeShot(&g_FiLegacySend))
         return FALSE;
 
-    LogWarning("QGAFAULT FI_LEGACY_SEND firing: this send takes the UNBOUNDED vendored "
-        L"path (vchan-common.c:96-102), bypassing the bounded wrapper. %d shots left",
+    // The unbounded path this send takes is the vendored vchan-common.c send (its lines 96-102 when
+    // this was written), bypassing the bounded wrapper: the pre-fix behaviour vchan.c reproduces on
+    // demand under this knob.
+    LogWarning("QGAFAULT FI_LEGACY_SEND firing: this send may block forever (legacy path); %d shots left",
         g_FiLegacySend);
     return TRUE;
 }

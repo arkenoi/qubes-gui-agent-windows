@@ -83,12 +83,12 @@ static void VchanGiveUpLocked(IN struct libvchan *vchan, IN VCHAN_SEND_RESULT re
         // is merely reading a dialog.
         g_VchanSendDegraded = TRUE;
 
+        // Later sends fail fast until the ring drains; the first 20 drops and every 1000th are logged.
         g_VchanSendGiveUps++;
         if (g_VchanSendGiveUps <= 20 || (g_VchanSendGiveUps % 1000) == 0)
         {
             LogWarning("VCHANSLOW dropping %s (%I64u bytes): gui-daemon has not drained the "
-                "ring in %u ms (open=%d, ring free=%d) - connection KEPT, sends fail fast "
-                "until it drains; %I64u drops so far",
+                "ring in %u ms (open=%d, ring free=%d); connection kept, %I64u drops so far",
                 what, (ULONG64)size, VCHAN_SEND_DEADLINE_MS,
                 libvchan_is_open(vchan), VchanGetWriteBufferSize(vchan), g_VchanSendGiveUps);
         }
@@ -101,9 +101,9 @@ static void VchanGiveUpLocked(IN struct libvchan *vchan, IN VCHAN_SEND_RESULT re
     g_VchanSendWedged = TRUE;
     g_VchanWedgeResult = result;
 
-    // Already held by the caller, so this is the same lock hold that ordered the message
-    // we just failed to write - no window in which another thread starts a send believing
-    // the daemon is still there.
+    // The vchan client is declared gone here. Already held by the caller, so this is the
+    // same lock hold that ordered the message we just failed to write - no window in which
+    // another thread starts a send believing the daemon is still there.
     g_VchanClientConnected = FALSE;
 
     // Same rate limit as the created-window gate in send.c: loud on the first occurrences,
@@ -112,8 +112,7 @@ static void VchanGiveUpLocked(IN struct libvchan *vchan, IN VCHAN_SEND_RESULT re
     if (g_VchanSendGiveUps <= 20 || (g_VchanSendGiveUps % 1000) == 0)
     {
         LogWarning("VCHANWEDGE giving up on %s (%I64u bytes): daemon %s "
-            "(open=%d, ring free=%d, deadline %u ms) - the vchan client is declared gone "
-            "and nothing more is sent on this connection; %I64u give-ups so far",
+            "(open=%d, ring free=%d, deadline %u ms); nothing more is sent on this connection, %I64u give-ups so far",
             what, (ULONG64)size,
             result == VCHAN_SEND_DEAD ? L"disconnected" : L"not draining the ring",
             libvchan_is_open(vchan), VchanGetWriteBufferSize(vchan),
@@ -212,16 +211,15 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             // wedge this whole layer exists to remove, for the one message class that can
             // reach it (an oversize MSG_WINDOW_DUMP on a very large desktop). Past the hard
             // cap the choice is between a desynced stream and a permanently frozen guest
-            // display, and the desync is the recoverable one: DEAD makes the caller give up,
+            // display - rather than hanging the display forever, the desync is the
+            // recoverable one: DEAD makes the caller give up,
             // which clears g_VchanClientConnected, latches the wedge, and takes the process
             // down for a clean respawn - the only state from which the stream is well
             // defined again.
             if (GetTickCount64() - firstBlock >= (ULONGLONG)VCHAN_SEND_COMMITTED_DEADLINE_MS)
             {
-                LogError("VCHANWAIT %s: no room after %u ms with a message already partly "
-                    "written - abandoning the connection (the stream is desynced; the agent "
-                    "exits for a clean respawn rather than hanging the display forever)",
-                    what, VCHAN_SEND_COMMITTED_DEADLINE_MS);
+                LogError("VCHANWAIT %s: no room after %u ms with a message already partly written; "
+                    "connection abandoned, the agent exits", what, VCHAN_SEND_COMMITTED_DEADLINE_MS);
                 *result = VCHAN_SEND_DEAD;
                 if (consumedWake)
                     SetEvent(vchanEvent);
@@ -417,8 +415,10 @@ void VchanHandshakeComplete(void)
     g_VchanHandshakeThread = 0;
     InterlockedExchange(&g_VchanHandshakeOpen, 1);
     LONG drops = InterlockedCompareExchange(&g_VchanHandshakeDrops, 0, 0);
+    // The refusals are the lines above this one (see them for the message names): the protocol version
+    // goes out first.
     if (drops)
-        LogWarning("QGAHANDSHAKE the protocol version went out first; %ld message(s) were refused before it (see the lines above)", drops);
+        LogWarning("QGAHANDSHAKE %ld message(s) refused before the protocol version went out", drops);
 }
 
 BOOL VchanSendVectored(IN struct libvchan *vchan, IN const VCHAN_IOV *iov, IN int iovCount, IN const WCHAR *what)
