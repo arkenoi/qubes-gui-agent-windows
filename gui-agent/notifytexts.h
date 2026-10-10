@@ -105,14 +105,6 @@ static const QerrText QerrTexts[] = {
     /* wgcbroker.exe is installed but has not been running for over 30 s on a system that needs it (log line
      * QGADESLICEDOWN): the de-slice path is down and nothing of ours relaunches it. The gui-agent and
      * wgcbroker logs have the sequence. */
-    /* A window was launched into a guest that has no desktop yet, so the de-slice broker could not be
-     * started and the window waits (log line QGANOSHELLHOLD). Not a display fault: the per-window path
-     * is fine, there is nothing to run the helper in. */
-    { "no-shell-hold", "gui-agent", "no-shell-hold", QERR_SEV_ACTION, "gui-agent.exe", NULL,
-      "The guest has no desktop yet",
-      "The window appears as soon as the desktop finishes starting.",
-      "Cause: no shell is running in the guest's session, so the capture helper cannot start.",
-      ", line QGANOSHELLHOLD" },
     { "deslice-down-present", "gui-agent", "deslice-down", QERR_SEV_ACTION, "gui-agent.exe", NULL,
       "The notification and menu capture helper is not running",
       "Menus, modern apps and notifications do not appear in dom0 until it is back.",

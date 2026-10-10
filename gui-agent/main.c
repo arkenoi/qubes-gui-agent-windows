@@ -3915,9 +3915,6 @@ static void BrokerShutdown(void)
 #define DIRECT_NOTIFY_REPEAT_MS (5u * 60u * 1000u)
 static ULONGLONG g_DirectNotifyNext = 0;
 static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL resident);   // defined below
-// Both defined below, used by the window-hold cause above: the desktop-INDEPENDENT shell fact and its name.
-static QGA_SHELL_PROCESS ShellProcessInConsoleSession(OUT DWORD *err);
-static const WCHAR *ShellProcessName(IN QGA_SHELL_PROCESS p);
 static void DirectSuppressNotifyUser(IN DWORD count)
 {
     ULONGLONG now = GetTickCount64();
@@ -8954,44 +8951,19 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             else if (!windowData->PwDirectSuppressed)
             {
                 windowData->PwDirectSuppressed = TRUE;
-                // WHICH FAULT IS THIS? (QgaHoldFaultCause). A window mapped over qrexec before the shell
-                // exists - qrexec serves an app ~16-40 s before the broker's launch is even possible - used
-                // to be written up as a DISPLAY fault, which is the owner's second P1 of the day. Both arms
-                // stay loud; only the cause differs, and every doubtful fact falls through to the display arm
-                // so nothing can be muted. DirectSuppressed means "a display fault withheld a window" and
-                // acceptance asserts it is 0, so only the display arm counts.
-                DWORD shellProcErr = 0;
-                const QGA_SHELL_PROCESS shellProc = (!g_WgcLaunched && !ShellWindowNow())
-                                                    ? ShellProcessInConsoleSession(&shellProcErr)
-                                                    : QGA_SHELLPROC_UNREAD;
-                if (QgaHoldFaultCause(g_WgcLaunched, ShellWindowNow(), shellProc) == QGA_HOLD_NO_SHELL)
-                {
-                    // The guest has no desktop yet, so the capture helper could not be started and this
-                    // window waits. Not a display fault - the facts it rests on are named here.
-                    LogError("QGANOSHELLHOLD hwnd 0x%x (class %s, %ux%u) NOT SHOWN YET: the guest has no "
-                        L"desktop shell, so the de-slice broker could not be launched (launched=%d "
-                        L"shellWindow=0 shellProcess=%S err=%lu); it maps as soon as a frame arrives",
-                        (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
-                        windowData->Width, windowData->Height,
-                        g_WgcLaunched ? 1 : 0, ShellProcessName(shellProc), shellProcErr);
-                    QerrReportText(QerrTextFind("no-shell-hold"), NULL, NULL);
-                }
-                else
-                {
-                    (void)CfgWriteDword(NULL, REG_CONFIG_DIRECT_SUPPRESSED_VALUE,
-                                        ++g_DirectSuppressed, NULL);
-                    // No composite fallback: mapping it would show a BLACK window. A BUG TO FIX, not a degraded mode -
-                    // QGADESLICEDOWN/DesliceBrokerDown for the broker, BROKERDIMS/BROKERREREG for a capture desync;
-                    // DirectSuppressed is the counter under the Qubes Tools config key.
-                    LogError("QGADIRECTSUPPRESS hwnd 0x%x (class %s, %ux%u) NOT SHOWN: never received a frame on the "
-                        L"required direct per-window path, suppressed instead of mapped black (sliceFed=1 "
-                        L"brokerSourced=%d slot=%d brokerActive=%d DirectSuppressed=%lu)",
-                        (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
-                        windowData->Width, windowData->Height,
-                        windowData->PwBrokerSourced, windowData->PwBrokerSlot,
-                        WgcBrokerActive(), g_DirectSuppressed);
-                    DirectSuppressNotifyUser(g_DirectSuppressed);
-                }
+                (void)CfgWriteDword(NULL, REG_CONFIG_DIRECT_SUPPRESSED_VALUE,
+                                    ++g_DirectSuppressed, NULL);
+                // No composite fallback: mapping it would show a BLACK window. A BUG TO FIX, not a degraded mode -
+                // QGADESLICEDOWN/DesliceBrokerDown for the broker, BROKERDIMS/BROKERREREG for a capture desync;
+                // DirectSuppressed is the counter under the Qubes Tools config key.
+                LogError("QGADIRECTSUPPRESS hwnd 0x%x (class %s, %ux%u) NOT SHOWN: never received a frame on the "
+                    L"required direct per-window path, suppressed instead of mapped black (sliceFed=1 "
+                    L"brokerSourced=%d slot=%d brokerActive=%d DirectSuppressed=%lu)",
+                    (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
+                    windowData->Width, windowData->Height,
+                    windowData->PwBrokerSourced, windowData->PwBrokerSlot,
+                    WgcBrokerActive(), g_DirectSuppressed);
+                DirectSuppressNotifyUser(g_DirectSuppressed);
             }
         }
         else if (cropReady || timedOut)
