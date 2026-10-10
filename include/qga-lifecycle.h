@@ -279,6 +279,98 @@ static __inline QGA_HELPER_STOP_OUTCOME QgaHelperStopOutcome(IN BOOL sessionEndi
     return QGA_HELPER_STOP_EXPIRED;   // DEFECT knob: a teardown falls through to here and is written up as a miss
 }
 
+// ---- THE VERDICT ON A SESSION LOCK (agent side: the secure-desktop block of ProcessNewFrame) ------------------
+// A locked guest is reported to dom0 at once and once per boot (owner 2026-10-09: "if it is locked it should be
+// detected fast"; 2026-10-10: "if there IS locked guest we need to report it, ONCE, but NEVER assume there is as
+// based on inaccurate measurements"). The fact is READ from Windows - WTSSessionInfoEx -> WTSINFOEX_LEVEL1.SessionFlags
+// - and this is the pure part: the facts as read in, one of five arms out, so the branch is held offline.
+//
+// THE DEFECT THIS CLOSES (measured 2026-10-10 on win10-acc, 4.3.36.915, gui-agent-20261010.log:569-570 and
+// :827-828): two agent instances, each ~2 s after its own start, on the FIRST secure frame it ever saw, elapsed on
+// the secure desktop 0 s, no Default -> secure transition observed - "QGADESKSTUCK the session is LOCKED after 0 s on
+// the secure desktop" and a dom0 notification from each. Owner, who saw it: "it was NEVER a locked guest. it was
+// secure-desktop detected on display reattach before main desktop owns it." The predicate excluded one thing (a
+// session that is ending) and had no notion of whether this agent had ever seen the user's desktop at all.
+//
+// THE GATE (Jev 2026-10-10, shell-seen-since-start 0.73 at confidence 0.68): no lock is asserted on the WTS
+// reading alone until THIS agent instance has observed a shell window (GetShellWindow() non-NULL) at least once
+// since it started - the phase gate the helpers' launch sites and the Mode-1 fullscreen guard already apply, and
+// the question docs/ADR-uac.md's own flowchart asks first ("is the Windows shell up?").
+//
+// AND THE ABSENCE OF THAT WINDOW IS NOT THE ABSENCE OF A SESSION (the review's one objection, latch-never-set, 0.75
+// of the mass). GetShellWindow() is per DESKTOP: the shell registers its window on Default, so a thread attached
+// to the Winlogon desktop - which is where this agent sits throughout a secure episode - reads NULL even while
+// explorer is alive on Default. A fresh agent whose first frame is secure therefore never latches, and on the
+// window alone a guest that really IS locked at that moment would be graded PRE_SHELL and degrade to the 30 s
+// path's 10-minute backstop - the "report it, ONCE" half of the owner's rule traded away for the "never assume"
+// half, which he stated in one sentence. So when the reading says LOCK and no window was seen, the verdict turns
+// on ONE desktop-independent fact: whether a shell PROCESS runs in the console session (main.c reads it from the
+// same Toolhelp pass that finds LogonUI/consent, matched to the console session). Present -> a real lock met by
+// a fresh agent, reported; absent -> PRE_SHELL; unreadable -> NO_FACT, said at WARNING - never silently "absent",
+// never a lock. A user-name read would not do: WTSUserName is set at logon success, before any shell exists.
+//   NO_FACT    a fact the verdict needs could not be read: the query failed, a level the union does not document,
+//              a flags value that is neither LOCK nor UNLOCK, or - on the LOCK-without-window path - the process
+//              list. Never a lock. WTS_SESSIONSTATE_LOCK is 0, so a ZEROED buffer reads as a lock unless the level
+//              is checked - this arm is what stands between that and a dom0 notification.
+//   TEARDOWN   the session is ending: a teardown, whatever the flags say (a console user is present, LogonUI is up).
+//   UNLOCKED   read: WTS_SESSIONSTATE_UNLOCK. A fact, and not a lock (a logon in progress, a UAC prompt).
+//   PRE_SHELL  read: LOCK, no shell window seen by this instance AND no shell process in the session: the session
+//              has not reached a shell. LOGGED with its facts, never reported.
+//   LOCKED     read: LOCK, no teardown, and a shell either SEEN (the window) or FOUND (the process). The one arm
+//              that reports - at once, once per boot (the once is notifyerr.c's persisted marker, not this header's).
+// `shellProcess` is read ONLY on the LOCK-without-window path and is UNREAD everywhere else (the earlier arms
+// return first, so an UNREAD value is never consulted where it was not needed). `infoLevel` is WTSINFOEX.Level as
+// read, 0 when nothing was read; `sessionFlags` likewise, UNKNOWN when nothing was.
+// Two knobs, each the measured or the reviewed defect, each required to make the suite FAIL:
+//   QGA_LIFECYCLE_DEFECT_PRESHELLLOCK     a LOCK reading is asserted with no shell seen or found (the measured one)
+//   QGA_LIFECYCLE_DEFECT_SHELLPROCSILENT  an UNREADABLE process list is read as "no shell" (the silent-skip shape)
+#define QGA_WTS_SESSIONSTATE_LOCK     0x00000000UL   // wtsapi32.h's WTS_SESSIONSTATE_LOCK, mirrored so this header
+#define QGA_WTS_SESSIONSTATE_UNLOCK   0x00000001UL   // stays pure and the suite builds without that header;
+#define QGA_WTS_SESSIONSTATE_UNKNOWN  0xFFFFFFFFUL   // main.c C_ASSERTs each against the real one
+typedef enum _QGA_SHELL_PROCESS
+{
+    QGA_SHELLPROC_UNREAD = 0,   // not read: not needed on this path, or the process list could not be snapshotted
+    QGA_SHELLPROC_ABSENT,       // the list was read: no shell process runs in the console session
+    QGA_SHELLPROC_PRESENT       // the list was read: a shell process runs in the console session
+} QGA_SHELL_PROCESS;
+typedef enum _QGA_LOCK_VERDICT
+{
+    QGA_LOCK_NO_FACT = 0,
+    QGA_LOCK_TEARDOWN,
+    QGA_LOCK_UNLOCKED,
+    QGA_LOCK_PRE_SHELL,
+    QGA_LOCK_LOCKED
+} QGA_LOCK_VERDICT;
+
+static __inline QGA_LOCK_VERDICT QgaLockVerdict(IN BOOL shellSeen, IN QGA_SHELL_PROCESS shellProcess,
+                                                IN BOOL sessionEnding, IN DWORD infoLevel, IN DWORD sessionFlags)
+{
+    if (sessionEnding)
+        return QGA_LOCK_TEARDOWN;
+    if (infoLevel != 1)
+        return QGA_LOCK_NO_FACT;
+    if (sessionFlags == QGA_WTS_SESSIONSTATE_UNLOCK)
+        return QGA_LOCK_UNLOCKED;
+    if (sessionFlags != QGA_WTS_SESSIONSTATE_LOCK)
+        return QGA_LOCK_NO_FACT;
+    if (shellSeen)
+        return QGA_LOCK_LOCKED;        // the window was seen on Default by this instance: a lock after a shell
+#ifdef QGA_LIFECYCLE_DEFECT_PRESHELLLOCK
+    (void)shellProcess;   /* the knob asserts a lock on a desktop this agent cannot place: the measured defect */
+    return QGA_LOCK_LOCKED;
+#else
+    if (shellProcess == QGA_SHELLPROC_PRESENT)
+        return QGA_LOCK_LOCKED;        // no window from the Winlogon desktop, but the session HAS a shell: a real lock
+    if (shellProcess == QGA_SHELLPROC_ABSENT)
+        return QGA_LOCK_PRE_SHELL;     // the session has not reached a shell: said, not reported
+#ifdef QGA_LIFECYCLE_DEFECT_SHELLPROCSILENT
+    return QGA_LOCK_PRE_SHELL;         /* the knob reads an unreadable list as "no shell": the silent-skip defect */
+#else
+    return QGA_LOCK_NO_FACT;           // the one fact that would decide could not be read: said at WARNING
+#endif
+#endif
+}
+
 // ---- THE AGENT'S OWN READING OF ITS EXIT CODE (WinMain) ------------------------------------------------------
 // An expected exit - requested, session end, reconnect, no GUI domain - is logged at INFO naming the reason; anything
 // else is a failure, logged at ERROR with the code that caused it. "WinMain: WatchForEvents failed with error 0xb7"

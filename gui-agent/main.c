@@ -2916,6 +2916,29 @@ void HelpersRearm(void)
     EtwProxyRearm();
 }
 
+// THE SHELL-SEEN LATCH (2026-10-10): has THIS agent instance observed the user's desktop with its shell up at least
+// once since it started? GetShellWindow() is per desktop - it returns the shell's desktop window only while the
+// calling thread is attached to a desktop that has one - so it is NULL on the Winlogon desktop and NULL on Default
+// until Explorer registers one. The agent already asks it at every phase gate (the helpers' launch sites, the
+// restore sweep, the shell-identity check in GetWindowData, the Mode-1 fullscreen guard), and each of those asks
+// through ShellWindowNow() now, which latches a non-NULL answer. NO NEW POLL: the latch is set by consults that
+// already happen and read by the lock verdict (QgaLockVerdict, qga-lifecycle.h), which may not call a session
+// LOCKED on a desktop this instance has never seen the Default side of - the two measured false reports were each
+// an agent's FIRST secure frame, 2 s after its start. Never cleared: the question is "has this instance ever seen
+// a shell", not "is one up now" (the sites that need the live answer keep the HWND they get).
+static volatile LONG g_ShellSeen = 0;
+static HWND ShellWindowNow(void)
+{
+    const HWND shell = GetShellWindow();
+    if (shell && !g_ShellSeen && InterlockedExchange(&g_ShellSeen, 1) == 0)
+        LogInfo("QGASHELLSEEN the shell window is up - a lock can be asserted from here on; hwnd=0x%p", shell);
+    return shell;
+}
+static BOOL ShellSeenSinceStart(void)
+{
+    return InterlockedCompareExchange(&g_ShellSeen, 0, 0) != 0;
+}
+
 // The five XML-significant characters, escaped; the task XML carries our own paths and arguments only.
 static void XmlEscapeInto(OUT WCHAR *out, IN size_t cch, IN const WCHAR *in)
 {
@@ -3717,7 +3740,7 @@ static void BrokerSupervise(void)
     //     g_AgentStartTick`, so holding the clock at zero here makes it fall back to the agent's
     //     start tick - which is what the old Init-time anchor amounted to. BRK_STARTING/BRK_DOWN
     //     therefore behave exactly as before; only this report's deadline moves.
-    if (!GetShellWindow() && !g_WgcLaunched)
+    if (!ShellWindowNow() && !g_WgcLaunched)
     {
         // Not a fault and not a grace period: there is no session to run it in. The guest having no
         // shell is its own condition and QGADESKSTUCK owns reporting it.
@@ -3781,7 +3804,7 @@ static void BrokerSupervise(void)
     // THE ONE LAUNCH PER AGENT LIFE (HELPER LIFECYCLE above): once a console session with a shell exists, and never
     // into a session that is ending. No throttle, no retry - a launch that fails is said at ERROR and QGADESLICEDOWN
     // escalates; Task Scheduler's restart-on-failure is the only relauncher of what did start.
-    if (!g_WgcLaunched && !HelpersDisarmed() && sid != 0xFFFFFFFF && GetShellWindow())
+    if (!g_WgcLaunched && !HelpersDisarmed() && sid != 0xFFFFFFFF && ShellWindowNow())
     {
         g_WgcLaunched = TRUE;
         g_WgcLastLaunch = now;
@@ -4083,7 +4106,7 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL 
     // 2026-09-08, during the first logon of a guest that was still installing.
     // Returning FALSE here is a DEFINED outcome the callers already handle (they log "no
     // interactive session?" and keep the failure in the log), not a silent drop.
-    if (!GetShellWindow()) return FALSE;
+    if (!ShellWindowNow()) return FALSE;
 
     WCHAR userId[256];
     if (!TaskUserId(sid, userId, RTL_NUMBER_OF(userId))) return FALSE;
@@ -4192,7 +4215,7 @@ static void NotifBridgeRestoreSweep(void)
     ULONGLONG now = GetTickCount64();
     if (now < g_NotifNextPoll) return;
     g_NotifNextPoll = now + 5000;
-    if (WTSGetActiveConsoleSessionId() == 0xFFFFFFFF || !GetShellWindow()) return;
+    if (WTSGetActiveConsoleSessionId() == 0xFFFFFFFF || !ShellWindowNow()) return;
     if (NotifRunInSession(NOTIF_RESTORE_TASK_NAME, L"--restore-banners", FALSE))
     {
         LogInfo("NOTIFBRIDGE gate-off restore sweep launched (crash-leftover banner markers)");
@@ -4402,7 +4425,7 @@ static void NotifBridgeSupervise(void)
     if (g_NotifBridgeProc) return;            // running: nothing to do and nothing armed
     DWORD sid = WTSGetActiveConsoleSessionId();
     // No session or no shell yet: the shell's own window events wake this loop when it comes up.
-    if (sid == 0xFFFFFFFF || !GetShellWindow()) return;
+    if (sid == 0xFFFFFFFF || !ShellWindowNow()) return;
 
     // READY? A launch (or a scheduler restart after an exit) is in flight: take the pid its instance published - only
     // from a file written AFTER that launch or exit (a dead instance's file can still be there, and a reused pid could
@@ -6990,7 +7013,7 @@ static void UacPendingPromptEnsureVisible(void)
         L"shell=%d taskbar=%d - the taskbar button Windows expects to be clicked does not exist "
         L"without a shell. Switch this qube to the windowed desktop to answer it.",
         (now - s_StandInSince) / 1000, pid, scan.Seen,
-        GetShellWindow() ? 1 : 0, g_TaskbarWindow ? 1 : 0);
+        ShellWindowNow() ? 1 : 0, g_TaskbarWindow ? 1 : 0);
     QerrReportText(QerrTextFind("uac-pending"), NULL, NULL);
 }
 
@@ -7935,7 +7958,7 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     if (ErrBoxIsSystemBox(data))
         return TRUE;
 
-    if (!(g_DiagWindowFilterOff & 1) && data->Handle == GetShellWindow())
+    if (!(g_DiagWindowFilterOff & 1) && data->Handle == ShellWindowNow())
         return FALSE;
 
     // THE BROKER'S OWN WINDOWS ARE INFRASTRUCTURE, NEVER USER CONTENT. The user-session broker needs
@@ -8001,14 +8024,14 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         // seen to fail. Compiles to a constant FALSE in release.
         if (!FiGateOff(FI_GATE_MODE1) &&
             (data->IsOverrideRedirect || wcsstr(data->Class, L"LogonUI") ||
-             !GetShellWindow() || g_OnSecureDesktop ||
+             !ShellWindowNow() || g_OnSecureDesktop ||
              (g_SecureDesktopLeftTick != 0 &&
               GetTickCount64() - g_SecureDesktopLeftTick < FS_BOOT_SETTLE_MS)))
         {
             LogDebug("0x%x: boot/shutdown/logon-phase fullscreen (class %s, %ux%u, shell=%d, "
                 L"secure=%d) - unconditionally denied, feature or not",
                 data->Handle, data->Class, data->Width, data->Height,
-                GetShellWindow() ? 1 : 0, g_OnSecureDesktop ? 1 : 0);
+                ShellWindowNow() ? 1 : 0, g_OnSecureDesktop ? 1 : 0);
             return FALSE;
         }
         // A WINDOWED fullscreen (a maximized normal app - it has a title bar / WS_CAPTION) is
@@ -10992,7 +11015,7 @@ static AutologonState AutologonEnsure(OUT WCHAR *user, IN size_t ucch,
     return AL_FIXED;
 }
 
-// IS THE SESSION LOCKED RIGHT NOW?// IS THE SESSION LOCKED RIGHT NOW? ASKED, NOT INFERRED.
+// IS THE SESSION LOCKED RIGHT NOW? ASKED, NOT INFERRED - AND NOT ASSERTED ON A DESKTOP THIS AGENT CANNOT PLACE.
 // This first shipped as `ConsoleUserPresent() && ProcessRunningByName(L"LogonUI.exe")`, taken from
 // this file's own comment - "LogonUI.exe with a console user -> the session is LOCKED" - which I
 // adopted as established instead of checking it. IT IS NOT ESTABLISHED. That pair only says the
@@ -11007,33 +11030,213 @@ static AutologonState AutologonEnsure(OUT WCHAR *user, IN size_t ucch,
 // WTS_SESSIONSTATE_LOCK or WTS_SESSIONSTATE_UNLOCK. That is what is asked now. If the query fails
 // or the level is not the one documented, the answer is NO - a report is owed only on a positive
 // fact, never on a failure to read one.
-static BOOL SecureDesktopLockedNow(IN ULONGLONG now, IN BOOL reported, IN OUT ULONGLONG *nextCheck)
+//
+// AND EVEN THE ASKED FACT IS NOT ASSERTED BEFORE THIS AGENT HAS SEEN THE DESKTOP IT IS ABOUT
+// (2026-10-10). Two agent instances on win10-acc (4.3.36.915) each reported "the session is LOCKED
+// after 0 s" ~2 s after their own start, on the first secure frame they ever saw, with no Default ->
+// secure transition observed, and dom0 was told each time. Owner, who saw it: "it was NEVER a locked
+// guest. it was secure-desktop detected on display reattach before main desktop owns it" - and the
+// rule: "if there IS locked guest we need to report it, ONCE, but NEVER assume there is as based on
+// inaccurate measurements." The verdict is now QgaLockVerdict's (qga-lifecycle.h; the rows are held
+// offline): the reading below plus two facts this predicate did not have - whether this instance has
+// seen a shell since it started (ShellSeenSinceStart) and whether the session is ending - and only
+// its LOCKED arm returns TRUE. Every other arm is said ONCE per secure-desktop episode with the facts
+// it rests on, so a report that did not go out can be found in the log with the reason it was refused,
+// and a read that failed is a WARNING rather than a silent "not locked" (missing data fails).
+C_ASSERT(QGA_WTS_SESSIONSTATE_LOCK == WTS_SESSIONSTATE_LOCK);
+C_ASSERT(QGA_WTS_SESSIONSTATE_UNLOCK == WTS_SESSIONSTATE_UNLOCK);
+C_ASSERT(QGA_WTS_SESSIONSTATE_UNKNOWN == WTS_SESSIONSTATE_UNKNOWN);
+
+// The facts a lock verdict was given, AS READ - nothing decided here, and what was not read is said as
+// such (a level of 0 and flags of UNKNOWN can only mean "nothing was read"; ShellProcess stays UNREAD
+// on every path that did not need it).
+typedef struct _SESSION_LOCK_READING
 {
-    DWORD csid;
+    BOOL  QueryOk;             // WTSQuerySessionInformation(WTSSessionInfoEx) returned a buffer of the documented size
+    DWORD QueryError;          // the Win32 error when it did not (0 otherwise)
+    DWORD Level;               // WTSINFOEX.Level as read; 0 when nothing was read
+    DWORD SessionFlags;        // WTSINFOEX_LEVEL1.SessionFlags as read; WTS_SESSIONSTATE_UNKNOWN when nothing was read
+    BOOL  ShellSeen;           // this instance has seen a shell WINDOW (ShellSeenSinceStart) at verdict time
+    QGA_SHELL_PROCESS ShellProcess;   // a shell PROCESS in the console session: read only on the LOCK-without-window path
+    DWORD ShellProcessError;   // the Win32 error when that read failed (0 otherwise)
+} SESSION_LOCK_READING;
+
+static void SessionLockRead(OUT SESSION_LOCK_READING *r)
+{
     LPWSTR buf = NULL;
     DWORD cb = 0;
-    BOOL locked = FALSE;
+    const DWORD csid = WTSGetActiveConsoleSessionId();
+    ZeroMemory(r, sizeof(*r));
+    r->SessionFlags = WTS_SESSIONSTATE_UNKNOWN;
+    if (csid == 0xFFFFFFFF)
+    {
+        r->QueryError = ERROR_NO_SUCH_LOGON_SESSION;   // no console session is attached: said with this code, not a stale GetLastError
+        return;
+    }
+    if (WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, csid, WTSSessionInfoEx, &buf, &cb)
+        && buf && cb >= sizeof(WTSINFOEX))
+    {
+        const WTSINFOEX* ix = (const WTSINFOEX*)buf;
+        r->QueryOk = TRUE;
+        r->Level = ix->Level;
+        if (ix->Level == 1)
+            r->SessionFlags = ix->Data.WTSInfoExLevel1.SessionFlags;
+    }
+    else
+        r->QueryError = GetLastError();
+    if (buf)
+        WTSFreeMemory(buf);
+}
 
+// THE FACTS A SECURE-DESKTOP LINE CARRIES BESIDE THE SESSION READING: the INPUT desktop's name (not this
+// thread's) and whether the two processes that own secure desktops are present. This snapshots the process
+// list, so it is read only when a line is about to be written - never per frame, never per throttle tick. A
+// running consent.exe is a fact about the process list, not evidence a prompt is shown (docs/ADR-uac.md 5).
+typedef struct _SECURE_DESKTOP_FACTS
+{
+    WCHAR InputDesktop[64];   // '?' when the input desktop could not be opened or named
+    BOOL  LogonUi;            // LogonUI.exe present
+    BOOL  Consent;            // consent.exe present
+} SECURE_DESKTOP_FACTS;
+
+static void SecureDesktopFactsRead(OUT SECURE_DESKTOP_FACTS *f)
+{
+    HDESK input = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+    DWORD needed = 0;
+    StringCchCopy(f->InputDesktop, RTL_NUMBER_OF(f->InputDesktop), L"?");
+    if (input)
+    {
+        if (!GetUserObjectInformation(input, UOI_NAME, f->InputDesktop, sizeof(f->InputDesktop), &needed))
+            StringCchCopy(f->InputDesktop, RTL_NUMBER_OF(f->InputDesktop), L"?");
+        CloseDesktop(input);
+    }
+    f->LogonUi = ProcessRunningByName(L"LogonUI.exe");
+    f->Consent = ProcessRunningByName(L"consent.exe");
+}
+
+// IS A SHELL PROCESS RUNNING IN THE CONSOLE SESSION? The DESKTOP-INDEPENDENT fact the lock verdict turns on when
+// no shell window was seen (qga-lifecycle.h, "the absence of that window is not the absence of a session").
+// GetShellWindow() is per desktop and this agent sits on the Winlogon desktop throughout a secure episode, so a
+// fresh agent whose first frame is secure reads NULL even while explorer is alive on Default - and a guest that
+// really is locked at that moment must still be reported, once, at once. The process list does not depend on the
+// desktop: one Toolhelp pass, the same mechanism SecureDesktopFactsRead uses for LogonUI/consent, matched to the
+// console session by ProcessIdToSessionId so another session's shell does not count. The shell is explorer.exe
+// (Winlogon's default Shell value; nothing of ours changes it). Tri-state: a list that could not be read is said
+// as UNREAD with the error, never as "no shell" - the verdict turns that into NO_FACT at WARNING.
+static QGA_SHELL_PROCESS ShellProcessInConsoleSession(OUT DWORD *err)
+{
+    const DWORD csid = WTSGetActiveConsoleSessionId();
+    HANDLE snap;
+    PROCESSENTRY32W pe;
+    QGA_SHELL_PROCESS found = QGA_SHELLPROC_ABSENT;
+    *err = 0;
+    if (csid == 0xFFFFFFFF)
+    {
+        *err = ERROR_NO_SUCH_LOGON_SESSION;
+        return QGA_SHELLPROC_UNREAD;
+    }
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+    {
+        *err = GetLastError();
+        return QGA_SHELLPROC_UNREAD;
+    }
+    ZeroMemory(&pe, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    if (!Process32FirstW(snap, &pe))
+    {
+        *err = GetLastError();
+        CloseHandle(snap);
+        return QGA_SHELLPROC_UNREAD;
+    }
+    do {
+        DWORD psid = 0;
+        if (_wcsicmp(pe.szExeFile, L"explorer.exe") == 0 &&
+            ProcessIdToSessionId(pe.th32ProcessID, &psid) && psid == csid)
+        {
+            found = QGA_SHELLPROC_PRESENT;
+            break;
+        }
+    } while (Process32NextW(snap, &pe));
+    CloseHandle(snap);
+    return found;
+}
+static const WCHAR *ShellProcessName(IN QGA_SHELL_PROCESS p)
+{
+    return p == QGA_SHELLPROC_PRESENT ? L"present" : p == QGA_SHELLPROC_ABSENT ? L"absent" : L"unread";
+}
+
+// TRUE exactly on QgaLockVerdict's LOCKED arm; the caller writes that line and reports, because it owns the
+// episode's clock and once-flag. `armsSaid` is a bit per QGA_LOCK_* arm already said this episode and
+// `shellAbsent` the episode's "no shell process" latch (the caller zeroes both with the episode); `r` is the
+// reading the caller's LOCKED line carries.
+static BOOL SecureDesktopLockedNow(IN ULONGLONG now, IN BOOL reported, IN OUT ULONGLONG *nextCheck,
+                                   IN OUT DWORD *armsSaid, IN OUT BOOL *shellAbsent, OUT SESSION_LOCK_READING *r)
+{
     if (reported || now < *nextCheck)
         return FALSE;
     *nextCheck = now + 1000;   // DDA can deliver frames while a secure desktop is up (a blinking
                                // caret is damage), so this is not asked per frame. One second is
                                // immediate for a human and keeps a syscall off the sign-in path.
-    if (LifecycleSessionEnding())
-        return FALSE;          // a teardown is not a lock, whatever the session flags say
-    csid = WTSGetActiveConsoleSessionId();
-    if (csid == 0xFFFFFFFF)
-        return FALSE;
-    if (WTSQuerySessionInformation(WTS_CURRENT_SERVER_HANDLE, csid, WTSSessionInfoEx, &buf, &cb)
-        && buf && cb >= sizeof(WTSINFOEX))
+    SessionLockRead(r);
+    const BOOL shellSeen = ShellSeenSinceStart();
+    const BOOL ending = LifecycleSessionEnding();
+    r->ShellSeen = shellSeen;
+    // THE DESKTOP-INDEPENDENT FACT, read only where it decides: LOCK read, no shell window seen by this
+    // instance, no teardown. On every other path the verdict returns before consulting it, so the
+    // process list is not snapshotted at all (the arms' order is the header's). And ONE snapshot per
+    // episode once it says "no shell": a shell starting switches the input desktop to Default, which
+    // ends this episode and latches the window on the next enumeration, so re-reading every second
+    // could only repeat the answer (Jev on a 1 Hz pass for the length of a sign-in screen: acceptable
+    // 0.33). An UNREAD answer is retried on the next tick - a transient snapshot failure must not
+    // stand for the episode.
+    if (!shellSeen && !ending && r->Level == 1 && r->SessionFlags == WTS_SESSIONSTATE_LOCK)
     {
-        const WTSINFOEX* ix = (const WTSINFOEX*)buf;
-        if (ix->Level == 1)
-            locked = (ix->Data.WTSInfoExLevel1.SessionFlags == WTS_SESSIONSTATE_LOCK);
+        if (*shellAbsent)
+            r->ShellProcess = QGA_SHELLPROC_ABSENT;
+        else
+        {
+            r->ShellProcess = ShellProcessInConsoleSession(&r->ShellProcessError);
+            if (r->ShellProcess == QGA_SHELLPROC_ABSENT)
+                *shellAbsent = TRUE;
+        }
     }
-    if (buf)
-        WTSFreeMemory(buf);
-    return locked;
+    const QGA_LOCK_VERDICT v = QgaLockVerdict(shellSeen, r->ShellProcess, ending, r->Level, r->SessionFlags);
+    if (v == QGA_LOCK_LOCKED)
+        return TRUE;
+    if (*armsSaid & (1u << v))
+        return FALSE;
+    *armsSaid |= 1u << v;
+    switch (v)
+    {
+    case QGA_LOCK_PRE_SHELL:
+    {
+        // The fourth classifier arm (docs/ADR-uac.md 5): the secure desktop is current before the session
+        // has reached a shell - no window seen by this instance AND no shell process in the session: the
+        // sign-in screen, or a display reattach before logon. SAID, with the facts, and not reported. A
+        // lock that is real is reported here only when a shell is SEEN (the window) or FOUND (the process).
+        SECURE_DESKTOP_FACTS f;
+        SecureDesktopFactsRead(&f);
+        LogInfo("QGADESKPRESHELL LOCK read with no shell in the session yet - not reported; "
+            L"wts-flags=%lu level=%lu input-desktop=%s LogonUI.exe=%d consent.exe=%d",
+            r->SessionFlags, r->Level, f.InputDesktop, (int)f.LogonUi, (int)f.Consent);
+        break;
+    }
+    case QGA_LOCK_NO_FACT:
+        LogWarning("QGADESKLOCKREAD a fact the lock verdict needs could not be read - no lock is asserted; "
+            L"wts-query=%d wts-err=%lu level=%lu wts-flags=0x%lx shell-seen=%d shell-process=%s shell-process-err=%lu",
+            (int)r->QueryOk, r->QueryError, r->Level, r->SessionFlags, (int)shellSeen,
+            ShellProcessName(r->ShellProcess), r->ShellProcessError);
+        break;
+    case QGA_LOCK_TEARDOWN:
+        LogDebug("QGADESKLOCK the session is ending - a teardown, not a lock; wts-flags=0x%lx level=%lu",
+            r->SessionFlags, r->Level);
+        break;
+    default:   // QGA_LOCK_UNLOCKED
+        LogDebug("QGADESKLOCK the session reads UNLOCK - not a lock; level=%lu shell-seen=%d", r->Level, (int)shellSeen);
+        break;
+    }
+    return FALSE;
 }
 
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
@@ -11126,11 +11329,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         static ULONGLONG s_SecureNextWarn = 0;
         static BOOL s_LockReported = FALSE;   // one lock report per secure-desktop episode
         static ULONGLONG s_LockCheckNext = 0;   // SecureDesktopLockedNow's throttle
+        static DWORD s_LockArmsSaid = 0;        // the non-reporting lock arms already said this episode (a bit per QGA_LOCK_*)
+        static BOOL s_ShellProcAbsent = FALSE;  // the process list read "no shell" this episode: not snapshotted again
         static AutologonState s_Al = AL_OK;     // this episode's autologon verdict, decided on entry
         static WCHAR s_AlUser[64] = L"";        // the account it is (or would be) armed for
         if (g_OnSecureDesktop)
         {
             ULONGLONG now = GetTickCount64();
+            SESSION_LOCK_READING lockRead;   // the reading the LOCKED line below carries
             if (!s_WasSecure)
             {
                 s_SecureSince = now;
@@ -11138,6 +11344,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 s_ShownNonSeamless = FALSE;
                 s_LockReported = FALSE;   // a new episode may be a different cause
                 s_LockCheckNext = 0;      // check the first frame of it immediately
+                s_LockArmsSaid = 0;       // and say each refused arm once more, with this episode's facts
+                s_ShellProcAbsent = FALSE;   // a new episode may have reached a shell since
                 // AUTOLOGON, ON THE FIRST FRAME OF THIS EPISODE, WITH NO WAIT. Nothing below
                 // this line waits to find out whether autologon works: it is read, the cause is
                 // removed where that needs no credential, the result is read back, and the two
@@ -11222,20 +11430,30 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             // 2026-10-09: "no one will wait for 10 minutes at locked machine. if it is locked it
             // should be detected fast." The previous version of this fix got the classification
             // right but left it inside the 30 s warn point, so a lock was still reported 30 s late
-            // and, with autologon armed, could fall through to the 10 min backstop. Both facts a
-            // lock needs - LogonUI up AND a console user logged on - are available on the first
-            // secure frame, so they are read there and the report goes out immediately, once.
+            // and, with autologon armed, could fall through to the 10 min backstop. The fact a lock
+            // needs - the session's own LOCK state, read from WTSSessionInfoEx - is available on the
+            // first secure frame, so it is read there and the report goes out immediately, once.
             // A session that is ENDING is excluded: during shutdown the console user is still
             // present while LogonUI is up, and that is a teardown, not a lock.
-            else if (SecureDesktopLockedNow(now, s_LockReported, &s_LockCheckNext))
+            // AND A LOCK IS NEVER ASSUMED (owner, 2026-10-10: "if there IS locked guest we need to
+            // report it, ONCE, but NEVER assume there is as based on inaccurate measurements"): the
+            // verdict is QgaLockVerdict's, and it is not LOCKED until this agent instance has seen a
+            // shell window - the two measured false reports were each this agent's FIRST secure frame,
+            // 2 s after its start, with no desktop it had ever seen to compare against. The line
+            // carries the facts it rests on; the once per boot is notifyerr's persisted marker.
+            else if (SecureDesktopLockedNow(now, s_LockReported, &s_LockCheckNext, &s_LockArmsSaid,
+                                            &s_ShellProcAbsent, &lockRead))
             {
+                SECURE_DESKTOP_FACTS f;
                 s_LockReported = TRUE;
-                LogWarning("QGADESKSTUCK the session is LOCKED after %I64u s on the secure desktop "
-                    L"(LogonUI up with a console user logged on) - dom0 is shown NOTHING while it stays "
-                    L"locked. Reported at once rather than at the %u s warn point: a lock is a human "
-                    L"action and only a human clears it, so there is nothing to wait for.",
-                    (now - s_SecureSince) / 1000,
-                    (unsigned)(SECURE_DESKTOP_FIRST_WARN_MS / 1000));
+                SecureDesktopFactsRead(&f);
+                // shell-by says which fact established the shell: "window" (seen on Default by this
+                // instance) or "process" (explorer.exe found in the console session from the Winlogon
+                // desktop - a real lock met by a fresh agent). A reader can tell the two paths apart.
+                LogWarning("QGADESKSTUCK the session is LOCKED - dom0 is shown nothing; shell-by=%s secure-for=%I64u s "
+                    L"wts-flags=%lu level=%lu input-desktop=%s LogonUI.exe=%d consent.exe=%d",
+                    lockRead.ShellSeen ? L"window" : L"process", (now - s_SecureSince) / 1000,
+                    lockRead.SessionFlags, lockRead.Level, f.InputDesktop, (int)f.LogonUi, (int)f.Consent);
                 QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
             }
             else if (now >= s_SecureNextWarn)
@@ -11264,9 +11482,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 //     and printed so the next reader does not have to guess which it was.
                 //   LogonUI.exe with a console user -> the session is LOCKED.
                 //   LogonUI.exe with no console user -> the SIGN-IN screen (autologon did not run).
+                //   LogonUI.exe before this agent has seen a shell -> THE FOURTH ARM (2026-10-10, ADR-uac
+                //     5): the secure desktop is current before the main desktop owns the session - a
+                //     display reattach, the sign-in screen, or a lock that predates this agent. Named
+                //     as that, never asserted as a lock (the measured false "LOCKED" reports were this).
                 const WCHAR* path = L"unclassified";
                 BOOL consent = ProcessRunningByName(L"consent.exe");
                 BOOL logonui = ProcessRunningByName(L"LogonUI.exe");
+                const BOOL shellSeen = ShellSeenSinceStart();
                 DWORD promptOnSecure = 0xFFFFFFFF;
                 {
                     HKEY k;
@@ -11283,6 +11506,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 }
                 if (consent)
                     path = L"a UAC consent prompt is on the SECURE desktop, which PromptOnSecureDesktop=0 is supposed to prevent";
+                else if (logonui && !shellSeen)
+                    path = L"LogonUI is up before this agent saw a shell";
                 else if (logonui)
                     path = L"LogonUI is up: the sign-in or lock screen";
                 // The description for the log line below, from this episode's verdict.
@@ -11317,7 +11542,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s - dom0 is being shown "
                     L"NOTHING and will keep seeing nothing until this desktop goes away. PATH: %s "
                     L"(consent.exe=%d LogonUI.exe=%d PromptOnSecureDesktop=%s autologon=%s "
-                    L"console-user=%d). A few seconds "
+                    L"console-user=%d shell-seen=%d). A few seconds "
                     L"of this at boot is normal (autologon). Persisting means the guest is waiting at "
                     L"the Windows sign-in or lock screen, which is not shown in SEAMLESS mode: arm "
                     L"autologon in the guest, or switch this qube to the windowed desktop "
@@ -11325,7 +11550,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     L"where the sign-in screen IS shown inside the bounded window.",
                     desktopName, (now - s_SecureSince) / 1000, path, (int)consent, (int)logonui,
                     promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"), autoDesc,
-                    (int)consoleUser);
+                    (int)consoleUser, (int)shellSeen);
                 // A UAC PROMPT HERE IS A DEFECT OF OURS AND SAYS SO, SEPARATELY AND LOUDLY. It is
                 // not the sign-in screen the notification below describes, and telling the user to
                 // "arm autologon" would be wrong advice for it.

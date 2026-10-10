@@ -16,6 +16,10 @@
  *   HELPERSYSKILLDEATH  a helper the system killed (0x40010004) is written up as a death
  *   HELPERSTOPTEARDOWN  a helper's stop wait expiring during the session's teardown is graded an ERROR miss (the
  *                       measured 2026-10-10 defect: "did not leave within 3 s of the stop file" at every shutdown)
+ *   PRESHELLLOCK        a LOCK reading is asserted with no shell seen or found (the measured 2026-10-10 defect:
+ *                       "the session is LOCKED after 0 s" on an agent's first secure frame, dom0 notified)
+ *   SHELLPROCSILENT     an UNREADABLE process list is read as "no shell" on the LOCK-without-window path (the
+ *                       silent-skip shape the review named: a real lock would then be PRE_SHELL, unsaid)
  * Prints "ok <case>" / "FAIL <case>" lines; exit 0 iff no FAIL.
  */
 #include <stdio.h>
@@ -133,6 +137,72 @@ int main(void)
           QgaHelperStopOutcome(FALSE, WAIT_FAILED) == QGA_HELPER_STOP_EXPIRED);
     check("the teardown arm is SEPARATE from the satisfied one: it is still said (INFO), not swallowed",
           QgaHelperStopOutcome(TRUE, WAIT_TIMEOUT) != QGA_HELPER_STOP_LEFT);
+
+    /* ---- 2d. THE LOCK VERDICT (QgaLockVerdict) -----------------------------------------------------------
+       MEASURED 2026-10-10 (gui-agent-20261010.log:569-570 and :827-828, 4.3.36.915): two agent instances each
+       reported "the session is LOCKED after 0 s" ~2 s after their own start, on the first secure frame they
+       ever saw, and dom0 was notified each time. Owner: "it was NEVER a locked guest. it was secure-desktop
+       detected on display reattach before main desktop owns it." No lock is asserted until this instance has
+       seen a shell; a real lock still reports at once (the once per boot is notifyerr's, not tested here). */
+    check("LOCK read after a shell WINDOW was seen, no teardown: LOCKED - the process is not even consulted",
+          QgaLockVerdict(TRUE, QGA_SHELLPROC_UNREAD, FALSE, 1, QGA_WTS_SESSIONSTATE_LOCK) == QGA_LOCK_LOCKED &&
+          QgaLockVerdict(TRUE, QGA_SHELLPROC_ABSENT, FALSE, 1, QGA_WTS_SESSIONSTATE_LOCK) == QGA_LOCK_LOCKED);
+    /* THE REVIEW'S ONE OBJECTION (latch-never-set, 0.75): GetShellWindow() is per desktop, so a fresh agent on
+       the Winlogon desktop never sees the window even while explorer is alive on Default - the window's absence
+       must not be read as the session's absence, or a guest that really is locked when the agent starts would
+       never be reported. The shell PROCESS in the console session is the desktop-independent fact. */
+    check("LOCK read, no shell window seen, a shell PROCESS in the session: LOCKED - a real lock met by a fresh agent, reported",
+          QgaLockVerdict(FALSE, QGA_SHELLPROC_PRESENT, FALSE, 1, QGA_WTS_SESSIONSTATE_LOCK) == QGA_LOCK_LOCKED);
+    check("LOCK read, no shell window seen, NO shell process: PRE_SHELL, nothing reported - the measured false report",
+          QgaLockVerdict(FALSE, QGA_SHELLPROC_ABSENT, FALSE, 1, QGA_WTS_SESSIONSTATE_LOCK) == QGA_LOCK_PRE_SHELL);
+    check("LOCK read, no shell window seen, the process list UNREADABLE: NO_FACT - never PRE_SHELL-silent, never LOCKED",
+          QgaLockVerdict(FALSE, QGA_SHELLPROC_UNREAD, FALSE, 1, QGA_WTS_SESSIONSTATE_LOCK) == QGA_LOCK_NO_FACT);
+    check("a session that is ending is a TEARDOWN whatever the flags say, shell seen or found or not",
+          QgaLockVerdict(TRUE, QGA_SHELLPROC_UNREAD, TRUE, 1, QGA_WTS_SESSIONSTATE_LOCK) == QGA_LOCK_TEARDOWN &&
+          QgaLockVerdict(FALSE, QGA_SHELLPROC_PRESENT, TRUE, 1, QGA_WTS_SESSIONSTATE_LOCK) == QGA_LOCK_TEARDOWN &&
+          QgaLockVerdict(FALSE, QGA_SHELLPROC_ABSENT, TRUE, 1, QGA_WTS_SESSIONSTATE_LOCK) == QGA_LOCK_TEARDOWN &&
+          QgaLockVerdict(TRUE, QGA_SHELLPROC_UNREAD, TRUE, 0, QGA_WTS_SESSIONSTATE_UNKNOWN) == QGA_LOCK_TEARDOWN);
+    check("a failed query (no level read) is NO_FACT, never a lock - and a shell process does not rescue it",
+          QgaLockVerdict(TRUE, QGA_SHELLPROC_UNREAD, FALSE, 0, QGA_WTS_SESSIONSTATE_UNKNOWN) == QGA_LOCK_NO_FACT &&
+          QgaLockVerdict(FALSE, QGA_SHELLPROC_PRESENT, FALSE, 0, QGA_WTS_SESSIONSTATE_UNKNOWN) == QGA_LOCK_NO_FACT);
+    check("a level the union does not document is NO_FACT even when its flags word reads LOCK",
+          QgaLockVerdict(TRUE, QGA_SHELLPROC_PRESENT, FALSE, 2, QGA_WTS_SESSIONSTATE_LOCK) == QGA_LOCK_NO_FACT);
+    check("WTS_SESSIONSTATE_LOCK is 0, so a ZEROED buffer reads as a lock unless the level is checked: level 0 + flags 0 -> NO_FACT",
+          QGA_WTS_SESSIONSTATE_LOCK == 0 && QgaLockVerdict(TRUE, QGA_SHELLPROC_PRESENT, FALSE, 0, 0) == QGA_LOCK_NO_FACT);
+    check("an UNLOCK reading is a fact and not a lock, whatever the shell facts say",
+          QgaLockVerdict(TRUE, QGA_SHELLPROC_UNREAD, FALSE, 1, QGA_WTS_SESSIONSTATE_UNLOCK) == QGA_LOCK_UNLOCKED &&
+          QgaLockVerdict(FALSE, QGA_SHELLPROC_ABSENT, FALSE, 1, QGA_WTS_SESSIONSTATE_UNLOCK) == QGA_LOCK_UNLOCKED &&
+          QgaLockVerdict(FALSE, QGA_SHELLPROC_PRESENT, FALSE, 1, QGA_WTS_SESSIONSTATE_UNLOCK) == QGA_LOCK_UNLOCKED);
+    check("a flags value that is neither LOCK nor UNLOCK is NO_FACT",
+          QgaLockVerdict(TRUE, QGA_SHELLPROC_PRESENT, FALSE, 1, QGA_WTS_SESSIONSTATE_UNKNOWN) == QGA_LOCK_NO_FACT &&
+          QgaLockVerdict(TRUE, QGA_SHELLPROC_PRESENT, FALSE, 1, 7) == QGA_LOCK_NO_FACT);
+    {
+        /* the invariants over the whole space: LOCKED needs no teardown, level 1, flags LOCK, and a shell either
+           SEEN or FOUND; PRE_SHELL needs the same reading with the shell neither seen nor found; an UNREAD
+           process on the LOCK-without-window path is NO_FACT and nothing else */
+        const DWORD flags[] = { QGA_WTS_SESSIONSTATE_LOCK, QGA_WTS_SESSIONSTATE_UNLOCK, QGA_WTS_SESSIONSTATE_UNKNOWN, 2 };
+        const QGA_SHELL_PROCESS procs[] = { QGA_SHELLPROC_UNREAD, QGA_SHELLPROC_ABSENT, QGA_SHELLPROC_PRESENT };
+        int lockedOnlyOneWay = 1, preShellOnlyOneWay = 1, unreadIsNoFact = 1, seen, ending;
+        DWORD lvl;
+        size_t fi, pi;
+        for (seen = 0; seen < 2; seen++)
+            for (ending = 0; ending < 2; ending++)
+                for (lvl = 0; lvl < 3; lvl++)
+                    for (fi = 0; fi < RTL_NUMBER_OF(flags); fi++)
+                        for (pi = 0; pi < RTL_NUMBER_OF(procs); pi++)
+                        {
+                            const QGA_LOCK_VERDICT lv = QgaLockVerdict(seen, procs[pi], ending, lvl, flags[fi]);
+                            const int lockRead = !ending && lvl == 1 && flags[fi] == QGA_WTS_SESSIONSTATE_LOCK;
+                            const int shouldLock = lockRead && (seen || procs[pi] == QGA_SHELLPROC_PRESENT);
+                            const int shouldPre = lockRead && !seen && procs[pi] == QGA_SHELLPROC_ABSENT;
+                            if ((lv == QGA_LOCK_LOCKED) != shouldLock) lockedOnlyOneWay = 0;
+                            if ((lv == QGA_LOCK_PRE_SHELL) != shouldPre) preShellOnlyOneWay = 0;
+                            if (lockRead && !seen && procs[pi] == QGA_SHELLPROC_UNREAD && lv != QGA_LOCK_NO_FACT) unreadIsNoFact = 0;
+                        }
+        check("invariant: LOCKED exactly when not ending AND level 1 AND flags LOCK AND (shell seen OR shell process present), over the whole space", lockedOnlyOneWay);
+        check("invariant: PRE_SHELL exactly when that reading has the shell neither seen nor found, over the whole space", preShellOnlyOneWay);
+        check("invariant: an UNREADABLE process list on the LOCK-without-window path is NO_FACT, never silent, never a lock", unreadIsNoFact);
+    }
 
     /* ---- 3. deaths: every undefined code, crash or not ---------------------------------------------------- */
     for (i = 0; i < RTL_NUMBER_OF(crashes); i++)
