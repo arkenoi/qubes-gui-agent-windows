@@ -316,6 +316,20 @@ int main(void)
     check("deslice: armed and past the deadline is due",
           QgaDesliceWarnDue(1000, 31000, 120000) == TRUE);
 
+    /* ---- which fault withheld the window: display path, or no desktop at all (2026-10-11) ---- */
+    /* NEVER MUTE, ONLY RE-ATTRIBUTE: every doubtful fact must fall through to the DISPLAY arm, so a
+     * wrong or unreadable shell reading can mislabel a report but never remove one. */
+    check("hold: a launch already fired -> display fault, whatever the shell facts say",
+          QgaHoldFaultCause(TRUE, FALSE, QGA_SHELLPROC_ABSENT) == QGA_HOLD_DISPLAY_FAULT);
+    check("hold: this desktop sees a shell -> display fault",
+          QgaHoldFaultCause(FALSE, TRUE, QGA_SHELLPROC_ABSENT) == QGA_HOLD_DISPLAY_FAULT);
+    check("hold: no shell window but a shell PROCESS exists -> display fault (the per-desktop trap)",
+          QgaHoldFaultCause(FALSE, FALSE, QGA_SHELLPROC_PRESENT) == QGA_HOLD_DISPLAY_FAULT);
+    check("hold: the process list could not be read -> display fault, never muted on a doubt",
+          QgaHoldFaultCause(FALSE, FALSE, QGA_SHELLPROC_UNREAD) == QGA_HOLD_DISPLAY_FAULT);
+    check("hold: no launch, no shell window, no shell process -> the guest has no desktop yet",
+          QgaHoldFaultCause(FALSE, FALSE, QGA_SHELLPROC_ABSENT) == QGA_HOLD_NO_SHELL);
+
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

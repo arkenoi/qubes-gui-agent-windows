@@ -468,3 +468,52 @@ static __inline BOOL QgaDesliceWarnDue(IN unsigned long long downSince, IN unsig
 #endif
     return (BOOL)(now >= nextWarn);
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * WHICH FAULT WITHHELD THIS WINDOW?  (QGADIRECTSUPPRESS vs the guest having no desktop yet)
+ *
+ * Owner, 2026-10-11: "if ANY app we start from qubes menu on a freshly booted VM causes a loud
+ * error, it is another P1." It can: qrexec serves an app the moment a session exists (measured
+ * 00:25:43.181) while the broker's one launch waits for a shell (00:25:59.623, 16.4 s later, ~40 s
+ * on another boot). A window mapped in that gap is withheld, and once both graces expire - 10 s for
+ * the window, 45 s for the broker measured from the AGENT'S start when no launch has fired - the
+ * suppression path declares a DISPLAY fault and tells dom0 "the per-window display path is not
+ * working". On a slow-shell boot (our own appvm cell allows explorer up to 180 s) that is false: the
+ * display path is fine, the guest simply has no desktop yet.
+ *
+ * NEVER MUTE, ONLY RE-ATTRIBUTE. Both arms are loud; only the cause differs. The no-shell arm needs
+ * all three facts to agree, and a fact that cannot be read falls through to the DISPLAY arm, so a
+ * wrong or unreadable reading can only ever MISLABEL a report, never remove one (Jev: never_quieter
+ * 0.94, quiet_on_normal_boot 0.96, can_a_window_stay_hidden 0.08). ShellWindowNow() alone is not
+ * enough - it is per-DESKTOP and reads NULL from a Winlogon-attached thread while explorer is alive
+ * on Default, the same trap the lock path hit this morning - hence the desktop-independent tri-state.
+ * RESIDUAL, named rather than hidden: the process fact looks for a shell process, so a guest running
+ * a REPLACED shell reads ABSENT while a shell exists, and the report is then mislabelled (Jev:
+ * wrong-cause-only 0.17). It stays loud, and DirectSuppressed - which means "a display fault
+ * withheld a window", and which acceptance asserts is 0 - is only incremented on the display arm.
+ */
+typedef enum _QGA_HOLD_CAUSE
+{
+    QGA_HOLD_DISPLAY_FAULT = 0,   /* the per-window path should have worked: the existing loud path */
+    QGA_HOLD_NO_SHELL             /* the broker could not have been launched: no desktop in the session */
+} QGA_HOLD_CAUSE;
+
+static __inline QGA_HOLD_CAUSE QgaHoldFaultCause(IN BOOL brokerLaunched, IN BOOL shellWindow,
+                                                 IN QGA_SHELL_PROCESS shellProcess)
+{
+#ifdef QGA_LIFECYCLE_DEFECT_NOSHELLMUTE
+    /* DEFECT: the no-shell arm is taken on the window fact alone, so a real display fault on a guest
+     * whose desktop is merely on another desktop handle is mislabelled - and with a muting arm it
+     * would have been silenced outright. */
+    (void)brokerLaunched; (void)shellProcess;
+    return shellWindow ? QGA_HOLD_DISPLAY_FAULT : QGA_HOLD_NO_SHELL;
+#else
+    if (brokerLaunched)                                  /* a launch fired: the broker's own problem */
+        return QGA_HOLD_DISPLAY_FAULT;
+    if (shellWindow)                                     /* this desktop sees a shell */
+        return QGA_HOLD_DISPLAY_FAULT;
+    if (shellProcess != QGA_SHELLPROC_ABSENT)            /* PRESENT or UNREAD: never mute on a doubt */
+        return QGA_HOLD_DISPLAY_FAULT;
+    return QGA_HOLD_NO_SHELL;
+#endif
+}
