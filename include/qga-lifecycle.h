@@ -513,3 +513,37 @@ static __inline BOOL QgaIsSessionShellImage(IN const wchar_t *image, IN const wc
 #endif
     return (BOOL)QgaWcsIEqAscii(image, L"explorer.exe");   /* the default shell, always still a shell */
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * A HOLD WHILE THE BROKER IS STILL STARTING IS NOT A FAULT.
+ *
+ * Owner, 2026-10-11, on what acceptance means: "acceptance criteria includes absence of
+ * notification noise", and his standing rule from 2026-10-08: "no warnings on normal operation.
+ * warning means something is not quite normal, yet workable."
+ *
+ * MEASURED on win11-app, the boot at 03:43:55, with a window opened 3.3 s before the broker was up:
+ *   03:44:06.737  W  BROKERHOLD hwnd 0x2002a holding last content ... brokerActive=0 slot=-1
+ *   03:44:07.700  W  BROKERHOLD hwnd 0x2002a ... brokerActive=0 slot=-1
+ *   03:44:10.526  I  WGCBROKER ready
+ *   03:44:10.576  W  BROKERLATEREG hwnd 0x2002a ... withheld until now
+ * Three WARNINGs for the designed path. The window was held correctly and delivered with pixels -
+ * nothing went wrong - but the log reports every cold boot as something to investigate, and those
+ * lines are counted as ours by the sweep.
+ *
+ * The emitter's own comment carries the wrong premise: "brokerActive=0 is always the latter [a feed
+ * loss to investigate]". It is not. The broker's one launch waits for a shell, so on EVERY cold boot
+ * there is a window - measured 10.8-11.6 s on an AppVM, 1.4-4.3 s on a StandaloneVM - in which
+ * brokerActive=0 means "it has not started yet", which is normal. A broker that WAS ready and went
+ * away is the fault, and the agent already distinguishes them.
+ */
+static __inline BOOL QgaHoldIsStartup(IN BOOL brokerActive, IN BOOL brokerEverReadyThisAgent)
+{
+    if (brokerActive)
+        return FALSE;                       /* not a hold for want of a broker at all */
+#ifndef QGA_LIFECYCLE_DEFECT_HOLDALWAYSLOUD
+    return (BOOL)(!brokerEverReadyThisAgent);   /* never ready yet = still starting = normal */
+#else
+    (void)brokerEverReadyThisAgent;         /* DEFECT: every hold is a fault, so normal boots shout */
+    return FALSE;
+#endif
+}

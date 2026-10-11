@@ -328,6 +328,16 @@ int main(void)
     check("shell: an unreadable configured value never narrows - explorer still matches",
           QgaIsSessionShellImage(L"explorer.exe", L"kioskapp.exe") == TRUE);
 
+    /* ---- a hold while the broker is still starting is not a fault (2026-10-11) ---- */
+    check("hold: broker never ready yet -> STARTUP, the designed path on every cold boot",
+          QgaHoldIsStartup(FALSE, FALSE) == TRUE);
+    check("hold: broker WAS ready and is gone -> a fault, loud as before",
+          QgaHoldIsStartup(FALSE, TRUE) == FALSE);
+    check("hold: broker active and the window still holds -> a fault, loud as before",
+          QgaHoldIsStartup(TRUE, TRUE) == FALSE);
+    check("hold: broker active but never recorded ready -> still not a startup hold",
+          QgaHoldIsStartup(TRUE, FALSE) == FALSE);
+
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

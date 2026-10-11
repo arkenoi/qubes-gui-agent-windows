@@ -8782,9 +8782,20 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             const BOOL suppressed = windowData->PwDirectSuppressed;
             windowData->PwSliceNeedsFull = TRUE;   // its first frame must be a full copy
             if (BrokerRegister(windowData))
-                LogWarning("BROKERLATEREG hwnd 0x%x registered with the broker LATE at %ux%u - it was added while the "
-                    L"broker could not take it, and was withheld until now", (DWORD)(ULONG_PTR)windowData->Handle,
-                    windowData->PwWidth, windowData->PwHeight);
+            {
+                // SAME RULE AS BROKERHOLD: a window added before the broker had started, registered
+                // the moment it became ready, is the designed path on every cold boot - the owner's
+                // rule is no warnings on normal operation. Registering late because the broker DIED
+                // and came back is a different thing and stays loud.
+                if (QgaHoldIsStartup(FALSE, g_BrokerReadyAt != 0))
+                    LogInfo("BROKERLATEREG hwnd 0x%x registered with the broker at %ux%u - it was added before the "
+                        L"broker had started and was withheld until now", (DWORD)(ULONG_PTR)windowData->Handle,
+                        windowData->PwWidth, windowData->PwHeight);
+                else
+                    LogWarning("BROKERLATEREG hwnd 0x%x registered with the broker LATE at %ux%u - it was added while the "
+                        L"broker could not take it, and was withheld until now", (DWORD)(ULONG_PTR)windowData->Handle,
+                        windowData->PwWidth, windowData->PwHeight);
+            }
             else
                 windowData->PwDirectSuppressed = suppressed;
         }
@@ -12090,10 +12101,23 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     if (!entry->PwHoldLogged)   // one-shot diagnostic per window
                     {
                         entry->PwHoldLogged = TRUE;
-                        // WARNING, not INFO: on an eligible guest a hold is either the normal
-                        // sub-second wait for a first frame or a feed loss to investigate, and
-                        // the log has to name which. brokerActive=0 is always the latter.
-                        LogWarning("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
+                        // THE LEVEL SAYS WHICH KIND OF HOLD THIS IS. The old comment here claimed
+                        // "brokerActive=0 is always the latter [a feed loss]" - it is not. The
+                        // broker's one launch waits for a shell, so EVERY cold boot has a window
+                        // (measured 10.8-11.6 s on an AppVM, 1.4-4.3 s on a StandaloneVM) in which
+                        // brokerActive=0 means "not started yet", and a window held through it is
+                        // the designed path, not something to investigate. Three WARNINGs per
+                        // cold boot for correct behaviour is the noise the owner refuses. A broker
+                        // that WAS ready and went away is still a fault, still loud.
+                        if (QgaHoldIsStartup(WgcBrokerActive(), g_BrokerReadyAt != 0))
+                            LogInfo("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
+                                L"brokerActive=0 sourced=%d slot=%d - the broker has not started yet "
+                                L"(it waits for a shell); the window is withheld until its first frame",
+                                (DWORD)(ULONG_PTR)entry->Handle,
+                                pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
+                                entry->PwBrokerSourced, entry->PwBrokerSlot);
+                        else
+                            LogWarning("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
                                 L"brokerActive=%d sourced=%d slot=%d (direct required: composite "
                                 L"fallback refused)",
                                 (DWORD)(ULONG_PTR)entry->Handle,
