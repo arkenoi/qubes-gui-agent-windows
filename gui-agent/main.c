@@ -8797,8 +8797,15 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // by a healthy boot. The first attempt at this gate asked whether the broker was
                 // ready - which it always is here, by construction - and was inert.
                 if (QgaLateRegIsStartup(refusedWhileUp, hadSlotBefore))
-                    LogInfo("BROKERLATEREG hwnd 0x%x registered with the broker at %ux%u - it was added before the "
-                        L"broker had started and was withheld until now", (DWORD)(ULONG_PTR)windowData->Handle,
+                    // SAYS ONLY WHAT IT KNOWS. The earlier wording asserted "it was added before the
+                    // broker had started", which these two facts do not establish: BrokerRegister
+                    // also returns early for a window of zero size (main.c's Width/Height guard)
+                    // with the broker ACTIVE, and such a window, once it has dimensions, reaches
+                    // here with both facts FALSE. The level is still right - nothing failed - but
+                    // the cause would have been misattributed, which is the QGADESKSTUCK mistake
+                    // (a line printing two facts its predicate never looked at).
+                    LogInfo("BROKERLATEREG hwnd 0x%x registered with the broker at %ux%u - it was withheld "
+                        L"until the broker could take it", (DWORD)(ULONG_PTR)windowData->Handle,
                         windowData->PwWidth, windowData->PwHeight);
                 else
                     LogWarning("BROKERLATEREG hwnd 0x%x registered with the broker LATE at %ux%u - a running broker "
