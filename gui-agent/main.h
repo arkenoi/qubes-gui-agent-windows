@@ -386,6 +386,11 @@ typedef struct _WINDOW_DATA
     // re-attach: it is what tells a late registration after the broker DIED (loud - a working
     // component stopped) from the cold-boot one where the broker had simply not started yet
     // (quiet - the designed path). See QgaLateRegIsStartup.
+    // IT SURVIVES THE RESYNC PASS because UpdateWindowData measures into a LOCAL scratch
+    // WINDOW_DATA (GetWindowData ZeroMemory's whatever it is handed) and then copies named fields
+    // onto the tracked entry one at a time. Adding this field to that copy list, or replacing it
+    // with a struct assignment, would zero this bit every pass and make BROKERLATEREG loud again
+    // on every cold boot.
     BOOL      PwBrokerEverSourced;
 
     // One-shot log: the raise-on-foreground corrective was skipped for this window because it has
