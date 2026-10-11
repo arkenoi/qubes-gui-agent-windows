@@ -106,6 +106,24 @@ static void Check(const char* name, int ok)
     if (!ok) g_fail++;
     printf("%s %s\n", ok ? "ok  " : "FAIL", name);
 }
+/* A COUNT, WITH THE COUNT PRINTED. "logged ONCE" failing says nothing about which way it went,
+ * and the two directions have opposite causes: 2+ is a log storm, 0 is usually that the text was
+ * REWORDED out from under the needle. That is what happened on 2026-10-10: the message-plain-and-
+ * short pass lowercased "NOT PRESENT" and dropped "CreateProcess", three checks here went to 0,
+ * and build.yml stayed red for 14 runs because its conclusion was never read (the receipts were
+ * taken off release-package, a different workflow). A zero now names itself. */
+static void CheckCount(const char* name, const char* needle, unsigned got, unsigned want)
+{
+    g_run++;
+    if (got != want) g_fail++;
+    if (got == want)
+        printf("ok   %s\n", name);
+    else if (got == 0)
+        printf("FAIL %s: '%s' was NEVER logged (want %u) - reworded out from under this check?\n",
+               name, needle, want);
+    else
+        printf("FAIL %s: '%s' logged %u time(s), want %u\n", name, needle, got, want);
+}
 static void CheckDecision(const char* name, QerrDecision got, QerrDecision want)
 {
     g_run++;
@@ -401,7 +419,9 @@ int main(void)
               strncmp(g_lastNotify, "A chrome window stopped updating\r\n", 34) == 0 && FileExists("gui-agent.capture-deaf-chrome"));
         g_logN = 0;
         CheckDecision("row send: a missing row is refused, never dereferenced", QerrReportText(NULL, NULL, NULL), QERR_REJECT_NAME);
-        Check("row send: the missing row is logged as a bug of ours", LogCount("notifytexts.h") == 1);
+        CheckCount("row send: the missing row is logged as a bug of ours",
+                   "QGANOTIFYERR notification text row missing",
+                   LogCount("QGANOTIFYERR notification text row missing"), 1);
         /* the image's version unreadable at Init: the row still sends, and the line says the build is unknown */
         QerrTestBuild = NULL;
         QerrInit(1, g_dir);
@@ -438,14 +458,20 @@ int main(void)
           g_boxes == 1 && strcmp(g_lastBoxHeader, "The GUI agent crashed") == 0 && strcmp(g_lastBoxText, "The GUI agent crashed\r\ny\r\nz") == 0);
     (void)QerrReport("gui-agent", "b", QERR_SEV_ACTION, "x", "y", NULL, "z");
     (void)QerrReport("gui-agent", "c", QERR_SEV_ACTION, "x", "y", NULL, "z");
-    Check("fail-open: three failures, the missing exe logged ONCE", LogCount("NOT PRESENT") == 1);
+    CheckCount("fail-open: three failures, the missing exe logged ONCE",
+               "notifhost.exe not present", LogCount("notifhost.exe not present"), 1);
     Check("fail-open: three distinct errors, three windows (each under its own per-boot record)", g_boxes == 3);
     CheckDecision("fail-open: the same error again is a duplicate - no second window", QerrReport("gui-agent", "a", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_SUPPRESS_DUP);
     Check("fail-open: still three windows", g_boxes == 3);
     QerrTestSpawnHook = SpawnFail;
     (void)QerrReport("gui-agent", "d", QERR_SEV_ACTION, "x", "y", NULL, "z");
     (void)QerrReport("gui-agent", "e", QERR_SEV_ACTION, "x", "y", NULL, "z");
-    Check("fail-open: spawn failures logged ONCE", LogCount("CreateProcess") == 1);
+    /* TAG-PREFIXED on purpose: the bare phrase is ALSO the reason string handed to the fallback
+     * window, so it appears once per window shown and the count was 3. The needle has to be unique
+     * to the emitter whose once-ness is being asserted. */
+    CheckCount("fail-open: spawn failures logged ONCE",
+               "NOTIFYERR notifhost could not be started",
+               LogCount("NOTIFYERR notifhost could not be started"), 1);
     Check("fail-open: a spawn failure shows the window too", g_boxes == 5);
     QerrTestBoxHook = BoxFail;
     (void)QerrReport("gui-agent", "f-nobox", QERR_SEV_ACTION, "x", "y", NULL, "z");
