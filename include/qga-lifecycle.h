@@ -549,6 +549,45 @@ static __inline BOOL QgaHoldIsStartup(IN BOOL brokerActive, IN BOOL brokerEverRe
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * WAS THIS LATE REGISTRATION THE DESIGNED COLD-BOOT PATH?  (BROKERLATEREG's level)
+ *
+ * A window added while the broker had not started yet gets no slot, is withheld, and is registered
+ * by the periodic resync the moment the broker becomes ready. That is the designed path and happens
+ * on EVERY cold boot, so it may not be a warning.
+ *
+ * THE MISTAKE THIS REPLACES, worth keeping because it is the third of its kind in two days: the
+ * first version asked QgaHoldIsStartup(FALSE, g_BrokerReadyAt != 0) here. Late registration only
+ * SUCCEEDS once the broker is ready, so g_BrokerReadyAt is non-zero at every call and the quiet
+ * branch was unreachable - the fix read as applied, the guest still logged W, and only the receipt
+ * caught it (2026-10-11). A predicate fed a fact that is constant at its call site is inert.
+ *
+ * The two facts that do vary, both true AT THE TIME the window went without a slot:
+ *   refusedByActiveBroker - an ACTIVE broker had no free slot or no arena room for it
+ *                           (PwRegFailLogged, snapshotted before the retry clears it). The broker
+ *                           was there and said no: that is the capacity fault QGABROKERREGFAIL
+ *                           already shouts about, and the late registration is its tail.
+ *   everSourcedThisWindow - the window HELD a slot earlier in its life and lost it, which on this
+ *                           path means the broker died and was relaunched. A component that was
+ *                           working and stopped is a failure, reported loudly, never quietly
+ *                           recovered from (CLAUDE.md, capabilities are decided at start).
+ * Neither true = the window was never registered and was never refused, so the only thing that was
+ * missing is a broker that had not started yet. Quiet.
+ */
+static __inline BOOL QgaLateRegIsStartup(IN BOOL refusedByActiveBroker, IN BOOL everSourcedThisWindow)
+{
+#ifndef QGA_LIFECYCLE_DEFECT_LATEREGALWAYSLOUD
+    if (refusedByActiveBroker)
+        return FALSE;                       /* the broker was up and had no room: a capacity fault */
+    if (everSourcedThisWindow)
+        return FALSE;                       /* it had a slot and lost it: the broker died */
+    return TRUE;                            /* never registered, never refused: still starting */
+#else
+    (void)refusedByActiveBroker; (void)everSourcedThisWindow;
+    return FALSE;                           /* DEFECT: every cold boot warns about correct behaviour */
+#endif
+}
+
+/* ---------------------------------------------------------------------------------------------
  * IS THIS WINDOW'S FAULT CLOCK ACTUALLY DUE?  (QGADIRECTSUPPRESS and the dom0 notice it sends)
  *
  * MEASURED on win11-app, 2026-10-11, a window opened ~29 s before the broker became ready:

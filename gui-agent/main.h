@@ -378,7 +378,15 @@ typedef struct _WINDOW_DATA
     // has been eligible this long without a painted frame - before that it is simply young,
     // which is a defined state, not a defect. 0 = not eligible yet.
     ULONGLONG PwDirectSince;
+    // Also LOAD-BEARING for a log LEVEL: BROKERLATEREG reads it to tell an active broker's refusal
+    // (a fault) from a broker that had not started (normal). Changing when this is set changes that
+    // level - the lifecycle selftest's main_latereg_level shape check pins the pair together.
     BOOL      PwRegFailLogged;   // QGABROKERREGFAIL said once for this window (cleared by a successful registration)
+    // This window has HELD a broker slot at some point in its life. Never cleared, not even by a
+    // re-attach: it is what tells a late registration after the broker DIED (loud - a working
+    // component stopped) from the cold-boot one where the broker had simply not started yet
+    // (quiet - the designed path). See QgaLateRegIsStartup.
+    BOOL      PwBrokerEverSourced;
 
     // One-shot log: the raise-on-foreground corrective was skipped for this window because it has
     // its own per-window buffer (the corrective is a slice-era stacking workaround).

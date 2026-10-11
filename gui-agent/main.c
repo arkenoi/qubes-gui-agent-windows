@@ -4904,6 +4904,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&h->ControlGen);
     entry->PwBrokerSlot = slot; entry->PwBrokerSourced = TRUE; entry->PwBrokerArenaOff = off0;
+    entry->PwBrokerEverSourced = TRUE;   // sticky for this window's life (QgaLateRegIsStartup)
     g_SlotQuietSeen[slot] = s->QuietReroutes;   // QGAWGCRECREATE baseline for this window
     g_SlotClosedSeen[slot] = s->ItemClosed;     // QGAWGCITEMCLOSED baseline for this window
     BrokerRequestSent(slot);
@@ -8780,21 +8781,30 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             // must leave it as it was, or the suppress report below - an error line, a registry counter and a user
             // notification - would fire again on every resync.
             const BOOL suppressed = windowData->PwDirectSuppressed;
+            // SNAPSHOT BEFORE THE RETRY, because a successful BrokerRegister clears PwRegFailLogged
+            // and sets PwBrokerEverSourced - read afterwards, both would describe the retry rather
+            // than the outage it is the tail of.
+            const BOOL refusedWhileUp = windowData->PwRegFailLogged;
+            const BOOL hadSlotBefore  = windowData->PwBrokerEverSourced;
             windowData->PwSliceNeedsFull = TRUE;   // its first frame must be a full copy
             if (BrokerRegister(windowData))
             {
-                // SAME RULE AS BROKERHOLD: a window added before the broker had started, registered
-                // the moment it became ready, is the designed path on every cold boot - the owner's
-                // rule is no warnings on normal operation. Registering late because the broker DIED
-                // and came back is a different thing and stays loud.
-                if (QgaHoldIsStartup(FALSE, g_BrokerReadyAt != 0))
+                // SAME RULE AS BROKERHOLD, asked of the right facts. A window added before the
+                // broker had started, registered the moment it became ready, is the designed path on
+                // every cold boot - no warnings on normal operation. Registering late because an
+                // ACTIVE broker had no room for it, or because the broker DIED and came back, is a
+                // fault and stays loud; the loud line below names that, so it must not be reached
+                // by a healthy boot. The first attempt at this gate asked whether the broker was
+                // ready - which it always is here, by construction - and was inert.
+                if (QgaLateRegIsStartup(refusedWhileUp, hadSlotBefore))
                     LogInfo("BROKERLATEREG hwnd 0x%x registered with the broker at %ux%u - it was added before the "
                         L"broker had started and was withheld until now", (DWORD)(ULONG_PTR)windowData->Handle,
                         windowData->PwWidth, windowData->PwHeight);
                 else
-                    LogWarning("BROKERLATEREG hwnd 0x%x registered with the broker LATE at %ux%u - it was added while the "
-                        L"broker could not take it, and was withheld until now", (DWORD)(ULONG_PTR)windowData->Handle,
-                        windowData->PwWidth, windowData->PwHeight);
+                    LogWarning("BROKERLATEREG hwnd 0x%x registered with the broker LATE at %ux%u - a running broker "
+                        L"could not take it (refused=%d hadSlot=%d); it was withheld until now",
+                        (DWORD)(ULONG_PTR)windowData->Handle, windowData->PwWidth, windowData->PwHeight,
+                        refusedWhileUp, hadSlotBefore);
             }
             else
                 windowData->PwDirectSuppressed = suppressed;

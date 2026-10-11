@@ -338,6 +338,19 @@ int main(void)
     check("hold: broker active but never recorded ready -> still not a startup hold",
           QgaHoldIsStartup(TRUE, FALSE) == FALSE);
 
+    /* ---- a LATE registration: which outage was it the tail of? (2026-10-11) ----
+     * The first fix here asked QgaHoldIsStartup(FALSE, brokerReady) at a site where brokerReady is
+     * true by construction, so the quiet branch was unreachable and the guest kept logging W. These
+     * drive both facts that actually vary. */
+    check("latereg: never refused, never had a slot -> the broker had not started: quiet",
+          QgaLateRegIsStartup(FALSE, FALSE) == TRUE);
+    check("latereg: a RUNNING broker refused it (no slot / arena full) -> capacity fault, loud",
+          QgaLateRegIsStartup(TRUE, FALSE) == FALSE);
+    check("latereg: it HELD a slot and lost it -> the broker died, loud",
+          QgaLateRegIsStartup(FALSE, TRUE) == FALSE);
+    check("latereg: refused AND previously sourced -> loud",
+          QgaLateRegIsStartup(TRUE, TRUE) == FALSE);
+
     /* ---- the per-window fault clock cannot start before the broker can feed it (2026-10-11) ---- */
     /* THE MEASURED CASE: registered at 1000 while the broker was still coming up, ready only at
      * 26000; at 30000 the window is 29 s old but has had the broker for 4 s - not a fault yet. */
