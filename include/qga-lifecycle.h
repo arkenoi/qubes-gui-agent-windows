@@ -547,3 +547,46 @@ static __inline BOOL QgaHoldIsStartup(IN BOOL brokerActive, IN BOOL brokerEverRe
     return FALSE;
 #endif
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * IS THIS WINDOW'S FAULT CLOCK ACTUALLY DUE?  (QGADIRECTSUPPRESS and the dom0 notice it sends)
+ *
+ * MEASURED on win11-app, 2026-10-11, a window opened ~29 s before the broker became ready:
+ *   09:38:09.121  BROKERHOLD hwnd 0x10094 ... brokerActive=0 slot=-1     (held, correctly)
+ *   06:38:35.047  E QGADIRECTSUPPRESS hwnd 0x10094 (class Notepad, 1428x783) NOT SHOWN: never
+ *                 received a frame ... (sliceFed=1 brokerSourced=1 slot=0 brokerActive=1
+ *                 DirectSuppressed=1)
+ *   06:38:35.064  DirectSuppressNotifyUser: user notification sent (1 suppressed window(s))
+ *   ~11 s later   dom0 shows that window at 1428x783, mean 0.9906 - WHITE, correct, never black
+ * So dom0 was told "a window could not be shown - the per-window display path is not working" about
+ * a window that was fine, and DirectSuppressed - which acceptance asserts is 0 - was incremented on
+ * a healthy guest.
+ *
+ * WHY. The window's own grace runs "from REGISTRATION", and the window was registered into a broker
+ * that had only just become active and was not yet feeding anything. The comment above the old code
+ * says the two clocks exist so that "a window freshly registered with a READY broker" is not
+ * mistaken for one the broker can never capture - but the registration happened while the broker was
+ * still coming up, so the window's 10 s was already spent by the time the broker could feed it.
+ *
+ * THE RULE: the per-window clock cannot start before the broker is in a position to feed it. It runs
+ * from the LATER of the window's registration and the moment the broker became ready. If the broker
+ * has never been ready (readyAt == 0), the clock runs from registration exactly as before, so a
+ * broker that never arrives still ends in a bounded, loud fault - QGADESLICEDOWN names that case,
+ * and nothing here can hide it.
+ */
+static __inline BOOL QgaWindowFaultDue(IN unsigned long long registeredAt, IN unsigned long long brokerReadyAt,
+                                       IN unsigned long long now, IN unsigned long long graceMs)
+{
+    unsigned long long from;
+    if (registeredAt == 0)
+        return FALSE;                       /* never registered: no clock, nothing to declare */
+#ifndef QGA_LIFECYCLE_DEFECT_FAULTFROMREG
+    from = (brokerReadyAt > registeredAt) ? brokerReadyAt : registeredAt;
+#else
+    (void)brokerReadyAt;                    /* DEFECT: the clock runs from registration even when the
+                                             * broker could not feed the window yet - the false
+                                             * "a window could not be shown" measured on 2026-10-11 */
+    from = registeredAt;
+#endif
+    return (BOOL)(now > from && (now - from) >= graceMs);
+}

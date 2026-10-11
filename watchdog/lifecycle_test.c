@@ -338,6 +338,22 @@ int main(void)
     check("hold: broker active but never recorded ready -> still not a startup hold",
           QgaHoldIsStartup(TRUE, FALSE) == FALSE);
 
+    /* ---- the per-window fault clock cannot start before the broker can feed it (2026-10-11) ---- */
+    /* THE MEASURED CASE: registered at 1000 while the broker was still coming up, ready only at
+     * 26000; at 30000 the window is 29 s old but has had the broker for 4 s - not a fault yet. */
+    check("fault: registered before the broker was ready -> the grace runs from broker-ready",
+          QgaWindowFaultDue(1000, 26000, 30000, 10000) == FALSE);
+    check("fault: and it IS due once the grace has run since broker-ready",
+          QgaWindowFaultDue(1000, 26000, 37000, 10000) == TRUE);
+    check("fault: registered with a broker already ready -> the grace runs from registration",
+          QgaWindowFaultDue(26000, 1000, 37000, 10000) == TRUE);
+    check("fault: inside the grace is never due",
+          QgaWindowFaultDue(26000, 1000, 30000, 10000) == FALSE);
+    check("fault: a broker that was NEVER ready does not postpone the report",
+          QgaWindowFaultDue(1000, 0, 12000, 10000) == TRUE);
+    check("fault: a window never registered has no clock at all",
+          QgaWindowFaultDue(0, 1000, 99000, 10000) == FALSE);
+
     printf("%d checks, %d failed\n", g_run, g_fail);
     return g_fail ? 1 : 0;
 }

@@ -8939,9 +8939,16 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             // This costs nothing in responsiveness: the window still maps the moment its first
             // painted frame arrives (DirectWouldShowBlack goes false and the arm below maps it).
             // The grace delays only the DECLARATION of a fault, never the display of a window.
+            // THE CLOCK CANNOT START BEFORE THE BROKER CAN FEED THE WINDOW (QgaWindowFaultDue).
+            // Measured 2026-10-11: a window registered while the broker was still coming up had its
+            // 10 s spent before the broker served anything, so the moment the broker went active the
+            // agent declared a display fault and sent dom0 "a window could not be shown" - about a
+            // window that appeared, correct and white, 11 s later. The clock now runs from the LATER
+            // of registration and broker-ready; with no broker ever ready it runs from registration
+            // exactly as before, so a broker that never arrives is still reported.
             ULONGLONG dsince = windowData->PwDirectSince;
-            BOOL windowYoung = (dsince == 0) ||
-                               ((GetTickCount64() - dsince) < DIRECT_WINDOW_GRACE_MS);
+            BOOL windowYoung = !QgaWindowFaultDue(dsince, g_BrokerReadyAt, GetTickCount64(),
+                                                  (ULONGLONG)DIRECT_WINDOW_GRACE_MS);
             if (BrokerState() == BRK_STARTING || windowYoung)
             {
                 if (!windowData->PwDirectWaitLogged)
