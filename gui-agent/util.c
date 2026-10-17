@@ -26,6 +26,7 @@
 
 #include "common.h"
 #include "main.h"
+#include "util.h"   // its own declarations: FOREGROUND_HOW / ApplyForeground live here
 #include "resource.h"
 
 #include <log.h>

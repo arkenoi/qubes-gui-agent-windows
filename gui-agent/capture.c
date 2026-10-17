@@ -753,6 +753,12 @@ static void XcLogger(IN XENCONTROL_LOG_LEVEL logLevel, IN const char* function, 
 {
     wchar_t buf[1024];
 
+    // ONE LINE IS DROPPED HERE, and only one: xencontrol's per-notify Debug line, measured at 118
+    // identical copies in a single run. See QgaXcLineKept - the drop is at this callback rather
+    // than by capping xencontrol's level, because the cap would also hide its grant and map lines.
+    if (!QgaXcLineKept((int)logLevel, function))   // GUARD:xcnotify
+        return;
+
     StringCbVPrintfW(buf, sizeof(buf), format, args);
     // XC log levels are the same as ours
     _LogFormat(logLevel, /*raw=*/FALSE, function, buf);

@@ -427,6 +427,87 @@ int main(void)
         check("start invariant: dom0's live window is preferred to the desktop fallback", badPref == 0);
     }
 
+    /* ---- the settings matrix, and the COMPANION half of "fully suppressed" (2026-10-17) ----
+     * A 25H2 Start opening brings up two surfaces: StartMenuExperienceHost's, and a SearchHost one
+     * carrying the search box ('Suche' on the German guest, 800x750). Refusing only the first left
+     * the second on dom0's screen. The stock rule for this compared the handle to a caption lookup
+     * (FindWindow(..., L"Search")) - measured 0x0 on that guest while the caption is 'Suche', so it
+     * never fired on the configuration the defect came from.
+     * hiddenStartOpen is the ONLY fact separating the companion from a standalone Win+S Search the
+     * user asked for and must get, so the suite drives both directions. */
+    {
+        /* the four shipped cells x the surface kinds */
+        check("surface: non-seamless presents everything, Start included",
+              QgaShellSurfacePolicy(FALSE, FALSE, QGA_SURFACE_KIND_START, FALSE) == QGA_SURFACE_PRESENT);
+        check("surface: SeamlessStart=1 presents the Start surface",
+              QgaShellSurfacePolicy(TRUE, TRUE, QGA_SURFACE_KIND_START, FALSE) == QGA_SURFACE_PRESENT);
+        check("surface: seamless + SeamlessStart=0 refuses the Start surface",
+              QgaShellSurfacePolicy(TRUE, FALSE, QGA_SURFACE_KIND_START, FALSE) == QGA_SURFACE_REFUSE_START);
+        check("surface: the Search companion OF a hidden Start opening is refused",
+              QgaShellSurfacePolicy(TRUE, FALSE, QGA_SURFACE_KIND_SEARCH, TRUE) == QGA_SURFACE_REFUSE_COMPANION);
+        check("surface: a STANDALONE Search is presented - the user asked for it",
+              QgaShellSurfacePolicy(TRUE, FALSE, QGA_SURFACE_KIND_SEARCH, FALSE) == QGA_SURFACE_PRESENT);
+        check("surface: a toast is presented whatever Start is doing",
+              QgaShellSurfacePolicy(TRUE, FALSE, QGA_SURFACE_KIND_TOAST, TRUE) == QGA_SURFACE_PRESENT);
+        check("surface: SeamlessStart=1 presents the companion too",
+              QgaShellSurfacePolicy(TRUE, TRUE, QGA_SURFACE_KIND_SEARCH, TRUE) == QGA_SURFACE_PRESENT);
+        /* whole space: nothing is refused outside seamless, and only Start/Search are ever refused */
+        {
+            int badOutside = 0, badKind = 0, n = 0;
+            for (int sm = 0; sm < 2; sm++)
+            for (int ss = 0; ss < 2; ss++)
+            for (int k = 0; k <= QGA_SURFACE_KIND_SEARCH; k++)
+            for (int ho = 0; ho < 2; ho++)
+            {
+                const QGA_SURFACE_POLICY p = QgaShellSurfacePolicy((BOOL)sm, (BOOL)ss, k, (BOOL)ho);
+                n++;
+                if (p != QGA_SURFACE_PRESENT && (!sm || ss)) badOutside++;
+                if (p != QGA_SURFACE_PRESENT && k != QGA_SURFACE_KIND_START && k != QGA_SURFACE_KIND_SEARCH) badKind++;
+            }
+            check("surface invariant: every cell driven", n == 32);
+            check("surface invariant: nothing is refused outside seamless-with-SeamlessStart=0", badOutside == 0);
+            check("surface invariant: only Start and Search surfaces are ever refused", badKind == 0);
+        }
+    }
+
+    /* ---- the card rule follows the KIND, and Search gets NO rule (2026-10-17) ----
+     * MEASURED, the same Search window at its two raw sizes:
+     *   raw 800x798 -> largest=(2364,655) 774x724   union=(2363,655) 775x777
+     *   raw 800x750 -> largest=(2196,687) 728x32    union=(2196,687) 728x32
+     * At the smaller size BOTH candidates collapse to the same 728x32 sliver - the search input
+     * field, not the card - so a crop from either would clip the flyout. Jev on those walk lines:
+     * neither-announce-uncropped 0.72. The selector used to be one BOOL ("is it a menu popup"), so
+     * every non-menu surface got the TOAST rule by construction. */
+    {
+        check("card: a menu popup uses the union rule",
+              QgaCardRuleForSurface(QGA_SURFACE_KIND_NONE, TRUE) == QGA_CARD_RULE_MENU_UNION);
+        check("card: a toast uses the largest rule",
+              QgaCardRuleForSurface(QGA_SURFACE_KIND_TOAST, FALSE) == QGA_CARD_RULE_TOAST_LARGEST);
+        check("card: the 25H2 Start card is still found by the largest rule",
+              QgaCardRuleForSurface(QGA_SURFACE_KIND_START, FALSE) == QGA_CARD_RULE_TOAST_LARGEST);
+        check("card: a Search flyout gets NO rule - both candidates collapse at one raw size",
+              QgaCardRuleForSurface(QGA_SURFACE_KIND_SEARCH, FALSE) == QGA_CARD_RULE_NONE);
+        check("card: a menu popup wins over the kind",
+              QgaCardRuleForSurface(QGA_SURFACE_KIND_SEARCH, TRUE) == QGA_CARD_RULE_MENU_UNION);
+        check("card: an unclassified surface gets no rule",
+              QgaCardRuleForSurface(QGA_SURFACE_KIND_NONE, FALSE) == QGA_CARD_RULE_NONE);
+    }
+
+    /* ---- xencontrol's per-notify Debug line is dropped at our callback (2026-10-17) ----
+     * MEASURED: 118 identical "XcEvtchnNotify: LocalPort: 19" lines at Debug in one run - a line
+     * per vchan notification, i.e. one per success. Dropped at the callback rather than by capping
+     * xencontrol's level, which would also hide its grant and map lines. 4 == LOG_LEVEL_DEBUG. */
+    {
+        check("xc: the per-notify Debug line is dropped",
+              QgaXcLineKept(4, "XcEvtchnNotify") == FALSE);
+        check("xc: that same function at WARNING is KEPT - a failing notify path is not suppressed",
+              QgaXcLineKept(2, "XcEvtchnNotify") == TRUE);
+        check("xc: another function at Debug is kept (the level is not capped)",
+              QgaXcLineKept(4, "XcGnttabPermitForeignAccess") == TRUE);
+        check("xc: a NULL function name is kept - never drop what cannot be identified",
+              QgaXcLineKept(4, NULL) == TRUE);
+    }
+
     /* ---- BROKERHOLD's level follows its REASON (2026-10-17) ----
      * BrokerFreshFrame refuses a frame for eleven reasons and now names which. Exactly ONE is
      * normal: a slot the broker has registered but not yet published to, which carries

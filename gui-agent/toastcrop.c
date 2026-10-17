@@ -33,6 +33,7 @@
 #include "toastcrop-pick.h"
 #include "toasthold.h"   // ToastHoldApplyIdentity: identity reads ride this module's UIA worker
 #include "toastident.h"  // the card's AutomationId predicates (TiIsSenderAutomationId & co.), pure, no linkage
+#include "qga-lifecycle.h"   // QgaCardRuleForSurface: which card rule measures which surface kind
 
 #include <log.h>
 #include <config.h>
@@ -1441,6 +1442,23 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
     // window rect, all measured + cropped by the same generic TcFindCardRect card finder.
     if (!IsShellToastWindow(data) && !IsMenuPopupWindow(data))
         return FALSE;
+
+    // ...EXCEPT A KIND WITH NO RELIABLE CARD. The rule used to be chosen by one BOOL ("is it a menu
+    // popup"), so every non-menu surface got the TOAST rule by construction - including a Search
+    // flyout, which is not a toast. MEASURED on the German 25H2 guest, the same Search window at
+    // its two raw sizes: at 800x798 the walk finds a plausible card (largest 774x724, union
+    // 775x777), but at 800x750 BOTH candidates collapse to the same 728x32 sliver - the search
+    // input field. A crop from either would clip the flyout, and the sticky last-good crop then
+    // carries a wrong one. Jev on those walk lines alone: neither-announce-uncropped 0.72.
+    // So no measurement is queued: the window is announced UNCROPPED, which is this module's
+    // normal fail-soft. The cost is stated rather than hidden - the flyout shows its ~13 px shadow
+    // margin, which is worse pixels than a correct crop and better than a clipped window. It also
+    // ends seven "cropped size 728x32 below the floor" warnings per run.
+    if (QgaCardRuleForSurface((int)ShellSurfaceKind(data), IsMenuPopupWindow(data)) == QGA_CARD_RULE_NONE)   // GUARD:cardrule
+    {
+        LogDebug("0x%x: no crop rule for this surface kind - announced uncropped", data->Handle);
+        return FALSE;
+    }
 
     // A WINDOW SMALLER THAN THE CROP FLOOR CAN NEVER YIELD A CARD: a card lies inside its window and TcValidateInsets
     // refuses any crop below the floor (the same floor, computed the same way). So no measurement is queued for it. These

@@ -2000,7 +2000,15 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     // yields zero insets, which leaves the rect exactly as it is today. The same crop also
     // squares Win11 WinUI MENUS (IsMenuPopupWindow) - their transparent shadow margin shows as
     // black when the menu materializes as its own dom0 window (not synthesized into an owner).
-    if (IsShellToastWindow(entry) || IsMenuPopupWindow(entry))
+    // A SURFACE THAT WILL BE REFUSED IS NOT MEASURED. This gate runs BEFORE ShouldAcceptWindow,
+    // so a hidden Start surface - re-examined on every foreground move, by design, because the
+    // dismissal needs its visibility each time - was queueing a cross-process UIA card walk per
+    // pass for a window that is never announced. Deciding it with the same predicate that refuses
+    // the window keeps the two answers from drifting.
+    if ((IsShellToastWindow(entry) || IsMenuPopupWindow(entry)) &&
+        QgaShellSurfacePolicy(g_SeamlessMode, g_SeamlessStart, (int)ShellSurfaceKind(entry),
+            InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, NULL) != NULL)
+            == QGA_SURFACE_PRESENT)   // GUARD:cropgate
     {
         // Zero-init: the compiler cannot prove that every path setting have=TRUE also wrote
         // insets once the broker-authority short-circuit is in the condition (C4701, warnings
@@ -5197,7 +5205,28 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
     WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
     WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[e->PwBrokerSlot];
     if (s->Hwnd != (UINT64)(ULONG_PTR)e->Handle) BFF_NO(L"slot-holds-another-hwnd");
-    if (s->AckState != WGCBRK_ACTIVE) BFF_NO(L"slot-not-ACTIVE");
+    // WHICH not-ACTIVE, because the three mean different things and the field log said only
+    // "slot-not-ACTIVE" for all of them. ReqState is ours, AckState is the broker's
+    // (wgcbroker_ipc.h:149,154), so REQUESTED-with-FREE-ack is a request of ours the broker has not
+    // answered yet, while FAILED is the broker refusing the window.
+    //
+    // NOTHING IS DEMOTED HERE, and that is a measurement, not caution. The proposal was to read
+    // ack-pending as NORMAL on the grounds that it is the agent's own re-registration after a size
+    // change (main.c's needReg path, which logs nothing). Checked against the 2026-10-17 capture:
+    // of four slot-not-ACTIVE holds on the Search window, only the one at 120650.506 plausibly
+    // follows a size change - 120645.775 and 120653.999 sit nowhere near one. So the premise is
+    // unproven on the only capture that has it, and a blanket demotion here was already made once
+    // and reverted at Jev 0.60. Jev on the hold lines and the size changes:
+    // not-justified-rename-only 0.89 (justified 0.05). The next capture can answer it, because the
+    // reason now names the state instead of hiding three behind one word.
+    if (s->AckState != WGCBRK_ACTIVE)
+    {
+        if (s->AckState == WGCBRK_FAILED)
+            BFF_NO(L"slot-FAILED");
+        if (s->ReqState == WGCBRK_REQUESTED && s->AckState == WGCBRK_FREE)
+            BFF_NO(L"slot-ack-pending");
+        BFF_NO(L"slot-not-ACTIVE");
+    }
     if (!h->Producing) BFF_NO(L"broker-paused");   // broker paused (secure desktop)
 
     for (int t = 0; t < 4; t++)
@@ -8294,14 +8323,50 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // the Super key is already dropped in seamless (BlockMenuKey), so the usual way to
     // summon it is closed too. Toasts are NOT affected: they render correctly and stay.
     // Re-enable with SeamlessStart=1 to work on it; see docs/PLAN-start-menu.md.
-    if (!FiGateOff(FI_GATE_START) &&
-        g_SeamlessMode && !g_SeamlessStart && ShellSurfaceKind(data) == ShellSurfaceStart)
+    // The kinds this predicate takes are mirrored as plain ints so the header stays free of the
+    // agent's headers; keep the two in step.
+    C_ASSERT((int)ShellSurfaceNone == QGA_SURFACE_KIND_NONE);
+    C_ASSERT((int)ShellSurfaceToast == QGA_SURFACE_KIND_TOAST);
+    C_ASSERT((int)ShellSurfaceStart == QGA_SURFACE_KIND_START);
+    C_ASSERT((int)ShellSurfaceSearch == QGA_SURFACE_KIND_SEARCH);
+
+    if (!FiGateOff(FI_GATE_START))
     {
-        LogDebug("0x%x: Start surface not presented in seamless mode (SeamlessStart=0)",
-            data->Handle);
-        InterlockedExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, data->Handle);   // GUARD:startfg - look again when the foreground moves
-        DismissHiddenStartSurface(data->Handle);   // GUARD:startdismiss - hidden must also mean CLOSED
-        return FALSE;
+        const QGA_SURFACE_POLICY policy = QgaShellSurfacePolicy(g_SeamlessMode, g_SeamlessStart,
+            (int)ShellSurfaceKind(data),
+            InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, NULL) != NULL);
+        if (policy == QGA_SURFACE_REFUSE_START)
+        {
+            // ONCE PER OPENING, not once per examination. The refused surface is re-examined on
+            // purpose - every foreground move looks at it again, because the dismissal needs its
+            // visibility each time - and this line was written on every one of those passes. The
+            // TEXT is unchanged byte for byte: four consumers test for its presence
+            // (tools/rnd-score.py, protocol/steps/p4-rendering.json START_HIDDEN_BY_DESIGN,
+            // mgmt/harness/p5-run.sh, guest/startproof.ps1) and none counts it.
+            const PVOID prev = InterlockedExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, data->Handle);   // GUARD:startfg - look again when the foreground moves
+            if (prev != (PVOID)data->Handle)
+            {
+                LogDebug("0x%x: Start surface not presented in seamless mode (SeamlessStart=0)",
+                    data->Handle);
+                // A SearchHost companion already mapped before the Start surface was seen is now
+                // examined again, and refused by the branch below.
+                PokeWindowTracking();
+            }
+            DismissHiddenStartSurface(data->Handle);   // GUARD:startdismiss - hidden must also mean CLOSED
+            return FALSE;
+        }
+        if (policy == QGA_SURFACE_REFUSE_COMPANION)
+        {
+            // THE OTHER HALF OF "FULLY SUPPRESSED". A 25H2 Start opening brings up a SearchHost
+            // surface as well ('Suche' on this guest, 800x750), and refusing only the Start one
+            // left that on dom0's screen. The stock rule for this compared the handle against a
+            // caption lookup (FindWindow(..., L"Search")), which is 0x0 on any non-English guest -
+            // measured here as "start: 0x10180, search: 0x0" while the caption is 'Suche' - so it
+            // never once fired on the configuration the defect was reported from. Deleted, not
+            // repaired: a caption is not an identity in this project.
+            LogDebug("0x%x: Search surface of a hidden Start opening - not presented", data->Handle);
+            return FALSE;
+        }
     }
 
     // GENUINE-OPEN GATE. A shell host (StartMenuExperienceHost / ShellExperienceHost /
@@ -8330,15 +8395,15 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // must DEFER THE MAP for an accepted+tracked window, not reject it; until then a toast/menu
     // maps immediately and the crop lands one pass later, cropped correctly and unshifted.)
 
-    // hide search regardless of its state if start is being shown
-    // FIXME: this is a workaround for search being detected as visible and not DWM-cloaked
-    // even if it's really invisible/transparent
-    if (g_StartVisible && data->Handle == g_SearchWindow)
-    {
-        // Rejected because Start is up: Search reads visible even when it is not.
-        LogDebug("rejecting Search while Start is visible");
-        return FALSE;
-    }
+    // THE STOCK "hide search while start is shown" RULE WAS HERE, and it is deleted rather than
+    // kept alongside the policy above. It read
+    //     if (g_StartVisible && data->Handle == g_SearchWindow)
+    // with g_SearchWindow from util.c's FindWindow(L"Windows.UI.Core.CoreWindow", L"Search"). That
+    // caption lookup returns 0x0 on every non-English guest, and data->Handle is never 0x0, so the
+    // rule could not fire there. MEASURED on the German 25H2 guest this defect was reported from,
+    // from the agent's own line: "desktop: 0x1000c, start: 0x10180, search: 0x0", while the
+    // window's caption is 'Suche' (12 occurrences in that capture). QgaShellSurfacePolicy decides
+    // it by KIND and by whether a hidden Start opening is in flight, which is locale-independent.
 
     // too small?
     // The SM_CXMIN/CYMIN floor models a NORMAL window's decoration minimum; popups have

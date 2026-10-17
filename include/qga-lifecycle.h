@@ -680,6 +680,143 @@ static __inline QGA_START_VERDICT QgaHiddenStartVerdict(
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * IS THIS XENCONTROL LINE WORTH KEEPING?  (the per-notify Debug line, x118 in one run)
+ *
+ * xencontrol.dll logs through OUR callback (capture.c's XcLogger) at whatever level we hand it, and
+ * one of its lines is per-event-channel-notify: "XcEvtchnNotify: LocalPort: 19". MEASURED on the
+ * 2026-10-17 Start run: 118 of them, identical, every one at Debug. That is a line per vchan
+ * notification - it says the transport worked, which is the definition of normal operation.
+ *
+ * DROPPED AT THE CALLBACK rather than by capping xencontrol's level: the level cap would also hide
+ * its grant and map Debug lines, which a grant-lifetime diagnosis needs. Exactly one (level,
+ * function) pair is dropped, and that function at WARNING or above still comes through - if the
+ * notify path starts failing, the failure is not suppressed with the heartbeat.
+ *
+ * No summary line replaces it: the frame heartbeat is already counted in QGAPERF.
+ */
+static __inline BOOL QgaXcLineKept(IN int level, IN const char* function)
+{
+    if (!function)
+        return TRUE;                        /* no function name: never drop what cannot be identified */
+#ifndef QGA_LIFECYCLE_DEFECT_XCNOTIFYKEPT
+    /* 4 == LOG_LEVEL_DEBUG (windows-utils log.h); xencontrol's levels are the same as ours. */
+    if (level == 4 && strcmp(function, "XcEvtchnNotify") == 0)
+        return FALSE;
+#else
+    (void)level; (void)function;            /* DEFECT: the per-notify Debug line is kept - 118
+                                             * identical lines in one run saying the transport works */
+#endif
+    return TRUE;
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * IS THIS SHELL SURFACE PRESENTED, AND IF NOT, WHY NOT?  (the settings matrix, as one predicate)
+ *
+ * Four shipped configurations crossed with the surface kinds, decided in one place so the suite can
+ * drive every cell. The axis is SeamlessStart: 0 (the default) means a native Start that opens is
+ * not shown, 1 means work on it is enabled and everything is presented.
+ *
+ * THE COMPANION IS THE HALF THAT WAS MISSING. A Start opening on 25H2 brings up TWO surfaces: the
+ * StartMenuExperienceHost one, and a SearchHost one ('Suche' on a German guest, WS_EX_TOPMOST,
+ * 800x750) that carries the search box. Refusing only the first leaves the second mapped, so a
+ * menu declared "not presented" still puts a slice of itself on dom0's screen.
+ *
+ * AND THE STOCK RULE FOR THIS CANNOT FIRE OUTSIDE ENGLISH. main.c had
+ *     if (g_StartVisible && data->Handle == g_SearchWindow)
+ * where g_SearchWindow comes from util.c's FindWindow(L"Windows.UI.Core.CoreWindow", L"Search").
+ * MEASURED on the German 25H2 guest, from the agent's own line: "start: 0x10180, search: 0x0",
+ * while the window's caption is 'Suche'. A caption lookup in one language is 0x0 everywhere else,
+ * and data->Handle is never 0x0, so that rule has never once fired on the configuration the defect
+ * was reported from. It is deleted, not fixed: captions are banned as identity in this project.
+ *
+ * THE DISCRIMINATOR IS hiddenStartOpen, and it is the only fact that separates the two cases a
+ * SearchHost window can be in - the companion of a Start opening, or a standalone Win+S Search the
+ * user asked for and must get. Measured 2026-10-04 (main.c:7835): 0 Start-surface examinations in
+ * 2 Win+S openings, against 2 per Shift+Win opening. Nothing else separates them: the kind, the
+ * foreground process, the focused window, the size and the caption are identical in both, and
+ * Windows exposes no owner relation (Owner == NULL is part of the classifier).
+ */
+typedef enum {
+    QGA_SURFACE_PRESENT = 0,
+    QGA_SURFACE_REFUSE_START,       /* the Start surface itself, in seamless with SeamlessStart=0 */
+    QGA_SURFACE_REFUSE_COMPANION    /* the Search surface OF a hidden Start opening */
+} QGA_SURFACE_POLICY;
+
+/* kind: mirrors SHELL_SURFACE_KIND (toastcrop.h) as plain ints so this header stays free of the
+ * agent's own headers; main.c C_ASSERTs the two agree. */
+#define QGA_SURFACE_KIND_NONE   0
+#define QGA_SURFACE_KIND_TOAST  1
+#define QGA_SURFACE_KIND_START  2
+#define QGA_SURFACE_KIND_SEARCH 3
+
+static __inline QGA_SURFACE_POLICY QgaShellSurfacePolicy(
+    IN BOOL seamless,
+    IN BOOL seamlessStart,
+    IN int kind,
+    IN BOOL hiddenStartOpen)
+{
+    if (!seamless)
+        return QGA_SURFACE_PRESENT;         /* non-seamless shows the whole desktop anyway */
+    if (seamlessStart)
+        return QGA_SURFACE_PRESENT;         /* work on Start is enabled: present everything */
+    if (kind == QGA_SURFACE_KIND_START)
+        return QGA_SURFACE_REFUSE_START;
+#ifndef QGA_LIFECYCLE_DEFECT_COMPANIONSHOWN
+    if (kind == QGA_SURFACE_KIND_SEARCH && hiddenStartOpen)
+        return QGA_SURFACE_REFUSE_COMPANION;
+#else
+    (void)hiddenStartOpen;                  /* DEFECT: the Search companion of a hidden Start is
+                                             * presented - a menu declared not-shown still puts a
+                                             * slice of itself on the screen */
+#endif
+#ifdef QGA_LIFECYCLE_DEFECT_SEARCHALWAYSHIDDEN
+    if (kind == QGA_SURFACE_KIND_SEARCH)
+        return QGA_SURFACE_REFUSE_COMPANION;   /* DEFECT: a standalone Win+S Search the user asked
+                                                * for is refused too */
+#endif
+    return QGA_SURFACE_PRESENT;
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * WHICH CARD RULE MEASURES THIS SURFACE?  (the crop, decided by KIND)
+ *
+ * The card walk reports two candidates per measurement - the largest qualifying element and the
+ * union of them - and the rule chosen decides which becomes the crop. A Search flyout was being
+ * measured by the TOAST rule because the selector was a single BOOL ("is it a menu popup"), so
+ * every non-menu surface got the toast rule by construction.
+ *
+ * SEARCH GETS NO RULE, and that was decided by reading the walks rather than by preference.
+ * MEASURED on the German 25H2 guest, the same window at its two raw sizes:
+ *     raw 800x798 -> largest=(2364,655) 774x724   union=(2363,655) 775x777
+ *     raw 800x750 -> largest=(2196,687) 728x32    union=(2196,687) 728x32
+ * At the smaller size BOTH candidates collapse to the same 728x32 sliver - the search input field,
+ * not the card - so neither rule is reliable for this surface and a crop from either would clip the
+ * flyout. Jev on the walk lines alone: neither-announce-uncropped 0.72 (largest 0.19, union 0.08).
+ * The cost is stated rather than hidden: the flyout is announced with its ~13 px shadow margin
+ * showing, which is worse pixels than a correct crop and better than a clipped window.
+ */
+typedef enum {
+    QGA_CARD_RULE_NONE = 0,         /* announce uncropped - no reliable card for this kind */
+    QGA_CARD_RULE_TOAST_LARGEST,
+    QGA_CARD_RULE_MENU_UNION
+} QGA_CARD_RULE;
+
+static __inline QGA_CARD_RULE QgaCardRuleForSurface(IN int kind, IN BOOL isMenuPopup)
+{
+    if (isMenuPopup)
+        return QGA_CARD_RULE_MENU_UNION;    /* a real menu popup, whatever process owns it */
+#ifdef QGA_LIFECYCLE_DEFECT_SEARCHASTOAST
+    if (kind == QGA_SURFACE_KIND_SEARCH)
+        return QGA_CARD_RULE_TOAST_LARGEST; /* DEFECT: today's construction - the selector was one
+                                             * BOOL, so every non-menu surface got the toast rule
+                                             * and a Search flyout was measured as a toast */
+#endif
+    if (kind == QGA_SURFACE_KIND_TOAST || kind == QGA_SURFACE_KIND_START)
+        return QGA_CARD_RULE_TOAST_LARGEST; /* the 25H2 Start card is found by this rule today */
+    return QGA_CARD_RULE_NONE;              /* search, and anything unclassified: measured above */
+}
+
+/* ---------------------------------------------------------------------------------------------
  * IS THIS HOLD'S REASON A NORMAL ONE?  (BROKERHOLD's level, decided per CAUSE)
  *
  * BrokerFreshFrame refuses a frame for eleven distinct reasons and now names which; this decides
