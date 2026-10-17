@@ -395,17 +395,28 @@ typedef struct _WGCBRK_SLOT {
     /* ABI 23: THE AGENT ASKS FOR A ROUTE. WGCBRK_ROUTE_WGC (0) = no preference, the broker decides as before;
      * WGCBRK_ROUTE_RELAY (1) = this window is NOT capturable by a session on itself, open it on the relay.
      *
-     * WHY THE AGENT AND NOT THE BROKER. The broker's ladder keys on a SYMPTOM - "quiet while the agent says it
-     * changed" - and shell CoreWindows do not go quiet: they deliver frames that are entirely BLACK. MEASURED
-     * 2026-10-17 on win11de-sm (26200.8037): 26 of 26 shell-surface frames black or near-black
-     * (QGASLICEBLACK nonblack=0/9400 Search 800x750, 0/7371 Start 642x726), ordinary windows on the same path
-     * fine; an independent guest-side PrintWindow(PW_RENDERFULLCONTENT) of the same visible, uncloaked surface
-     * also returned maxchannel=0. A black-but-arriving feed is INVISIBLE to a quiet detector, so the ladder
-     * never fired and the live broker read relayOk=0 relayFail=0 on every slot - zero relay ATTEMPTS, ever,
-     * with relayCapable=1 published as available. Both `g_forcePw[i] = true` sites require the slot to ALREADY
-     * be a relay, so nothing could ENTER the route. Only the agent knows the window's class, and it already
-     * classifies it (ShellSurfaceKind) to decide cropping; this carries that answer to where the route is
-     * chosen rather than duplicating the classifier in the broker, where the two would drift.
+     * WHY. A per-HWND WGC session is UNRELIABLE for this class - not incapable, unreliable, and the difference
+     * matters. MEASURED 2026-10-17 on win11de-sm (26200.8037), counted per OPENING (one QGABROKERREG):
+     * ordinary windows reached a painted frame in 3 of 3 openings and produced NO black frame at all; the
+     * Search surfaces reached one in 14 of 28; the Start surface in 0 of 2. The shape of a failing opening is
+     * always the same - one QGASLICEBLACK nonblack=0/9400 published at 45-171 ms, then QGADIRECTWAIT "no
+     * painted frame yet" for 719 ms, then the opening ends. When an opening DOES paint, the painted frame is
+     * published at ~392 ms (nonblack=9125/10000). So the first frame is empty and the SECOND arrival is the
+     * one that matters, and it often never comes: WGC publishes on surface CHANGE, and a surface composed
+     * before the session started has no further change to report. The relay captures a destination WE own
+     * carrying a DWM thumbnail, which DWM recomposes, so arrivals do not depend on the source changing again.
+     * (An earlier version of this comment said 26 of 26 frames black and "zero painted, ever". That came from
+     * counting QGASLICEBLACK without counting QGASLICECONTENT - one emitter, not the population - and it
+     * overstated impossibility where the truth is unreliability. Jev on the corrected numbers: the defect is
+     * real-unreliable-first-frame 1.00, this fix relay-still-right 0.76.)
+     *
+     * AND WHY THE AGENT ASKS, rather than the broker deciding. The broker's ladder keys on a SYMPTOM - "quiet
+     * while the agent says it changed" - which cannot see a feed that delivered one empty frame and stopped.
+     * The live broker read relayOk=0 relayFail=0 on every slot with relayCapable=1 published as available, and
+     * both `g_forcePw[i] = true` sites require the slot to ALREADY be a relay, so nothing could ENTER the
+     * route. Only the agent knows the window's class, and it already classifies it (ShellSurfaceKind) to
+     * decide cropping; this carries that answer to where the route is chosen rather than duplicating the
+     * classifier in the broker, where the two would drift.
      *
      * This does NOT re-add the rung ADR-capture 32 removed. That decision took the relay out of the QUIET
      * LADDER (its invisible destination sat over other windows and got a neighbour falsely recreated, rz27) and
