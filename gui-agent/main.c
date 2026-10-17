@@ -3382,8 +3382,58 @@ static ULONGLONG BrokerNextDue(void)
 // The user-facing half of QGAWGCDEAF (ADR-capture 32). The id carries the app's image name reduced to [a-z0-9-] (the route's
 // name rule), so each deaf app is reported once per boot; the text is the "capture-deaf" row of notifytexts.h, its header
 // naming the app (the image name without ".exe" - a human name, not a file name); the generic row when there is no name.
+// IS THE GUEST STILL COMING UP, for the purposes of TALKING TO THE USER?
+//
+// QgaHoldIsStartup answers "the broker has not started yet", which stops being true the moment the
+// broker is ready - and the broker's one launch waits for the SHELL, so it becomes ready at the
+// exact moment the user can first start an app. The field reporter's case lands in that gap: "When
+// trying to start Explorer before Windows 11 has completely settled down after boot, 2 messages are
+// shown, one complaining that it is not yet ready" (2026-10-17, 4.3.36). The broker was up; the
+// shell was not finished; the window was withheld for a few seconds, correctly; and the agent told
+// him about it.
+//
+// So the user-facing routes also stay quiet for a short settle after the broker becomes ready.
+// THIS IS NOT A DEADLINE FOR SHOWING ANYTHING - nothing is mapped, hidden or timed out by it, and
+// the ERROR lines are unchanged. It only decides whether a transient condition during startup is
+// worth INTERRUPTING THE USER about, and the owner's rule for that is plain: "you should not talk
+// shit during the normal boot."
+#define NOTIFY_SETTLE_AFTER_BROKER_MS (30u * 1000u)
+static BOOL NotifyWouldInterruptStartup(void)
+{
+    if (QgaHoldIsStartup(WgcBrokerActive(), g_BrokerReadyAt != 0))
+        return TRUE;                       /* the display path has never been up this boot */
+    if (g_BrokerReadyAt != 0)
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= g_BrokerReadyAt && (now - g_BrokerReadyAt) < NOTIFY_SETTLE_AFTER_BROKER_MS)
+            return TRUE;                   /* up, but the shell is still arriving behind it */
+    }
+    return FALSE;
+}
+
 static void DeafNotifyUser(IN HWND window)
 {
+    // NOT DURING A NORMAL BOOT. This line is loud BECAUSE it should not fire under normal
+    // circumstances (owner 2026-10-02: "fail loudly (including user facing message) if capture
+    // really goes deaf someday") - and a cold boot is not someday. This file's own broker records
+    // it as routine: "A cold boot makes the broker's FIRST sessions deaf, plain-WGC ones
+    // included", measured 2026-09-27. Notifying on that turns a documented startup behaviour into
+    // a user-facing fault report at every boot, which is what the field reporter sees as messages
+    // on startup (2026-10-17, 4.3.36). Owner, the same day: "it has mandate to be loud because it
+    // should not fire under normal circumstances. you should not talk shit during the normal boot."
+    //
+    // The ERROR line at the call site is unchanged - a deaf hold is always recorded. Only the
+    // user-facing route is held back while the display path is still coming up, judged by the same
+    // QgaHoldIsStartup the hold line and the suppress notifier use, so the three cannot drift. A
+    // session that was serving and THEN went deaf is not startup, and is still reported loudly.
+    if (NotifyWouldInterruptStartup())
+    {
+        LogInfo("QGAWGCDEAF during startup - the display path is not up yet, which this broker "
+            L"documents as routine for its first sessions, so the user is NOT notified "
+            L"(the ERROR above stands)");
+        return;
+    }
+
     char image[64] = "an app";
     char id[QERR_MAX_ID + 1] = "capture-deaf";
     BOOL named = FALSE;
@@ -3975,6 +4025,28 @@ static ULONGLONG g_DirectNotifyNext = 0;
 static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL resident);   // defined below
 static void DirectSuppressNotifyUser(IN DWORD count)
 {
+    // NOT AT BOOT. The broker's one launch waits for a shell, so EVERY cold boot has a window -
+    // measured 10.8-11.6 s on an AppVM, 1.4-4.3 s on a StandaloneVM - in which a window is
+    // legitimately withheld because the display path is not up YET. Telling the user "a window
+    // could not be shown" then is the agent reporting its own designed startup as a fault, and it
+    // is what the field reporter sees: "Windows 10 now shows 2 messages on startup", "When trying
+    // to start Explorer before Windows 11 has completely settled down after boot, 2 messages are
+    // shown, one complaining that it is not yet ready", "After completing the boot process,
+    // Windows 11 shows 3 messages" (2026-10-17, on 4.3.36). The owner had promised him this would
+    // stop and it did not.
+    //
+    // The ERROR lines at both call sites are UNCHANGED - we still record it, every time. What stops
+    // is the user-facing toast, for exactly the condition QgaHoldIsStartup already names for the
+    // hold line; the same predicate is used so the two cannot drift. A broker that WAS ready and
+    // went away is not startup, and still notifies.
+    if (NotifyWouldInterruptStartup())
+    {
+        LogInfo("QGADIRECTSUPPRESS: %lu withheld window(s) during startup - the display path is not "
+            L"up yet, which is the designed path, so the user is NOT notified (the ERROR above stands)",
+            count);
+        return;
+    }
+
     ULONGLONG now = GetTickCount64();
     if (g_DirectNotifyNext != 0 && now < g_DirectNotifyNext)
         return;
@@ -5557,10 +5629,24 @@ static BOOL SliceChromeContentReady(IN const WINDOW_DATA* entry)
 // nothing about a held window. A new toast IS the foreground, so it sailed straight past the
 // guard. Every map site now asks this question.
 static BOOL SliceContentReady(IN const WINDOW_DATA* entry);
+// UNPAINTED IS UNPAINTED, however many frames arrived. The frame count used to end this
+// predicate: after DIRECT_DARK_FRAMES distinct frames it returned FALSE even though the buffer
+// still held no content, on the reasoning that a delivering feed proves the blackness belongs to
+// the app. The map arm below then showed the window - and that is the defect the field reporter
+// has been filing since 2026-08-27 and still saw in 4.3.36: "repeating this several times once
+// again showed the black, clickable (and working) rectangle" (2026-10-17). A window that is
+// clickable and working and BLACK is this escape firing.
+//
+// The reasoning was refuted the same day: a shell CoreWindow on 26200 delivers frames ON TIME that
+// are all empty (BROKERCHAIN arrived_ms=76 publish_ms=105 with nonblack=0/7371), so arriving
+// frames do not establish that the app is dark - only that the capture path cannot see it. The
+// owner's rule decides the rest: a black window is never acceptable. So an unpainted, slice-fed
+// window on a direct-required guest is withheld, for as long as it stays unpainted, and
+// QGADIRECTSUPPRESS reports it. The cost is explicit: a genuinely dark app window is never mapped
+// either. That is the intended trade - "either show it or don't".
 static BOOL DirectWouldShowBlack(IN const WINDOW_DATA* entry)
 {
-    return DirectRequired() && entry->PwSliceFed && !SliceContentReady(entry) &&
-           entry->PwBrokerFrames < DIRECT_DARK_FRAMES;
+    return DirectRequired() && entry->PwSliceFed && !SliceContentReady(entry);
 }
 
 // IS THIS TOAST BANNER WITHHELD BY THE BRIDGE VERDICT? (docs/ADR-toasts.md 10; toasthold.c.) TRUE while the
@@ -9229,10 +9315,15 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // (SliceContentReady == PwSliceContentTick, set only by SlicePainted), which covers both
         // "no frame" and "frames that carry nothing".
         //
-        // The escape that keeps a genuinely DARK surface from being hidden for ever: once the
-        // feed has delivered DIRECT_DARK_FRAMES distinct frames and the buffer is still
-        // unpainted, map it and say so once (QGADIRECTDARK). One black frame is not evidence of
-        // a working feed; it is the exact signature of the failure above.
+        // THE ESCAPE IS GONE (2026-10-17). It mapped a window that was still unpainted once the
+        // feed had delivered DIRECT_DARK_FRAMES distinct frames, on the reasoning that a
+        // delivering feed proves the blackness is the app's. That produced the black, clickable,
+        // working rectangle the field reporter has filed since 2026-08-27 and saw again in
+        // 4.3.36. The reasoning is refuted: a shell CoreWindow delivers empty frames on time, so
+        // arrival proves nothing about content. DirectWouldShowBlack now stays TRUE for as long
+        // as the buffer is unpainted, so this arm holds the window and QGADIRECTSUPPRESS reports
+        // it, and the QGADIRECTDARK map below is unreachable - deleted rather than left to look
+        // like a live path.
         //
         // THE PREMISE OF THIS ESCAPE WAS REFUTED 2026-10-17, and it is scheduled to go. It read
         // "the feed is demonstrably working and the blackness belongs to the surface, not to us".
@@ -9328,33 +9419,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 LogWarning("QGACROPLATE hwnd 0x%x (class %s) mapped uncropped after %lu ms, shadow strip visible until cropped",
                     (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
                     (ULONG)CROP_BEFORE_SHOW_TIMEOUT_MS);
-            if (timedOut && !cropReady && DirectRequired() && windowData->PwSliceFed &&
-                !SliceContentReady(windowData))
-            {
-                // IT MUST NOT NAME THE APP. This said "the app's surface itself is dark", on the
-                // reasoning that frames arriving prove the feed works - so blackness had to be the
-                // app's. MEASURED 2026-10-17 and that is false: a shell CoreWindow on route 0
-                // delivers frames on time (BROKERCHAIN arrived_ms=76 publish_ms=105) and every one
-                // of them is empty, because a WGC session on such a window captures nothing. An
-                // independent PrintWindow of the same visible, uncloaked surface returned
-                // maxchannel=0 too. Arriving frames do NOT establish a working feed, so this line
-                // cannot tell an unpainted app from a route that cannot see it - and it had been
-                // asserting the first for weeks. Jev, on the receipts: not-established 1.00,
-                // must-not-name-the-app 0.92. It now reports the ROUTE and the frame count, which
-                // is what it actually knows, and names both candidates without choosing.
-                const WGCBRK_SLOT* ds = (g_WgcBase && windowData->PwBrokerSlot >= 0 &&
-                                         windowData->PwBrokerSlot < WGCBRK_MAX_SLOTS)
-                                        ? &WGCBRK_SLOTS(g_WgcBase)[windowData->PwBrokerSlot] : NULL;
-                const LONG dr = ds ? ds->Route : -1;
-                LogWarning("QGADIRECTDARK hwnd 0x%x (class %s) mapped unpainted after %lu broker frame(s) "
-                    L"on route=%s - the frames arrive and carry no content; app-dark and route-blind are "
-                    L"not distinguished by this",
-                    (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
-                    windowData->PwBrokerFrames,
-                    dr == (LONG)WGCBRK_ROUTE_RELAY ? L"relay" :
-                    dr == (LONG)WGCBRK_ROUTE_PW    ? L"printwindow" :
-                    dr == (LONG)WGCBRK_ROUTE_WGC   ? L"wgc" : L"unknown");
-            }
+            // (the QGADIRECTDARK map that stood here is unreachable now that an unpainted window is
+            // never mapped - see DirectWouldShowBlack. Removed rather than kept as dead code that
+            // reads like a live fallback.)
             windowData->MapDeferred = FALSE;
             windowData->PwDirectSuppressed = FALSE;
             // FILL AND DAMAGE **BEFORE** THE MAP. The buffer is attached before mapping, but
