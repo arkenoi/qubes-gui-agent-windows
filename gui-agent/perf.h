@@ -171,12 +171,17 @@ extern BOOL     g_ButtonAbsolute;
 // ("ShellManaged"): 0 = none (every shell surface stays an override-redirect popup,
 // Linux-agent parity), 1 = all classified surfaces, 2 = START ONLY (Start is movable +
 // size-locked, toasts stay corner popups per the 2026-08-12 user spec).
-// THE CODE'S DEFAULT IS 0, not 2. This comment said "2 = START ONLY (the GWeck goal state,
-// default...)" while perf.c initialises g_ShellManaged to SHELL_MANAGED_NONE and falls back to
-// NONE whenever the registry value is absent, so a reader checking the documented default got the
-// opposite of the shipped one. 2 is the GOAL state, which is a different thing from the default:
-// changing the effective default is a behaviour change and the owner's call, so only the comment
-// is corrected here. The startup line now says which of the two the running agent used.
+// THE CODE'S DEFAULT IS 2 (START ONLY) as of 2026-10-18. It was 0 while the comment claimed 2 -
+// a reader checking the documented default got the opposite of the shipped one - and that was
+// corrected the other way, by fixing the comment, because changing the effective default is a
+// behaviour change and the owner's call. He has now made it: "start menu is either movable and
+// resizeable normal window (like settings), or (last option) override-redirect", amended to
+// "resizable may drop" / "movable is important". So Start is announced or=0 and size-locked.
+// What made an unguarded flip dangerous - a shell CoreWindow is SCREEN-SIZED while it composes,
+// measured holding 5120x1392 for a whole opening, and 2026-08-12 recorded one announced or=0 at
+// 5120x1336 - is refused by QgaShellFrameAllowed (agent/include/qga-lifecycle.h) rather than by
+// leaving the policy off for everyone. The startup line still says which source the value came
+// from, so a registry override remains visible.
 #define SHELL_MANAGED_NONE  0
 #define SHELL_MANAGED_ALL   1
 #define SHELL_MANAGED_START 2

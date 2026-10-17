@@ -30,16 +30,25 @@ BOOL     g_ProtoTrace  = FALSE;
 BOOL     g_ProtoTraceWobble = FALSE;
 BOOL     g_ProtoTraceDrag = FALSE;
 BOOL     g_ButtonAbsolute = TRUE;
-// DEFAULT NONE (2026-08-12 verdict, wf_82456c4a): every classified shell surface stays an
-// override-redirect corner popup. A WM-managed Start is announced at a MOVED rect, but its
-// content is slice-fed from the composited desktop at that rect - and a DirectComposition
-// Start does not paint its card at the moved HWND position, so the user saw bare wallpaper.
-// Slice-feed is only correct at the surface's NATURAL anchor, and no alternative capture
-// path exists for these surfaces (PrintWindow/WGC of the XAML host is blank from our
-// context). The OR corner Start is the one configuration ever confirmed to render
-// correctly. Movable Start needs a frozen-anchor architecture (capture window-relative at
-// the natural anchor, let dom0 move only the frame) - a separate future experiment.
-DWORD    g_ShellManaged = SHELL_MANAGED_NONE;
+// DEFAULT START-ONLY as of 2026-10-18 (PerfInit decides the running value; this initialiser only
+// covers the window before it runs). It was NONE on the 2026-08-12 verdict, and that verdict named
+// two blockers, BOTH of which have since been removed - which is why this is a correction of the
+// record and not a reversal of someone's judgement:
+//   "its content is slice-fed from the composited desktop at that rect ... slice-feed is only
+//    correct at the surface's NATURAL anchor" -> the frozen-anchor architecture it called "a
+//    separate future experiment" is built and is documented on WINDOW_DATA.DaemonOwnsPos: dom0 owns
+//    the placement, the guest HWND is never moved, and the content is copied into a PER-WINDOW
+//    buffer so what dom0 displays is position-independent.
+//   "no alternative capture path exists for these surfaces (PrintWindow/WGC of the XAML host is
+//    blank from our context)" -> measured false on 2026-10-18. WGC CreateForWindow on the Start
+//    host's own CoreWindow returns frameArrived=1 nonBlank=1 content=5120x1392, and the card
+//    sampled inside it is nonblack=3563/4623 with the Windows accent blues. The menu was black
+//    because the crop pointed at the screen's empty top-left corner, not because the pixels were
+//    unavailable; with that fixed the card is photographed rendering at 100% non-black.
+// The owner's requirement is the movable window ("resizable may drop", "movable is important").
+// The screen-sized state that would otherwise be framed full-screen is refused by
+// QgaShellFrameAllowed, not by leaving the policy off for everyone.
+DWORD    g_ShellManaged = SHELL_MANAGED_START;
 BOOL     g_SeamlessStart = FALSE;
 // Blocked by default; dom0 re-enables per qube with `qvm-features <vm> service.enableWinKey 1`
 // (see the qubesdb read in PerfInit). That is the designed remedy and it is deliberate: the admin
@@ -357,7 +366,7 @@ void PerfInit(void)
     // Shell-surface policy: 0 = none (all or=1), 1 = all managed, 2 = Start-only managed
     // (default - the GWeck goal state: movable+size-locked Start, corner-popup toasts).
     {
-        DWORD mv = SHELL_MANAGED_NONE;
+        DWORD mv = SHELL_MANAGED_START;
         BOOL fromRegistry = FALSE;
         if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SHELL_MANAGED_VALUE, &mv, NULL))
@@ -367,7 +376,13 @@ void PerfInit(void)
                 mv = SHELL_MANAGED_START;
         }
         else
-            mv = SHELL_MANAGED_NONE;
+            // THE DEFAULT IS NOW START-ONLY. The owner, 2026-10-18: "start menu is either movable
+            // and resizeable normal window (like settings), or (last option) override-redirect",
+            // then "resizable may drop" / "movable is important". perf.h recorded that changing
+            // this default was his call to make; he has made it. Size-locked and movable is the
+            // whole of the requirement, and the screen-sized state that made an unguarded flip
+            // dangerous is refused by QgaShellFrameAllowed rather than by leaving the policy off.
+            mv = SHELL_MANAGED_START;
         g_ShellManaged = mv;
         // WHERE THE VALUE CAME FROM, appended rather than inserted: the one consumer
         // (guest/verify-running-agent.ps1:32) matches the prefix 'QGASHELLMANAGED policy=', so
