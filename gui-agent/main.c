@@ -11746,7 +11746,34 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // failure record, which this frame path is the wrong place to read.
                 // consoleUser stays in this gate as a safety net for a lock the fast path above
                 // did not catch, guarded so an already-reported lock is not reported twice.
-                if (!autoArmed || (consoleUser && !s_LockReported) ||
+                // A CONSOLE USER WITHOUT A SHELL IS A LOGON IN PROGRESS, NOT A LOCK.
+                // The lock arm above reasons "armed + a console user present -> the session is
+                // LOCKED: a human locked it and only a human clears it". That inference fails during
+                // autologon: the console user exists as soon as the session is created, which is
+                // BEFORE the shell starts, so an ordinary autologon boot satisfies it.
+                // MEASURED win11-reinstall, campaign run 38971675274, agent pid 4184 - and the line
+                // directly above names every fact needed to see it:
+                //   QGADESKSTUCK on the secure desktop 'Winlogon' for 30 s ... PATH: LogonUI is up
+                //   before this agent saw a shell (consent.exe=0 LogonUI.exe=1 autologon=armed for
+                //   'user' console-user=1 shell-seen=0)
+                // autologon ARMED, the 600 s backstop nowhere near, so this arm fired - and 7 s
+                // later the desktop went to Default on its own: Winlogon -> Default at 02:14:52
+                // against a notification sent at 02:14:45. dom0 told the user to go and sign in to a
+                // guest that signed itself in eight seconds later, at QERR_SEV_ACTION severity. That
+                // is the notification-noise class GWeck field-reported (forum 42717 post 175).
+                // THE DISCRIMINATOR IS ALREADY COMPUTED AND ALREADY PRINTED: shellSeen. A human
+                // locking a running desktop necessarily did so with a shell up, so a real lock has
+                // shell-seen=1; a console user with NO shell ever seen is a logon in flight. This
+                // costs nothing in the case the arm exists for and removes it in the case it does
+                // not, and the armed-but-never-completes state is still covered by the 600 s
+                // backstop below - the one case this code says it leaves to a clock.
+                // AND THE FAST PATH ALREADY LEARNED THIS. The lock report above is explicit: "a lock
+                // is never assumed (owner, 2026-10-10: 'if there IS locked guest we need to report
+                // it, ONCE, but NEVER assume there is as based on inaccurate measurements'): ... it
+                // is not LOCKED until this agent instance has seen a shell window - the two measured
+                // false reports were each this agent's FIRST secure frame". Same instruction, same
+                // reasoning, same evidence; this arm simply never got it.
+                if (!autoArmed || (consoleUser && shellSeen && !s_LockReported) ||
                     (now - s_SecureSince) >= SECURE_DESKTOP_NOTIFY_ARMED_MS)
                     QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
                 else
