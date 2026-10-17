@@ -4977,6 +4977,77 @@ static void WgcArenaReapPending(BOOL all)
 // ProcessNewFrame. (An earlier comment credited toasts to the "notifhost interceptor" -
 // that component was never launched; see toastcrop for how toast surfaces are handled.)
 // Returns TRUE if registered.
+// WHICH WINDOW ACTUALLY HOLDS THIS SURFACE'S PIXELS.
+//
+// A Start/Search opening owns TWO CoreWindows and they capture differently. MEASURED 2026-10-17 on
+// win11de-cold (26200.8037) with plain CreateForWindow in the user session, on the handles this
+// agent names in its own log:
+//     card-sized surface 0x10182 (800x750 at 2160,674)   frameArrived=1 nonBlank=0 distinct=1
+//     host root surface  0x1017c (5120x1392 at 0,0)      frameArrived=1 nonBlank=1 distinct=10
+//     the root sampled at the CARD's rect: nonblack=3509/4422 maxchannel=255 distinct=16,
+//     rectcolors=000000,F2F2F2,2F2F2F,FFFFFF,168FC0,0178D4,... - the menu's own pixels.
+// We registered the card, which is the blank one. That is why the menu never painted, and why
+// "this class cannot be captured per-window" looked true for weeks: one of its two windows is
+// blank and we picked that one.
+//
+// THE ROOT IS NOT THE DESKTOP, which had to be checked before using it. The same capture sampled
+// at 400,400 600x300 - where Notepad windows sit on screen - returns nonblack=0/5025,
+// rectcolors=000000. It carries the shell's own content and nothing else, so cropping the card out
+// of it is an ordinary per-window capture and NOT the desktop-sourced path that was reverted
+// earlier the same day on the owner's absolute directive.
+//
+// Found by walking our own tracked list: same process, a different window, covering the card.
+// Shell CoreWindows are invisible to EnumWindows (the 2026-09-02 toast finding), so the tracked
+// list is the only enumeration that sees them at all. No root found -> behave exactly as before.
+static WINDOW_DATA* BrokerSourceEntry(IN const WINDOW_DATA* entry)
+{
+    if (!entry || ShellSurfaceKind(entry) == ShellSurfaceNone)
+        return NULL;
+    WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
+    while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
+    {
+        e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (e->Handle != entry->Handle && e->ProcessId == entry->ProcessId &&
+            e->Width > entry->Width && e->Height > entry->Height &&
+            (LONG)e->X <= (LONG)entry->X && (LONG)e->Y <= (LONG)entry->Y &&
+            (LONG)e->X + (LONG)e->Width  >= (LONG)entry->X + (LONG)entry->Width &&
+            (LONG)e->Y + (LONG)e->Height >= (LONG)entry->Y + (LONG)entry->Height)
+            return e;
+        e = (WINDOW_DATA*)e->ListEntry.Flink;
+    }
+    return NULL;
+}
+
+static HWND BrokerSourceWindow(IN const WINDOW_DATA* entry)
+{
+    const WINDOW_DATA* src = BrokerSourceEntry(entry);
+    return src ? src->Handle : (entry ? entry->Handle : NULL);
+}
+
+// THE CROP IS INTO WHATEVER THE BROKER CAPTURED, so its frame of reference follows the source. On
+// the window's own capture it is the card's offset INSIDE that window (the transparent shadow
+// margin the toast/menu crop trims). When the source is the shell host's ROOT, the texture is that
+// root, so the crop is the card's offset inside IT. Get this wrong and the publish lifts the wrong
+// rectangle: pixels, but the wrong ones, which is worse than black. Four sites read or write these
+// fields - the registration, the resize retarget, and two staleness tests - so they share one
+// answer and cannot drift.
+static void BrokerDesiredCrop(IN const WINDOW_DATA* entry, OUT LONG* cropX, OUT LONG* cropY)
+{
+    const WINDOW_DATA* src = BrokerSourceEntry(entry);
+    if (src) { *cropX = (LONG)entry->X - (LONG)src->X; *cropY = (LONG)entry->Y - (LONG)src->Y; }
+    else     { *cropX = (LONG)entry->CropLeft;         *cropY = (LONG)entry->CropTop; }
+}
+
+// Does the slot still describe this window - the SOURCE it should capture, and the crop into it?
+static BOOL BrokerSlotStale(IN const WINDOW_DATA* e, IN const WGCBRK_SLOT* bs)
+{
+    LONG cx = 0, cy = 0;
+    if (!bs) return TRUE;
+    BrokerDesiredCrop(e, &cx, &cy);
+    return (BOOL)(bs->Hwnd != (UINT64)(ULONG_PTR)BrokerSourceWindow(e) ||
+                  bs->ReqCropX != cx || bs->ReqCropY != cy);
+}
+
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
 {
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1;
@@ -5053,7 +5124,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     // the card right/down by the crop and clips its far edges, the exact defect seen on WinUI
     // menus once they were both broker-captured AND cropped). entry->CropLeft/Top are set by the
     // toast/menu crop in GetWindowData before the slice-fed window is (re)registered here.
-    s->ReqCropX = (LONG)entry->CropLeft; s->ReqCropY = (LONG)entry->CropTop;
+    { LONG cx, cy; BrokerDesiredCrop(entry, &cx, &cy); s->ReqCropX = cx; s->ReqCropY = cy; }
     // ASK FOR THE ROUTE THIS WINDOW CLASS NEEDS (ABI 23). A shell CoreWindow - toast host, Start,
     // Search - is not served by a WGC session on itself: it delivers frames that are entirely
     // BLACK, which the broker's quiet ladder cannot see, so the window stayed on route 0 for ever
@@ -5073,7 +5144,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;  // "not measured yet" until the broker reports
     s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
     MemoryBarrier();
-    s->Hwnd = (UINT64)(ULONG_PTR)entry->Handle;
+    s->Hwnd = (UINT64)(ULONG_PTR)BrokerSourceWindow(entry);   // the window that HOLDS the pixels
     s->ReqState = WGCBRK_REQUESTED;
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&h->ControlGen);
@@ -5216,8 +5287,7 @@ BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
     // exactly what keeps the WGC capture session alive across the resize.
     s->ReqWidth  = (LONG)entry->Width;
     s->ReqHeight = (LONG)entry->Height;
-    s->ReqCropX  = (LONG)entry->CropLeft;
-    s->ReqCropY  = (LONG)entry->CropTop;
+    { LONG cx, cy; BrokerDesiredCrop(entry, &cx, &cy); s->ReqCropX = cx; s->ReqCropY = cy; }
     s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;   // re-measured for the new geometry
     MemoryBarrier();
     _InterlockedIncrement(&s->ControlSeq);
@@ -8887,11 +8957,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                                windowData->PwBrokerSlot < WGCBRK_MAX_SLOTS)
                 ? &WGCBRK_SLOTS(g_WgcBase)[windowData->PwBrokerSlot] : NULL;
             BOOL needReg = !windowData->PwBrokerSourced || !bs ||
-                bs->Hwnd != (UINT64)(ULONG_PTR)windowData->Handle ||
                 bs->ReqWidth != (LONG)windowData->Width ||
                 bs->ReqHeight != (LONG)windowData->Height ||
-                bs->ReqCropX != (LONG)windowData->CropLeft ||
-                bs->ReqCropY != (LONG)windowData->CropTop;
+                BrokerSlotStale(windowData, bs);
             if (needReg)
             {
                 if (windowData->PwBrokerSourced)
@@ -9196,11 +9264,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                            windowData->PwBrokerSlot < WGCBRK_MAX_SLOTS)
             ? &WGCBRK_SLOTS(g_WgcBase)[windowData->PwBrokerSlot] : NULL;
         BOOL reqStale = windowData->PwBrokerSourced &&
-            (!bs || bs->Hwnd != (UINT64)(ULONG_PTR)windowData->Handle ||
-             bs->ReqWidth != (LONG)windowData->PwWidth ||
+            (!bs || bs->ReqWidth != (LONG)windowData->PwWidth ||
              bs->ReqHeight != (LONG)windowData->PwHeight ||
-             bs->ReqCropX != (LONG)windowData->CropLeft ||
-             bs->ReqCropY != (LONG)windowData->CropTop);
+             BrokerSlotStale(windowData, bs));
         // NEVER REGISTERED. A slice-fed window added while the broker could not take it - it was not ready yet, or it had
         // died and was being relaunched, or the arena or the slots were full - has PwBrokerSourced FALSE, which the repair
         // below never looks at, so nothing ever registered it and a direct-required window with no slot is WITHHELD from
