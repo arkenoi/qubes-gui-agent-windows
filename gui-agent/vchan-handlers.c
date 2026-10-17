@@ -1490,9 +1490,15 @@ static DWORD HandleFocus(IN HWND window)
         {
             LogWarning("window 0x%x not tracked", window);
         }
+        // THE TEST IS THE SURFACE'S KIND, NOT "does it have a crop". It was the latter, and the
+        // difference only became reachable on 2026-10-18 when ShellManaged's default went from NONE
+        // to START: a crop is also measured for an ORDINARY application's WinUI menu popup
+        // (IsMenuPopupWindow / BrokerOpaqueInsets), so the old condition would have stopped
+        // forwarding dom0 focus to those too - a silent behaviour change for ordinary apps, carried
+        // in on the back of a Start-menu change. The log line below already called this branch
+        // "shell surface"; the condition now says the same thing.
         else if (g_ShellManaged != SHELL_MANAGED_NONE &&
-                 (data->CropLeft || data->CropTop || data->CropRight ||
-                 data->CropBottom || IsShellToastWindow(data)))
+                 (ShellSurfaceKind(data) != ShellSurfaceNone || IsShellToastWindow(data)))
         {
             // A WM-managed toast gets X focus the moment the dom0 WM maps or the user
             // clicks its frame; forwarding that as SetForegroundWindow(ShellExperienceHost)

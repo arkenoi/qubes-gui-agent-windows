@@ -2117,17 +2117,32 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     // CoreWindow announced or=0 at 5120x1336). Staying an override-redirect popup until the
     // card is known avoids that; the crop-resolve re-announce then flips it to or=0 via the
     // usual UpdateWindowData->ToggleMap path, and the size-lock hint goes out with it.
+    // ...and the crop gate alone is NOT sufficient, which is why the whole decision moved into
+    // QgaShellFrameAllowed. A crop can resolve to the window's OWN FULL EXTENT, and a shell
+    // CoreWindow is screen-sized while it composes: measured 2026-10-18, the Start host's window
+    // held 5120x1392 at 0,0 for an entire opening while the card inside it was 642x726. Framing
+    // that state is the 2026-08-12 shape - a full-screen, framed, draggable window on dom0's
+    // screen. The predicate refuses a card that spans the screen and the surface stays
+    // override-redirect, which is the safe direction.
+    // The crop gate stays exactly where it was - it is cheap, and it keeps ShellSurfaceKind off the
+    // path of every ordinary override-redirect popup (a combo dropdown, a tooltip), which is what
+    // widening this test would have cost.
     if (entry->IsOverrideRedirect &&
         (entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom))
     {
         SHELL_SURFACE_KIND kind = ShellSurfaceKind(entry);
-        if (kind != ShellSurfaceNone &&
-            (g_ShellManaged == SHELL_MANAGED_ALL ||
-             (g_ShellManaged == SHELL_MANAGED_START && kind == ShellSurfaceStart)))
+        if (QgaShellFrameAllowed(g_ShellManaged, (int)kind,
+                                 entry->Width, entry->Height, g_ScreenWidth, g_ScreenHeight))
         {
             LogDebug("0x%x: cropped shell surface kind=%d announced WM-managed (policy %u)",
                 entry->Handle, kind, g_ShellManaged);
             entry->IsOverrideRedirect = FALSE;
+        }
+        else if (kind != ShellSurfaceNone && g_ShellManaged != SHELL_MANAGED_NONE)
+        {
+            // The one case worth a line: the policy wanted a frame and the guard refused it.
+            LogDebug("0x%x: shell surface %ux%u spans the %ux%u screen - no frame, left o-r",
+                entry->Handle, entry->Width, entry->Height, g_ScreenWidth, g_ScreenHeight);
         }
     }
 
@@ -6484,6 +6499,37 @@ static BOOL DaemonGeometryUnsettled(IN const WINDOW_DATA* entry)
 
 // Send a position the rate limiter withheld, once the window has stopped moving. Called from
 // the tracking pass for every window; cheap no-op when nothing is pending.
+// WHICH ORIGIN TO ANNOUNCE for this window - the guest's anchor, or dom0's own placement.
+//
+// Normally the guest's anchor, entry->X/Y. For a WM-managed shell surface under the FROZEN ANCHOR
+// (WINDOW_DATA.DaemonOwnsPos) dom0 owns the placement: the guest HWND is deliberately never moved
+// and X/Y stays the slice source and the origin every damage rect and injected click is translated
+// against. Announcing X/Y would therefore tell dom0 to put the window back where the shell paints
+// it - undoing the user's drag.
+//
+// The position-only announce is already withheld for exactly this reason (the posOnly arm below),
+// but that is only half the path: a SIZE change still goes out carrying X/Y, and a Win11 menu
+// RESIZES while it is open (main.c's own note, and measured here: 800x798@2373,642 ->
+// 800x750@2160,642 in one opening). So a dragged Start snapped back to its anchor on the shell's
+// next resize. dom0's last placement is what dom0 already believes, so re-stating it moves nothing
+// while the size change still lands.
+//
+// The CHANGE TESTS must read the same origin, or a frozen-anchor window would differ from its own
+// last announce on every single pass and announce for ever.
+// The SHELL-KIND test is not redundant with DaemonOwnsPos, and it is here deliberately. That flag
+// is only ever set for a cropped shell surface, but it is set in another file (HandleConfigure) and
+// an ordinary window's WinUI popup also carries a crop - so "no ordinary window can reach this"
+// rests today on a property of a distant call site. Testing the kind HERE makes it structural: an
+// unclassified window takes the guest anchor by construction, whatever a future caller does with
+// the flag.
+static void CfgAnnounceOrigin(IN const WINDOW_DATA* e, OUT int* x, OUT int* y)
+{
+    if (e->DaemonOwnsPos && e->CfgSentValid && ShellSurfaceKind(e) != ShellSurfaceNone)
+    { *x = e->LastCfgX; *y = e->LastCfgY; }
+    else
+    { *x = e->X;        *y = e->Y; }
+}
+
 static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->CfgPendingPos)
@@ -6512,19 +6558,20 @@ static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
     // window may have moved again since the limiter (or the daemon-drive hold) recorded
     // them, and announcing a stale intermediate is exactly the replay this exists to stop.
     entry->CfgPendingPos = FALSE;
+    int annX, annY; CfgAnnounceOrigin(entry, &annX, &annY);
     if (entry->CfgSentValid &&
-        entry->LastCfgX == entry->X && entry->LastCfgY == entry->Y &&
+        entry->LastCfgX == annX && entry->LastCfgY == annY &&
         entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
         entry->LastCfgOvr == entry->IsOverrideRedirect)
         return; // already exactly what the daemon knows - announcing it again would echo
 
     entry->CfgLastSentTick = GetTickCount();
-    if (SendWindowConfigure(entry->Handle, entry->X, entry->Y,
+    if (SendWindowConfigure(entry->Handle, annX, annY,
             entry->Width, entry->Height, entry->IsOverrideRedirect) == ERROR_SUCCESS)
     {
         entry->CfgSentValid = TRUE;
-        entry->LastCfgX = entry->X;
-        entry->LastCfgY = entry->Y;
+        entry->LastCfgX = annX;
+        entry->LastCfgY = annY;
         entry->LastCfgW = (int)entry->Width;
         entry->LastCfgH = (int)entry->Height;
         entry->LastCfgOvr = entry->IsOverrideRedirect;
@@ -6563,8 +6610,9 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
 
     if (entry->Synthesized)
         return ERROR_SUCCESS; // never announced; see main.h
+    int annX, annY; CfgAnnounceOrigin(entry, &annX, &annY);
     if (entry->CfgSentValid &&
-        entry->LastCfgX == entry->X && entry->LastCfgY == entry->Y &&
+        entry->LastCfgX == annX && entry->LastCfgY == annY &&
         entry->LastCfgW == (int)entry->Width && entry->LastCfgH == (int)entry->Height &&
         entry->LastCfgOvr == entry->IsOverrideRedirect)
         return ERROR_SUCCESS;
@@ -6590,9 +6638,11 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
             entry->LastCfgOvr == entry->IsOverrideRedirect;
         DWORD now = GetTickCount();
         // FROZEN ANCHOR: dom0 owns this shell surface's placement (see DaemonOwnsPos).
-        // Re-announcing the guest anchor would make the daemon snap its window back from
-        // wherever the user dragged it. Size / override-redirect changes still go out -
-        // only the position is dom0's to keep.
+        // Size / override-redirect changes still go out - only the position is dom0's to keep.
+        // A BACKSTOP NOW, not the mechanism: since the announced origin is itself dom0's last
+        // placement (CfgAnnounceOrigin), a pure move of such a window no longer differs from its
+        // own last announce and returns earlier than this. Kept because it costs nothing and the
+        // arm above depends on CfgSentValid, which this does not assume on its own.
         if (posOnly && entry->DaemonOwnsPos)
         {
             entry->CfgPendingPos = FALSE;
@@ -6655,13 +6705,13 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         entry->CfgPendingPos = FALSE;
     }
 
-    ULONG status = SendWindowConfigure(entry->Handle, entry->X, entry->Y,
+    ULONG status = SendWindowConfigure(entry->Handle, annX, annY,
         entry->Width, entry->Height, entry->IsOverrideRedirect);
     if (status == ERROR_SUCCESS)
     {
         entry->CfgSentValid = TRUE;
-        entry->LastCfgX = entry->X;
-        entry->LastCfgY = entry->Y;
+        entry->LastCfgX = annX;
+        entry->LastCfgY = annY;
         entry->LastCfgW = (int)entry->Width;
         entry->LastCfgH = (int)entry->Height;
         entry->LastCfgOvr = entry->IsOverrideRedirect;
@@ -8668,6 +8718,10 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     C_ASSERT((int)ShellSurfaceToast == QGA_SURFACE_KIND_TOAST);
     C_ASSERT((int)ShellSurfaceStart == QGA_SURFACE_KIND_START);
     C_ASSERT((int)ShellSurfaceSearch == QGA_SURFACE_KIND_SEARCH);
+    // ...and the ShellManaged policy values, mirrored for the same reason (QgaShellFrameAllowed).
+    C_ASSERT(SHELL_MANAGED_NONE == QGA_SHELL_MANAGED_NONE);
+    C_ASSERT(SHELL_MANAGED_ALL == QGA_SHELL_MANAGED_ALL);
+    C_ASSERT(SHELL_MANAGED_START == QGA_SHELL_MANAGED_START);
 
     if (!FiGateOff(FI_GATE_START))
     {

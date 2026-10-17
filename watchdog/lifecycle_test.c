@@ -529,6 +529,49 @@ int main(void)
             check("surface invariant: nothing is refused outside seamless-with-SeamlessStart=0", badOutside == 0);
             check("surface invariant: only Start and Search surfaces are ever refused", badKind == 0);
         }
+
+        /* ---- MAY A SHELL SURFACE BE A MOVABLE (WM-MANAGED) WINDOW? ----
+         * The owner, 2026-10-18: "resizable may drop", "movable is important". Start is announced
+         * or=0 and size-locked. The guard is the screen-sized state: measured the same day, the
+         * host's CoreWindow held 5120x1392 at 0,0 for a whole opening while its card was 642x726,
+         * and 2026-08-12 recorded a shell CoreWindow announced or=0 at 5120x1336 - a full-screen
+         * framed draggable window on dom0's screen. */
+        check("frame: a measured Start card on a 5120x1440 screen is movable",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_START, QGA_SURFACE_KIND_START,
+                                   642, 726, 5120, 1440) == TRUE);
+        check("frame: the SCREEN-SIZED state of that same surface is refused the frame",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_START, QGA_SURFACE_KIND_START,
+                                   5120, 1392, 5120, 1440) == FALSE);
+        check("frame: the 2026-08-12 shape, or=0 at 5120x1336, is refused",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_START, QGA_SURFACE_KIND_START,
+                                   5120, 1336, 5120, 1440) == FALSE);
+        check("frame: a card on a 1920x1080 screen is still movable (the test is not tuned to 5120)",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_START, QGA_SURFACE_KIND_START,
+                                   640, 750, 1920, 1080) == TRUE);
+        /* "no crop resolved yet -> no frame" is the CALLER's gate and is deliberately not a
+         * parameter here: at the only call site it would always be TRUE, which is an inert
+         * argument. */
+        check("frame: policy NONE keeps every surface override-redirect",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_NONE, QGA_SURFACE_KIND_START,
+                                   642, 726, 5120, 1440) == FALSE);
+        check("frame: START-only policy does not frame a toast",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_START, QGA_SURFACE_KIND_TOAST,
+                                   364, 326, 5120, 1440) == FALSE);
+        check("frame: policy ALL does frame a toast",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_ALL, QGA_SURFACE_KIND_TOAST,
+                                   364, 326, 5120, 1440) == TRUE);
+        check("frame: an unclassified window is never framed by this rule",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_ALL, QGA_SURFACE_KIND_NONE,
+                                   642, 726, 5120, 1440) == FALSE);
+        check("frame: a zero-sized announce is refused",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_START, QGA_SURFACE_KIND_START,
+                                   0, 726, 5120, 1440) == FALSE);
+        /* screen not known yet (g_ScreenWidth is 0 until the first xconf): the proportion test is
+         * disabled, everything else still applies - refusing every shell frame until then would be
+         * its own defect. */
+        check("frame: an unknown screen size does not refuse the frame outright",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_START, QGA_SURFACE_KIND_START,
+                                   642, 726, 0, 0) == TRUE);
     }
 
     /* ---- the card rule follows the KIND, and Search gets NO rule (2026-10-17) ----

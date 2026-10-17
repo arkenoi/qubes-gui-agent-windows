@@ -831,10 +831,69 @@ typedef enum {
 
 /* kind: mirrors SHELL_SURFACE_KIND (toastcrop.h) as plain ints so this header stays free of the
  * agent's own headers; main.c C_ASSERTs the two agree. */
+#define QGA_SHELL_MANAGED_NONE  0u  /* mirrors perf.h's SHELL_MANAGED_*, so this header stays */
+#define QGA_SHELL_MANAGED_ALL   1u  /* pure and the offline suite builds without it; main.c    */
+#define QGA_SHELL_MANAGED_START 2u  /* C_ASSERTs each against the real one                     */
 #define QGA_SURFACE_KIND_NONE   0
 #define QGA_SURFACE_KIND_TOAST  1
 #define QGA_SURFACE_KIND_START  2
 #define QGA_SURFACE_KIND_SEARCH 3
+
+/* ---- MAY THIS SHELL SURFACE BE ANNOUNCED AS A WM-MANAGED (MOVABLE) WINDOW? --------------------
+ * The owner's requirement, 2026-10-18: "start menu is either movable and resizeable normal window
+ * (like settings), or (last option) override-redirect", then amended - "resizable may drop",
+ * "movable is important". So Start is announced or=0 and SIZE-LOCKED; the dom0 WM frames it and
+ * drags it, and SendWindowSizeLock's PMinSize==PMaxSize offering no resize handle is now the
+ * intended behaviour rather than a contradiction.
+ *
+ * CROP RESOLUTION IS THE CALLER'S GATE, not a parameter here. It was a parameter in the first
+ * draft, and at the only call site it was always TRUE - the site is reached only once a crop has
+ * resolved - which makes it an inert argument, the shape this project has been caught by before.
+ * The caller keeps that test where it already lived; this predicate decides policy, kind and size.
+ *
+ * THE GUARD THIS EXISTS FOR. A shell CoreWindow is SCREEN-SIZED while it composes and card-sized
+ * once the menu is placed - measured 2026-10-18, the host's window held 5120x1392 at 0,0 for a whole
+ * opening while the card it carries is 642x726. Announcing the screen-sized state as a NORMAL window
+ * puts a full-screen framed, draggable window on dom0's screen; the 2026-08-12 measurement recorded
+ * exactly that ("a shell CoreWindow announced or=0 at 5120x1336"). The existing site gates the flip
+ * on the crop having resolved, which is necessary and NOT sufficient: a crop can resolve to the
+ * window's own full extent. So a card that spans the screen is refused the frame and stays
+ * override-redirect, which is the safe direction - a menu nobody can drag beats a full-screen
+ * window the user cannot get rid of.
+ *
+ * screenW/screenH of 0 mean "not known yet" and disable only the proportion test, never the rest:
+ * at startup g_ScreenWidth is 0 until the first xconf, and refusing every shell frame until then
+ * would be a different defect.
+ * Knob: QGA_LIFECYCLE_DEFECT_GIANTSHELLFRAME removes the proportion test, so a screen-sized shell
+ * surface is announced as a normal window - the 2026-08-12 shape. The suite must fail with it. */
+static __inline BOOL QgaShellFrameAllowed(
+    IN unsigned shellManaged,      /* SHELL_MANAGED_NONE / _ALL / _START */
+    IN int kind,                   /* QGA_SURFACE_KIND_* */
+    IN unsigned announcedW,
+    IN unsigned announcedH,
+    IN unsigned screenW,           /* 0 = not known yet */
+    IN unsigned screenH)
+{
+    if (kind == QGA_SURFACE_KIND_NONE)
+        return FALSE;
+    if (shellManaged == QGA_SHELL_MANAGED_NONE)
+        return FALSE;
+    if (shellManaged == QGA_SHELL_MANAGED_START && kind != QGA_SURFACE_KIND_START)
+        return FALSE;
+    if (announcedW == 0 || announcedH == 0)
+        return FALSE;
+#ifndef QGA_LIFECYCLE_DEFECT_GIANTSHELLFRAME
+    /* 90% of either axis. A real card is at most about half the screen; the measured bad state is
+     * the full width. Integer, so no float creeps into a decision. */
+    if (screenW != 0 && (unsigned long long)announcedW * 10ULL >= (unsigned long long)screenW * 9ULL)
+        return FALSE;
+    if (screenH != 0 && (unsigned long long)announcedH * 10ULL >= (unsigned long long)screenH * 9ULL)
+        return FALSE;
+#else
+    (void)screenW; (void)screenH;  /* DEFECT: a screen-sized shell surface gets a dom0 frame */
+#endif
+    return TRUE;
+}
 
 static __inline QGA_SURFACE_POLICY QgaShellSurfacePolicy(
     IN BOOL seamless,
