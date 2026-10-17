@@ -8338,6 +8338,47 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     if (!g_ShowTaskbar && data->Handle == g_TaskbarWindow)
         return FALSE;
 
+    // AN OWNED POPUP THAT LIES WHOLLY INSIDE ITS OWNER IS NOT A SECOND WINDOW.
+    //
+    // A WinUI popup - a tooltip, a flyout, a teaching tip - is its own top-level HWND, so it used
+    // to be announced to dom0 separately. dom0 marks every window it is given with the qube's 2 px
+    // label border, which drew a coloured rectangle INSIDE the parent, around a popup that was
+    // entirely within it. Photographed 2026-10-17 on a Notepad teaching tip; the owner, looking at
+    // the same window: "the o-r pop up could be either properly synthesized or properly cut, and it
+    // is neither", and then "why is pop-up still o-r while it is fully inside the parent window?"
+    //
+    // Cropping could not finish it: that popup has a callout BEAK, so the rows beside the beak are
+    // transparent, transparency arrives from a premultiplied capture as opaque BLACK, and no
+    // rectangle can exclude them.
+    //
+    // So it is synthesized instead - and at no cost, because Windows does the compositing. The
+    // broker sets GraphicsCaptureSession.IncludeSecondaryWindows, so an owner's frames already
+    // CONTAIN its owned popups with their real transparency (measured on 26200 before this was
+    // written: with the flag off the owner's frame held the parent's own text at the popup's rect,
+    // with it on that text was replaced by the popup's panel). Nothing extra is captured or copied,
+    // and the owner's feed changes when the popup opens AND closes, so no region needs repairing.
+    //
+    // NARROW BY CONSTRUCTION. Only a WinUI popup class, only with a TRACKED owner, only when it is
+    // fully inside that owner, and only while the broker is active - because the broker is what
+    // composites it. A popup that extends past its owner (most context menus) fails the
+    // containment test and is announced exactly as before; a popup with no tracked owner likewise.
+    if (IsMenuPopupWindow(data) && data->Owner && WgcBrokerActive())
+    {
+        const WINDOW_DATA* ownerData = FindWindowByHandle(data->Owner);
+        if (ownerData && ownerData->IsVisible &&
+            (LONG)data->X >= (LONG)ownerData->X &&
+            (LONG)data->Y >= (LONG)ownerData->Y &&
+            (LONG)data->X + (LONG)data->Width  <= (LONG)ownerData->X + (LONG)ownerData->Width &&
+            (LONG)data->Y + (LONG)data->Height <= (LONG)ownerData->Y + (LONG)ownerData->Height)
+        {
+            LogDebug("0x%x: owned popup (class %s, %ux%u at %d,%d) lies wholly inside owner 0x%x "
+                L"(%ux%u at %d,%d) - not announced; the owner's capture carries it",
+                (DWORD)(ULONG_PTR)data->Handle, data->Class, data->Width, data->Height, data->X, data->Y,
+                (DWORD)(ULONG_PTR)data->Owner, ownerData->Width, ownerData->Height, ownerData->X, ownerData->Y);
+            return FALSE;
+        }
+    }
+
     if (data->DeletePending)
         return FALSE;
 

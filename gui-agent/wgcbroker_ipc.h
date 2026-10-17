@@ -12,7 +12,19 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  23u  /* 23: ReqRoute - the agent ASKS for a route, so a window class WGC cannot
+#define WGCBRK_ABI_VERSION  24u  /* 24: BEHAVIOUR, not layout - the broker sets
+                                  *     GraphicsCaptureSession.IncludeSecondaryWindows, so an owner's
+                                  *     frames contain its owned popups and the agent stops announcing
+                                  *     a popup that lies wholly inside a tracked owner. The version is
+                                  *     bumped PRECISELY so an older broker cannot pair: it refuses a
+                                  *     section whose AbiVersion differs (wgcbroker.cpp returns 6),
+                                  *     never becomes active, and the agent's WgcBrokerActive() guard
+                                  *     then keeps announcing popups as before. Without the bump the
+                                  *     two would pair at 23, the agent would withhold the popup and
+                                  *     the old broker would not carry it - the popup would vanish
+                                  *     (Jev agent-broker-skew 0.96). No field moved;
+                                  *     sizeof(WGCBRK_SLOT) is unchanged;
+                                  * 23: ReqRoute - the agent ASKS for a route, so a window class WGC cannot
                                   *     capture reaches the relay instead of being served black
                                   *     (2026-10-17); appended: sizeof(WGCBRK_SLOT) 3440 -> 3448;
                                   * 22: DirtyPublishes/DirtyFullCopies/DirtyBytes (rest-zero S1 dirty regions, M9(b)),
