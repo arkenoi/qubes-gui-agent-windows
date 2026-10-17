@@ -338,6 +338,33 @@ int main(void)
     check("hold: broker active but never recorded ready -> still not a startup hold",
           QgaHoldIsStartup(TRUE, FALSE) == FALSE);
 
+    /* ---- BROKERHOLD's level follows its REASON (2026-10-17) ----
+     * BrokerFreshFrame refuses a frame for eleven reasons and now names which. Exactly ONE is
+     * normal: a slot the broker has registered but not yet published to, which carries
+     * FrameWidth=FrameHeight=0 and so lands in the dims branch silently (its log is gated on
+     * fw>0 && fh>0 - which is why 589 holds coexisted with ZERO BROKERDIMS and why reading that
+     * silence as "not the dims cause" was backwards). QGADIRECTSUPPRESS reports exactly this
+     * condition persisting, so here the safety net is the right one rather than a borrowed one.
+     * Every other reason is a different finding and stays loud. */
+    check("holdreason: a slot with no first frame yet is normal - quiet",
+          QgaHoldReasonIsNormal(L"first-frame-pending") == TRUE);
+    check("holdreason: the agent and broker disagreeing about a slot owner is NOT normal",
+          QgaHoldReasonIsNormal(L"slot-holds-another-hwnd") == FALSE);
+    check("holdreason: a feed lost past its bound is NOT normal",
+          QgaHoldReasonIsNormal(L"dims-mismatch-STUCK") == FALSE);
+    check("holdreason: a NON-ZERO dims mismatch is a real size disagreement, still loud",
+          QgaHoldReasonIsNormal(L"dims-mismatch-transient") == FALSE);
+    check("holdreason: the secure desktop pausing the broker is still said",
+          QgaHoldReasonIsNormal(L"broker-paused") == FALSE);
+    check("holdreason: contention on the ring is still said",
+          QgaHoldReasonIsNormal(L"torn-read-4-retries") == FALSE);
+    check("holdreason: a slot that is not ACTIVE is still said",
+          QgaHoldReasonIsNormal(L"slot-not-ACTIVE") == FALSE);
+    check("holdreason: a reason nobody has classified is LOUD by default, not quiet",
+          QgaHoldReasonIsNormal(L"some-reason-added-later") == FALSE);
+    check("holdreason: and no reason at all is never quiet",
+          QgaHoldReasonIsNormal(NULL) == FALSE);
+
     /* ---- the first seconds of a slow capture pass are not a warning (2026-10-17) ----
      * Measured over run 38994277148: every slow pass in the campaign was 1-3 s against the 15 s
      * wedge, the wedge arm fired ZERO times, all recovered, all during install/boot load. The

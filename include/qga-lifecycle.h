@@ -58,6 +58,7 @@
 
 #include <windows.h>
 #include <strsafe.h>
+#include <wchar.h>   // wcscmp: QgaHoldReasonIsNormal compares a hold reason
 #include "qga-exitcodes.h"
 
 #define QGA_LIFECYCLE_NAME_FMT      L"Global\\QGA_LIFECYCLE_%lu_%s"
@@ -545,6 +546,51 @@ static __inline BOOL QgaHoldIsStartup(IN BOOL brokerActive, IN BOOL brokerEverRe
 #else
     (void)brokerEverReadyThisAgent;         /* DEFECT: every hold is a fault, so normal boots shout */
     return FALSE;
+#endif
+}
+
+/* ---------------------------------------------------------------------------------------------
+ * IS THIS HOLD'S REASON A NORMAL ONE?  (BROKERHOLD's level, decided per CAUSE)
+ *
+ * BrokerFreshFrame refuses a frame for eleven distinct reasons and now names which; this decides
+ * which of those names is worth a warning. ONE is excluded, on the owner's reading: a slot the
+ * broker has registered but not yet published to.
+ *
+ * WHY THAT ONE IS NORMAL, end to end. A window appears; the agent decides it needs per-window
+ * capture and asks the broker to take it; the broker assigns a slot and starts a WGC session for
+ * that HWND, and the agent records sourced=1 slot=N. The session needs a few milliseconds and a
+ * compositor tick before it publishes anything. If a damage pass runs in that gap, the slot exists
+ * and is ACTIVE but carries FrameWidth=FrameHeight=0, the dims comparison rejects it, and the
+ * slice-fed caller HOLDS last content for that one pass. Milliseconds later the first frame lands
+ * and the window paints. Nothing failed, and on a guest that opens many short-lived surfaces it
+ * happens constantly - which is why the Start-menu reproduction harness carries 18-49 of these per
+ * run while an ordinary acceptance cell carries one or two.
+ *
+ * AND THIS IS THE ONE CASE WHERE THE SAFETY NET REALLY DOES COVER IT. QGADIRECTSUPPRESS reports a
+ * window that NEVER RECEIVED A FRAME, on QgaWindowFaultDue's clock below - which is exactly this
+ * condition persisting. An earlier attempt to demote this line offered that net for ALL 589
+ * healthy-feed holds and was reverted at Jev 0.60 because it does not cover a window that was fed
+ * and then stopped. Keyed on this single reason it is the right net, not a borrowed one.
+ *
+ * EVERY OTHER REASON STAYS LOUD, and they are not the same finding: slot-holds-another-hwnd is the
+ * agent and the broker disagreeing about who owns a slot; dims-mismatch-STUCK is a feed lost past
+ * its bound; broker-paused is the secure desktop; torn-read-4-retries is contention. A dims
+ * mismatch with NON-ZERO dimensions is a real disagreement about size and keeps its warning - only
+ * the all-zero case, which means "nothing written yet", is quiet.
+ *
+ * WHY A PREDICATE AND NOT A STRING TEST AT THE CALL SITE: so the offline suite can drive every
+ * reason through it, and so a reason added later is LOUD by default rather than silently matching.
+ */
+static __inline BOOL QgaHoldReasonIsNormal(IN const WCHAR* why)
+{
+    if (!why)
+        return FALSE;                       /* no reason recorded: never quiet on an unknown */
+#ifndef QGA_LIFECYCLE_DEFECT_HOLDREASONALLNORMAL
+    return (BOOL)(wcscmp(why, L"first-frame-pending") == 0);
+#else
+    (void)why;                              /* DEFECT: every reason reads as normal, so a broker
+                                             * that dropped a slot is as quiet as a first frame */
+    return TRUE;
 #endif
 }
 

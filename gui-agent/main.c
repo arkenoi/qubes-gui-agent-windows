@@ -5239,6 +5239,19 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
                     PokeWindowTracking();
                 }
             }
+            // A SLOT THE BROKER HAS NEVER PUBLISHED IS NOT A DIMS MISMATCH, and conflating the
+            // two is what made this condition unreadable. An unwritten slot carries
+            // FrameWidth=FrameHeight=0, which fails the comparison above - so it lands in this
+            // branch - and the `fw > 0 && fh > 0` guard then suppresses BROKERDIMS, the stuck
+            // clock AND the re-registration poke for it. That is deliberate (0x0 is not a
+            // disagreement about size, it is an absence), but it means the first-frame case
+            // returns from here in total silence.
+            // IT ALSO MISLED ME: 589 BROKERHOLD warnings with BROKERDIMS at ZERO across 93
+            // captures read as "the dims cause is excluded", and it is the opposite - silence here
+            // is the SIGNATURE of a slot with no frame yet. Named separately so the two can never
+            // be read as one again.
+            if (fw == 0 && fh == 0)
+                BFF_NO(L"first-frame-pending");
             BFF_NO(e->PwDimsStuck ? L"dims-mismatch-STUCK" : L"dims-mismatch-transient");
         }
         e->PwDimsSince = 0;   // dims agree: any outstanding mismatch run is over
@@ -12247,7 +12260,19 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // configs (win10 / below the 26100 floor / the explicit WgcBroker=0 opt-out).
                 else if (DirectRequired())
                 {
-                    if (!entry->PwHoldLogged)   // one-shot diagnostic per window
+                    // A NORMAL REASON IS NOT LOGGED AT ALL, AND MUST NOT SPEND THE ONE-SHOT.
+                    // Owner, 2026-10-17: "we should not log this at all. we should log when
+                    // something goes wrong." A slot the broker has registered but not published to
+                    // yet is not something going wrong - the next pass feeds it - and on a guest
+                    // that opens many short-lived surfaces it would cost one line per surface
+                    // (18-49 per Start-menu repro run) whatever level it carried.
+                    //
+                    // THE LATCH IS THE TRAP HERE. PwHoldLogged is one-shot PER WINDOW, so a silent
+                    // first-frame hold that still SET it would suppress the window's one real line
+                    // for ever - a later hold on the same window for slot-holds-another-hwnd or
+                    // dims-mismatch-STUCK would never be said. So the quiet arm returns without
+                    // touching it, and the latch is spent only by a line that is actually written.
+                    if (!entry->PwHoldLogged && !QgaHoldReasonIsNormal(holdWhy))
                     {
                         entry->PwHoldLogged = TRUE;
                         // THE LEVEL SAYS WHICH KIND OF HOLD THIS IS. The old comment here claimed
