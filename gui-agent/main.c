@@ -4978,17 +4978,26 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     // menus once they were both broker-captured AND cropped). entry->CropLeft/Top are set by the
     // toast/menu crop in GetWindowData before the slice-fed window is (re)registered here.
     s->ReqCropX = (LONG)entry->CropLeft; s->ReqCropY = (LONG)entry->CropTop;
-    s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;  // "not measured yet" until the broker reports
-    s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
-    MemoryBarrier();
-    s->Hwnd = (UINT64)(ULONG_PTR)entry->Handle;
     // ASK FOR THE ROUTE THIS WINDOW CLASS NEEDS (ABI 23). A shell CoreWindow - toast host, Start,
     // Search - is not served by a WGC session on itself: it delivers frames that are entirely
     // BLACK, which the broker's quiet ladder cannot see, so the window stayed on route 0 for ever
     // and was mapped dark or never shown at all. The same classifier that decides this window's
     // crop decides its route, so the two cannot drift. See wgcbroker_ipc.h ReqRoute.
+    // START AND SEARCH ONLY - NOT THE TOAST, and that is a measurement, not caution. Every black
+    // surface in the 2026-10-17 captures is one of those two: Start 0x10174 (642x726) and the
+    // 'Suche' SearchHost surfaces 0x10180/82/86/88/8a/a0 (800x750, 800x798). No toast appears in
+    // the evidence at all. And the toast has its own recorded measurement pointing the other way:
+    // "warm, the toast is served on plain WGC and matches (MAD 2.2); on every cold boot it ended
+    // on the relay, whose thumbnail renders it with 15 colours against the guest's 28 (MAD 17.7)"
+    // (Jev relay-renders-the-toast-unfaithfully 0.83). Routing toasts here would trade a defect
+    // they do not have for a fidelity loss they do.
     const SHELL_SURFACE_KIND routeKind = ShellSurfaceKind(entry);
-    s->ReqRoute = (routeKind != ShellSurfaceNone) ? (LONG)WGCBRK_ROUTE_RELAY : (LONG)WGCBRK_ROUTE_WGC;
+    s->ReqRoute = (routeKind == ShellSurfaceStart || routeKind == ShellSurfaceSearch)
+                  ? (LONG)WGCBRK_ROUTE_RELAY : (LONG)WGCBRK_ROUTE_WGC;
+    s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;  // "not measured yet" until the broker reports
+    s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
+    MemoryBarrier();
+    s->Hwnd = (UINT64)(ULONG_PTR)entry->Handle;
     s->ReqState = WGCBRK_REQUESTED;
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&h->ControlGen);
@@ -9224,6 +9233,16 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // feed has delivered DIRECT_DARK_FRAMES distinct frames and the buffer is still
         // unpainted, map it and say so once (QGADIRECTDARK). One black frame is not evidence of
         // a working feed; it is the exact signature of the failure above.
+        //
+        // THE PREMISE OF THIS ESCAPE WAS REFUTED 2026-10-17, and it is scheduled to go. It read
+        // "the feed is demonstrably working and the blackness belongs to the surface, not to us".
+        // Arriving frames do not demonstrate a working feed: a shell CoreWindow served by a WGC
+        // session on itself delivers frames on time that are ALL empty (26 of 26 on this rig), so
+        // this escape mapped a capture defect onto the user's screen as a dark window with a
+        // shadow strip. Jev: remove-it-fix-the-route 1.00. The route fix (ABI 23 ReqRoute) lands
+        // first and must be MEASURED to paint this class; removing the escape before that would
+        // turn a dark menu into no menu at all, which is not an improvement for anyone looking at
+        // the screen. Ordering, not hesitation.
         if (toastHeld)
         {
             // Held or suppressed by the bridge verdict: stays unmapped (see above).
@@ -9240,16 +9259,6 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             // still ends in BRK_DOWN and the loud path below.
             // TWO young states, not one. Measured 2026-09-08 on win11-brk with this very build:
             // gating only on the BROKER being young was not enough - both faults fired with
-        //
-        // THE PREMISE OF THIS ESCAPE WAS REFUTED 2026-10-17, and it is scheduled to go. It read
-        // "the feed is demonstrably working and the blackness belongs to the surface, not to us".
-        // Arriving frames do not demonstrate a working feed: a shell CoreWindow served by a WGC
-        // session on itself delivers frames on time that are ALL empty (26 of 26 on this rig), so
-        // this escape mapped a capture defect onto the user's screen as a dark window with a
-        // shadow strip. Jev: remove-it-fix-the-route 1.00. The route fix (ABI 23 ReqRoute) lands
-        // first and must be MEASURED to paint this class; removing the escape before that would
-        // turn a dark menu into no menu at all, which is not an improvement for anyone looking at
-        // the screen. Ordering, not hesitation.
             // brokerActive=1, for a toast (Windows.UI.Core.CoreWindow 364x109) and a terminal
             // (CASCADIA_HOSTING_WINDOW_CLASS) that had simply not been sourced yet. A window
             // freshly registered with a READY broker is indistinguishable, at this instant, from a
@@ -11557,6 +11566,63 @@ static void ShellImageConfigured(OUT WCHAR *image, IN size_t cch)
     WCHAR *sl = wcsrchr(p, L'\\');
     StringCchCopy(image, cch, sl ? sl + 1 : p);
 }
+
+// IS A THIRD-PARTY START REPLACEMENT RUNNING IN THE CONSOLE SESSION?
+//
+// This decides whether the host's menu key is forwarded (QgaMenuKeyPolicy). It cannot be answered
+// from the registered shell - a replacement runs ALONGSIDE explorer, so Winlogon\Shell still reads
+// explorer.exe - nor from its menu window, which exists only while the menu is open, i.e. after the
+// key. So it is the process, in the console session. Jev: installed-and-running-process 0.98.
+//
+// LATCHED, never per key event (Jev 1.00): a key press must not pay a process snapshot. Once a
+// replacement has been seen the answer stays PRESENT for the session; otherwise the tracking pass
+// refreshes it. The tri-state matters: UNREAD is NOT absent, and the caller forwards the key unless
+// it positively knows none is there - a silently dead key on the user's own menu is worse than a
+// suppressed surface holding focus, which at least gets reported (Jev 0.74).
+static volatile LONG g_StartReplacement = 0;   // 0 = unknown, 1 = present, -1 = absent (enumerated)
+
+static void StartReplacementRefresh(void)
+{
+    if (InterlockedCompareExchange(&g_StartReplacement, 0, 0) == 1)
+        return;                                 // latched present: nothing can un-install it under us
+    const DWORD csid = WTSGetActiveConsoleSessionId();
+    if (csid == 0xFFFFFFFF)
+        return;                                 // no console session: stays unknown, key forwarded
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE)
+        return;                                 // could not look: stays unknown, key forwarded
+    PROCESSENTRY32W pe;
+    ZeroMemory(&pe, sizeof(pe));
+    pe.dwSize = sizeof(pe);
+    LONG found = -1;                            // the enumeration SUCCEEDED, so absent is decisive
+    if (Process32FirstW(snap, &pe))
+    {
+        do
+        {
+            DWORD psid = 0;
+            if (QgaIsStartReplacementImage(pe.szExeFile) &&
+                ProcessIdToSessionId(pe.th32ProcessID, &psid) && psid == csid)
+            {
+                found = 1;
+                break;
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    else
+        found = 0;                              // could not enumerate: unknown, not absent
+    CloseHandle(snap);
+    const LONG was = InterlockedExchange(&g_StartReplacement, found);
+    if (was != found)
+        LogInfo("QGASTARTREPL %s (console session %lu) - the menu key is %s",
+            found == 1 ? L"a Start replacement is running" :
+            found == -1 ? L"no Start replacement is running" : L"could not be determined",
+            csid,
+            found == -1 ? L"dropped while Start is suppressed" : L"forwarded");
+}
+
+// Read by the input path; never enumerates.
+BOOL StartReplacementKnown(void)   { return (BOOL)(InterlockedCompareExchange(&g_StartReplacement, 0, 0) != 0); }
+BOOL StartReplacementPresent(void) { return (BOOL)(InterlockedCompareExchange(&g_StartReplacement, 0, 0) == 1); }
 
 static QGA_SHELL_PROCESS ShellProcessInConsoleSession(OUT DWORD *err)
 {
