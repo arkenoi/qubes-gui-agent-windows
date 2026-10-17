@@ -279,6 +279,53 @@ ULONG DisableEffects(void)
     return ERROR_SUCCESS;
 }
 
+// GIVE A WINDOW THE FOREGROUND. Lifted verbatim out of HandleFocus (vchan-handlers.c) so the
+// hidden-Start dismissal uses the SAME body rather than a second copy of it; see util.h for why.
+//
+// SetForegroundWindow SILENTLY FAILS - returns FALSE, changes nothing - when another process owns
+// the foreground and Windows' foreground lock is in force. AttachThreadInput is the documented way
+// through: while our thread shares an input queue with the current foreground thread we are inside
+// the same foreground context and the call is permitted. Attach only on failure, and ALWAYS detach
+// - a leaked attachment couples our input queue to another process's for good, so a hang there
+// becomes our hang.
+//
+// A REFUSED CALL IS NOT A NO-OP (measured 2026-10-01, w11-ds): Windows then activates the window
+// inside its OWN thread's input queue while the foreground stays where it was, and the window
+// repaints for ever with nothing deactivating it. That is why a refusal is worth reporting and not
+// just retrying, and why the dom0-focus caller nudges the input queue BEFORE calling this.
+BOOL ApplyForeground(IN HWND window, OUT FOREGROUND_HOW *how)
+{
+    if (how)
+        *how = FOREGROUND_REFUSED;
+    if (!window)
+        return FALSE;                       // an activation of nothing: the callers' predicates must never produce one
+
+    if (SetForegroundWindow(window))
+    {
+        if (how)
+            *how = FOREGROUND_PLAIN;
+        return TRUE;
+    }
+
+    HWND fg = GetForegroundWindow();
+    DWORD fgThread = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
+    DWORD ourThread = GetCurrentThreadId();
+    BOOL recovered = FALSE;
+
+    if (fgThread && fgThread != ourThread &&
+        AttachThreadInput(ourThread, fgThread, TRUE))
+    {
+        recovered = SetForegroundWindow(window);
+        if (recovered)
+            BringWindowToTop(window);
+        AttachThreadInput(ourThread, fgThread, FALSE);
+    }
+
+    if (recovered && how)
+        *how = FOREGROUND_ATTACHED;
+    return recovered;
+}
+
 // Set current thread's desktop to the current input desktop.
 ULONG AttachToInputDesktop(void)
 {

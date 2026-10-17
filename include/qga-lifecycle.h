@@ -584,17 +584,99 @@ static __inline BOOL QgaHoldIsStartup(IN BOOL brokerActive, IN BOOL brokerEverRe
  * did before and is no worse than before when focus cannot be read. NEVER NULL, because posting to
  * NULL is a broadcast to every top-level window, i.e. exactly the global inject this forbids.
  */
-static __inline HWND QgaStartDismissTarget(IN HWND focused, IN HWND startSurface)
+/* THE KEYSTROKE WAS THE WRONG MECHANISM, and this project's own code said so before it was written.
+ *
+ * main.c:7832, comment dated 2026-10-04: "A posted WM_KEYDOWN Escape to that window does NOT close
+ * Start; a real Escape keystroke does (measured)". The change from SendInput to PostMessage - made
+ * to stop a global inject closing Open-Shell's menu - kept the TARGETING property and dropped the
+ * only mechanism ever measured to work. A later fix then repaired the TARGET of that posted Escape
+ * (it had gone to the tracked surface while SearchHost's window held the input) and was REFUTED on
+ * the guest the same day: the Escape lands on the focused window now, and the menu is still open
+ * 1000 and 1063 ms later, twice. Targeting was never the defect. So: no keystroke is posted, by
+ * this predicate or anywhere below it, and QgaStartDismissTarget - which chose between two windows
+ * for a message that cannot work - is gone with its knob.
+ *
+ * WHAT CLOSES IT INSTEAD. Start is a LIGHT-DISMISS surface: it closes when something else takes
+ * activation, which is what a click on another window does. That is Windows' own close path, so the
+ * Start app's own state stays consistent - unlike hiding the window (keyboard focus stays in an
+ * invisible search box) or closing it (the shell's Start component is destroyed). The agent
+ * therefore returns activation to the window dom0 says the user is in, and the guest's shell
+ * desktop only when dom0 names none.
+ *
+ * AND THE CLOSURE IS OBSERVED, ONCE, WITHIN A BOUND - which is the part that was missing. Before
+ * this, the two ways an opening ended were both SILENT: ShouldAcceptWindow clearing the tracked
+ * handle when the surface was seen cloaked, and the re-arm clearing the flag when the foreground
+ * left Start. Nothing ever said "it closed", so a success and a never-attempted dismissal read
+ * identically in a log, and only the FAILURE was ever written down.
+ *
+ * WHY A PREDICATE: eight outcomes over six facts, three of them racing (the surface's visibility,
+ * where the foreground sits, whether dom0's window still exists), and the suite has to be able to
+ * drive every row including the ones a live guest produces rarely. The settle time is a PARAMETER
+ * rather than a constant read inside, so a test can assert the BOUND rather than the literal.
+ */
+typedef enum {
+    QGA_START_LOOK_AGAIN = 0,       /* Start is up but input has not moved to it yet - a later event looks again */
+    QGA_START_RETURN_FOCUS,         /* hand activation back to the window dom0 named */
+    QGA_START_RETURN_DESKTOP,       /* dom0 named none: the shell's desktop window */
+    QGA_START_NO_TARGET,            /* nothing to activate - ERROR, and nothing is touched */
+    QGA_START_CLOSING,              /* activation returned, surface not gone yet, still inside the bound */
+    QGA_START_CLOSED_CLOAKED,       /* observed closed: the surface itself is no longer visible */
+    QGA_START_CLOSED_FG_LEFT,       /* observed closed: the foreground is no longer Start/Search */
+    QGA_START_STUCK                 /* past the bound and still holding input - clicks go to a hidden menu */
+} QGA_START_VERDICT;
+
+static __inline QGA_START_VERDICT QgaHiddenStartVerdict(
+    IN BOOL attempted,              /* activation already returned in THIS opening */
+    IN BOOL surfaceVisible,         /* the tracked Start surface is still visible */
+    IN BOOL fgIsStartOrSearch,      /* StartMenuExperienceHost or SearchHost holds the foreground */
+    IN BOOL dom0FocusAlive,         /* dom0 named a window and it still exists */
+    IN BOOL shellWindowPresent,     /* the shell's desktop window exists (it does not at logon/shutdown) */
+    IN unsigned long long sinceAttemptMs,
+    IN unsigned long long settleMs)
 {
-#ifndef QGA_LIFECYCLE_DEFECT_DISMISSTOSTART
-    if (focused)
-        return focused;                     /* the window that actually has the keystroke's queue */
+    if (attempted)
+    {
+        /* CLOAKED BEATS FOREGROUND-LEFT when both hold: the surface being gone is the stronger
+         * statement, and it is the one the user sees. */
+#ifndef QGA_LIFECYCLE_DEFECT_STARTCLOSEUNSAID
+        if (!surfaceVisible)
+            return QGA_START_CLOSED_CLOAKED;
+        if (!fgIsStartOrSearch)
+            return QGA_START_CLOSED_FG_LEFT;
 #else
-    (void)focused;                          /* DEFECT: post to the tracked surface however focus sits -
-                                             * the measured 2026-10-17 failure, Escape to 0x10180 while
-                                             * SearchHost's 0x1018a held the input */
+        if (!surfaceVisible || !fgIsStartOrSearch)
+            return QGA_START_LOOK_AGAIN;    /* DEFECT: both closures stay silent and re-arm, as before -
+                                             * a dismissal that worked is indistinguishable from one that
+                                             * never ran */
 #endif
-    return startSurface;                    /* focus unreadable: no worse than before, still ONE window */
+        if (sinceAttemptMs < settleMs)
+            return QGA_START_CLOSING;
+#ifndef QGA_LIFECYCLE_DEFECT_STARTNEVERSTUCK
+        return QGA_START_STUCK;
+#else
+        return QGA_START_CLOSING;           /* DEFECT: never stuck, so a menu that stayed open past the
+                                             * bound is reported as still closing, for ever */
+#endif
+    }
+
+    /* 25H2 moves the foreground to Start's search box on its own schedule - measured up to 480 ms
+     * after the surface appears, sometimes after that opening's last window event. Not yet is not a
+     * failure: EVENT_SYSTEM_FOREGROUND brings us back. */
+    if (!fgIsStartOrSearch)
+        return QGA_START_LOOK_AGAIN;
+
+    if (dom0FocusAlive)
+        return QGA_START_RETURN_FOCUS;
+#ifndef QGA_LIFECYCLE_DEFECT_STARTRETURNNULL
+    if (shellWindowPresent)
+        return QGA_START_RETURN_DESKTOP;
+    return QGA_START_NO_TARGET;             /* say so and touch nothing: an activation of NULL is not a
+                                             * request, and at logon/shutdown there is no shell window */
+#else
+    (void)shellWindowPresent;               /* DEFECT: activate the shell desktop even when there is
+                                             * none, i.e. activate NULL */
+    return QGA_START_RETURN_DESKTOP;
+#endif
 }
 
 /* ---------------------------------------------------------------------------------------------

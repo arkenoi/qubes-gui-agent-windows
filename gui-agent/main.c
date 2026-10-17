@@ -817,6 +817,10 @@ static const struct
 // and the dismissal decides on the foreground (see DismissHiddenStartSurface).
 static HWND volatile g_StartSurfaceOpen = NULL;
 
+// Declared in main.h: the window dom0 last named as focused. Written by HandleFocus on the vchan
+// thread, read here by the dismissal on the tracking thread.
+HWND volatile g_Dom0FocusWindow = NULL;
+
 // TRUE for events whose effect on eligibility is INVISIBLE to the cheap reject-cache
 // signature (pid/tid/style/exstyle/rect), so a cached rejection cannot be trusted and the
 // window must be interrogated again.
@@ -7897,49 +7901,132 @@ static void StartDismissNotifyUser(void)
 }
 
 // TRUE when the foreground window belongs to StartMenuExperienceHost or SearchHost (image read fresh - see ShellHostKindOfProcess).
-// AND IT REPORTS THE FOCUSED WINDOW, not just the process. The kind-of-process answer is the right
-// GUARD - it is what says "Start or Search has the input" - but it was also, implicitly, the whole
-// basis for the TARGET, and the target was wrong: measured 2026-10-17, the Escape went to the tracked
-// Start surface 0x10180 while SearchHost's 0x1018a held the input, and the menu was still open
-// 1031 ms later, twice in one run. GetGUIThreadInfo on the FOREGROUND THREAD names the window whose
-// queue a posted keystroke actually reaches. `focused` is NULL when it cannot be read (another
-// desktop, a thread that has gone) and the caller then keeps the old target rather than broadcasting.
-// `focused` is optional so the re-arm path, which only needs the guard, passes NULL.
-static BOOL StartOrSearchHoldsForeground(OUT DWORD* fgPid, OUT HWND* focused)
+// This is the GUARD - "Start or Search has the input" - and nothing more. It used to ALSO report the
+// focused window via GetGUIThreadInfo, because the focused window was the posted Escape's target;
+// that whole mechanism is gone (see the note above DismissHiddenStartSurface), so the out-parameter
+// went with it rather than being left to be passed NULL by its only caller.
+static BOOL StartOrSearchHoldsForeground(OUT DWORD* fgPid)
 {
     *fgPid = 0;
-    if (focused) *focused = NULL;
     HWND fg = GetForegroundWindow();
-    DWORD tid = 0;
     if (fg)
-        tid = GetWindowThreadProcessId(fg, fgPid);
+        (void)GetWindowThreadProcessId(fg, fgPid);
     SHELL_SURFACE_KIND k = ShellHostKindOfProcess(*fgPid);
-    if (focused && tid)
-    {
-        GUITHREADINFO gti;
-        ZeroMemory(&gti, sizeof(gti));
-        gti.cbSize = sizeof(gti);
-        if (GetGUIThreadInfo(tid, &gti) && gti.hwndFocus)
-            *focused = gti.hwndFocus;
-    }
     return k == ShellSurfaceStart || k == ShellSurfaceSearch;
 }
 
-// Escape already sent in this opening and Start/Search still holds the foreground: the menu is closing (a debug line) until
-// START_DISMISS_SETTLE_MS after the Escape, stuck after it (one LOUD line per opening).
-static void StartDismissCheckStuck(IN HWND start, IN DWORD fgPid)
+// Is the tracked surface still there? The re-arm path has no WINDOW_DATA, so the cloak check
+// GetWindowData folds into IsVisible is repeated here - a cloaked Start surface is styled visible
+// and drawn nowhere, which is exactly "the menu closed".
+static BOOL StartSurfaceStillVisible(IN HWND start)
 {
-    const ULONGLONG since = GetTickCount64() - g_StartDismissSentAt;
-    if (since < START_DISMISS_SETTLE_MS)
+    if (!start || !IsWindow(start) || !IsWindowVisible(start))
+        return FALSE;
+    DWORD cloaked = 0;
+    if (SUCCEEDED(DwmGetWindowAttribute(start, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked != 0)
+        return FALSE;
+    return TRUE;
+}
+
+// ONE EXAMINATION of a hidden-Start opening: gather the six facts, take the verdict, act, and say
+// what happened once. Three call sites ask the same question - the hidden-Start branch when a
+// surface appears or is looked at again, the re-arm on every window event while a dismissal is
+// outstanding, and the site that clears the tracked handle when the surface is seen cloaked - so
+// there is one body and one place where a closure is recorded.
+//
+// `surfaceVisible` is passed in because two of those sites already know it from WINDOW_DATA (whose
+// IsVisible is the cloak-aware one) and only the re-arm has to go and look.
+static void StartOpeningExamine(IN HWND start, IN BOOL surfaceVisible)
+{
+    if (!start)
+        return;
+
+    DWORD fgPid = 0;
+    const BOOL fgIsShell = StartOrSearchHoldsForeground(&fgPid);
+    const HWND dom0Focus = (HWND)InterlockedCompareExchangePointer((PVOID volatile*)&g_Dom0FocusWindow, NULL, NULL);
+    // The handle dom0 named may have died between the vchan thread recording it and this read.
+    const BOOL dom0Alive = dom0Focus && IsWindow(dom0Focus) && IsWindowVisible(dom0Focus);
+    const HWND shell = ShellWindowNow();
+    const ULONGLONG since = g_StartDismissSent ? (GetTickCount64() - g_StartDismissSentAt) : 0;
+
+    const QGA_START_VERDICT verdict = QgaHiddenStartVerdict(g_StartDismissSent, surfaceVisible, fgIsShell,
+        dom0Alive, shell != NULL, since, START_DISMISS_SETTLE_MS);
+
+    switch (verdict)
     {
-        LogDebug("QGASTARTDISMISS 0x%x: Start still closing %llu ms after Escape (foreground pid %lu)", start, since, fgPid);
+    case QGA_START_LOOK_AGAIN:
+        // Start is up but 25H2 has not moved the input to it yet (measured up to 480 ms, sometimes
+        // after that opening's last window event). EVENT_SYSTEM_FOREGROUND brings us back.
+        g_StartDismissSent = FALSE;
+        g_StartDismissStuckLogged = FALSE;
+        return;
+
+    case QGA_START_CLOSED_CLOAKED:
+    case QGA_START_CLOSED_FG_LEFT:
+        // THE RECEIPT. Both of these were silent before: the opening simply stopped being
+        // mentioned, so a dismissal that worked and one that never ran read identically.
+        LogInfo("QGASTARTDISMISS 0x%x: closed (%s) %llu ms after activation returned",
+            (DWORD)(ULONG_PTR)start,
+            verdict == QGA_START_CLOSED_CLOAKED ? "surface cloaked" : "foreground left",
+            since);
+        g_StartDismissSent = FALSE;
+        g_StartDismissStuckLogged = FALSE;
+        return;
+
+    case QGA_START_CLOSING:
+        LogDebug("QGASTARTDISMISS 0x%x: closing, %llu ms after activation returned (foreground pid %lu)",
+            (DWORD)(ULONG_PTR)start, since, fgPid);
+        return;
+
+    case QGA_START_STUCK:
+        // ERROR, not a warning: a menu the user cannot see is taking their clicks, which is not a
+        // workable state. One line per opening.
+        if (!g_StartDismissStuckLogged)
+        {
+            g_StartDismissStuckLogged = TRUE;
+            LogError("QGASTARTDISMISS 0x%x: still open %llu ms after activation returned (foreground pid %lu) - "
+                "clicks go to a menu the user cannot see", (DWORD)(ULONG_PTR)start, since, fgPid);
+        }
+        return;
+
+    case QGA_START_NO_TARGET:
+        // Nothing is activated. At logon or shutdown there is no shell window and dom0 has named
+        // nothing; activating NULL is not a request, it is a broadcast with no addressee.
+        LogError("QGASTARTDISMISS 0x%x: nothing to return activation to - the hidden menu may take clicks",
+            (DWORD)(ULONG_PTR)start);
+        g_StartDismissSent = TRUE;              // do not re-ask on every window event; the re-arm clears it
+        g_StartDismissSentAt = GetTickCount64();
+        g_StartDismissStuckLogged = FALSE;
+        return;
+
+    case QGA_START_RETURN_FOCUS:
+    case QGA_START_RETURN_DESKTOP:
+    {
+        const HWND target = (verdict == QGA_START_RETURN_FOCUS) ? dom0Focus : shell;
+        FOREGROUND_HOW how = FOREGROUND_REFUSED;
+        const BOOL applied = ApplyForeground(target, &how);
+
+        g_StartDismissSent = TRUE;
+        g_StartDismissSentAt = GetTickCount64();
+        g_StartDismissStuckLogged = FALSE;
+
+        if (applied)
+            LogInfo("QGASTARTDISMISS 0x%x: the Windows Start menu opened in seamless mode, where it is never shown "
+                "(SeamlessStart=0) - activation returned to 0x%x (%s, %s), foreground pid %lu",
+                (DWORD)(ULONG_PTR)start, (DWORD)(ULONG_PTR)target,
+                verdict == QGA_START_RETURN_FOCUS ? "dom0 focus" : "shell desktop",
+                how == FOREGROUND_ATTACHED ? "attached" : "plain", fgPid);
+        else
+            LogError("QGASTARTDISMISS 0x%x: activation to 0x%x refused - foreground held by pid %lu; "
+                "the hidden menu may take clicks", (DWORD)(ULONG_PTR)start, (DWORD)(ULONG_PTR)target, fgPid);
+
+        if (!g_StartDismissNotified)
+        {
+            g_StartDismissNotified = TRUE;
+            StartDismissNotifyUser();
+        }
         return;
     }
-    if (!g_StartDismissStuckLogged)
-    {
-        g_StartDismissStuckLogged = TRUE;
-        LogWarning("QGASTARTDISMISS 0x%x: the hidden Start menu is STILL open %llu ms after Escape (foreground pid %lu) - clicks go to a menu the user cannot see",
-            start, since, fgPid);
     }
 }
 
@@ -7951,78 +8038,48 @@ static void StartDismissMaybeRearm(void)
 {
     if (!g_StartDismissSent)
         return;
-    DWORD fgPid = 0;
-    if (!StartOrSearchHoldsForeground(&fgPid, NULL))
+    // ANY window event is an occasion to re-examine the outstanding opening: the foreground may
+    // have left Start, or the surface may have cloaked, and both of those END this opening and are
+    // now RECORDED rather than inferred from silence. This path has no WINDOW_DATA for the Start
+    // surface, so it looks the visibility up itself.
+    HWND start = (HWND)InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, NULL);
+    if (!start)
     {
+        // The surface is already untracked (seen cloaked): the opening is over either way.
         g_StartDismissSent = FALSE;
         g_StartDismissStuckLogged = FALSE;
         return;
     }
-    // Still Start/Search in front: once the settle time is over, ANY window event is the evidence for a Start the Escape did not
-    // close - provided the Start surface has not been seen closed (cloaked) since, which clears g_StartSurfaceOpen.
-    HWND start = (HWND)InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, NULL);
-    if (start && GetTickCount64() - g_StartDismissSentAt >= START_DISMISS_SETTLE_MS)
-        StartDismissCheckStuck(start, fgPid);
+    StartOpeningExamine(start, StartSurfaceStillVisible(start));
 }
 
 static void DismissHiddenStartSurface(IN HWND start)
 {
-    DWORD fgPid = 0;
-    HWND focused = NULL;
-    if (!StartOrSearchHoldsForeground(&fgPid, &focused))
-    {
-        // Start is not holding input (or not open yet - a later event of this opening looks again): nothing to close.
-        g_StartDismissSent = FALSE;
-        g_StartDismissStuckLogged = FALSE;
-        return;
-    }
-    if (g_StartDismissSent)
-    {
-        StartDismissCheckStuck(start, fgPid);   // closing, or - after the settle time - stuck (once, LOUDLY)
-        return;
-    }
-    // TARGETED, NEVER GLOBAL. This used to be SendInput(VK_ESCAPE), which injects into the SYSTEM
-    // input queue: the guard above reads the foreground BEFORE the call, and the keystroke is
-    // delivered to whatever holds the foreground when it is DEQUEUED. The guard therefore
-    // constrains the check and not the delivery, so our Escape could land in another process's
-    // window - and the one process guaranteed to be competing for the foreground on the very key
-    // press that opens Start is a third-party menu like Open-Shell, which is exactly the
-    // configuration this defect was reported from (service.enableWinKey 1, Open-Shell user).
-    // MEASURED SHAPE, recorded and then wrongly dismissed at p=0.22: on 4.3.35, Open-Shell's menu
-    // closed itself 6-15 ms after taking the foreground in 3 of 57 Win presses, against 0 of 36 on
-    // 4.3.34 - and 6-15 ms is the latency of an injected keystroke being dequeued, not a
-    // coincidence. Jev on the mechanism alone, independent of any field report: race_is_real 0.96.
-    // Owner, 2026-10-08: "the reproduction is never source of truth" - so this is fixed as a CLASS,
-    // by making misdelivery impossible, rather than by demonstrating a symptom on a rig.
-    // PostMessage goes to THAT WINDOW's queue and nowhere else. If the Start surface ignores it,
-    // nothing else is affected and the existing stuck-check says so LOUDLY after the settle time -
-    // and there is deliberately NO fallback to a global inject, because a fallback here is the bug.
-    // THE WINDOW THAT HAS THE INPUT, not the one we were tracking. QgaStartDismissTarget chooses
-    // between exactly two windows and never NULL - PostMessage(NULL, ...) is a broadcast to every
-    // top-level window, which is the global inject this whole path forbids.
-    HWND target = QgaStartDismissTarget(focused, start);
-    BOOL posted = PostMessage(target, WM_KEYDOWN, VK_ESCAPE, 0x00010001)
-               && PostMessage(target, WM_KEYUP, VK_ESCAPE, (LPARAM)0xC0010001);
-    UINT sent = posted ? 2 : 0;
-    g_StartDismissSent = TRUE;
-    g_StartDismissSentAt = GetTickCount64();
-    g_StartDismissStuckLogged = FALSE;
-    if (sent == 2)
-        LogInfo("QGASTARTDISMISS 0x%x: the Windows Start menu opened in seamless mode, where it is never shown (SeamlessStart=0) - "
-            "posted Escape to 0x%x (focus=0x%x) so no invisible window takes input, and no other process can receive it "
-            "(foreground pid %lu)",
-            (DWORD)(ULONG_PTR)start, (DWORD)(ULONG_PTR)target, (DWORD)(ULONG_PTR)focused, fgPid);
-    else
-        // PostMessage(Escape) to the Start surface failed. NOT retried with a global inject: that could close
-        // another process's menu, which is the defect this replaced; the hidden Start menu may stay open.
-        LogError("QGASTARTDISMISS 0x%x: Escape to 0x%x failed (0x%x), it may stay open and take clicks",
-            (DWORD)(ULONG_PTR)start, (DWORD)(ULONG_PTR)target, GetLastError());
-    if (!g_StartDismissNotified)
-    {
-        g_StartDismissNotified = TRUE;
-        StartDismissNotifyUser();
-    }
+    // Reached from the hidden-Start branch, which has already established the surface is visible.
+    StartOpeningExamine(start, TRUE);
 }
+
+// WHY NO KEYSTROKE IS POSTED FROM HERE ANY MORE. Kept as a note, not as code: three successive
+// fixes were spent inside the posted-Escape mechanism before this project's own 2026-10-04
+// measurement of it was read.
+//
+// TARGETED, NEVER GLOBAL. This used to be SendInput(VK_ESCAPE), which injects into the SYSTEM
+// input queue: the guard reads the foreground BEFORE the call, and the keystroke is delivered to
+// whatever holds the foreground when it is DEQUEUED, so our Escape could land in another process's
+// window - and the one process guaranteed to be competing for the foreground on the very key press
+// that opens Start is a third-party menu like Open-Shell, which is exactly the configuration this
+// defect was reported from. MEASURED: on 4.3.35 Open-Shell's menu closed itself 6-15 ms after
+// taking the foreground in 3 of 57 Win presses, against 0 of 36 on 4.3.34 - the latency of an
+// injected keystroke being dequeued. Jev race_is_real 0.96. That constraint still binds: nothing
+// in this file injects input to close Start.
+//
+// PostMessage replaced it and could not work at all. main.c's own comment, 2026-10-04: "A posted
+// WM_KEYDOWN Escape to that window does NOT close Start; a real Escape keystroke does (measured)".
+// The SendInput->PostMessage change kept the targeting and dropped the only mechanism measured to
+// work; a later fix repaired the TARGET and was refuted on the guest the same day, twice, with the
+// menu still open 1000 and 1063 ms after an Escape that landed on the window holding the input.
+// Returning activation replaces it: Start is a light-dismiss surface, so the close path is
+// Windows' own and the Start app's state stays consistent.
 
 // ---- THE ERROR WINDOW (docs/ADR-supervision.md 6, main repo; owner 2026-10-07) -----------------------------------
 //
@@ -8113,7 +8170,14 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     if (!data->IsVisible)
     {
         if (data->Handle == g_StartSurfaceOpen)   // the hidden Start closed: foreground changes stop looking at it
+        {
+            // SAY IT CLOSED. This clearing was the silent half of the opening's life: the handle
+            // stopped being tracked and nothing anywhere recorded that the dismissal had worked,
+            // so a success and a dismissal that never ran left identical logs. The examination
+            // below writes the receipt (CLOSED_CLOAKED) exactly once, then the handle is dropped.
+            StartOpeningExamine(data->Handle, FALSE);
             InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, data->Handle);
+        }
         return FALSE;
     }
 

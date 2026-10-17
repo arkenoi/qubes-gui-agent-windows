@@ -1451,6 +1451,10 @@ static DWORD HandleFocus(IN HWND window)
             // button=7, motion=1061, focus=35 to the non-seamless desktop and the owner confirmed
             // "all fine, input works too". Windows manages focus inside its own desktop from the
             // first click, exactly as it does on real hardware.
+            // dom0 names no window, so neither do we: the hidden-Start dismissal must fall back to
+            // the shell's own desktop window rather than hand activation to a window dom0 has
+            // since moved away from.
+            InterlockedExchangePointer((PVOID volatile*)&g_Dom0FocusWindow, NULL);
             LogDebug("desktop focus event for window 0 - nothing to forward");
             return ERROR_SUCCESS;
         }
@@ -1523,36 +1527,33 @@ static DWORD HandleFocus(IN HWND window)
                 nudge.mi.dwFlags = MOUSEEVENTF_MOVE;   // dx = dy = 0: the cursor does not move
                 (void)InjectInput(&nudge, "SendInput(focus nudge)");
             }
-            if (!SetForegroundWindow(window))
+            // The body itself now lives in util.c (ApplyForeground), because the hidden-Start
+            // dismissal has to make the same request against the same lock and two copies of an
+            // attach-and-detach would drift. Identical in effect to what stood here: plain call
+            // first, attach fallback on refusal, always detached, same two log lines at the same
+            // two levels. The nudge above stays HERE - it belongs to dom0's focus path, and the
+            // dismissal must not inject input at all.
+            FOREGROUND_HOW how = FOREGROUND_REFUSED;
+            if (!ApplyForeground(window, &how))
             {
                 HWND fg = GetForegroundWindow();
                 DWORD fgThread = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
-                DWORD ourThread = GetCurrentThreadId();
-                BOOL recovered = FALSE;
-
-                if (fgThread && fgThread != ourThread &&
-                    AttachThreadInput(ourThread, fgThread, TRUE))
-                {
-                    recovered = SetForegroundWindow(window);
-                    if (recovered)
-                        BringWindowToTop(window);
-                    AttachThreadInput(ourThread, fgThread, FALSE);
-                }
-
-                if (recovered)
-                {
-                    LogDebug("0x%x: foreground was locked by 0x%x, taken via AttachThreadInput",
-                        window, fg);
-                }
-                else
-                {
-                    // Do not fail the message: focus is advisory and the guest is still usable.
-                    // But say so, because a silently ignored focus request is exactly what made
-                    // this defect invisible until a human noticed the chiming.
-                    LogWarning("0x%x: dom0 focus NOT applied - foreground held by 0x%x (thread %u)",
-                        window, fg, fgThread);
-                }
+                // Do not fail the message: focus is advisory and the guest is still usable.
+                // But say so, because a silently ignored focus request is exactly what made
+                // this defect invisible until a human noticed the chiming.
+                LogWarning("0x%x: dom0 focus NOT applied - foreground held by 0x%x (thread %u)",
+                    window, fg, fgThread);
             }
+            else if (how == FOREGROUND_ATTACHED)
+            {
+                LogDebug("0x%x: foreground was locked, taken via AttachThreadInput", window);
+            }
+
+            // WHAT dom0 LAST SAID IS FOCUSED. Recorded here, where dom0's decision arrives, and
+            // read by the hidden-Start dismissal: when a Start surface the guest must not show
+            // takes the input, the window to hand it back to is the one dom0 believes the user is
+            // in. This is a RECORD of dom0's own choice, not the agent choosing a window.
+            InterlockedExchangePointer((PVOID volatile*)&g_Dom0FocusWindow, (PVOID)window);
 
             // Z-ORDER SYNC, runtime-switchable (registry DWORD "FocusRaise", default 0 =
             // historic behaviour). MSG_FOCUS is the only stacking-adjacent thing dom0 sends:

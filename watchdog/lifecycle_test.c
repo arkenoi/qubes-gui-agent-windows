@@ -338,24 +338,93 @@ int main(void)
     check("hold: broker active but never recorded ready -> still not a startup hold",
           QgaHoldIsStartup(TRUE, FALSE) == FALSE);
 
-    /* ---- the hidden Start menu's Escape goes to the FOCUSED window (2026-10-17) ----
-     * MEASURED on win11de-sm with 4.3.36+agent.0824ac03e2e5: the menu opened twice, the Escape went
-     * to the tracked Start surface 0x10180, and both times it was "STILL open 1031 ms after Escape -
-     * clicks go to a menu the user cannot see". The agent's own line in the same run reads
-     * "start: 0x10180, search: 0x0" while SearchHost's 0x1018a ('Suche', WS_EX_TOPMOST, 800x750) was
-     * the visible window holding the input. The guard was right and the target was wrong.
-     * NEVER NULL: PostMessage(NULL, ...) broadcasts to every top-level window, which is the global
-     * inject this path exists to forbid (it was measured closing Open-Shell's own menu). */
+    /* ---- the hidden Start menu is CLOSED by returning activation, and the closure is SAID (2026-10-17) ----
+     * The posted Escape was never going to work and this project had already measured that: main.c's
+     * own comment of 2026-10-04 reads "A posted WM_KEYDOWN Escape to that window does NOT close
+     * Start; a real Escape keystroke does (measured)". Targeting it better was tried and REFUTED on
+     * win11de-sm the same day - the Escape landed on the window holding the input (0x10188) and the
+     * menu was "STILL open" 1000 and 1063 ms later, twice. So the mechanism changed, and with it the
+     * thing under test: not "which window gets the keystroke" but "what should happen to this
+     * opening now". A real Escape via SendInput stays forbidden - measured closing Open-Shell's own
+     * menu, Jev race_is_real 0.96.
+     * The settle time is a PARAMETER here, so these assert the BOUND and not the literal 1000. */
     {
-        HWND focused = (HWND)(ULONG_PTR)0x1018a, surface = (HWND)(ULONG_PTR)0x10180;
-        check("startdismiss: the focused window wins when the foreground thread has one",
-              QgaStartDismissTarget(focused, surface) == focused);
-        check("startdismiss: focus unreadable -> the tracked Start surface, as before",
-              QgaStartDismissTarget(NULL, surface) == surface);
-        check("startdismiss: and it is NEVER NULL - a NULL post is a broadcast",
-              QgaStartDismissTarget(NULL, surface) != NULL);
-        check("startdismiss: focus == the surface is simply that window",
-              QgaStartDismissTarget(surface, surface) == surface);
+        const unsigned long long S = 1000;   /* START_DISMISS_SETTLE_MS at the call site */
+
+        /* the eight rows, each driven on its own */
+        check("start: not attempted, input not on Start yet -> look again",
+              QgaHiddenStartVerdict(FALSE, TRUE, FALSE, TRUE, TRUE, 0, S) == QGA_START_LOOK_AGAIN);
+        check("start: not attempted, Start holds input, dom0 named a live window -> return focus",
+              QgaHiddenStartVerdict(FALSE, TRUE, TRUE, TRUE, TRUE, 0, S) == QGA_START_RETURN_FOCUS);
+        check("start: dom0 named none -> the shell desktop",
+              QgaHiddenStartVerdict(FALSE, TRUE, TRUE, FALSE, TRUE, 0, S) == QGA_START_RETURN_DESKTOP);
+        check("start: no dom0 window and no shell window -> NO TARGET, nothing is activated",
+              QgaHiddenStartVerdict(FALSE, TRUE, TRUE, FALSE, FALSE, 0, S) == QGA_START_NO_TARGET);
+        check("start: attempted, surface gone -> closed (cloaked)",
+              QgaHiddenStartVerdict(TRUE, FALSE, TRUE, TRUE, TRUE, 10, S) == QGA_START_CLOSED_CLOAKED);
+        check("start: attempted, foreground left Start -> closed (fg left)",
+              QgaHiddenStartVerdict(TRUE, TRUE, FALSE, TRUE, TRUE, 10, S) == QGA_START_CLOSED_FG_LEFT);
+        check("start: attempted, still up inside the bound -> closing",
+              QgaHiddenStartVerdict(TRUE, TRUE, TRUE, TRUE, TRUE, 328, S) == QGA_START_CLOSING);
+        check("start: attempted, still up past the bound -> STUCK",
+              QgaHiddenStartVerdict(TRUE, TRUE, TRUE, TRUE, TRUE, 1031, S) == QGA_START_STUCK);
+
+        /* THE MEASURED SHAPE, from the run that refuted the previous fix: attempted, the surface
+         * still visible, SearchHost still in front, 1031 ms gone against a 1000 ms bound. */
+        check("start: the 2026-10-17 measured shape reads STUCK",
+              QgaHiddenStartVerdict(TRUE, TRUE, TRUE, TRUE, TRUE, 1031, S) == QGA_START_STUCK);
+
+        /* the boundary, from both sides - the bound itself is "settled" */
+        check("start: 999 ms is still closing",
+              QgaHiddenStartVerdict(TRUE, TRUE, TRUE, TRUE, TRUE, 999, S) == QGA_START_CLOSING);
+        check("start: exactly the settle time is already stuck",
+              QgaHiddenStartVerdict(TRUE, TRUE, TRUE, TRUE, TRUE, 1000, S) == QGA_START_STUCK);
+        /* ...and it is the PARAMETER, not the number: a 4 s bound moves it */
+        check("start: with a 4 s bound, 1031 ms is still closing",
+              QgaHiddenStartVerdict(TRUE, TRUE, TRUE, TRUE, TRUE, 1031, 4000) == QGA_START_CLOSING);
+
+        /* cloaked beats foreground-left when both hold: the surface being gone is what the user sees */
+        check("start: surface gone AND foreground left -> cloaked wins",
+              QgaHiddenStartVerdict(TRUE, FALSE, FALSE, TRUE, TRUE, 10, S) == QGA_START_CLOSED_CLOAKED);
+        /* a live dom0 window wins over the desktop fallback */
+        check("start: dom0's window wins over the shell desktop",
+              QgaHiddenStartVerdict(FALSE, TRUE, TRUE, TRUE, TRUE, 0, S) != QGA_START_RETURN_DESKTOP);
+
+        /* WHOLE-SPACE INVARIANTS, every combination of the five flags x four elapsed values. These
+         * are what stop a later row from quietly activating NULL or reporting a closure that was
+         * never attempted. */
+        int combos = 0, badClosure = 0, badAttempted = 0, badFg = 0, badDesktop = 0, badPref = 0;
+        for (int a = 0; a < 2; a++)
+        for (int sv = 0; sv < 2; sv++)
+        for (int fg = 0; fg < 2; fg++)
+        for (int df = 0; df < 2; df++)
+        for (int sw = 0; sw < 2; sw++)
+        {
+            const unsigned long long elapsed[4] = { 0, 1, 999, 5000 };
+            for (int e = 0; e < 4; e++)
+            {
+                const QGA_START_VERDICT v = QgaHiddenStartVerdict((BOOL)a, (BOOL)sv, (BOOL)fg,
+                    (BOOL)df, (BOOL)sw, elapsed[e], S);
+                const int closureish = (v == QGA_START_CLOSED_CLOAKED || v == QGA_START_CLOSED_FG_LEFT ||
+                                        v == QGA_START_CLOSING || v == QGA_START_STUCK);
+                const int actionish = (v == QGA_START_RETURN_FOCUS || v == QGA_START_RETURN_DESKTOP ||
+                                       v == QGA_START_NO_TARGET);
+                combos++;
+                if (closureish && !a)                                   badAttempted++;
+                if (actionish && a)                                     badClosure++;
+                if (actionish && !fg)                                   badFg++;
+                if (v == QGA_START_RETURN_DESKTOP && !sw)               badDesktop++;
+                if (df && fg && !a && v != QGA_START_RETURN_FOCUS)      badPref++;
+            }
+        }
+        /* One assertion per invariant over the whole space, so a violation names WHICH rule broke
+         * and in how many combinations - rather than 3200 ok lines burying the named cases above. */
+        check("start invariant: every combination was driven (5 flags x 4 elapsed)", combos == 128);
+        check("start invariant: a closure verdict only ever follows an attempt", badAttempted == 0);
+        check("start invariant: an activation is only decided when nothing was attempted yet", badClosure == 0);
+        check("start invariant: an activation is only decided while Start holds the input", badFg == 0);
+        check("start invariant: the desktop is NEVER chosen without a shell window - no activation of NULL", badDesktop == 0);
+        check("start invariant: dom0's live window is preferred to the desktop fallback", badPref == 0);
     }
 
     /* ---- BROKERHOLD's level follows its REASON (2026-10-17) ----

@@ -46,6 +46,14 @@ extern volatile LONG g_InKeypress, g_InButton, g_InMotion, g_InFocus;
 // directly - the flag is the policy, this is the policy applied to the current mode.
 BOOL NoScreenGrantActive(void);
 extern HWND g_DesktopWindow;
+
+/* THE WINDOW dom0 LAST SAID WAS FOCUSED, written by HandleFocus as dom0's decisions arrive and read
+ * by the hidden-Start dismissal, which hands activation back to it. NULL means dom0 has not named
+ * one in this session, or named the desktop (window 0). It is a record of dom0's choice: the agent
+ * does not pick a window to focus on dom0's behalf (owner: "i do not want it to intercept focus").
+ * Written on the vchan thread, read on the window-tracking thread, so interlocked at both ends -
+ * and the handle may have DIED between the two, which the reader must check. */
+extern HWND volatile g_Dom0FocusWindow;
 extern volatile BOOL g_OnSecureDesktop;
 // Window currently being dragged with a held mouse button (input path); NULL when none.
 // Suppresses per-window PrintWindow recapture for that window - see its definition.
