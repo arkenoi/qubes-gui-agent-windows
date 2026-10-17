@@ -11,6 +11,7 @@
 #include "send.h"
 #include "wincapture.h"
 #include "perwindow.h"
+#include "qga-lifecycle.h"   // QgaXcLineKept: the per-notify Debug line
 #include "pwcarry.h"
 #include "perf.h"
 #include "faultinject.h"
@@ -49,6 +50,11 @@ static void PwXcLogger(IN XENCONTROL_LOG_LEVEL logLevel, IN const char* function
                        IN const wchar_t* format, IN va_list args)
 {
     wchar_t buf[1024];
+    // THE SECOND PRODUCER. capture.c's XcLogger got this guard and this one did not, so 98 of the
+    // 118 per-notify Debug lines survived - measured on win11de-sm 2026-10-17. The per-window path
+    // is the busy one, which is exactly why patching only the other logger changed almost nothing.
+    if (!QgaXcLineKept((int)logLevel, function))   // GUARD:xcnotify
+        return;
     if (FAILED(StringCbVPrintfW(buf, sizeof(buf), format, args)))
         return;
     _LogFormat(logLevel, /*raw=*/FALSE, function, buf);
