@@ -7880,6 +7880,12 @@ static ULONGLONG g_StartDismissSentAt = 0;     // GetTickCount64() when that Esc
 // after it is the evidence that the Escape did not close it. A threshold on an event that happens anyway - nothing is armed or waited.
 #define START_DISMISS_SETTLE_MS 1000
 static BOOL g_StartDismissStuckLogged = FALSE;
+// WAS THE ACTIVATION ACTUALLY APPLIED, or refused? Without this the closure line read
+// "closed ... after activation returned" even when the foreground lock had refused the
+// request, which claims this agent closed a surface it did not. MEASURED 2026-10-17: both
+// openings refused, both closures logged with that wording, and Jev reading the capture
+// concluded the agent HAD closed it (0.63) - from my own sentence.
+static BOOL g_StartDismissApplied = FALSE;
 static BOOL g_StartDismissNotified = FALSE;
 
 static void StartDismissNotifyUser(void)
@@ -7994,12 +8000,17 @@ static void StartOpeningExamine(IN HWND start, IN BOOL surfaceVisible)
     case QGA_START_CLOSED_FG_LEFT:
         // THE RECEIPT. Both of these were silent before: the opening simply stopped being
         // mentioned, so a dismissal that worked and one that never ran read identically.
-        LogInfo("QGASTARTDISMISS 0x%x: closed (%s) %llu ms after activation returned",
+        // The second clause is the whole point: a closure that followed a REFUSED activation is not
+        // this agent's doing, and the line must not let a reader think it was.
+        LogInfo("QGASTARTDISMISS 0x%x: closed (%s) %llu ms after %s",
             (DWORD)(ULONG_PTR)start,
             verdict == QGA_START_CLOSED_CLOAKED ? L"surface cloaked" : L"foreground left",
-            since);
+            since,
+            g_StartDismissApplied ? L"activation returned - closed by this request"
+                                  : L"a REFUSED activation - NOT closed by this request");
         g_StartDismissSent = FALSE;
         g_StartDismissStuckLogged = FALSE;
+        g_StartDismissApplied = FALSE;
         return;
 
     case QGA_START_CLOSING:
@@ -8024,6 +8035,7 @@ static void StartOpeningExamine(IN HWND start, IN BOOL surfaceVisible)
         LogError("QGASTARTDISMISS 0x%x: nothing to return activation to - the hidden menu may take clicks",
             (DWORD)(ULONG_PTR)start);
         g_StartDismissSent = TRUE;              // do not re-ask on every window event; the re-arm clears it
+        g_StartDismissApplied = FALSE;           // nothing was activated
         g_StartDismissSentAt = GetTickCount64();
         g_StartDismissStuckLogged = FALSE;
         return;
@@ -8038,6 +8050,7 @@ static void StartOpeningExamine(IN HWND start, IN BOOL surfaceVisible)
         g_StartDismissSent = TRUE;
         g_StartDismissSentAt = GetTickCount64();
         g_StartDismissStuckLogged = FALSE;
+        g_StartDismissApplied = applied;
 
         if (applied)
             LogInfo("QGASTARTDISMISS 0x%x: the Windows Start menu opened in seamless mode, where it is never shown "
