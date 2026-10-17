@@ -550,6 +550,54 @@ static __inline BOOL QgaHoldIsStartup(IN BOOL brokerActive, IN BOOL brokerEverRe
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * WHICH WINDOW GETS THE ESCAPE THAT CLOSES THE HIDDEN START MENU?
+ *
+ * MEASURED 2026-10-17 on win11de-sm (German 25H2 26200) with 4.3.36+agent.0824ac03e2e5 installed and
+ * verified: the hidden Start menu opened TWICE and our Escape did not close it either time -
+ *   120650.185 I QGASTARTDISMISS 0x10180: ... posted Escape TO THAT WINDOW ... (foreground pid 2920)
+ *   120651.216 W QGASTARTDISMISS 0x10180: the hidden Start menu is STILL open 1031 ms after Escape
+ *                (foreground pid 2920) - clicks go to a menu the user cannot see
+ * and again at 120653.978 / 120655.006. That is the field report this dismissal was written for
+ * (GWeck #172), reproducing on the current build; the owner had already retracted a claim that
+ * 4.3.35 fixed it. Jev: P1-class 0.88.
+ *
+ * WHY IT FAILED. The agent's own tracking line in the same run reads
+ *   AttachToInputDesktop: desktop: 0x1000c, start: 0x10180, search: 0x0
+ * so its `search` handle is 0x0 - never found - while the window that is actually visible,
+ * WS_EX_TOPMOST and owned by SearchHost.exe is 0x1018a ('Suche', 800x750, parent 0x1000c). The post
+ * went to 0x10180. The GUARD was right and the TARGET was wrong: StartOrSearchHoldsForeground asks
+ * only what KIND OF PROCESS holds the foreground, so it correctly reported Search (pid 2920), and
+ * the Escape was then posted to a different window of the same hierarchy. PostMessage returned TRUE
+ * both times - the Info line is written only when both posts succeed - so nothing failed loudly;
+ * the keystroke simply went to a queue whose window does not have the input. Jev: the cause is the
+ * wrong target rather than a CoreWindow ignoring a posted key, 0.87.
+ *
+ * AND THE DELIVERY STAYS TARGETED. This must not become a global SendInput again: that injects into
+ * the SYSTEM input queue and was measured closing Open-Shell's OWN menu (3 of 57 Win presses on
+ * 4.3.35, 6-15 ms after it took the foreground, against 0 of 36 on 4.3.34; Jev race_is_real 0.96).
+ * The emitter's comment is explicit - "there is deliberately NO fallback to a global inject, because
+ * a fallback here is the bug" - so this only ever chooses between TWO WINDOWS, never a broadcast.
+ * Jev on the direction: post to the focused window 0.99, measure-first 0.00.
+ *
+ * THE CHOICE IS PURE, so it is decided here and the suite holds both arms: the focused window when
+ * the foreground thread has one, and otherwise the tracked Start surface - which is what the agent
+ * did before and is no worse than before when focus cannot be read. NEVER NULL, because posting to
+ * NULL is a broadcast to every top-level window, i.e. exactly the global inject this forbids.
+ */
+static __inline HWND QgaStartDismissTarget(IN HWND focused, IN HWND startSurface)
+{
+#ifndef QGA_LIFECYCLE_DEFECT_DISMISSTOSTART
+    if (focused)
+        return focused;                     /* the window that actually has the keystroke's queue */
+#else
+    (void)focused;                          /* DEFECT: post to the tracked surface however focus sits -
+                                             * the measured 2026-10-17 failure, Escape to 0x10180 while
+                                             * SearchHost's 0x1018a held the input */
+#endif
+    return startSurface;                    /* focus unreadable: no worse than before, still ONE window */
+}
+
+/* ---------------------------------------------------------------------------------------------
  * IS THIS HOLD'S REASON A NORMAL ONE?  (BROKERHOLD's level, decided per CAUSE)
  *
  * BrokerFreshFrame refuses a frame for eleven distinct reasons and now names which; this decides

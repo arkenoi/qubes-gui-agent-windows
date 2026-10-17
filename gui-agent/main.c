@@ -7897,13 +7897,31 @@ static void StartDismissNotifyUser(void)
 }
 
 // TRUE when the foreground window belongs to StartMenuExperienceHost or SearchHost (image read fresh - see ShellHostKindOfProcess).
-static BOOL StartOrSearchHoldsForeground(OUT DWORD* fgPid)
+// AND IT REPORTS THE FOCUSED WINDOW, not just the process. The kind-of-process answer is the right
+// GUARD - it is what says "Start or Search has the input" - but it was also, implicitly, the whole
+// basis for the TARGET, and the target was wrong: measured 2026-10-17, the Escape went to the tracked
+// Start surface 0x10180 while SearchHost's 0x1018a held the input, and the menu was still open
+// 1031 ms later, twice in one run. GetGUIThreadInfo on the FOREGROUND THREAD names the window whose
+// queue a posted keystroke actually reaches. `focused` is NULL when it cannot be read (another
+// desktop, a thread that has gone) and the caller then keeps the old target rather than broadcasting.
+// `focused` is optional so the re-arm path, which only needs the guard, passes NULL.
+static BOOL StartOrSearchHoldsForeground(OUT DWORD* fgPid, OUT HWND* focused)
 {
     *fgPid = 0;
+    if (focused) *focused = NULL;
     HWND fg = GetForegroundWindow();
+    DWORD tid = 0;
     if (fg)
-        GetWindowThreadProcessId(fg, fgPid);
+        tid = GetWindowThreadProcessId(fg, fgPid);
     SHELL_SURFACE_KIND k = ShellHostKindOfProcess(*fgPid);
+    if (focused && tid)
+    {
+        GUITHREADINFO gti;
+        ZeroMemory(&gti, sizeof(gti));
+        gti.cbSize = sizeof(gti);
+        if (GetGUIThreadInfo(tid, &gti) && gti.hwndFocus)
+            *focused = gti.hwndFocus;
+    }
     return k == ShellSurfaceStart || k == ShellSurfaceSearch;
 }
 
@@ -7934,7 +7952,7 @@ static void StartDismissMaybeRearm(void)
     if (!g_StartDismissSent)
         return;
     DWORD fgPid = 0;
-    if (!StartOrSearchHoldsForeground(&fgPid))
+    if (!StartOrSearchHoldsForeground(&fgPid, NULL))
     {
         g_StartDismissSent = FALSE;
         g_StartDismissStuckLogged = FALSE;
@@ -7950,7 +7968,8 @@ static void StartDismissMaybeRearm(void)
 static void DismissHiddenStartSurface(IN HWND start)
 {
     DWORD fgPid = 0;
-    if (!StartOrSearchHoldsForeground(&fgPid))
+    HWND focused = NULL;
+    if (!StartOrSearchHoldsForeground(&fgPid, &focused))
     {
         // Start is not holding input (or not open yet - a later event of this opening looks again): nothing to close.
         g_StartDismissSent = FALSE;
@@ -7978,21 +7997,26 @@ static void DismissHiddenStartSurface(IN HWND start)
     // PostMessage goes to THAT WINDOW's queue and nowhere else. If the Start surface ignores it,
     // nothing else is affected and the existing stuck-check says so LOUDLY after the settle time -
     // and there is deliberately NO fallback to a global inject, because a fallback here is the bug.
-    BOOL posted = PostMessage(start, WM_KEYDOWN, VK_ESCAPE, 0x00010001)
-               && PostMessage(start, WM_KEYUP, VK_ESCAPE, (LPARAM)0xC0010001);
+    // THE WINDOW THAT HAS THE INPUT, not the one we were tracking. QgaStartDismissTarget chooses
+    // between exactly two windows and never NULL - PostMessage(NULL, ...) is a broadcast to every
+    // top-level window, which is the global inject this whole path forbids.
+    HWND target = QgaStartDismissTarget(focused, start);
+    BOOL posted = PostMessage(target, WM_KEYDOWN, VK_ESCAPE, 0x00010001)
+               && PostMessage(target, WM_KEYUP, VK_ESCAPE, (LPARAM)0xC0010001);
     UINT sent = posted ? 2 : 0;
     g_StartDismissSent = TRUE;
     g_StartDismissSentAt = GetTickCount64();
     g_StartDismissStuckLogged = FALSE;
     if (sent == 2)
         LogInfo("QGASTARTDISMISS 0x%x: the Windows Start menu opened in seamless mode, where it is never shown (SeamlessStart=0) - "
-            "posted Escape TO THAT WINDOW so no invisible window takes input, and no other process can receive it (foreground pid %lu)",
-            start, fgPid);
+            "posted Escape to 0x%x (focus=0x%x) so no invisible window takes input, and no other process can receive it "
+            "(foreground pid %lu)",
+            (DWORD)(ULONG_PTR)start, (DWORD)(ULONG_PTR)target, (DWORD)(ULONG_PTR)focused, fgPid);
     else
         // PostMessage(Escape) to the Start surface failed. NOT retried with a global inject: that could close
         // another process's menu, which is the defect this replaced; the hidden Start menu may stay open.
-        LogError("QGASTARTDISMISS 0x%x: Escape to the Start menu failed (0x%x), it may stay open and take clicks",
-            start, GetLastError());
+        LogError("QGASTARTDISMISS 0x%x: Escape to 0x%x failed (0x%x), it may stay open and take clicks",
+            (DWORD)(ULONG_PTR)start, (DWORD)(ULONG_PTR)target, GetLastError());
     if (!g_StartDismissNotified)
     {
         g_StartDismissNotified = TRUE;

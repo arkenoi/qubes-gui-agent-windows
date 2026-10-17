@@ -338,6 +338,26 @@ int main(void)
     check("hold: broker active but never recorded ready -> still not a startup hold",
           QgaHoldIsStartup(TRUE, FALSE) == FALSE);
 
+    /* ---- the hidden Start menu's Escape goes to the FOCUSED window (2026-10-17) ----
+     * MEASURED on win11de-sm with 4.3.36+agent.0824ac03e2e5: the menu opened twice, the Escape went
+     * to the tracked Start surface 0x10180, and both times it was "STILL open 1031 ms after Escape -
+     * clicks go to a menu the user cannot see". The agent's own line in the same run reads
+     * "start: 0x10180, search: 0x0" while SearchHost's 0x1018a ('Suche', WS_EX_TOPMOST, 800x750) was
+     * the visible window holding the input. The guard was right and the target was wrong.
+     * NEVER NULL: PostMessage(NULL, ...) broadcasts to every top-level window, which is the global
+     * inject this path exists to forbid (it was measured closing Open-Shell's own menu). */
+    {
+        HWND focused = (HWND)(ULONG_PTR)0x1018a, surface = (HWND)(ULONG_PTR)0x10180;
+        check("startdismiss: the focused window wins when the foreground thread has one",
+              QgaStartDismissTarget(focused, surface) == focused);
+        check("startdismiss: focus unreadable -> the tracked Start surface, as before",
+              QgaStartDismissTarget(NULL, surface) == surface);
+        check("startdismiss: and it is NEVER NULL - a NULL post is a broadcast",
+              QgaStartDismissTarget(NULL, surface) != NULL);
+        check("startdismiss: focus == the surface is simply that window",
+              QgaStartDismissTarget(surface, surface) == surface);
+    }
+
     /* ---- BROKERHOLD's level follows its REASON (2026-10-17) ----
      * BrokerFreshFrame refuses a frame for eleven reasons and now names which. Exactly ONE is
      * normal: a slot the broker has registered but not yet published to, which carries
