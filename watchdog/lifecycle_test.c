@@ -338,6 +338,29 @@ int main(void)
     check("hold: broker active but never recorded ready -> still not a startup hold",
           QgaHoldIsStartup(TRUE, FALSE) == FALSE);
 
+    /* ---- the first seconds of a slow capture pass are not a warning (2026-10-17) ----
+     * Measured over run 38994277148: every slow pass in the campaign was 1-3 s against the 15 s
+     * wedge, the wedge arm fired ZERO times, all recovered, all during install/boot load. The
+     * split is HALF THE WEDGE - derived from the wedge, not from those numbers, so it would sit in
+     * the same place whatever the campaign had shown. Jev: graduate the report 0.86, raise the
+     * threshold 0.00. */
+    check("slowpass: 1 s of a 15 s budget is brief - Info",
+          QgaCaptureSlowIsNormal(1000, 15000) == TRUE);
+    check("slowpass: the longest pass the campaign measured, 3 s, is still brief",
+          QgaCaptureSlowIsNormal(3000, 15000) == TRUE);
+    check("slowpass: just under half the budget is still brief",
+          QgaCaptureSlowIsNormal(7499, 15000) == TRUE);
+    check("slowpass: AT half the budget it is a warning - more spent than left",
+          QgaCaptureSlowIsNormal(7500, 15000) == FALSE);
+    check("slowpass: well past half, loud",
+          QgaCaptureSlowIsNormal(14000, 15000) == FALSE);
+    check("slowpass: the boundary follows the wedge, not a literal - a 4 s wedge warns at 2 s",
+          QgaCaptureSlowIsNormal(2000, 4000) == FALSE);
+    check("slowpass: and is brief below it on that same wedge",
+          QgaCaptureSlowIsNormal(1999, 4000) == TRUE);
+    check("slowpass: no wedge configured -> nothing to be a fraction of, so never quiet",
+          QgaCaptureSlowIsNormal(1000, 0) == FALSE);
+
     /* ---- and a hold on a HEALTHY feed is not a fault either (2026-10-17) ----
      * QgaHoldIsStartup only separates "not started yet" from everything else, so every other hold
      * stayed at W: 589 of the 597 warnings in all 93 captures on this rig are an active broker with

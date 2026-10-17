@@ -651,6 +651,49 @@ static __inline BOOL QgaLateRegIsStartup(IN BOOL refusedByActiveBroker, IN BOOL 
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * IS A SLOW CAPTURE PASS WORTH A WARNING YET?  (CaptureThread's "main loop slow")
+ *
+ * The capture loop has TWO arms: at CAPTURE_READY_WEDGE_MS (15 s) it declares the loop wedged,
+ * releases the frame, signals error_event and exits the thread; below that it logs "main loop
+ * slow" once per second. The soft arm warned from the FIRST second.
+ *
+ * MEASURED over run 38994277148, every occurrence in the campaign:
+ *   waited=1000ms x10, waited=2000ms x2, waited=3000ms x1
+ * and because the emitter speaks once per second of the SAME pass, those 13 lines are ~9 distinct
+ * slow passes - win11-clean 06:02:58+:59 is one pass of ~2 s, win11-reinstall 06:15:52+:53+:54 one
+ * of ~3 s. The longest pass in the whole campaign was 3 s against a 15 s wedge, the hard arm fired
+ * ZERO times, and every pass recovered on its own. All of them landed inside install or boot
+ * activity on six different cells, i.e. while the guest was busy.
+ * Jev: graduate the report 0.86 (leave it loud 0.14, RAISE THE THRESHOLD 0.00); is this a product
+ * defect 0.23.
+ *
+ * SO THE WEDGE IS NOT MOVED AND NOTHING IS TUNED. This project refuses "tune the number until it
+ * passes", and a timeout is never a fix - so the 15 s arm is untouched and this predicate does not
+ * know what the data looked like. What changes is only the LEVEL of the sub-wedge report: the first
+ * part of the wait is said at Info, and it becomes a Warning once the pass is closer to being
+ * reinitialized than to being brief.
+ *
+ * THE BOUNDARY IS DERIVED FROM THE WEDGE, NOT FROM THE MEASUREMENT - which is what keeps it from
+ * being the tuning this project refuses. Half of the wedge is the point past which a pass has less
+ * of its budget left than it has already spent; it would sit at the same place whatever the
+ * campaign had shown, and it is expressed as a fraction so that moving the wedge moves it too
+ * rather than leaving a stale literal behind. That the measured 3 s falls below it is a
+ * CONSEQUENCE, not the reason, and if a pass ever does cross it the line is loud again with no
+ * further change.
+ */
+static __inline BOOL QgaCaptureSlowIsNormal(IN unsigned long waitedMs, IN unsigned long wedgeMs)
+{
+    if (wedgeMs == 0)
+        return FALSE;                       /* no wedge configured: nothing to be a fraction of */
+#ifndef QGA_LIFECYCLE_DEFECT_SLOWALWAYSLOUD
+    return (BOOL)(waitedMs * 2 < wedgeMs);  /* less than half the budget spent: still brief */
+#else
+    (void)waitedMs;                         /* DEFECT: every slow pass warns from its first second */
+    return FALSE;
+#endif
+}
+
+/* ---------------------------------------------------------------------------------------------
  * IS THIS WINDOW'S FAULT CLOCK ACTUALLY DUE?  (QGADIRECTSUPPRESS and the dom0 notice it sends)
  *
  * MEASURED on win11-app, 2026-10-11, a window opened ~29 s before the broker became ready:
