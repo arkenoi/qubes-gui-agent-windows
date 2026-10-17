@@ -479,6 +479,25 @@ static __inline unsigned WgcbrkStageBudgetMs(unsigned stageCode)
 #define WGCBRK_ROUTE_WGC    0u   /* WGC on the window itself - arrival-driven */
 #define WGCBRK_ROUTE_RELAY  1u   /* WGC on a destination carrying a DWM thumbnail - arrival-driven */
 #define WGCBRK_ROUTE_PW     2u   /* polled PrintWindow - the fallback this relay exists to retire */
+#define WGCBRK_ROUTE_MONITOR 3u  /* capture the MONITOR and publish only this slot's crop - the ONLY
+                                  * source measured to carry a shell CoreWindow's pixels. 2026-10-17,
+                                  * one Search surface, one opening, four sources: WGC on the window
+                                  * 0/9400 non-black, WGC on a DWM thumbnail of it black too,
+                                  * PrintWindow(PW_RENDERFULLCONTENT) maxchannel=0, and
+                                  * `wgcprobe mon 2160 642 800 750` -> 4623/4623 non-black,
+                                  * maxchannel=255, 16 colours. The pixels exist; only this sees them.
+                                  * This is the architecture pinned 2026-09-02 ("per-HWND WGC for
+                                  * app/UWP/NRB/o-r-menu windows + ONE monitor capture for shell
+                                  * CoreWindows"), not the composite fallback the owner prohibited:
+                                  * that prohibition is about serving an ORDINARY window from the
+                                  * desktop composite WHEN A DIRECT PATH EXISTS, and for this class
+                                  * none does (Jev different-it-is-the-pinned-design 0.94). The crop
+                                  * happens in the BROKER, so only the card's rect ever reaches the
+                                  * slot and the agent consumes it as an ordinary per-window frame -
+                                  * no agent-side desktop copy, so QGACOMPOSITECOPY keeps its
+                                  * meaning. OCCLUDER BLEED on these surfaces is NOT yet measured
+                                  * (Jev 0.49/0.49): the menu is topmost while open, which makes it
+                                  * unlikely, and unlikely is not a measurement. */
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))
 #define WGCBRK_SLOTS(base)     ((WGCBRK_SLOT*)((BYTE*)(base)+sizeof(WGCBRK_HEADER)))
