@@ -4549,8 +4549,32 @@ static void NotifBridgeSupervise(void)
                 // them apart by asking whether the pid exists AT ALL first.
                 HANDLE probe = OpenProcess(SYNCHRONIZE, FALSE, hbPid);
                 if (!probe)
-                    // A crash, not a forged pid; Task Scheduler restarts it only if it exited with a failure.
-                    LogWarning("NOTIFBRIDGE published pid %lu is gone, the bridge crashed right after starting", hbPid);
+                {
+                    // A GONE PID THIS AGENT NEVER SAW READY IS NOT A CRASH IT OBSERVED.
+                    // The heartbeat's tick is checked against this agent's own launch, which is
+                    // right - but a PREDECESSOR's bridge can still be alive and heart-beating when a
+                    // new agent starts, so a FRESH tick can still carry the OLD bridge's pid. A fresh
+                    // agent process holds no knowledge of its predecessor's pid, so it cannot tell
+                    // the two apart; what it CAN say is whether it ever saw this pid ready itself.
+                    // MEASURED win11-clean, campaign run 38994277148, agent pid 4508:
+                    //   06:05:14.139  NOTIFHOST launched via Task Scheduler
+                    //   06:05:16.752  W NOTIFBRIDGE published pid 4996 is gone, the bridge crashed
+                    //                   right after starting
+                    //   06:05:21.181  I NOTIFBRIDGE ready (pid 8340 published 10375 ms after launch)
+                    // and pid 4996 was published at 06:03:08 by the PREVIOUS agent instance (4236).
+                    // Nothing crashed: a predecessor's bridge exited while ours was still starting,
+                    // and the line blamed our launch for it. Jev rated that signature defect 0.61 -
+                    // above the floor - so it failed an acceptance cell on a phantom.
+                    // A bridge this agent DID see ready and which then exits is reported by the exit
+                    // path above, with its exit code; that is where a real crash is named.
+                    if (g_NotifBridgePid == hbPid)
+                        LogWarning("NOTIFBRIDGE pid %lu was ready here and is now gone - it exited right after starting", hbPid);
+                    else
+                        // Not ours to call a crash: a predecessor's heartbeat, or one never
+                        // validated here. Keep waiting for the pid our own launch publishes.
+                        LogInfo("NOTIFBRIDGE published pid %lu is gone and was never ready here - a "
+                            L"predecessor's heartbeat; still waiting for the pid our launch publishes", hbPid);
+                }
                 else
                 {
                     CloseHandle(probe);
