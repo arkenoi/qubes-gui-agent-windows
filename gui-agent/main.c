@@ -5288,6 +5288,15 @@ BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
     s->ReqWidth  = (LONG)entry->Width;
     s->ReqHeight = (LONG)entry->Height;
     { LONG cx, cy; BrokerDesiredCrop(entry, &cx, &cy); s->ReqCropX = cx; s->ReqCropY = cy; }
+    // WHERE THE CARD IS, not how far inside the window it was when we last looked (ABI 25). For a
+    // shell surface those differ: its CoreWindow is full-screen while the shell composes and
+    // card-sized once the menu is placed, so an inset measured in one state is wrong in the other
+    // and the crop lifts an empty corner of the screen. Screen coordinates do not have that
+    // problem - the broker subtracts the window's live origin when it captures.
+    if (ShellSurfaceKind(entry) != ShellSurfaceNone)
+    { s->ReqCardX = (LONG)entry->X; s->ReqCardY = (LONG)entry->Y; }
+    else
+    { s->ReqCardX = -1; s->ReqCardY = -1; }
     s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;   // re-measured for the new geometry
     MemoryBarrier();
     _InterlockedIncrement(&s->ControlSeq);

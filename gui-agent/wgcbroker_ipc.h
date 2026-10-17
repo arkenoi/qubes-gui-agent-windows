@@ -12,7 +12,11 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  24u  /* 24: BEHAVIOUR, not layout - the broker sets
+#define WGCBRK_ABI_VERSION  25u  /* 25: ReqCardX/ReqCardY - the card's SCREEN position, so the broker
+                                  *     derives the crop from the window's LIVE rect instead of from
+                                  *     insets measured at another moment. Appended; sizeof(WGCBRK_SLOT)
+                                  *     3448 -> 3456;
+                                  * 24: BEHAVIOUR, not layout - the broker sets
                                   *     GraphicsCaptureSession.IncludeSecondaryWindows, so an owner's
                                   *     frames contain its owned popups and the agent stops announcing
                                   *     a popup that lies wholly inside a tracked owner. The version is
@@ -443,6 +447,22 @@ typedef struct _WGCBRK_SLOT {
      * ($b+3424/3428/3432 are the ABI 22 fields above); a field in the middle would silently blind every
      * offset after it. This one lands at 3440 and nothing moves. */
     volatile LONG     ReqRoute;
+    /* ABI 25: THE CARD'S POSITION IN SCREEN COORDINATES, so the crop stops being a race.
+     *
+     * ReqCropX/Y are an OFFSET INSIDE THE WINDOW, measured by the agent's card walk at one moment
+     * and applied by the broker to whatever the window is at capture time. For a shell surface
+     * those two moments disagree: the walk reported "toast card in 666x750 window, insets l=12
+     * t=12" while the SAME handle measured 5120x1392 seconds later (2026-10-17, win11de-cold) -
+     * the shell's CoreWindow is full-screen while it composes and card-sized once the menu is
+     * placed. Cropping at (12,12) in the full-screen state lifts the top-left corner of the
+     * screen, which is empty: exactly the QGASLICEBLACK nonblack=0/7371 that has made the Start
+     * menu unpaintable.
+     *
+     * So the agent publishes where the card IS, and the broker derives the offset from the
+     * window's LIVE rect when it captures: cropX = ReqCardX - winRect.left. Whatever size the
+     * window is at that instant, the crop points at the card. -1 means "not supplied" and the
+     * broker uses ReqCropX/Y exactly as before, which is what every non-shell window does. */
+    volatile LONG     ReqCardX, ReqCardY;
 } WGCBRK_SLOT;
 
 /* ABI 18: WGCBRK_HEADER.BrokerStage codes (bits 8+; the low 8 bits are the slot). */
