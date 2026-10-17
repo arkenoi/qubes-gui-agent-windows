@@ -12,7 +12,11 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  25u  /* 25: ReqCardX/ReqCardY - the card's SCREEN position, so the broker
+#define WGCBRK_ABI_VERSION  26u  /* 26: CropUsedX/Y + CropWinX/Y - the crop the broker ACTUALLY used
+                                  *     and the window origin it derived it from, because the broker
+                                  *     has no log and a black cropped copy was otherwise
+                                  *     undiagnosable. Appended; sizeof(WGCBRK_SLOT) 3456 -> 3472;
+                                  * 25: ReqCardX/ReqCardY - the card's SCREEN position, so the broker
                                   *     derives the crop from the window's LIVE rect instead of from
                                   *     insets measured at another moment. Appended; sizeof(WGCBRK_SLOT)
                                   *     3448 -> 3456;
@@ -463,6 +467,21 @@ typedef struct _WGCBRK_SLOT {
      * window is at that instant, the crop points at the card. -1 means "not supplied" and the
      * broker uses ReqCropX/Y exactly as before, which is what every non-shell window does. */
     volatile LONG     ReqCardX, ReqCardY;
+    /* ABI 26: THE CROP THE BROKER ACTUALLY USED, and the window rect it derived it from.
+     *
+     * The broker has no log of any kind - it speaks only through this section - so when a cropped
+     * copy comes out black there is no way to tell "the crop was wrong" from "the crop was right
+     * and the pixels are not there". That is exactly where the Start menu stands on 2026-10-17:
+     * the slot captured 10 frames of 5120x1392 and the agent's copy of the card rect was still
+     * nonblack=0/7371, and I could not say which step lost them. Guessing at that is what this
+     * whole day went wrong doing.
+     *
+     * So the broker publishes what it used. Written on every publish that crops; read by
+     * guest/wgcbroker-peek.ps1 beside the request. CropUsedX/Y are in the captured texture's
+     * frame; CropWinX/Y are the window rect's origin at that instant, so a reader can check the
+     * arithmetic rather than trust it. */
+    volatile LONG     CropUsedX, CropUsedY;
+    volatile LONG     CropWinX, CropWinY;
 } WGCBRK_SLOT;
 
 /* ABI 18: WGCBRK_HEADER.BrokerStage codes (bits 8+; the low 8 bits are the slot). */
