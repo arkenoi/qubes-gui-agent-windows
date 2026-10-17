@@ -5174,14 +5174,27 @@ static DWORD g_RaiseSent = 0, g_RaiseSkipped = 0, g_RaiseDebounced = 0;
 // is validated before use (a user-IL process shares the section R/W); the frame is accepted
 // ONLY if its dims exactly match the slab and its arena region is fully in-bounds, so the
 // window-relative copy in PwSliceCopyAndDamageSrc cannot read outside the arena.
-static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* pitch, OUT UINT64* id)
+// WHY A FRAME WAS REFUSED, NOT JUST THAT IT WAS. This returned a bare FALSE from ELEVEN distinct
+// conditions, and its slice-fed caller turns that into one BROKERHOLD line - so the log could say a
+// window was held and never which of eleven reasons held it. 2026-10-17: 589 of 594 BROKERHOLD
+// warnings on this rig carry brokerActive=1 sourced=1 slot>=0, and with BROKERDIMS silent in the
+// same captures the dims cause is excluded, leaving "broker paused", "the slot now holds another
+// hwnd", "the slot is not ACTIVE", "the frame predates the last secure-desktop exit" and a torn
+// read - which are not the same finding at all, one of them being a disagreement between the agent
+// and the broker about who owns a slot. The level of that line cannot be decided while the reason
+// is unknown, and an attempt to decide it anyway (demoted on a resize story that BROKERDIMS=0
+// refutes) was reverted. `why` is nullable: a caller that does not report keeps passing NULL.
+#define BFF_NO(r) do { if (why) *why = (r); return FALSE; } while (0)
+static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* pitch, OUT UINT64* id,
+                             OUT const WCHAR** why)
 {
-    if (!g_WgcBase || e->PwBrokerSlot < 0 || e->PwBrokerSlot >= WGCBRK_MAX_SLOTS) return FALSE;
+    if (why) *why = L"unknown";
+    if (!g_WgcBase || e->PwBrokerSlot < 0 || e->PwBrokerSlot >= WGCBRK_MAX_SLOTS) BFF_NO(L"no-arena-or-slot");
     WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
     WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[e->PwBrokerSlot];
-    if (s->Hwnd != (UINT64)(ULONG_PTR)e->Handle) return FALSE;
-    if (s->AckState != WGCBRK_ACTIVE) return FALSE;
-    if (!h->Producing) return FALSE;   // broker paused (secure desktop)
+    if (s->Hwnd != (UINT64)(ULONG_PTR)e->Handle) BFF_NO(L"slot-holds-another-hwnd");
+    if (s->AckState != WGCBRK_ACTIVE) BFF_NO(L"slot-not-ACTIVE");
+    if (!h->Producing) BFF_NO(L"broker-paused");   // broker paused (secure desktop)
 
     for (int t = 0; t < 4; t++)
     {
@@ -5191,10 +5204,10 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
         LONG b = s->ActiveBuffer, fw = s->FrameWidth, fh = s->FrameHeight, stride = s->Stride;
         UINT64 fid = (UINT64)s->FrameId;
         LONGLONG tick = s->CaptureTick, boff;
-        if (b < 0 || b >= WGCBRK_RING) return FALSE;
+        if (b < 0 || b >= WGCBRK_RING) BFF_NO(L"ring-index-out-of-range");
         // The broker picks WHICH of the slot's two buffers is current; WHERE they are and how big is the agent's own record.
         boff = (LONGLONG)g_WgcSlotBufs[e->PwBrokerSlot].Off[b];
-        if (!boff) return FALSE;
+        if (!boff) BFF_NO(L"no-buffer-offset");
         // dims must EXACTLY match the slab (so the dest-bounds check covers the source too).
         // A mismatch is transient while a resize is in flight (the slot's request and the slab
         // are updated a pass apart) and PERMANENT if the two ever disagree at rest - and a
@@ -5226,15 +5239,15 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
                     PokeWindowTracking();
                 }
             }
-            return FALSE;
+            BFF_NO(e->PwDimsStuck ? L"dims-mismatch-STUCK" : L"dims-mismatch-transient");
         }
         e->PwDimsSince = 0;   // dims agree: any outstanding mismatch run is over
         // the frame fits the buffer the agent committed for it (its own record, not the section's fields)
         ULONGLONG need = (ULONGLONG)fh * (ULONGLONG)stride;
         if (need > g_WgcSlotBufs[e->PwBrokerSlot].Bytes)
-            return FALSE;
+            BFF_NO(L"frame-larger-than-committed-buffer");
         // never present a frame captured before the last secure-desktop exit
-        if ((ULONGLONG)tick < g_SecureDesktopLeftTick) return FALSE;
+        if ((ULONGLONG)tick < g_SecureDesktopLeftTick) BFF_NO(L"frame-predates-secure-desktop-exit");
         const BYTE* front = WGCBRK_ARENA(g_WgcBase, boff);
         MemoryBarrier();
         if (s->Seq == s0)   // stable across the read: not torn
@@ -5243,7 +5256,7 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
             return TRUE;
         }
     }
-    return FALSE;   // torn/starved -> slice-fed caller HOLDS last content this frame (synth uses its ladder)
+    BFF_NO(L"torn-read-4-retries");   // slice-fed caller HOLDS last content this frame (synth uses its ladder)
 }
 
 // Pixel-exact crop: the broker PrintWindow-renders the FULL window (transparent margin = black) and
@@ -9927,7 +9940,7 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
     int srcOriginX = 0, srcOriginY = 0;
     const BYTE* cb = NULL; int cp = 0; UINT64 cid = 0;
     if (g_SliceRetire && WgcBrokerActive() && ((const WINDOW_DATA*)c)->PwBrokerSourced &&
-        BrokerFreshFrame((WINDOW_DATA*)c, &cb, &cp, &cid))
+        BrokerFreshFrame((WINDOW_DATA*)c, &cb, &cp, &cid, NULL))
     {
         srcBase = cb; srcPitch = cp;
         srcW = c->X + (int)c->Width; srcH = c->Y + (int)c->Height;  // window-relative extent in screen coords
@@ -10802,12 +10815,18 @@ void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason)
 // FALSE when there is none, leaving the hold and slice arms to the caller. Shared by the desktop frame loop and the
 // broker's frame-published event (BrokerConsumePass), so a window whose own content changes while nothing else on the
 // desktop does - a covered one - is copied when ITS frame lands, not at the next unrelated desktop change.
-static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRectIn)
+static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRectIn,
+                                 OUT const WCHAR** why)
 {
     const RECT pwRect = *pwRectIn;
     const BYTE* bsrc = NULL; int bpitch = 0; UINT64 bid = 0;
-    if (!(entry->PwBrokerSourced && WgcBrokerActive() &&
-          BrokerFreshFrame(entry, &bsrc, &bpitch, &bid)))
+    if (why) *why = L"unknown";
+    // The two facts this function owns are named here; everything below the call is the broker's
+    // own refusal, which BrokerFreshFrame now states. A hold whose reason reads "unknown" means a
+    // path was added without naming itself, which is the state this exists to end.
+    if (!entry->PwBrokerSourced) { if (why) *why = L"window-not-sourced"; return FALSE; }
+    if (!WgcBrokerActive())      { if (why) *why = L"broker-not-active";  return FALSE; }
+    if (!BrokerFreshFrame(entry, &bsrc, &bpitch, &bid, why))
         return FALSE;
     if (bid != entry->PwBrokerLastId || entry->PwSliceNeedsFull)
     {
@@ -10976,7 +10995,7 @@ static void BrokerConsumePass(void)
         if (!PwIsAttached(w) || !w->PwSliceFed || !w->PwBrokerSourced)
             continue;
         const RECT r = { w->X, w->Y, w->X + (int)w->Width, w->Y + (int)w->Height };
-        (void)PwConsumeBrokerFrame(w, &r);
+        (void)PwConsumeBrokerFrame(w, &r, NULL);
     }
     LeaveCriticalSection(&g_csWatchedWindows);
 }
@@ -12201,7 +12220,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // desktop, torn read, size mismatch) -> the HOLD arm below keeps last content;
                 // broker INACTIVE (down / not ready / pre-24H2) -> the DDA slice fallback
                 // further below. Broker frames are window-relative: source origin = (entry->X, entry->Y).
-                if (PwConsumeBrokerFrame(entry, &pwRect))
+                const WCHAR* holdWhy = NULL;
+                if (PwConsumeBrokerFrame(entry, &pwRect, &holdWhy))
                 {
                     // fed from its own broker frame (copied now, or already current)
                 }
@@ -12241,32 +12261,38 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         if (QgaHoldIsStartup(WgcBrokerActive(), g_BrokerReadyAt != 0))
                             LogInfo("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
                                 L"brokerActive=0 sourced=%d slot=%d - the broker has not started yet "
-                                L"(it waits for a shell); the window is withheld until its first frame",
+                                L"(it waits for a shell); the window is withheld until its first frame [why=%s]",
                                 (DWORD)(ULONG_PTR)entry->Handle,
                                 pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
-                                entry->PwBrokerSourced, entry->PwBrokerSlot);
-                        // AND A HOLD ON A LIVE FEED IS NOT A FAULT EITHER. 589 of the 597 warnings
-                        // in every capture on this rig are this: an active broker, the window
-                        // registered and holding a slot, no usable frame on ONE pass - the reasons
-                        // listed above, "first frame pending ... torn read, dims mismatch". A
-                        // window that is held and never fed is still reported, at ERROR, by
-                        // QGADIRECTSUPPRESS on its fault clock; that line occurs 0 times in the
-                        // same captures, so these holds resolved.
-                        else if (QgaHoldFeedIsHealthy(WgcBrokerActive(), entry->PwBrokerSourced,
-                                                      entry->PwBrokerSlot))
-                            LogInfo("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
-                                L"brokerActive=1 sourced=%d slot=%d - no frame at this size on this "
-                                L"pass; held until the broker's next one (direct required)",
-                                (DWORD)(ULONG_PTR)entry->Handle,
-                                pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
-                                entry->PwBrokerSourced, entry->PwBrokerSlot);
+                                entry->PwBrokerSourced, entry->PwBrokerSlot, holdWhy ? holdWhy : L"unset");
+                        // NOT DEMOTED, AND THIS IS THE SECOND TIME THAT WAS DECIDED HERE.
+                        // 2026-10-17: 589 of the 594 parseable W lines across all 93 captures on
+                        // this rig are a LIVE broker with the window registered and holding a
+                        // slot, which reads like normal operation, and the line was moved to Info
+                        // on that basis (Jev 1.00). THE BRIEF THAT SCORED 1.00 WAS WRONG: it
+                        // claimed QGADIRECTSUPPRESS covers a window that stops being fed, and
+                        // that line reports a window which NEVER RECEIVED A FRAME - it is gated
+                        // on exactly the case it was offered to cover.
+                        // What this arm does is HOLD: keep last content, touch nothing. It is
+                        // one-shot per window, so a window the broker never feeds again shows
+                        // STALE PIXELS indefinitely with nothing further said about it. Asked
+                        // again with that corrected and with recovery measured only in the 57 of
+                        // 93 files that retain the BROKERFRAME Debug marker (41 holds unmeasured),
+                        // Jev: revert until a starvation detector exists 0.60, keep the demotion
+                        // 0.07, stale pixels are user-visible 0.70 - and, pointedly, a one-shot
+                        // warning IS NOT a usable starvation detector either (0.15).
+                        // So it stays loud: a poor detector is the only trace there is, and
+                        // demoting it would remove the last sign of a user-visible defect. The
+                        // real answer is a per-window clock that reports a hold beyond a bound;
+                        // until that exists this line is not quieted.
                         else
                             LogWarning("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
-                                L"brokerActive=%d sourced=%d slot=%d (direct required: composite "
-                                L"fallback refused)",
+                                L"brokerActive=%d sourced=%d slot=%d why=%s (direct required: "
+                                L"composite fallback refused)",
                                 (DWORD)(ULONG_PTR)entry->Handle,
                                 pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
-                                WgcBrokerActive(), entry->PwBrokerSourced, entry->PwBrokerSlot);
+                                WgcBrokerActive(), entry->PwBrokerSourced, entry->PwBrokerSlot,
+                                holdWhy ? holdWhy : L"unset");
                     }
                 }
                 // Agent-side slice (normal fallback / broker-inactive): copy the changed region of
