@@ -54,6 +54,13 @@ extern HWND g_DesktopWindow;
  * Written on the vchan thread, read on the window-tracking thread, so interlocked at both ends -
  * and the handle may have DIED between the two, which the reader must check. */
 extern HWND volatile g_Dom0FocusWindow;
+
+/* Is a third-party Start replacement running in the console session? Tri-state, latched, refreshed
+ * on the tracking pass - the input path reads it and never enumerates. KNOWN=false means we could
+ * not look, and the menu key is then FORWARDED: a silently dead key on the user's own menu is worse
+ * than a suppressed surface holding focus, which is reported. See QgaMenuKeyPolicy. */
+BOOL StartReplacementKnown(void);
+BOOL StartReplacementPresent(void);
 extern volatile BOOL g_OnSecureDesktop;
 // Window currently being dragged with a held mouse button (input path); NULL when none.
 // Suppresses per-window PrintWindow recapture for that window - see its definition.

@@ -680,6 +680,93 @@ static __inline QGA_START_VERDICT QgaHiddenStartVerdict(
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * IS THE HOST'S MENU KEY FORWARDED?  (and the reason a key may not summon the unclosable)
+ *
+ * The Super/Win key is dropped in seamless mode by default (BlockMenuKey), and dom0 can ask for it
+ * to pass (service.enableWinKey). That override exists because a THIRD-PARTY Start replacement
+ * wants that key - it is that menu's key, not ours.
+ *
+ * BUT A KEY MUST NEVER SUMMON A SURFACE WE REFUSE TO SHOW AND CANNOT CLOSE. With SeamlessStart=0
+ * the native Start is not presented, and MEASURED on win11de-sm 2026-10-17 the agent cannot close
+ * it: a posted Escape leaves it open (1000 and 1063 ms), and returning activation is REFUSED by the
+ * foreground lock even with an input nudge that injects cleanly - the surface closes ~2 s later
+ * because the foreground leaves, not because of us. A real injected Escape does close it and is
+ * refused on different grounds: it rides the SYSTEM input queue and is delivered on dequeue, which
+ * is a race, and this project does not ship races.
+ * So in that cell the key is dropped and the surface never opens. Suppression then holds BY
+ * CONSTRUCTION rather than by a mechanism that has to win something.
+ *
+ * AND IT IS CONDITIONAL, because dropping it unconditionally would silently break the user's own
+ * menu. When a replacement IS present the key is forwarded - the surface it summons is that menu's,
+ * which we present like any other window. Jev on the policy: conditional-on-a-replacement 0.99.
+ *
+ * HOW THE REPLACEMENT IS DETECTED, and why the two obvious bases are wrong. It is NOT the
+ * registered shell: a replacement runs ALONGSIDE the default shell, so HKLM Winlogon\Shell still
+ * reads explorer.exe with one installed. It is NOT its menu window class either: that window exists
+ * only while the menu is OPEN, which is after the key this predicate is deciding about. So the fact
+ * is its presence as an installed, running process in the console session - the only thing knowable
+ * before the menu exists (Jev: installed-and-running-process 0.98, registered-shell 0.00,
+ * menu-window-class 0.00). It is LATCHED when first seen and re-checked on a coarse trigger, never
+ * per key event (Jev 1.00). And never by caption: a caption lookup for L"Search" read 0x0 on this
+ * German guest while the window's caption was 'Suche', and that bug shipped for months.
+ *
+ * THE UNKNOWN CASE IS NOT A COIN FLIP. A false negative drops the key and the user's own Start menu
+ * stops answering it, silently, where the agent cannot see the user pressing it to no effect. A
+ * false positive forwards the key and a suppressed surface holds focus for ~2 s - which the
+ * examination path REPORTS, loudly. So the asymmetry decides it: forward unless we positively know
+ * no replacement is there (Jev: a silent dead key is worse, 0.74).
+ *
+ * WHEN IT CANNOT BE DECIDED, THE KEY IS FORWARDED (Jev 0.65). Silently breaking the user's own Start
+ * menu is the worse failure and the one we cannot see; a suppressed surface holding focus is loud,
+ * because the examination path reports it.
+ */
+/* Is this process image a third-party START REPLACEMENT - the thing that wants the host's menu key?
+ * A NAME LIST, and its limits stated: these products are identified by their own executable because
+ * nothing else is knowable before their menu exists (see QgaMenuKeyPolicy). A product not listed
+ * here reads as ABSENT, which would drop the key on a guest that has one - so the caller must treat
+ * "none found" as decisive only when the enumeration itself SUCCEEDED, and must forward the key
+ * whenever it could not look. Extend the list rather than widen the matching. */
+static __inline BOOL QgaIsStartReplacementImage(IN const wchar_t *image)
+{
+    if (!image || !image[0])
+        return FALSE;
+    return (BOOL)(QgaWcsIEqAscii(image, L"StartMenu.exe")          /* Open-Shell, Classic Shell */
+               || QgaWcsIEqAscii(image, L"ClassicStartMenu.exe")    /* Classic Shell, older */
+               || QgaWcsIEqAscii(image, L"StartIsBack.exe")
+               || QgaWcsIEqAscii(image, L"StartIsBackCfg.exe")
+               || QgaWcsIEqAscii(image, L"Start11.exe"));
+}
+
+typedef enum {
+    QGA_MENUKEY_FORWARD = 0,        /* pass it on */
+    QGA_MENUKEY_DROP_BLOCKED,       /* BlockMenuKey is on and dom0 did not override it */
+    QGA_MENUKEY_DROP_UNCLOSABLE     /* dom0 asked for it, but it would summon the unclosable */
+} QGA_MENUKEY_POLICY;
+
+static __inline QGA_MENUKEY_POLICY QgaMenuKeyPolicy(
+    IN BOOL seamless,
+    IN BOOL blockMenuKey,          /* the effective setting after any dom0 override */
+    IN BOOL seamlessStart,         /* 1 = the native Start IS presented when it opens */
+    IN BOOL replacementKnown,      /* could we decide whether a Start replacement is present? */
+    IN BOOL replacementPresent)
+{
+    if (!seamless)
+        return QGA_MENUKEY_FORWARD;         /* fullscreen always passes the key */
+    if (blockMenuKey)
+        return QGA_MENUKEY_DROP_BLOCKED;    /* the existing rule, unchanged */
+    if (seamlessStart)
+        return QGA_MENUKEY_FORWARD;         /* we present what it summons */
+#ifndef QGA_LIFECYCLE_DEFECT_MENUKEYALWAYSFORWARD
+    if (replacementKnown && !replacementPresent)
+        return QGA_MENUKEY_DROP_UNCLOSABLE; /* nothing may summon a surface we refuse and cannot close */
+#else
+    (void)replacementKnown; (void)replacementPresent;   /* DEFECT: forward regardless, so the key
+                                             * summons a hidden Start that holds the user's focus */
+#endif
+    return QGA_MENUKEY_FORWARD;             /* a replacement is present, or we could not tell */
+}
+
+/* ---------------------------------------------------------------------------------------------
  * IS THIS XENCONTROL LINE WORTH KEEPING?  (the per-notify Debug line, x118 in one run)
  *
  * xencontrol.dll logs through OUR callback (capture.c's XcLogger) at whatever level we hand it, and

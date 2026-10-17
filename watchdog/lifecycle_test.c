@@ -427,6 +427,67 @@ int main(void)
         check("start invariant: dom0's live window is preferred to the desktop fallback", badPref == 0);
     }
 
+    /* a Start replacement is identified by its OWN executable: nothing else is knowable before its
+     * menu window exists, and its menu window exists only after the key we are deciding about. */
+    {
+        check("replacement: Open-Shell's own executable counts",
+              QgaIsStartReplacementImage(L"StartMenu.exe") == TRUE);
+        check("replacement: case does not matter",
+              QgaIsStartReplacementImage(L"startmenu.EXE") == TRUE);
+        check("replacement: the default shell is NOT a replacement",
+              QgaIsStartReplacementImage(L"explorer.exe") == FALSE);
+        check("replacement: an unrelated process is not one",
+              QgaIsStartReplacementImage(L"notepad.exe") == FALSE);
+        check("replacement: an empty or missing image is not one",
+              QgaIsStartReplacementImage(L"") == FALSE && QgaIsStartReplacementImage(NULL) == FALSE);
+    }
+
+    /* ---- the host's menu key may not summon a surface we cannot close (2026-10-17) ----
+     * MEASURED: with SeamlessStart=0 the native Start is not presented and the agent cannot close
+     * it - a posted Escape leaves it open 1000/1063 ms, and returning activation is REFUSED even
+     * with an input nudge that injects cleanly. A real injected Escape does close it but rides the
+     * system input queue, which is a race. So in that cell the key is dropped and nothing opens.
+     * CONDITIONAL, because a third-party Start replacement wants that key: dropping it whenever we
+     * suppress would silently break the user's own menu. Jev: conditional-on-a-replacement 0.99,
+     * and FORWARD when we cannot tell (0.65) because that failure is the invisible one. */
+    {
+        /* not seamless: never our business */
+        check("menukey: fullscreen always passes the key",
+              QgaMenuKeyPolicy(FALSE, TRUE, FALSE, TRUE, FALSE) == QGA_MENUKEY_FORWARD);
+        /* the existing rule, unchanged */
+        check("menukey: blocked in seamless stays blocked",
+              QgaMenuKeyPolicy(TRUE, TRUE, FALSE, TRUE, FALSE) == QGA_MENUKEY_DROP_BLOCKED);
+        /* dom0 asked for the key and we PRESENT what it summons */
+        check("menukey: SeamlessStart=1 forwards - we present what it opens",
+              QgaMenuKeyPolicy(TRUE, FALSE, TRUE, TRUE, FALSE) == QGA_MENUKEY_FORWARD);
+        /* dom0 asked for it, we suppress, and no replacement wants it */
+        check("menukey: suppressing with no replacement -> dropped, so nothing unclosable opens",
+              QgaMenuKeyPolicy(TRUE, FALSE, FALSE, TRUE, FALSE) == QGA_MENUKEY_DROP_UNCLOSABLE);
+        /* a replacement IS present: the key is its own */
+        check("menukey: a Start replacement is present -> forwarded, it is that menu's key",
+              QgaMenuKeyPolicy(TRUE, FALSE, FALSE, TRUE, TRUE) == QGA_MENUKEY_FORWARD);
+        /* undecidable -> forward, because breaking the user's own menu is the invisible failure */
+        check("menukey: cannot tell whether a replacement exists -> forwarded",
+              QgaMenuKeyPolicy(TRUE, FALSE, FALSE, FALSE, FALSE) == QGA_MENUKEY_FORWARD);
+
+        /* whole space: the key is dropped as UNCLOSABLE only in the one cell that earns it */
+        int combos = 0, badDrop = 0, badBlock = 0;
+        for (int sm = 0; sm < 2; sm++)
+        for (int bm = 0; bm < 2; bm++)
+        for (int ss = 0; ss < 2; ss++)
+        for (int rk = 0; rk < 2; rk++)
+        for (int rp = 0; rp < 2; rp++)
+        {
+            const QGA_MENUKEY_POLICY v = QgaMenuKeyPolicy((BOOL)sm, (BOOL)bm, (BOOL)ss, (BOOL)rk, (BOOL)rp);
+            combos++;
+            if (v == QGA_MENUKEY_DROP_UNCLOSABLE && !(sm && !bm && !ss && rk && !rp)) badDrop++;
+            if (v == QGA_MENUKEY_DROP_BLOCKED && !(sm && bm))                         badBlock++;
+        }
+        check("menukey invariant: every combination driven", combos == 32);
+        check("menukey invariant: dropped-as-unclosable ONLY when seamless, allowed, suppressing, and no replacement is known absent", badDrop == 0);
+        check("menukey invariant: dropped-as-blocked only when seamless and blocked", badBlock == 0);
+    }
+
     /* ---- the settings matrix, and the COMPANION half of "fully suppressed" (2026-10-17) ----
      * A 25H2 Start opening brings up two surfaces: StartMenuExperienceHost's, and a SearchHost one
      * carrying the search box ('Suche' on the German guest, 800x750). Refusing only the first left
