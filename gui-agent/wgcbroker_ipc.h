@@ -12,7 +12,10 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  26u  /* 26: CropUsedX/Y + CropWinX/Y - the crop the broker ACTUALLY used
+#define WGCBRK_ABI_VERSION  27u  /* 27: ReqCardValid - a zero-initialised slot is not a card at (0,0);
+                                  *     the >= 0 test made the broker override a good crop with (0,0).
+                                  *     Appended; sizeof(WGCBRK_SLOT) 3472 -> 3480;
+                                  * 26: CropUsedX/Y + CropWinX/Y - the crop the broker ACTUALLY used
                                   *     and the window origin it derived it from, because the broker
                                   *     has no log and a black cropped copy was otherwise
                                   *     undiagnosable. Appended; sizeof(WGCBRK_SLOT) 3456 -> 3472;
@@ -482,6 +485,18 @@ typedef struct _WGCBRK_SLOT {
      * arithmetic rather than trust it. */
     volatile LONG     CropUsedX, CropUsedY;
     volatile LONG     CropWinX, CropWinY;
+    /* ABI 27: ARE ReqCardX/Y MEANINGFUL? 1 = yes, 0 = no.
+     *
+     * A zero-initialised slot cannot be told from a card at (0,0), and the first version of this
+     * tested ReqCardX >= 0. The slot's zeros passed that test, the broker derived 0 - 0 = (0,0),
+     * and it OVERRODE the agent's own reqcrop=12,12 to publish the empty top-left corner of a
+     * 5120x1392 window - which is the nonblack=0/7371 the Start menu was still producing after the
+     * "fix". Caught only because the broker had just been taught to report the crop it used:
+     * CROP used=0,0 winorigin=0,0 reqcard=0,0 reqcrop=12,12.
+     *
+     * A sentinel inside the value's own range is not a sentinel. This flag is written by the agent
+     * on every registration AND every retarget, next to the fields it describes. */
+    volatile LONG     ReqCardValid;
 } WGCBRK_SLOT;
 
 /* ABI 18: WGCBRK_HEADER.BrokerStage codes (bits 8+; the low 8 bits are the slot). */

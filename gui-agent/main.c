@@ -5036,6 +5036,38 @@ static void BrokerDesiredCrop(IN const WINDOW_DATA* entry, OUT LONG* cropX, OUT 
     const WINDOW_DATA* src = BrokerSourceEntry(entry);
     if (src) { *cropX = (LONG)entry->X - (LONG)src->X; *cropY = (LONG)entry->Y - (LONG)src->Y; }
     else     { *cropX = (LONG)entry->CropLeft;         *cropY = (LONG)entry->CropTop; }
+
+    // FOR A SHELL SURFACE, TAKE THE OFFSET FROM THE WINDOW'S RECT RIGHT NOW.
+    //
+    // CropLeft/CropTop come from the card walk, which measured "toast card in 666x750 window,
+    // insets l=12 t=12". The same HWND is 5120x1392 when the broker captures it - the shell's
+    // CoreWindow is full-screen while it composes and card-sized once the menu is placed. A (12,12)
+    // offset into the full-screen state lifts the empty top-left corner of the SCREEN, which is the
+    // QGASLICEBLACK nonblack=0/7371 that has kept this menu unpaintable. The card's own screen
+    // position minus the window's origin is right in BOTH states: card-sized gives back (12,12),
+    // full-screen gives (2239,654), where the pixels measurably are (nonblack=3509/4422).
+    //
+    // Read here, in the agent, from the handle we already own. The first attempt at this shipped
+    // the card's screen position to the broker instead (ABI 25/26/27) so the subtraction could
+    // happen at capture time; that cost three ABI versions, overrode a good crop with (0,0) through
+    // a sentinel a zeroed slot satisfied, and still did not paint. The residual - the window may
+    // resize between this read and the capture - is the same residual the inset already had, and it
+    // is fixed by re-registering on a move, which the staleness test already does.
+    if (entry && ShellSurfaceKind(entry) != ShellSurfaceNone)
+    {
+        RECT wr;
+        if (GetRealWindowRect(entry->Handle, &wr) == ERROR_SUCCESS &&
+            wr.right > wr.left && wr.bottom > wr.top)
+        {
+            const LONG lx = (LONG)entry->X - wr.left, ly = (LONG)entry->Y - wr.top;
+            if (lx >= 0 && ly >= 0 &&
+                lx + (LONG)entry->Width  <= wr.right - wr.left &&
+                ly + (LONG)entry->Height <= wr.bottom - wr.top)
+            {
+                *cropX = lx; *cropY = ly;
+            }
+        }
+    }
 }
 
 // Does the slot still describe this window - the SOURCE it should capture, and the crop into it?
