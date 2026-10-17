@@ -23,6 +23,8 @@
 
 #include "common.h"
 #include "main.h"
+#include "qga-lifecycle.h"   // QgaMenuKeyPolicy: the menu key and presentation are ONE decision
+
 #include "vchan.h"
 #include "capture.h" // CaptureRevokeStaleGrants (A6 window-0 dump ack)
 #include "vchan-handlers.h"
@@ -390,19 +392,42 @@ static DWORD HandleKeypress(IN HWND window)
     // Mod4 set; dropping only the Super events would leak a bare 'r'). Super RELEASES
     // always pass, so a stuck modifier is structurally impossible. The dom0 appmenu
     // shortcut opens Start via guest-local injection and never crosses this path.
-    if (g_BlockMenuKey && g_SeamlessMode)
+    // SUPPRESSION IS NOT FORWARDING THE KEY, and it is ONE decision with presentation (owner,
+    // 2026-10-17: "if we want to suppress the menu, we unmap the win key on the guest. if it is not
+    // unmapped, it should work ... what the fuck is rationale to let it launch and then doing ugly
+    // 'suppression' work"). BlockMenuKey used to be an INDEPENDENT knob gated only on seamless, so
+    // the combination blockkey=off + seamlessStart=off was reachable - and that is the state where
+    // the key is forwarded, the menu opens, and the agent then works to hide and close a window
+    // that should never have been summoned. Measured on this rig the same day: a hidden Start
+    // "still open 1594 ms after activation returned - clicks go to a menu the user cannot see".
+    //
+    // So the two are decided together, by QgaMenuKeyPolicy:
+    //   not seamless            -> FORWARD           (fullscreen always passes the key)
+    //   BlockMenuKey on         -> DROP_BLOCKED      (dom0 owns the key)
+    //   SeamlessStart on        -> FORWARD           (we are going to PRESENT it, so let it open)
+    //   a Start REPLACEMENT is present -> FORWARD    (Open-Shell's menu is an ordinary window and
+    //                                                 works; the key is the user's own shortcut)
+    //   replacement absent, and we would not present -> DROP_UNCLOSABLE
+    // "Could not look" forwards, deliberately: a silently dead key on the user's own menu is worse
+    // than a surface we would at least report.
+    const QGA_MENUKEY_POLICY menuKeyPolicy =
+        QgaMenuKeyPolicy(g_SeamlessMode, g_BlockMenuKey, g_SeamlessStart,
+                         StartReplacementKnown(), StartReplacementPresent());
+    if (menuKeyPolicy != QGA_MENUKEY_FORWARD)
     {
+        const WCHAR *why = (menuKeyPolicy == QGA_MENUKEY_DROP_BLOCKED)
+                           ? L"BlockMenuKey" : L"no-replacement-and-not-presented";
         WORD scan = g_KeycodeToScancode[keyMsg.keycode & 0xff];
         BOOL super = (scan == 0xe05b || scan == 0xe05c);
         if (super && keyMsg.type == KeyPress)
         {
-            LogDebug("QGABLOCKWIN dropped Super press (keycode 0x%x)", keyMsg.keycode);
+            LogDebug("QGABLOCKWIN dropped Super press (keycode 0x%x) - %s", keyMsg.keycode, why);
             return ERROR_SUCCESS;
         }
         if (!super && (keyMsg.state & (1u << Mod4MapIndex)))
         {
-            LogDebug("QGABLOCKWIN swallowed Mod4 chord key (keycode 0x%x type %u)",
-                keyMsg.keycode, keyMsg.type);
+            LogDebug("QGABLOCKWIN swallowed Mod4 chord key (keycode 0x%x type %u) - %s",
+                keyMsg.keycode, keyMsg.type, why);
             return ERROR_SUCCESS;
         }
     }
