@@ -4901,30 +4901,6 @@ static void WgcArenaReapPending(BOOL all)
 // ProcessNewFrame. (An earlier comment credited toasts to the "notifhost interceptor" -
 // that component was never launched; see toastcrop for how toast surfaces are handled.)
 // Returns TRUE if registered.
-// WHERE THE CARD SITS, IN THE FRAME OF REFERENCE THE ROUTE CAPTURES IN (ABI 23). A window capture
-// is cropped by the card's offset INSIDE the window - the transparent shadow margin the toast/menu
-// crop trims. A MONITOR capture's texture is the screen, so the same two fields must carry the
-// card's SCREEN origin instead. FOUR sites need this answer: the registration, the resize
-// retarget, and the two staleness tests that re-register when the slot disagrees with the window.
-// If any of them used the other frame of reference, a monitor-sourced slot would look permanently
-// stale and be torn down and rebuilt on every pass. One helper, so they cannot drift - the same
-// discipline as deciding a window's refusal and its card walk with one predicate.
-static __inline void BrokerDesiredCrop(IN const WINDOW_DATA* e, IN LONG reqRoute,
-                                       OUT LONG* cropX, OUT LONG* cropY)
-{
-    if (reqRoute == (LONG)WGCBRK_ROUTE_MONITOR) { *cropX = (LONG)e->X;        *cropY = (LONG)e->Y; }
-    else                                        { *cropX = (LONG)e->CropLeft; *cropY = (LONG)e->CropTop; }
-}
-
-// Does the slot's crop still describe this window? Asked with the SLOT's route, because that is
-// the frame of reference the broker is currently cropping in.
-static __inline BOOL BrokerCropStale(IN const WINDOW_DATA* e, IN const WGCBRK_SLOT* bs)
-{
-    LONG cx = 0, cy = 0;
-    BrokerDesiredCrop(e, bs ? bs->ReqRoute : (LONG)WGCBRK_ROUTE_WGC, &cx, &cy);
-    return (!bs || bs->ReqCropX != cx || bs->ReqCropY != cy);
-}
-
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
 {
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1;
@@ -5001,13 +4977,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     // the card right/down by the crop and clips its far edges, the exact defect seen on WinUI
     // menus once they were both broker-captured AND cropped). entry->CropLeft/Top are set by the
     // toast/menu crop in GetWindowData before the slice-fed window is (re)registered here.
-    // THE CROP IS INTO WHATEVER THE BROKER CAPTURED, so its frame of reference follows the route.
-    // On a window capture it is the card's offset INSIDE the window (the transparent shadow margin
-    // the toast/menu crop trims). On a MONITOR capture the texture is the screen, so the same two
-    // fields must carry the card's SCREEN origin - which is exactly what entry->X/Y hold, the
-    // position this window was announced to dom0 at. Get this wrong and the publish lifts the
-    // wrong rect out of the desktop: pixels, but the wrong ones, which is worse than black.
-    { LONG cx, cy; BrokerDesiredCrop(entry, s->ReqRoute, &cx, &cy); s->ReqCropX = cx; s->ReqCropY = cy; }
+    s->ReqCropX = (LONG)entry->CropLeft; s->ReqCropY = (LONG)entry->CropTop;
     // ASK FOR THE ROUTE THIS WINDOW CLASS NEEDS (ABI 23). A shell CoreWindow - toast host, Start,
     // Search - is not served by a WGC session on itself: it delivers frames that are entirely
     // BLACK, which the broker's quiet ladder cannot see, so the window stayed on route 0 for ever
@@ -5022,8 +4992,8 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     // (Jev relay-renders-the-toast-unfaithfully 0.83). Routing toasts here would trade a defect
     // they do not have for a fidelity loss they do.
     const SHELL_SURFACE_KIND routeKind = ShellSurfaceKind(entry);
-    const BOOL monitorSourced = (routeKind == ShellSurfaceStart || routeKind == ShellSurfaceSearch);
-    s->ReqRoute = monitorSourced ? (LONG)WGCBRK_ROUTE_MONITOR : (LONG)WGCBRK_ROUTE_WGC;
+    s->ReqRoute = (routeKind == ShellSurfaceStart || routeKind == ShellSurfaceSearch)
+                  ? (LONG)WGCBRK_ROUTE_RELAY : (LONG)WGCBRK_ROUTE_WGC;
     s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;  // "not measured yet" until the broker reports
     s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
     MemoryBarrier();
@@ -5042,8 +5012,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     LogDebug("QGABROKERREG hwnd=0x%x slot=%d %ux%u buf=%llu t=%llu reqroute=%s",
             (DWORD)(ULONG_PTR)entry->Handle, slot,
             entry->Width, entry->Height, one, (ULONGLONG)GetTickCount64(),
-            s->ReqRoute == (LONG)WGCBRK_ROUTE_MONITOR ? L"monitor" :
-            s->ReqRoute == (LONG)WGCBRK_ROUTE_RELAY   ? L"relay" : L"wgc");
+            s->ReqRoute == (LONG)WGCBRK_ROUTE_RELAY ? L"relay" : L"wgc");
     return TRUE;
 }
 
@@ -5171,7 +5140,8 @@ BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
     // exactly what keeps the WGC capture session alive across the resize.
     s->ReqWidth  = (LONG)entry->Width;
     s->ReqHeight = (LONG)entry->Height;
-    { LONG cx, cy; BrokerDesiredCrop(entry, s->ReqRoute, &cx, &cy); s->ReqCropX = cx; s->ReqCropY = cy; }
+    s->ReqCropX  = (LONG)entry->CropLeft;
+    s->ReqCropY  = (LONG)entry->CropTop;
     s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;   // re-measured for the new geometry
     MemoryBarrier();
     _InterlockedIncrement(&s->ControlSeq);
@@ -8789,7 +8759,8 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 bs->Hwnd != (UINT64)(ULONG_PTR)windowData->Handle ||
                 bs->ReqWidth != (LONG)windowData->Width ||
                 bs->ReqHeight != (LONG)windowData->Height ||
-                BrokerCropStale(windowData, bs);
+                bs->ReqCropX != (LONG)windowData->CropLeft ||
+                bs->ReqCropY != (LONG)windowData->CropTop;
             if (needReg)
             {
                 if (windowData->PwBrokerSourced)
@@ -9097,7 +9068,8 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             (!bs || bs->Hwnd != (UINT64)(ULONG_PTR)windowData->Handle ||
              bs->ReqWidth != (LONG)windowData->PwWidth ||
              bs->ReqHeight != (LONG)windowData->PwHeight ||
-             BrokerCropStale(windowData, bs));
+             bs->ReqCropX != (LONG)windowData->CropLeft ||
+             bs->ReqCropY != (LONG)windowData->CropTop);
         // NEVER REGISTERED. A slice-fed window added while the broker could not take it - it was not ready yet, or it had
         // died and was being relaunched, or the arena or the slots were full - has PwBrokerSourced FALSE, which the repair
         // below never looks at, so nothing ever registered it and a direct-required window with no slot is WITHHELD from
