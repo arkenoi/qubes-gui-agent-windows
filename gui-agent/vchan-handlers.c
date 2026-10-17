@@ -1520,13 +1520,10 @@ static DWORD HandleFocus(IN HWND window)
             // input with SendInput, and input from this process is what the foreground lock asks for.
             // Measured: the call then succeeds, and the window that loses the foreground goes quiet.
             // Only when the window is not already the foreground (Jev 0.60 over always).
-            if (GetForegroundWindow() != window)
-            {
-                INPUT nudge = { 0 };
-                nudge.type = INPUT_MOUSE;
-                nudge.mi.dwFlags = MOUSEEVENTF_MOVE;   // dx = dy = 0: the cursor does not move
-                (void)InjectInput(&nudge, "SendInput(focus nudge)");
-            }
+            // The nudge that makes the request ALLOWED now lives inside ApplyForeground, so the
+            // hidden-Start dismissal gets it too (it was refused on the guest without it). Same
+            // condition, same single zero-distance move, same place in the order - before the
+            // activation attempt.
             // The body itself now lives in util.c (ApplyForeground), because the hidden-Start
             // dismissal has to make the same request against the same lock and two copies of an
             // attach-and-detach would drift. Identical in effect to what stood here: plain call

@@ -301,6 +301,35 @@ BOOL ApplyForeground(IN HWND window, OUT FOREGROUND_HOW *how)
     if (!window)
         return FALSE;                       // an activation of nothing: the callers' predicates must never produce one
 
+    // SATISFY THE FOREGROUND LOCK FIRST, with one zero-distance relative mouse move. Windows grants
+    // SetForegroundWindow to a process the user has just interacted with, and input injected BY THIS
+    // PROCESS is what the lock asks for - the agent already injects all of dom0's input this way.
+    // Measured 2026-10-01 on the dom0-focus path: the call then succeeds, and the window that loses
+    // the foreground goes quiet. MEASURED AGAIN 2026-10-17, on the hidden-Start dismissal, which did
+    // NOT have this: "activation to 0x30062 refused - foreground held by pid 6088", twice in one
+    // run, while the surface closed ~2 s later by something that was not us.
+    //
+    // A ZERO-DISTANCE MOUSE MOVE IS NOT THE BANNED INJECTION. What is forbidden on the dismissal
+    // path is an ESCAPE KEYSTROKE: SendInput of a key goes to the SYSTEM input queue and was
+    // measured closing a third-party Start replacement's own menu (Jev race_is_real 0.96). dx=dy=0
+    // moves no cursor, produces no hover, and cannot dismiss anything. Jev on exactly that
+    // distinction: nudge-is-allowed 0.91.
+    //
+    // It lives HERE rather than at each caller so there is still one activation body: HandleFocus
+    // used to do this itself and now gets it from this call, unchanged in effect.
+    if (GetForegroundWindow() != window)
+    {
+        INPUT nudge;
+        ZeroMemory(&nudge, sizeof(nudge));
+        nudge.type = INPUT_MOUSE;
+        nudge.mi.dwFlags = MOUSEEVENTF_MOVE;   // dx = dy = 0: the cursor does not move
+        if (!SendInput(1, &nudge, sizeof(nudge)))
+        {
+            LogWarning("SendInput(focus nudge) failed (0x%x) - re-attaching the input desktop", GetLastError());
+            AttachToInputDesktop();         // best effort; a later activation retries
+        }
+    }
+
     if (SetForegroundWindow(window))
     {
         if (how)

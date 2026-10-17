@@ -7996,7 +7996,7 @@ static void StartOpeningExamine(IN HWND start, IN BOOL surfaceVisible)
         // mentioned, so a dismissal that worked and one that never ran read identically.
         LogInfo("QGASTARTDISMISS 0x%x: closed (%s) %llu ms after activation returned",
             (DWORD)(ULONG_PTR)start,
-            verdict == QGA_START_CLOSED_CLOAKED ? "surface cloaked" : "foreground left",
+            verdict == QGA_START_CLOSED_CLOAKED ? L"surface cloaked" : L"foreground left",
             since);
         g_StartDismissSent = FALSE;
         g_StartDismissStuckLogged = FALSE;
@@ -8043,8 +8043,8 @@ static void StartOpeningExamine(IN HWND start, IN BOOL surfaceVisible)
             LogInfo("QGASTARTDISMISS 0x%x: the Windows Start menu opened in seamless mode, where it is never shown "
                 "(SeamlessStart=0) - activation returned to 0x%x (%s, %s), foreground pid %lu",
                 (DWORD)(ULONG_PTR)start, (DWORD)(ULONG_PTR)target,
-                verdict == QGA_START_RETURN_FOCUS ? "dom0 focus" : "shell desktop",
-                how == FOREGROUND_ATTACHED ? "attached" : "plain", fgPid);
+                verdict == QGA_START_RETURN_FOCUS ? L"dom0 focus" : L"shell desktop",
+                how == FOREGROUND_ATTACHED ? L"attached" : L"plain", fgPid);
         else
             LogError("QGASTARTDISMISS 0x%x: activation to 0x%x refused - foreground held by pid %lu; "
                 "the hidden menu may take clicks", (DWORD)(ULONG_PTR)start, (DWORD)(ULONG_PTR)target, fgPid);
