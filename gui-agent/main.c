@@ -3382,34 +3382,8 @@ static ULONGLONG BrokerNextDue(void)
 // The user-facing half of QGAWGCDEAF (ADR-capture 32). The id carries the app's image name reduced to [a-z0-9-] (the route's
 // name rule), so each deaf app is reported once per boot; the text is the "capture-deaf" row of notifytexts.h, its header
 // naming the app (the image name without ".exe" - a human name, not a file name); the generic row when there is no name.
-// IS THE GUEST STILL COMING UP, for the purposes of TALKING TO THE USER?
-//
-// QgaHoldIsStartup answers "the broker has not started yet", which stops being true the moment the
-// broker is ready - and the broker's one launch waits for the SHELL, so it becomes ready at the
-// exact moment the user can first start an app. The field reporter's case lands in that gap: "When
-// trying to start Explorer before Windows 11 has completely settled down after boot, 2 messages are
-// shown, one complaining that it is not yet ready" (2026-10-17, 4.3.36). The broker was up; the
-// shell was not finished; the window was withheld for a few seconds, correctly; and the agent told
-// him about it.
-//
-// So the user-facing routes also stay quiet for a short settle after the broker becomes ready.
-// THIS IS NOT A DEADLINE FOR SHOWING ANYTHING - nothing is mapped, hidden or timed out by it, and
-// the ERROR lines are unchanged. It only decides whether a transient condition during startup is
-// worth INTERRUPTING THE USER about, and the owner's rule for that is plain: "you should not talk
-// shit during the normal boot."
-#define NOTIFY_SETTLE_AFTER_BROKER_MS (30u * 1000u)
-static BOOL NotifyWouldInterruptStartup(void)
-{
-    if (QgaHoldIsStartup(WgcBrokerActive(), g_BrokerReadyAt != 0))
-        return TRUE;                       /* the display path has never been up this boot */
-    if (g_BrokerReadyAt != 0)
-    {
-        const ULONGLONG now = GetTickCount64();
-        if (now >= g_BrokerReadyAt && (now - g_BrokerReadyAt) < NOTIFY_SETTLE_AFTER_BROKER_MS)
-            return TRUE;                   /* up, but the shell is still arriving behind it */
-    }
-    return FALSE;
-}
+// Defined below, next to g_BrokerReadyAt which it reads (see there for why it exists).
+static BOOL NotifyWouldInterruptStartup(void);
 
 static void DeafNotifyUser(IN HWND window)
 {
@@ -3560,6 +3534,35 @@ static BOOL g_WgcBrokerHung = FALSE;
 // loop's wait array); READY is the pid the broker publishes and then signals the frame event for; a HANG is a request
 // it has not acknowledged within WGCBRK_ACK_DEADLINE_MS (R1/R4). No heartbeat is read or written.
 static ULONGLONG g_BrokerReadyAt = 0;   // tick the current instance became ready: its run time in a death record
+
+// IS THE GUEST STILL COMING UP, for the purposes of TALKING TO THE USER?
+//
+// QgaHoldIsStartup answers "the broker has not started yet", which stops being true the moment the
+// broker is ready - and the broker's one launch waits for the SHELL, so it becomes ready at the
+// exact moment the user can first start an app. The field reporter's case lands in that gap: "When
+// trying to start Explorer before Windows 11 has completely settled down after boot, 2 messages are
+// shown, one complaining that it is not yet ready" (2026-10-17, 4.3.36). The broker was up; the
+// shell was not finished; the window was withheld for a few seconds, correctly; and the agent told
+// him about it.
+//
+// So the user-facing routes also stay quiet for a short settle after the broker becomes ready.
+// THIS IS NOT A DEADLINE FOR SHOWING ANYTHING - nothing is mapped, hidden or timed out by it, and
+// the ERROR lines are unchanged. It only decides whether a transient condition during startup is
+// worth INTERRUPTING THE USER about, and the owner's rule for that is plain: "you should not talk
+// shit during the normal boot."
+#define NOTIFY_SETTLE_AFTER_BROKER_MS (30u * 1000u)
+static BOOL NotifyWouldInterruptStartup(void)
+{
+    if (QgaHoldIsStartup(WgcBrokerActive(), g_BrokerReadyAt != 0))
+        return TRUE;                       /* the display path has never been up this boot */
+    if (g_BrokerReadyAt != 0)
+    {
+        const ULONGLONG now = GetTickCount64();
+        if (now >= g_BrokerReadyAt && (now - g_BrokerReadyAt) < NOTIFY_SETTLE_AFTER_BROKER_MS)
+            return TRUE;                   /* up, but the shell is still arriving behind it */
+    }
+    return FALSE;
+}
 static BOOL g_WgcLaunched = FALSE;      // the ONE launch this agent performs (HELPER LIFECYCLE above)
 // THE PID OF A PROCESS WITH THIS IMAGE NAME, or 0. Two callers, both about UAC:
 //   - classifying a SECURE DESKTOP we are stuck on (owner, 2026-10-08: "if it sits on the uac
@@ -3657,6 +3660,7 @@ static void BrokerSupervise(void)
         {
             _InterlockedExchange(&g_BrokerReady, 1);
             g_BrokerReadyAt = now;
+
             // A fresh instance answers every slot on its first pass: requests left outstanding by the previous one get
             // a fresh clock rather than being charged to this one.
             for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
