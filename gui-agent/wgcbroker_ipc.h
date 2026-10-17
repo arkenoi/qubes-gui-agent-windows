@@ -14,7 +14,15 @@
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
 #define WGCBRK_ABI_VERSION  27u  /* 27: ReqCardValid - a zero-initialised slot is not a card at (0,0);
                                   *     the >= 0 test made the broker override a good crop with (0,0).
-                                  *     Appended; sizeof(WGCBRK_SLOT) 3472 -> 3480;
+                                  *     Appended at offset 3468, which FILLS the padding ABI 26
+                                  *     already carried, so sizeof(WGCBRK_SLOT) STAYS 3472 - it does
+                                  *     NOT grow to 3480, as this line claimed until 2026-10-18.
+                                  *     guest/wgcbroker-peek.ps1 trusted that number and read every
+                                  *     slot after slot0 at the wrong base, reporting a live slot as
+                                  *     hwnd=0x2d600000282 publishes=13586208 bytes=1. Take this size
+                                  *     from the compiler (a file that includes this header behind a
+                                  *     windows.h shim and prints sizeof/offsetof), never by counting
+                                  *     fields: appending a LONG into existing padding is free;
                                   * 26: CropUsedX/Y + CropWinX/Y - the crop the broker ACTUALLY used
                                   *     and the window origin it derived it from, because the broker
                                   *     has no log and a black cropped copy was otherwise

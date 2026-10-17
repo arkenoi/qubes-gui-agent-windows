@@ -5070,12 +5070,54 @@ static void BrokerDesiredCrop(IN const WINDOW_DATA* entry, OUT LONG* cropX, OUT 
     }
 }
 
+// WHERE THE CARD IS, in SCREEN coordinates, so the broker can turn it into an offset against the
+// window's rect AT CAPTURE TIME instead of trusting an offset measured earlier (ABI 25/27).
+//
+// THE AGENT'S OWN INSET IS A RACE AND THIS IS THE MEASUREMENT OF IT (win11de-cold, 26200.8037,
+// agent 378b37c, 2026-10-18): the slot was registered with crop=12,12 - which is CORRECT for the
+// 666x750 card-sized state, where the card sits 12 px inside its window - and the broker then
+// opened its session against pool=5120x1392, because the shell's CoreWindow is full-screen while it
+// composes and card-sized once the menu is placed. So a crop that was right when it was written
+// lifted the empty top-left corner of the screen, and the slot published 31 frames at
+// PUBSIG colours=1. Nothing recomputed it: the agent's TRACKED rect for a shell surface is the CARD
+// rect from the UIA walk, which does not change when the underlying HWND resizes, so no geometry
+// event fired and the two staleness tests were never reached inside the menu's life.
+//
+// ReqCardValid is the gate on the broker's derivation, and it HAD NO WRITER ANYWHERE - the broker's
+// whole live-rect path was dead code, and ReqCardX/Y were written only by BrokerRetarget, never at
+// first registration. Both sites now go through here so they cannot drift.
+static void BrokerWriteCardPos(IN const WINDOW_DATA* entry, IN OUT WGCBRK_SLOT* s)
+{
+    if (entry && ShellSurfaceKind(entry) != ShellSurfaceNone)
+    {
+        s->ReqCardX = (LONG)entry->X;
+        s->ReqCardY = (LONG)entry->Y;
+        s->ReqCardValid = 1;
+    }
+    else
+    {
+        s->ReqCardX = -1;
+        s->ReqCardY = -1;
+        s->ReqCardValid = 0;
+    }
+}
+
 // Does the slot still describe this window - the SOURCE it should capture, and the crop into it?
+// THE CARD'S SCREEN POSITION IS PART OF THAT. Without it a card that MOVES keeps the broker
+// deriving its crop from the old position: the inset the agent computes beside it would usually
+// change too and drag the slot into staleness indirectly, but "usually" is not a guarantee and the
+// two can agree by coincidence (the card moving exactly as far as its window did). The position the
+// broker actually uses is the thing to compare.
 static BOOL BrokerSlotStale(IN const WINDOW_DATA* e, IN const WGCBRK_SLOT* bs)
 {
     LONG cx = 0, cy = 0;
     if (!bs) return TRUE;
     BrokerDesiredCrop(e, &cx, &cy);
+    const BOOL wantCard = (BOOL)(e && ShellSurfaceKind(e) != ShellSurfaceNone);
+    if ((BOOL)(bs->ReqCardValid != 0) != wantCard)
+        return TRUE;
+    if (wantCard && (bs->ReqCardX != (LONG)e->X || bs->ReqCardY != (LONG)e->Y))
+        return TRUE;
     return (BOOL)(bs->Hwnd != (UINT64)(ULONG_PTR)BrokerSourceWindow(e) ||
                   bs->ReqCropX != cx || bs->ReqCropY != cy);
 }
@@ -5085,6 +5127,7 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1;
     entry->PwBrokerLastId = 0; entry->PwBrokerArenaOff = 0;
     entry->PwDimsLogged = FALSE;   // re-arm the one-shot BROKERDIMS diagnostic per registration
+    entry->PwCropFallbackLogged = FALSE;   // ...and the one-shot QGACROPFALLBACK diagnostic
     entry->PwDimsSince = 0;
     entry->PwDimsStuck = FALSE;
     entry->PwDirectSuppressed = FALSE;
@@ -5157,6 +5200,10 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     // menus once they were both broker-captured AND cropped). entry->CropLeft/Top are set by the
     // toast/menu crop in GetWindowData before the slice-fed window is (re)registered here.
     { LONG cx, cy; BrokerDesiredCrop(entry, &cx, &cy); s->ReqCropX = cx; s->ReqCropY = cy; }
+    // ...and the card's SCREEN position, which lets the broker re-derive that crop against the
+    // window's rect at capture time. This was missing here entirely - only the retarget wrote it -
+    // so a slot's FIRST registration always shipped the racy inset alone.
+    BrokerWriteCardPos(entry, s);
     // ASK FOR THE ROUTE THIS WINDOW CLASS NEEDS (ABI 23). A shell CoreWindow - toast host, Start,
     // Search - is not served by a WGC session on itself: it delivers frames that are entirely
     // BLACK, which the broker's quiet ladder cannot see, so the window stayed on route 0 for ever
@@ -5325,10 +5372,7 @@ BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
     // card-sized once the menu is placed, so an inset measured in one state is wrong in the other
     // and the crop lifts an empty corner of the screen. Screen coordinates do not have that
     // problem - the broker subtracts the window's live origin when it captures.
-    if (ShellSurfaceKind(entry) != ShellSurfaceNone)
-    { s->ReqCardX = (LONG)entry->X; s->ReqCardY = (LONG)entry->Y; }
-    else
-    { s->ReqCardX = -1; s->ReqCardY = -1; }
+    BrokerWriteCardPos(entry, s);
     s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;   // re-measured for the new geometry
     MemoryBarrier();
     _InterlockedIncrement(&s->ControlSeq);
@@ -5436,6 +5480,24 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
         BFF_NO(L"slot-not-ACTIVE");
     }
     if (!h->Producing) BFF_NO(L"broker-paused");   // broker paused (secure desktop)
+
+    // DID THE BROKER CROP WHERE WE MEANT? One shot per registration, and only for a surface whose
+    // crop we asked it to derive. CropWinX/Y is the window origin IT saw and CropUsedX/Y the crop it
+    // actually applied (ABI 26, published before its own bounds test), so the comparison needs
+    // nothing from our side but the card's position. A disagreement means its live-rect derivation
+    // refused - the card is outside the captured texture - and it kept the racy inset, which is how
+    // this surface published 31 frames of one colour while every counter said the capture was
+    // healthy. Loud, because the alternative is a wrong rectangle that looks like a dead capture.
+    if (!e->PwCropFallbackLogged && s->ReqCardValid)
+    {
+        const LONG wantX = s->ReqCardX - s->CropWinX, wantY = s->ReqCardY - s->CropWinY;
+        if (s->CropUsedX != wantX || s->CropUsedY != wantY)
+        {
+            e->PwCropFallbackLogged = TRUE;
+            LogWarning("QGACROPFALLBACK hwnd=0x%x card outside the capture - cropped %d,%d not %d,%d",
+                       (DWORD)(ULONG_PTR)e->Handle, s->CropUsedX, s->CropUsedY, wantX, wantY);
+        }
+    }
 
     for (int t = 0; t < 4; t++)
     {
@@ -9359,16 +9421,39 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         }
         else if (windowData->PwDimsStuck || reqStale)
         {
-            LogWarning("BROKERREREG hwnd 0x%x re-registering broker capture at %ux%u crop %d,%d "
-                L"(stuck=%d reqStale=%d)", (DWORD)(ULONG_PTR)windowData->Handle,
-                windowData->PwWidth, windowData->PwHeight,
-                windowData->CropLeft, windowData->CropTop, windowData->PwDimsStuck, reqStale);
-            if (windowData->PwBrokerSourced)
-                BrokerUnregister(windowData);
-            windowData->PwDimsStuck = FALSE;
-            windowData->PwDimsSince = 0;
-            windowData->PwSliceNeedsFull = TRUE;   // first frame after re-register: full copy
-            (void)BrokerRegister(windowData);
+            // A CROP-ONLY DISAGREEMENT MUST KEEP THE CAPTURE SESSION. Tearing the slot down sets
+            // its Hwnd to 0, which makes the broker's Reconcile CLOSE the WGC session and pay a
+            // fresh CreateForWindow + frame pool + first frame on the next registration - the cost
+            // this project measured and removed once already, because a Win11 menu's card
+            // oscillates while it opens (this run: 800x798@2373,642 -> 800x750@2160,642) and every
+            // oscillation used to release the slot. Now that the card's SCREEN POSITION is part of
+            // the request, a card that merely MOVES is stale too, so without this arm the common
+            // case would be a rebuild per oscillation. BrokerRetarget rewrites the request in place
+            // and deliberately leaves Hwnd alone, which is exactly what keeps the session alive.
+            const BOOL cropOnly = !windowData->PwDimsStuck && bs &&
+                bs->Hwnd == (UINT64)(ULONG_PTR)BrokerSourceWindow(windowData) &&
+                bs->ReqWidth == (LONG)windowData->PwWidth &&
+                bs->ReqHeight == (LONG)windowData->PwHeight;
+            // NO PwSliceNeedsFull HERE, and that is not an omission: BrokerRetarget bumps
+            // ControlSeq, which the broker reads as a registration to answer and publishes the
+            // WHOLE card for, so the next frame is complete without asking for one.
+            // Reported from the SLOT, not recomputed - the numbers are the ones actually written.
+            if (cropOnly && BrokerRetarget(windowData))
+                LogInfo("BROKERRECROP hwnd 0x%x crop %d,%d - session kept",
+                    (DWORD)(ULONG_PTR)windowData->Handle, bs->ReqCropX, bs->ReqCropY);
+            else
+            {
+                LogWarning("BROKERREREG hwnd 0x%x re-registering broker capture at %ux%u crop %d,%d "
+                    L"(stuck=%d reqStale=%d)", (DWORD)(ULONG_PTR)windowData->Handle,
+                    windowData->PwWidth, windowData->PwHeight,
+                    windowData->CropLeft, windowData->CropTop, windowData->PwDimsStuck, reqStale);
+                if (windowData->PwBrokerSourced)
+                    BrokerUnregister(windowData);
+                windowData->PwDimsStuck = FALSE;
+                windowData->PwDimsSince = 0;
+                windowData->PwSliceNeedsFull = TRUE;   // first frame after re-register: full copy
+                (void)BrokerRegister(windowData);
+            }
         }
     }
 

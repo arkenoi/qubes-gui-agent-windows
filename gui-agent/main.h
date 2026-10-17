@@ -372,6 +372,14 @@ typedef struct _WINDOW_DATA
     // (the window then sits in the hold arm with whatever its slab holds - a feed loss, not a
     // transient). Re-armed on every BrokerRegister.
     BOOL     PwDimsLogged;
+    // One-shot QGACROPFALLBACK diagnostic emitted: the broker did NOT use the crop the card's
+    // screen position implies, i.e. its live-rect derivation refused and it kept the agent's inset
+    // instead (the card lies outside the captured texture - the 1392-vs-1440 case). That is a
+    // fallback, and this project logs a fallback loudly rather than shipping a quietly wrong
+    // rectangle: the user sees the empty corner of a screen, which is indistinguishable from a
+    // dead capture. Compared against the broker's own CropUsedX/Y and CropWinX/Y (ABI 26), so it
+    // reports what was ACTUALLY cropped, not what was asked for. Re-armed on every BrokerRegister.
+    BOOL     PwCropFallbackLogged;
     // BROKERDIMS repair state. PwDimsSince: tick of the FIRST rejected-for-dims frame in the
     // current run of them (0 = none outstanding; cleared on every accepted frame). PwDimsStuck:
     // the mismatch outlived BROKER_DIMS_STUCK_MS, i.e. it is a desync and not a resize in
