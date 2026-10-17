@@ -816,6 +816,10 @@ static const struct
 // the foreground goes to Start's search box (SearchHost) on its own schedule, possibly after the surface's last event of that opening,
 // and the dismissal decides on the foreground (see DismissHiddenStartSurface).
 static HWND volatile g_StartSurfaceOpen = NULL;
+// LOGGING ONLY. Whose refusal has already been written. Never read by a policy: see GUARD:startfg.
+// Cleared with the latch when the opening ends, because StartMenuExperienceHost keeps the SAME
+// window across openings - without the clear, every opening after the first would be silent.
+static HWND volatile g_StartRefusalSaid = NULL;
 
 // Declared in main.h: the window dom0 last named as focused. Written by HandleFocus on the vchan
 // thread, read here by the dismissal on the tracking thread.
@@ -8227,6 +8231,7 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
             // below writes the receipt (CLOSED_CLOAKED) exactly once, then the handle is dropped.
             StartOpeningExamine(data->Handle, FALSE);
             InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, data->Handle);
+            InterlockedCompareExchangePointer((PVOID volatile*)&g_StartRefusalSaid, NULL, data->Handle);
         }
         return FALSE;
     }
@@ -8364,14 +8369,25 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
             // TEXT is unchanged byte for byte: four consumers test for its presence
             // (tools/rnd-score.py, protocol/steps/p4-rendering.json START_HIDDEN_BY_DESIGN,
             // mgmt/harness/p5-run.sh, guest/startproof.ps1) and none counts it.
+            // TWO MARKERS, ON PURPOSE. g_StartSurfaceOpen is the behavioural fact - three other
+            // sites read it to refuse the companion, to re-examine on a foreground move and to
+            // gate the card walk. g_StartRefusalSaid exists only so the line above is written
+            // once. They were ONE variable until 2026-10-17, which made "say this less often" a
+            // change to a suppression decision: Jev, asked what that shape costs, answered
+            // one-global-two-jobs 0.98 / separate-the-two 1.00. Keep them apart so neither job can
+            // be broken for the other's sake.
             const PVOID prev = InterlockedExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, data->Handle);   // GUARD:startfg - look again when the foreground moves
             if (prev != (PVOID)data->Handle)
             {
+                // BEHAVIOUR, not logging: the latch has just begun tracking THIS surface, so a
+                // SearchHost companion that mapped before it was seen is examined again and
+                // refused by the branch below. This used to sit inside the log gate.
+                PokeWindowTracking();
+            }
+            if (InterlockedExchangePointer((PVOID volatile*)&g_StartRefusalSaid, data->Handle) != (PVOID)data->Handle)
+            {
                 LogDebug("0x%x: Start surface not presented in seamless mode (SeamlessStart=0)",
                     data->Handle);
-                // A SearchHost companion already mapped before the Start surface was seen is now
-                // examined again, and refused by the branch below.
-                PokeWindowTracking();
             }
             DismissHiddenStartSurface(data->Handle);   // GUARD:startdismiss - hidden must also mean CLOSED
             return FALSE;
