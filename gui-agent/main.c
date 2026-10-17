@@ -1607,11 +1607,53 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
         monitor = MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST);
         if (!GetMonitorSettings(monitor, &monInfo, &devMode))
         {
-            // Twice in a row is not a race. ONE line, naming the call that actually failed and the
-            // window, and a status the caller already treats as "not measurable this pass" so the
-            // same condition is not reported a second time under a different function's name.
+            // TWICE IN A ROW IS NOT A RACE - UNLESS THE WINDOW ITSELF IS GONE, which fails both asks
+            // for a reason that is not about monitors at all. MonitorFromWindow on a dead HWND hands
+            // back a handle that GetMonitorInfo then refuses, so a window closing mid-pass produces
+            // exactly this signature, and the consequence the error asserts - "dom0 kept its stale
+            // geometry" - cannot apply to a window dom0 was never told about.
+            // MEASURED on win10-clean, campaign run 38971675274 (frozen sha 8e0252e8), the ONE error
+            // line a clean install of that build produced: `0x40066: GetMonitorInfo failed twice
+            // (0x5b5, 0x5b5), not measured` - and 0x40066 appears EXACTLY ONCE in the whole agent
+            // log, only in that line. Never attached, never mapped, never destroyed, never mentioned
+            // again: a window that was enumerated once and was gone before it could be measured.
+            // So ask. IsWindow() == FALSE is conclusive (it cannot come back), which is the only
+            // direction needed here; TRUE does not close the race - see the note at the pending-map
+            // IsWindow check - but a window that is still there with two refused monitor lookups IS
+            // the topology fault this line was written for, and it stays an ERROR per occurrence.
+            // AND THIS TURNS AN INFERENCE INTO A MEASUREMENT. That the window was gone is, on the
+            // 2026-10-17 capture, an argument from ABSENCE - no attach, no map, no destroy for that
+            // handle anywhere - and Jev rated absence-as-evidence only 0.66 here, which is fair.
+            // The branch below therefore does not merely reclassify: it ASKS, and records the answer
+            // per occurrence at DEBUG with both error codes. The next capture states the fact
+            // directly instead of leaving it to be deduced, and if these lookups ever fail for a
+            // window that is STILL THERE the ERROR says so with no change in behaviour.
+            // The error code is taken BEFORE IsWindow, which clobbers GetLastError.
+            const DWORD secondError = GetLastError();
+            if (!IsWindow(window))
+            {
+                // Bounded and counted, the same shape as QGAMONSTALE above: a window vanishing
+                // mid-pass is ordinary, a RATE of them is a finding. Each occurrence is in the
+                // DEBUG log with its handle.
+                static volatile LONG s_goneCount = 0;
+                static ULONGLONG s_goneLastReport = 0;
+                const LONG gone = _InterlockedIncrement(&s_goneCount);
+                const ULONGLONG nowGone = GetTickCount64();
+                LogDebug("0x%x: window gone before it could be measured (0x%x, 0x%x)",
+                    window, firstError, secondError);
+                if (s_goneLastReport == 0 || nowGone - s_goneLastReport > 300000)
+                {
+                    s_goneLastReport = nowGone;
+                    LogInfo("QGAWNDGONE %d window(s) disappeared before they could be measured",
+                        gone);
+                }
+                return ERROR_INVALID_DATA;
+            }
+            // ONE line, naming the call that actually failed and the window, and a status the caller
+            // already treats as "not measurable this pass" so the same condition is not reported a
+            // second time under a different function's name.
             LogError("0x%x: GetMonitorInfo failed twice (0x%x, 0x%x), not measured",
-                window, firstError, GetLastError());
+                window, firstError, secondError);
             return ERROR_INVALID_DATA;
         }
         // The race itself is bounded and counted rather than logged per occurrence, the same shape
