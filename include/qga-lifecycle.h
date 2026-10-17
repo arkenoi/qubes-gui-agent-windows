@@ -549,6 +549,69 @@ static __inline BOOL QgaHoldIsStartup(IN BOOL brokerActive, IN BOOL brokerEverRe
 }
 
 /* ---------------------------------------------------------------------------------------------
+ * A HOLD ON A HEALTHY FEED IS NOT A FAULT EITHER.  (the rest of BROKERHOLD's level)
+ *
+ * QgaHoldIsStartup above only separates "the broker has not started yet" from everything else, so
+ * every OTHER hold stayed at W. MEASURED across all 93 captured logs on this rig that contain the
+ * line - every occurrence, not a sample:
+ *      422  W  brokerActive=1 sourced=1 slot=1
+ *      167  W  brokeractive=1 sourced=1 slot=0
+ *       35  I  brokerActive=0 sourced=0 slot=-1      the startup branch, already quiet
+ *        5  W  brokerActive=0 sourced=0 slot=-1      W here means the broker HAD been ready: it died
+ *        0     brokerActive=1 with slot=-1 or sourced=0   - never seen in these captures
+ * So 589 of the 597 warnings are a window with a LIVE broker, registered, holding a slot, that had
+ * no usable frame on one pass - the emitter's own list of reasons for reaching this arm begins
+ * "first frame pending ... torn read, dims mismatch". In run 38994277148 all 12 came in six pairs
+ * ~1 s apart whose content rect differed by ONE PIXEL: a window being resized, held for a pass,
+ * then fed. Nothing went wrong, and "no warnings on normal operation" is the owner's rule.
+ *
+ * AND IT HIDES NOTHING. A window that is held and never fed is reported at ERROR by
+ * QGADIRECTSUPPRESS on QgaWindowFaultDue's clock below - a clock whose both arms are asserted
+ * offline and which has fired in the field (falsely, on 2026-10-11, which is why it exists). That
+ * line occurs ZERO times in the same 93 logs, so no window in any of them was starved: the holds
+ * resolved. Jev: level wrong on a healthy feed 1.00, the quieted cases are benign 0.82, the kept
+ * ones are worth a warning 0.82, the demotion hides nothing 0.75.
+ *
+ * NOT INERT - the trap this project has fallen into four times. Both arms are populated by real
+ * captured occurrences, 589 against 5, so this question has two different answers in the field
+ * rather than one by construction. (Jev scored that 0.43 on my assertion and 0.75 on the table.)
+ * The active-broker-with-no-slot combination is kept LOUD although it appears 0 times here; that
+ * absence is stated, not reported as covered.
+ *
+ * AND ONE STATE THIS DEMOTION LEAVES REPORTED BY NOTHING - named, not covered. A window that WAS
+ * being fed and then stops, while the broker stays active and it keeps its slot, used to produce
+ * this W; now it produces an I, and QGADIRECTSUPPRESS does not describe it: that line reports a
+ * window which NEVER received a frame, and its clock is reached on that footing. Jev put the gap
+ * at 0.63 and naming it rather than closing it at 0.56 - marginal, and recorded as marginal.
+ *
+ * `PwBrokerFrames > 0` LOOKS LIKE THE DISCRIMINATOR AND IS NOT. It counts accepted broker frames
+ * per window and is preserved across a capture recreate, so "has been fed before" is available
+ * here for free. But the 12 occurrences in run 38994277148 are six windows logging twice ~1 s
+ * apart with their content rect one pixel apart - resizes of windows ALREADY being fed, so
+ * frames > 0 on every one of them. Keying on it would have kept the whole measured population
+ * loud: inert on the exact lines it was meant to quiet, which is the fifth instance of that trap
+ * and the reason it is written down here instead of committed.
+ * At the instant of a one-shot hold, "this frame is late" and "this feed has died" are the SAME
+ * observation; only elapsed time separates them, and no clock currently covers the fed-then-
+ * starved case. That is pre-existing - the W line did not distinguish them either - and this
+ * change makes it quieter rather than worse-covered. Closing it means a per-window starvation
+ * clock with its own tests, which is detection work, not a log level.
+ */
+static __inline BOOL QgaHoldFeedIsHealthy(IN BOOL brokerActive, IN BOOL windowSourced, IN int windowSlot)
+{
+#ifndef QGA_LIFECYCLE_DEFECT_HOLDFEEDALWAYSLOUD
+    if (!brokerActive)
+        return FALSE;                       /* no broker now: startup is handled above, so it died */
+    if (!windowSourced || windowSlot < 0)
+        return FALSE;                       /* an ACTIVE broker with no room for it: a capacity fault */
+    return TRUE;                            /* live broker, registered, slot held: one pass, no frame */
+#else
+    (void)brokerActive; (void)windowSourced; (void)windowSlot;
+    return FALSE;                           /* DEFECT: 589 of 597 warnings are correct behaviour */
+#endif
+}
+
+/* ---------------------------------------------------------------------------------------------
  * WAS THIS LATE REGISTRATION THE DESIGNED COLD-BOOT PATH?  (BROKERLATEREG's level)
  *
  * A window added while the broker had not started yet gets no slot, is withheld, and is registered

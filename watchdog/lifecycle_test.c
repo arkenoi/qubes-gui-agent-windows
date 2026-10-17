@@ -338,6 +338,29 @@ int main(void)
     check("hold: broker active but never recorded ready -> still not a startup hold",
           QgaHoldIsStartup(TRUE, FALSE) == FALSE);
 
+    /* ---- and a hold on a HEALTHY feed is not a fault either (2026-10-17) ----
+     * QgaHoldIsStartup only separates "not started yet" from everything else, so every other hold
+     * stayed at W: 589 of the 597 warnings in all 93 captures on this rig are an active broker with
+     * the window registered and a slot held, which is one pass without a frame at the window's
+     * current size. Both arms below are populated by real occurrences (589 against 5), so unlike
+     * the latereg mistake above this question is not constant at its call site. */
+    check("holdfeed: live broker, window sourced, slot held -> one pass without a frame: quiet",
+          QgaHoldFeedIsHealthy(TRUE, TRUE, 0) == TRUE);
+    check("holdfeed: and a non-zero slot is just as healthy (422 of the measured lines)",
+          QgaHoldFeedIsHealthy(TRUE, TRUE, 1) == TRUE);
+    check("holdfeed: no broker now -> startup is handled above, so it died: loud",
+          QgaHoldFeedIsHealthy(FALSE, FALSE, -1) == FALSE);
+    check("holdfeed: an ACTIVE broker with no slot for it -> capacity fault, loud",
+          QgaHoldFeedIsHealthy(TRUE, TRUE, -1) == FALSE);
+    check("holdfeed: an ACTIVE broker and the window never sourced -> loud",
+          QgaHoldFeedIsHealthy(TRUE, FALSE, 0) == FALSE);
+    /* THE KNOB, so this is a check that has been seen to fail: with the defect compiled in every
+     * one of those 589 lines is a warning again. */
+#ifdef QGA_LIFECYCLE_DEFECT_HOLDFEEDALWAYSLOUD
+    check("holdfeed DEFECT: a healthy feed warns again (this is the state being fixed)",
+          QgaHoldFeedIsHealthy(TRUE, TRUE, 0) == FALSE);
+#endif
+
     /* ---- a LATE registration: which outage was it the tail of? (2026-10-11) ----
      * The first fix here asked QgaHoldIsStartup(FALSE, brokerReady) at a site where brokerReady is
      * true by construction, so the quiet branch was unreachable and the guest kept logging W. These

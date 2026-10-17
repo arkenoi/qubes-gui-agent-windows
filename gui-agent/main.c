@@ -5599,16 +5599,28 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
     }
     // Token missing, profile not loaded yet, or the helper did not exit 0 (SpawnHelperInSession
     // logs which) - in every case not applied, and the sweep retries.
-    // WARNING, and NOT lowered to Info: it was, on 2026-10-07, with a comment claiming "if it
-    // never succeeds, the caller's own failure path reports that". That was checked and is FALSE -
-    // the only caller does `g_SeamlessShadowsDone = ApplyGuestShadows(FALSE); // retried by the
-    // sweep until applied`, with no attempt counter and no final report anywhere. So a session
-    // that never becomes usable leaves guest shadows on in seamless mode for the whole session, a
-    // visible defect, and Info would have said so for ever with nothing escalating. Jev 0.06.
-    // A bounded retry with a loud final failure would justify Info; until it exists, this stays.
-    // No session token, no profile or no helper yet.
-    LogWarning("no usable interactive session yet, cannot %s guest shadows (will retry)",
-        enable ? L"restore" : L"disable");
+    //
+    // INFO, BECAUSE THE CONDITION THIS COMMENT SET HAS BEEN MET. It read, from 2026-10-07:
+    // "WARNING, and NOT lowered to Info ... the only caller does `g_SeamlessShadowsDone =
+    // ApplyGuestShadows(FALSE)`, with no attempt counter and no final report anywhere. So a
+    // session that never becomes usable leaves guest shadows on in seamless mode for the whole
+    // session, a visible defect, and Info would have said so for ever with nothing escalating.
+    // Jev 0.06. A bounded retry with a loud final failure would justify Info; until it exists,
+    // this stays."
+    // That retry now EXISTS, and has for some time: SHADOW_APPLY_MAX_ATTEMPTS is 30, a success
+    // resets the counter, and exhaustion raises QGASHADOWGIVEUP at ERROR naming the visible
+    // consequence ("seamless windows keep their DWM drop shadows"). The comment outlived its own
+    // precondition and kept a W alive on the authority of a sentence that was no longer true -
+    // which is why the first classification of this line, made from this function alone, came back
+    // defect=0.56. Shown the bound as well, Jev: overlogged=0.89 defect=0.00, comment stale 0.65.
+    // MEASURED over run 38994277148, all six cells: QGASHADOWGIVEUP occurred ZERO times and every
+    // run of this line ended in the Info success above. 18 warnings for a bounded wait that always
+    // resolved - "no warnings on normal operation" (owner, 2026-10-08).
+    // The attempt number is IN the line, so an escalation toward the bound is still visible here
+    // and the ERROR at the bound is still the loud report.
+    LogInfo("no usable interactive session yet, cannot %s guest shadows (attempt %u of %u, will retry)",
+        enable ? L"restore" : L"disable",
+        (unsigned)(g_ShadowAttempts + 1), (unsigned)SHADOW_APPLY_MAX_ATTEMPTS);
     return FALSE;
 }
 
@@ -12230,6 +12242,21 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                             LogInfo("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
                                 L"brokerActive=0 sourced=%d slot=%d - the broker has not started yet "
                                 L"(it waits for a shell); the window is withheld until its first frame",
+                                (DWORD)(ULONG_PTR)entry->Handle,
+                                pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
+                                entry->PwBrokerSourced, entry->PwBrokerSlot);
+                        // AND A HOLD ON A LIVE FEED IS NOT A FAULT EITHER. 589 of the 597 warnings
+                        // in every capture on this rig are this: an active broker, the window
+                        // registered and holding a slot, no usable frame on ONE pass - the reasons
+                        // listed above, "first frame pending ... torn read, dims mismatch". A
+                        // window that is held and never fed is still reported, at ERROR, by
+                        // QGADIRECTSUPPRESS on its fault clock; that line occurs 0 times in the
+                        // same captures, so these holds resolved.
+                        else if (QgaHoldFeedIsHealthy(WgcBrokerActive(), entry->PwBrokerSourced,
+                                                      entry->PwBrokerSlot))
+                            LogInfo("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
+                                L"brokerActive=1 sourced=%d slot=%d - no frame at this size on this "
+                                L"pass; held until the broker's next one (direct required)",
                                 (DWORD)(ULONG_PTR)entry->Handle,
                                 pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
                                 entry->PwBrokerSourced, entry->PwBrokerSlot);
