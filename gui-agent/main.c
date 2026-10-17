@@ -8322,7 +8322,7 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // that shows wallpaper or a phantom at a random position, do not present it at all -
     // the Super key is already dropped in seamless (BlockMenuKey), so the usual way to
     // summon it is closed too. Toasts are NOT affected: they render correctly and stay.
-    // Re-enable with SeamlessStart=1 to work on it; see docs/PLAN-start-menu.md.
+    // Re-enable with SeamlessStart=1 to work on it.
     // The kinds this predicate takes are mirrored as plain ints so the header stays free of the
     // agent's headers; keep the two in step.
     C_ASSERT((int)ShellSurfaceNone == QGA_SURFACE_KIND_NONE);

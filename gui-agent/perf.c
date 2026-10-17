@@ -338,7 +338,7 @@ void PerfInit(void)
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_FOCUS_RAISE_VALUE, &rv, NULL))
             raise = (rv != 0);
         g_FocusRaise = raise;
-        LogInfo("QGAFOCUSRAISE %s", g_FocusRaise ? L"on" : L"off");
+        LogDebug("QGAFOCUSRAISE %s", g_FocusRaise ? L"on" : L"off");
     }
 
     // Button events carry their own absolute position (fixes clicks landing wherever the
@@ -358,16 +358,23 @@ void PerfInit(void)
     // (default - the GWeck goal state: movable+size-locked Start, corner-popup toasts).
     {
         DWORD mv = SHELL_MANAGED_NONE;
+        BOOL fromRegistry = FALSE;
         if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)) &&
             ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SHELL_MANAGED_VALUE, &mv, NULL))
         {
+            fromRegistry = TRUE;
             if (mv > SHELL_MANAGED_START)
                 mv = SHELL_MANAGED_START;
         }
         else
             mv = SHELL_MANAGED_NONE;
         g_ShellManaged = mv;
-        LogInfo("QGASHELLMANAGED policy=%u (0=none 1=all 2=start-only)", g_ShellManaged);
+        // WHERE THE VALUE CAME FROM, appended rather than inserted: the one consumer
+        // (guest/verify-running-agent.ps1:32) matches the prefix 'QGASHELLMANAGED policy=', so
+        // anything added AFTER the value is safe and anything added in front would blind it - which
+        // is how three consumers were blinded on 2026-10-16.
+        LogInfo("QGASHELLMANAGED policy=%u (0=none 1=all 2=start-only) (%s)", g_ShellManaged,
+            fromRegistry ? L"registry" : L"default");
     }
 
     // Menu-key block (seamless only; see perf.h).
@@ -442,9 +449,9 @@ void PerfInit(void)
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SWEEP_EXEMPT_VALUE, &v, NULL))
                 g_SweepDdaExempt = (v != 0);
         }
-        LogInfo("QGADDACAPTURE %s", g_DdaCapture ? L"on" : L"off");
-        LogInfo("QGAFRAMEDROP %s", g_FrameDrop ? L"on" : L"off");
-        LogInfo("QGASWEEPEXEMPT %s", g_SweepDdaExempt ? L"on" : L"off");
+        LogDebug("QGADDACAPTURE %s", g_DdaCapture ? L"on" : L"off");
+        LogDebug("QGAFRAMEDROP %s", g_FrameDrop ? L"on" : L"off");
+        LogDebug("QGASWEEPEXEMPT %s", g_SweepDdaExempt ? L"on" : L"off");
     }
 
     // Drag-wobble / mis-render fixes and upd-spike experiments. Logged unconditionally,
@@ -452,6 +459,7 @@ void PerfInit(void)
     // condition the deployed binary ran under.
     {
         DWORD v = 0;
+        BOOL seamlessStartFromRegistry = FALSE;   // provenance for the QGASEAMLESSSTART line below
         if (ERROR_SUCCESS == CfgGetModuleName(moduleName, RTL_NUMBER_OF(moduleName)))
         {
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_INPUT_DRAG_FREEZE_VALUE, &v, NULL))
@@ -498,7 +506,10 @@ void PerfInit(void)
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_MON_INFO_CACHE_VALUE, &v, NULL))
                 g_MonInfoCache = (v != 0);
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_SEAMLESS_START_VALUE, &v, NULL))
+            {
                 g_SeamlessStart = (v != 0);
+                seamlessStartFromRegistry = TRUE;
+            }
             if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_RESYNC_DRAG_DEFER_VALUE, &v, NULL))
                 g_ResyncDragDefer = (v != 0);
         }
@@ -513,7 +524,19 @@ void PerfInit(void)
         LogInfo("QGADRAGFREEZECONTENT %s", g_InputDragFreezeContent ? L"on" : L"off");
         LogInfo("QGADRAGEVTPRIO %s", g_DragEventPriority ? L"on" : L"off");
         LogInfo("QGAMONCACHE %s", g_MonInfoCache ? L"on" : L"off");
-        LogInfo("QGASEAMLESSSTART %s", g_SeamlessStart ? L"on" : L"off (Start hidden in seamless)");
+        LogInfo("QGASEAMLESSSTART %s (%s)", g_SeamlessStart ? L"on" : L"off (Start hidden in seamless)",
+            seamlessStartFromRegistry ? L"registry" : L"default");
+        // THE CELL, SAID ONCE, so nobody has to derive it from two lines printed hundreds of lines
+        // apart. The two switches are independent and the combination is what the user sees: the
+        // key being dropped decides whether Start can be summoned at all, SeamlessStart decides
+        // what happens if it opens anyway. Info even when the cell is the unusual one - a
+        // deliberate configuration is not a warning.
+        LogInfo("QGASTARTPOLICY blockkey=%s seamlessStart=%s -> %s",
+            g_BlockMenuKey ? L"on" : L"off",
+            g_SeamlessStart ? L"on" : L"off",
+            (!g_SeamlessStart && g_BlockMenuKey)  ? L"key dropped; a Start that opens anyway is not presented and is closed by returning activation" :
+            (!g_SeamlessStart && !g_BlockMenuKey) ? L"key passes; a Start that opens is not presented and is closed by returning activation" :
+                                                    L"Start is presented when it opens");
         LogInfo("QGARESYNCDEFER %s", g_ResyncDragDefer ? L"on" : L"off");
     }
 

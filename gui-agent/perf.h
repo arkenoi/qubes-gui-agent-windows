@@ -169,9 +169,14 @@ extern BOOL     g_ButtonAbsolute;
 // Announce classified shell surfaces (toasts/Start/Search) as WM-managed windows instead
 // of override-redirect, so the dom0 WM can frame and move them. Three-valued policy
 // ("ShellManaged"): 0 = none (every shell surface stays an override-redirect popup,
-// Linux-agent parity), 1 = all classified surfaces, 2 = START ONLY (the GWeck goal state,
-// default: Start is movable + size-locked, toasts stay corner popups per the 2026-08-12
-// user spec).
+// Linux-agent parity), 1 = all classified surfaces, 2 = START ONLY (Start is movable +
+// size-locked, toasts stay corner popups per the 2026-08-12 user spec).
+// THE CODE'S DEFAULT IS 0, not 2. This comment said "2 = START ONLY (the GWeck goal state,
+// default...)" while perf.c initialises g_ShellManaged to SHELL_MANAGED_NONE and falls back to
+// NONE whenever the registry value is absent, so a reader checking the documented default got the
+// opposite of the shipped one. 2 is the GOAL state, which is a different thing from the default:
+// changing the effective default is a behaviour change and the owner's call, so only the comment
+// is corrected here. The startup line now says which of the two the running agent used.
 #define SHELL_MANAGED_NONE  0
 #define SHELL_MANAGED_ALL   1
 #define SHELL_MANAGED_START 2
@@ -179,7 +184,7 @@ extern DWORD    g_ShellManaged;
 // Present the Start menu in seamless mode at all. Default 0: on 25H2 it never rendered
 // acceptably through the seamless path (parks off-screen while closed, morphs size, and its
 // DirectComposition content survives neither PrintWindow nor a framebuffer slice once
-// moved). Toasts are unaffected. See docs/PLAN-start-menu.md.
+// moved). Toasts are unaffected.
 extern BOOL     g_SeamlessStart;
 
 // Drop the forwarded Super/Windows key (and whole Mod4 chords) in seamless mode
