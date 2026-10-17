@@ -12,7 +12,10 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  22u  /* 22: DirtyPublishes/DirtyFullCopies/DirtyBytes (rest-zero S1 dirty regions, M9(b)),
+#define WGCBRK_ABI_VERSION  23u  /* 23: ReqRoute - the agent ASKS for a route, so a window class WGC cannot
+                                  *     capture reaches the relay instead of being served black
+                                  *     (2026-10-17); appended: sizeof(WGCBRK_SLOT) 3440 -> 3448;
+                                  * 22: DirtyPublishes/DirtyFullCopies/DirtyBytes (rest-zero S1 dirty regions, M9(b)),
                                   *     appended: sizeof(WGCBRK_SLOT) 3424 -> 3440;
                                   * 21: AgentWake* - the agent's main-loop wakes by what woke it (rest-zero M1);
                                   * 20: SameFrames (was BackoffMs, unused since S3) - WGC arrivals not republished
@@ -389,6 +392,34 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG     DirtyPublishes;
     volatile LONG     DirtyFullCopies;
     volatile LONGLONG DirtyBytes;
+    /* ABI 23: THE AGENT ASKS FOR A ROUTE. WGCBRK_ROUTE_WGC (0) = no preference, the broker decides as before;
+     * WGCBRK_ROUTE_RELAY (1) = this window is NOT capturable by a session on itself, open it on the relay.
+     *
+     * WHY THE AGENT AND NOT THE BROKER. The broker's ladder keys on a SYMPTOM - "quiet while the agent says it
+     * changed" - and shell CoreWindows do not go quiet: they deliver frames that are entirely BLACK. MEASURED
+     * 2026-10-17 on win11de-sm (26200.8037): 26 of 26 shell-surface frames black or near-black
+     * (QGASLICEBLACK nonblack=0/9400 Search 800x750, 0/7371 Start 642x726), ordinary windows on the same path
+     * fine; an independent guest-side PrintWindow(PW_RENDERFULLCONTENT) of the same visible, uncloaked surface
+     * also returned maxchannel=0. A black-but-arriving feed is INVISIBLE to a quiet detector, so the ladder
+     * never fired and the live broker read relayOk=0 relayFail=0 on every slot - zero relay ATTEMPTS, ever,
+     * with relayCapable=1 published as available. Both `g_forcePw[i] = true` sites require the slot to ALREADY
+     * be a relay, so nothing could ENTER the route. Only the agent knows the window's class, and it already
+     * classifies it (ShellSurfaceKind) to decide cropping; this carries that answer to where the route is
+     * chosen rather than duplicating the classifier in the broker, where the two would drift.
+     *
+     * This does NOT re-add the rung ADR-capture 32 removed. That decision took the relay out of the QUIET
+     * LADDER (its invisible destination sat over other windows and got a neighbour falsely recreated, rz27) and
+     * in the same sentence kept it as "a CAPTURE ROUTE for a window OPENED on it (cross-process content)" -
+     * which is exactly this. It also restores, for exactly the class that needs it, the architecture pinned
+     * 2026-09-02: "per-HWND WGC for app/UWP/NRB/o-r-menu windows + ONE monitor capture for shell CoreWindows".
+     * Jev, given the full constraint set including ADR-32: shape-route-shell-surfaces 0.97, adr32_conflict
+     * no-adr32-preserves-it 0.83, and the rz27 neighbour-recreate check MUST be re-measured on this
+     * (must-be-measured-not-assumed 0.64) before it ships.
+     *
+     * APPENDED, NOT INSERTED. guest/wgcbroker-peek.ps1 reads this struct at hardcoded byte offsets
+     * ($b+3424/3428/3432 are the ABI 22 fields above); a field in the middle would silently blind every
+     * offset after it. This one lands at 3440 and nothing moves. */
+    volatile LONG     ReqRoute;
 } WGCBRK_SLOT;
 
 /* ABI 18: WGCBRK_HEADER.BrokerStage codes (bits 8+; the low 8 bits are the slot). */

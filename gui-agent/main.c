@@ -4978,6 +4978,13 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
     MemoryBarrier();
     s->Hwnd = (UINT64)(ULONG_PTR)entry->Handle;
+    // ASK FOR THE ROUTE THIS WINDOW CLASS NEEDS (ABI 23). A shell CoreWindow - toast host, Start,
+    // Search - is not served by a WGC session on itself: it delivers frames that are entirely
+    // BLACK, which the broker's quiet ladder cannot see, so the window stayed on route 0 for ever
+    // and was mapped dark or never shown at all. The same classifier that decides this window's
+    // crop decides its route, so the two cannot drift. See wgcbroker_ipc.h ReqRoute.
+    const SHELL_SURFACE_KIND routeKind = ShellSurfaceKind(entry);
+    s->ReqRoute = (routeKind != ShellSurfaceNone) ? (LONG)WGCBRK_ROUTE_RELAY : (LONG)WGCBRK_ROUTE_WGC;
     s->ReqState = WGCBRK_REQUESTED;
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&h->ControlGen);
@@ -4989,9 +4996,10 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     if (g_WgcCtl) SetEvent(g_WgcCtl);
     // At Info, with a tick: the gap from here to QGASLICECONTENT is the broker's first-frame
     // latency, which is what menu latency reduces to once nothing maps unpainted (2026-09-11).
-    LogDebug("QGABROKERREG hwnd=0x%x slot=%d %ux%u buf=%llu t=%llu",
+    LogDebug("QGABROKERREG hwnd=0x%x slot=%d %ux%u buf=%llu t=%llu reqroute=%s",
             (DWORD)(ULONG_PTR)entry->Handle, slot,
-            entry->Width, entry->Height, one, (ULONGLONG)GetTickCount64());
+            entry->Width, entry->Height, one, (ULONGLONG)GetTickCount64(),
+            s->ReqRoute == (LONG)WGCBRK_ROUTE_RELAY ? L"relay" : L"wgc");
     return TRUE;
 }
 
@@ -9198,8 +9206,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         //
         // The escape that keeps a genuinely DARK surface from being hidden for ever: once the
         // feed has delivered DIRECT_DARK_FRAMES distinct frames and the buffer is still
-        // unpainted, the feed is demonstrably working and the blackness belongs to the surface,
-        // not to us - map it and say so once (QGADIRECTDARK). One black frame is not evidence of
+        // unpainted, map it and say so once (QGADIRECTDARK). One black frame is not evidence of
         // a working feed; it is the exact signature of the failure above.
         if (toastHeld)
         {
@@ -9217,6 +9224,16 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             // still ends in BRK_DOWN and the loud path below.
             // TWO young states, not one. Measured 2026-09-08 on win11-brk with this very build:
             // gating only on the BROKER being young was not enough - both faults fired with
+        //
+        // THE PREMISE OF THIS ESCAPE WAS REFUTED 2026-10-17, and it is scheduled to go. It read
+        // "the feed is demonstrably working and the blackness belongs to the surface, not to us".
+        // Arriving frames do not demonstrate a working feed: a shell CoreWindow served by a WGC
+        // session on itself delivers frames on time that are ALL empty (26 of 26 on this rig), so
+        // this escape mapped a capture defect onto the user's screen as a dark window with a
+        // shadow strip. Jev: remove-it-fix-the-route 1.00. The route fix (ABI 23 ReqRoute) lands
+        // first and must be MEASURED to paint this class; removing the escape before that would
+        // turn a dark menu into no menu at all, which is not an improvement for anyone looking at
+        // the screen. Ordering, not hesitation.
             // brokerActive=1, for a toast (Windows.UI.Core.CoreWindow 364x109) and a terminal
             // (CASCADIA_HOSTING_WINDOW_CLASS) that had simply not been sourced yet. A window
             // freshly registered with a READY broker is indistinguishable, at this instant, from a
@@ -9288,11 +9305,31 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                     (ULONG)CROP_BEFORE_SHOW_TIMEOUT_MS);
             if (timedOut && !cropReady && DirectRequired() && windowData->PwSliceFed &&
                 !SliceContentReady(windowData))
-                // The per-window feed is delivering, so a dark surface is the app's own, not a display fault. If it
-                // looks like a black window, this is the line to quote.
-                LogWarning("QGADIRECTDARK hwnd 0x%x (class %s) mapped unpainted after %lu broker frame(s), "
-                    L"the app's surface itself is dark", (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
-                    windowData->PwBrokerFrames);
+            {
+                // IT MUST NOT NAME THE APP. This said "the app's surface itself is dark", on the
+                // reasoning that frames arriving prove the feed works - so blackness had to be the
+                // app's. MEASURED 2026-10-17 and that is false: a shell CoreWindow on route 0
+                // delivers frames on time (BROKERCHAIN arrived_ms=76 publish_ms=105) and every one
+                // of them is empty, because a WGC session on such a window captures nothing. An
+                // independent PrintWindow of the same visible, uncloaked surface returned
+                // maxchannel=0 too. Arriving frames do NOT establish a working feed, so this line
+                // cannot tell an unpainted app from a route that cannot see it - and it had been
+                // asserting the first for weeks. Jev, on the receipts: not-established 1.00,
+                // must-not-name-the-app 0.92. It now reports the ROUTE and the frame count, which
+                // is what it actually knows, and names both candidates without choosing.
+                const WGCBRK_SLOT* ds = (g_WgcBase && windowData->PwBrokerSlot >= 0 &&
+                                         windowData->PwBrokerSlot < WGCBRK_MAX_SLOTS)
+                                        ? &WGCBRK_SLOTS(g_WgcBase)[windowData->PwBrokerSlot] : NULL;
+                const LONG dr = ds ? ds->Route : -1;
+                LogWarning("QGADIRECTDARK hwnd 0x%x (class %s) mapped unpainted after %lu broker frame(s) "
+                    L"on route=%s - the frames arrive and carry no content; app-dark and route-blind are "
+                    L"not distinguished by this",
+                    (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
+                    windowData->PwBrokerFrames,
+                    dr == (LONG)WGCBRK_ROUTE_RELAY ? L"relay" :
+                    dr == (LONG)WGCBRK_ROUTE_PW    ? L"printwindow" :
+                    dr == (LONG)WGCBRK_ROUTE_WGC   ? L"wgc" : L"unknown");
+            }
             windowData->MapDeferred = FALSE;
             windowData->PwDirectSuppressed = FALSE;
             // FILL AND DAMAGE **BEFORE** THE MAP. The buffer is attached before mapping, but
