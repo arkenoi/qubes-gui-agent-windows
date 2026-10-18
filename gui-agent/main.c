@@ -2797,8 +2797,19 @@ static BOOL SpawnHelperInSession(IN const WCHAR* args)
                         args, ec);
                 CloseHandle(pi.hProcess);
             }
+            else
+                LogWarning("session helper '%s' would not start in session %lu: 0x%x", args, sid, GetLastError());
         }
+        else
+            LogWarning("session helper '%s': own image path unreadable: 0x%x", args, GetLastError());
     }
+    // THESE THREE ARMS LOGGED NOTHING AT ALL, and the comment at the only caller claimed
+    // "SpawnHelperInSession logs which". Control is already past WTSGetActiveConsoleSessionId,
+    // WTSQueryUserToken and the HKU\<sid> check here, so the session IS usable - yet the caller's
+    // single line blamed "no usable interactive session yet" and GetLastError was discarded. Jev,
+    // shown the code: defect 1.00.
+    else
+        LogWarning("session helper '%s': token duplication failed: 0x%x", args, GetLastError());
     if (primary) CloseHandle(primary);
     CloseHandle(utok);
     return ok;
@@ -5955,8 +5966,10 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
             enable ? L"restored (fullscreen)" : L"disabled (seamless)");
         return TRUE;
     }
-    // Token missing, profile not loaded yet, or the helper did not exit 0 (SpawnHelperInSession
-    // logs which) - in every case not applied, and the sweep retries.
+    // Token missing, profile not loaded yet, a spawn that failed, or the helper did not exit 0
+    // (SpawnHelperInSession logs which - which it did NOT for three of those arms until they were
+    // given their else branches) - in every case not applied. The sweep retries the SEAMLESS
+    // direction only; the restore direction is terminal and its caller reports it at ERROR.
     //
     // INFO, BECAUSE THE CONDITION THIS COMMENT SET HAS BEEN MET. It read, from 2026-10-07:
     // "WARNING, and NOT lowered to Info ... the only caller does `g_SeamlessShadowsDone =
@@ -5976,9 +5989,14 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
     // resolved - "no warnings on normal operation" (owner, 2026-10-08).
     // The attempt number is IN the line, so an escalation toward the bound is still visible here
     // and the ERROR at the bound is still the loud report.
-    LogInfo("no usable interactive session yet, cannot %s guest shadows (attempt %u of %u, will retry)",
-        enable ? L"restore" : L"disable",
-        (unsigned)(g_ShadowAttempts + 1), (unsigned)SHADOW_APPLY_MAX_ATTEMPTS);
+    // DIRECTION-ACCURATE. The attempt counter and the retry promise belong to the seamless
+    // direction; this line claimed both for the restore direction, which has neither. The restore
+    // failure is reported by its own caller at ERROR - see ApplySeamlessTweaks.
+    if (enable)
+        LogInfo("no usable interactive session yet; guest shadows not restored, and this direction is not retried");
+    else
+        LogInfo("no usable interactive session yet, cannot disable guest shadows (attempt %u of %u, will retry)",
+            (unsigned)(g_ShadowAttempts + 1), (unsigned)SHADOW_APPLY_MAX_ATTEMPTS);
     return FALSE;
 }
 
@@ -6205,8 +6223,16 @@ static void ApplySeamlessTweaks(IN BOOL seamless)
         g_SeamlessShadowsDone = ApplyGuestShadows(FALSE);   // retried by the sweep until applied
     else
     {
-        ApplyGuestShadows(TRUE);
-        g_SeamlessShadowsDone = TRUE;                       // nothing to retry
+        // "NOTHING TO RETRY" WAS A STATEMENT ABOUT THE LATCH, NOT ABOUT THE GUEST. The sweep's
+        // bound at DaemonSettleSweep is gated on g_SeamlessMode, so this direction never retries,
+        // g_ShadowAttempts never moves and QGASHADOWGIVEUP can never fire for it - while the line
+        // ApplyGuestShadows emitted said "will retry". A failure here is TERMINAL and leaves the
+        // guest's windows on the seamless setting - shadows off - for the rest of the session, with
+        // dom0 no longer drawing them. Jev, shown both call sites: defect_p2 1.00.
+        if (!ApplyGuestShadows(TRUE))
+            LogError("QGASHADOWRESTORE guest window shadows not restored and not retried: windows stay "
+                L"shadowless outside seamless for this session");
+        g_SeamlessShadowsDone = TRUE;                       // nothing retries this direction
     }
 
     // 2. Drop shadow and window animation: dom0 draws the shadow, and the animation can never be
