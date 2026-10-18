@@ -1674,8 +1674,6 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
         // ChangeDisplaySettings(CDS_TEST) - a query, it never changes the mode.
         ULONGLONG waitStart = GetTickCount64();
         ULONG polls = 0;
-        ULONG reattach = 0;
-        ULONGLONG lastAttach = 0;
         BOOL offered = FALSE;
         for (;;)
         {
@@ -1688,50 +1686,6 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
             ULONGLONG elapsed = GetTickCount64() - waitStart;
             if (elapsed >= EXACT_MODE_WAIT_TIMEOUT_MS)
                 break;
-            // A DESKTOP SWITCH INSIDE THIS LOOP MAKES EVERY REMAINING PROBE FAIL, and until now the
-            // loop could not notice. The comment above the AttachToInputDesktop() call at the top of
-            // this file states the rule - "ChangeDisplaySettings fails if thread's desktop != input
-            // desktop" - and IsExactModeAvailableOn IS that call, with CDS_TEST. The only attach was
-            // in a different function, so once the input desktop moved under this thread the probe
-            // was being put to a desktop we no longer held, for the whole deadline.
-            //
-            // MEASURED, campaign 20261018-123812, one thread end to end:
-            //   161937.153  reload-returned sinceobtain=47 ms
-            //   161949.252  RESWAIT 5120x1440 not offered within 12000 ms (deadline; 74 polls)
-            //   161949.252  AttachToInputDesktop: tid=3540, from=Winlogon, to=Default, ok
-            //   161949.252  QGADESK secure-desktop LEFT
-            // tid 3540 held the WINLOGON desktop for all 74 polls and re-attached in the same
-            // millisecond the deadline expired - and that attach succeeded, so this thread is one
-            // that can attach. A healthy run is polls=2, sinceobtain=125 ms.
-            //
-            // THE SAME CLASS IS ALREADY FIXED FOR DuplicateOutput at capture.c:319, with the same
-            // reasoning: a desktop switch is both what invalidates the thing and what leaves this
-            // thread unable to re-acquire it, so re-attach before retrying. Jev: root cause
-            // desktop_switch 0.72, fix reattach_in_loop 0.85.
-            //
-            // RATE-LIMITED, BECAUSE THE ATTACH IS NOT QUIET. AttachToInputDesktop logs
-            // "QGADESK,tid=,from=,to=" at Info on EVERY successful call (util.c:414, unconditional),
-            // so re-attaching on all 74 polls would trade a 12 s stall for 74 log lines - the exact
-            // noise this gate exists to keep out. So: nothing for the first second, then at most one
-            // attach per second.
-            //
-            // A HEALTHY RUN THEREFORE ADDS NOTHING, and the gate is set from measurements rather
-            // than picked: the healthy cases on this rig complete at sinceobtain=125 ms (polls=2)
-            // and 281 ms (polls=1, in the cadence comment above), so a 500 ms gate is above both and
-            // is never reached by a run that is working. A stalled run attaches once, and if the
-            // desktop was the reason the very next probe succeeds and the loop leaves - so the cost
-            // of the fix is one Info line on a run that was already anomalous.
-            //
-            // THE FIRST 500 ms REMAIN UNGUARDED, deliberately: a switch landing there is ridden out
-            // until the gate opens. Closing it would mean attaching on the first failed poll, and a
-            // healthy run's first poll DOES fail (polls=2 means exactly that), so every resize would
-            // pay an Info line to cover a window half as long as one healthy completion.
-            if (elapsed >= 500 && (GetTickCount64() - lastAttach) >= 1000)
-            {
-                lastAttach = GetTickCount64();
-                if (AttachToInputDesktop() == ERROR_SUCCESS)
-                    reattach++;
-            }
             Sleep(elapsed < 500 ? 15 : (elapsed < 2000 ? 50 : EXACT_MODE_WAIT_STEP_MS));
         }
 
@@ -1767,18 +1721,18 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
             // is the reasoning above, not something to repeat per occurrence. At agent start no current
             // mode is recorded yet, which is the first line's case.
             if (g_ScreenWidth == 0 || g_ScreenHeight == 0)
-                LogWarning("RESWAIT %lux%lu not offered within %u ms (deadline; %lu polls, %lu desktop re-attach(es)), no current mode yet, applying anyway",
-                    width, height, (unsigned)EXACT_MODE_WAIT_TIMEOUT_MS, polls, reattach);
+                LogWarning("RESWAIT %lux%lu not offered within %u ms (deadline; %lu polls), no current mode yet, applying anyway",
+                    width, height, (unsigned)EXACT_MODE_WAIT_TIMEOUT_MS, polls);
             else
-                LogWarning("RESWAIT %lux%lu not offered within %u ms (deadline; %lu polls, %lu desktop re-attach(es)), mode now %lux%lu, applying anyway",
-                    width, height, (unsigned)EXACT_MODE_WAIT_TIMEOUT_MS, polls, reattach, g_ScreenWidth, g_ScreenHeight);
+                LogWarning("RESWAIT %lux%lu not offered within %u ms (deadline; %lu polls), mode now %lux%lu, applying anyway",
+                    width, height, (unsigned)EXACT_MODE_WAIT_TIMEOUT_MS, polls, g_ScreenWidth, g_ScreenHeight);
         }
         else
 
         {
             ULONGLONG now = GetTickCount64();
-            LogInfo("M0BLINK mode-offered t=%I64u polls=%lu reattach=%lu sinceobtain=%I64u ms",
-                now, polls, reattach, now - m0Start);
+            LogInfo("M0BLINK mode-offered t=%I64u polls=%lu sinceobtain=%I64u ms",
+                now, polls, now - m0Start);
         }
 
         replugged = TRUE;   // reached on BOTH paths now: the apply is attempted either way
