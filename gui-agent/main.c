@@ -1524,6 +1524,10 @@ static BOOL GetMonitorSettings(IN HMONITOR monitor, OUT MONITORINFOEX* monInfo, 
 // invisible grip handles managed by DWM. This function returns actual visible window size.
 // This function also accounts for a clipping region possibly defined for the window
 // and returns a minimal bounding rectangle that covers the visible region.
+// Defined with the broker code far below; declared here because the shell-card clamp in
+// GetWindowData needs to know which window a card will actually be lifted out of.
+static WINDOW_DATA* BrokerSourceEntry(IN const WINDOW_DATA* entry);
+
 ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
 {
     RECT dwmRect;
@@ -2099,6 +2103,39 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
             entry->Y = cy;
             entry->Width = (DWORD)(x2 - cx);
             entry->Height = (DWORD)(y2 - cy);
+        }
+    }
+
+    // A FOREIGN-SOURCED SHELL CARD CANNOT BE TALLER THAN ITS SOURCE. The Search companion is lifted
+    // out of the Start host's texture, and that texture is the SHELL'S WINDOW, not the screen:
+    // measured 5120x1392 against a 1440-tall screen, because the taskbar owns the bottom 48 px. The
+    // card itself was measured at BOTH y=642 (bottom exactly 1392, fitting) and y=674 (bottom 1424,
+    // 32 px over). In the second state the broker refuses the derived crop and keeps the stale
+    // inset, so the card goes black - a CORRECT refusal, because publishing those rows would be
+    // pixels from the wrong place. Announcing the card at the height its source can actually supply
+    // gives dom0 correct pixels in both states, 32 px shorter in the second. Trimming beats black
+    // and beats a wrong rectangle, and it is logged when it bites so a shortened card is never a
+    // silent surprise. Same all-or-nothing shape as the host-screen clamp above.
+    {
+        const WINDOW_DATA* csrc = BrokerSourceEntry(entry);
+        RECT sr;
+        if (csrc && GetRealWindowRect(csrc->Handle, &sr) == ERROR_SUCCESS &&
+            sr.right > sr.left && sr.bottom > sr.top)
+        {
+            int sx2 = entry->X + (int)entry->Width;
+            int sy2 = entry->Y + (int)entry->Height;
+            if (sx2 > sr.right)  sx2 = sr.right;
+            if (sy2 > sr.bottom) sy2 = sr.bottom;
+            if (sx2 > entry->X && sy2 > entry->Y &&
+                ((DWORD)(sx2 - entry->X) != entry->Width ||
+                 (DWORD)(sy2 - entry->Y) != entry->Height))
+            {
+                LogDebug("0x%x: card %ux%u trimmed to %ux%u - its source ends at %d,%d",
+                    entry->Handle, entry->Width, entry->Height,
+                    (DWORD)(sx2 - entry->X), (DWORD)(sy2 - entry->Y), sr.right, sr.bottom);
+                entry->Width  = (DWORD)(sx2 - entry->X);
+                entry->Height = (DWORD)(sy2 - entry->Y);
+            }
         }
     }
 
@@ -5016,20 +5053,33 @@ static void WgcArenaReapPending(BOOL all)
 // list is the only enumeration that sees them at all. No root found -> behave exactly as before.
 static WINDOW_DATA* BrokerSourceEntry(IN const WINDOW_DATA* entry)
 {
-    if (!entry || ShellSurfaceKind(entry) == ShellSurfaceNone)
+    // BY KIND, because the previous rule could never match and was measured never matching. It
+    // required the candidate to share this window's PROCESS and to CONTAIN its rect. Measured
+    // 2026-10-18: the Search card belongs to SearchHost while the window holding its pixels belongs
+    // to StartMenuExperienceHost - different processes - and the Start surface is tracked at CARD
+    // geometry (642x726), so it contains nothing. Both tests fail for the only case the function
+    // exists to serve, which is why every shell slot captured itself and the Search card, measured
+    // blank (frameArrived=1 nonBlank=0 distinctColors=1), had no pixels to crop at any offset.
+    //
+    // The window that holds an opening's pixels is the START surface: measured, its screen-sized
+    // CoreWindow carries the Search card's own pixels at the Search card's screen rect
+    // (nonblack=3563/4623, the Windows accent blues) and a flyout's too (nonblack=4096/4096). The
+    // shell composes its surfaces into that one window, across process boundaries.
+    if (!entry)
         return NULL;
+    const SHELL_SURFACE_KIND k = ShellSurfaceKind(entry);
+    if (k != ShellSurfaceSearch)
+        return NULL;   // the Start surface IS the source; toasts and ordinary windows capture themselves
     WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
     while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
     {
         e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
-        if (e->Handle != entry->Handle && e->ProcessId == entry->ProcessId &&
-            e->Width > entry->Width && e->Height > entry->Height &&
-            (LONG)e->X <= (LONG)entry->X && (LONG)e->Y <= (LONG)entry->Y &&
-            (LONG)e->X + (LONG)e->Width  >= (LONG)entry->X + (LONG)entry->Width &&
-            (LONG)e->Y + (LONG)e->Height >= (LONG)entry->Y + (LONG)entry->Height)
+        if (e->Handle != entry->Handle && e->IsVisible &&
+            ShellSurfaceKind(e) == ShellSurfaceStart)
             return e;
         e = (WINDOW_DATA*)e->ListEntry.Flink;
     }
+    // No Start surface tracked - a standalone Win+S Search. Capture ourselves, exactly as before.
     return NULL;
 }
 
@@ -5068,10 +5118,16 @@ static void BrokerDesiredCrop(IN const WINDOW_DATA* entry, OUT LONG* cropX, OUT 
     // a sentinel a zeroed slot satisfied, and still did not paint. The residual - the window may
     // resize between this read and the capture - is the same residual the inset already had, and it
     // is fixed by re-registering on a move, which the staleness test already does.
+    // MEASURE THE WINDOW THE SLOT WILL CAPTURE, which is not always this one. With a foreign source
+    // the two differ completely: the Search card sits at 2160,642 inside a texture whose origin is
+    // 0,0, so measuring this entry's own rect gives (0,0) - the texture's empty top-left corner -
+    // while src->X above gives 2160-2239 = -79, a negative crop the broker refuses outright. The
+    // source's live rect gives 2160,642, where the card's pixels measurably are.
     if (entry && ShellSurfaceKind(entry) != ShellSurfaceNone)
     {
+        const HWND srcWindow = src ? src->Handle : entry->Handle;
         RECT wr;
-        if (GetRealWindowRect(entry->Handle, &wr) == ERROR_SUCCESS &&
+        if (GetRealWindowRect(srcWindow, &wr) == ERROR_SUCCESS &&
             wr.right > wr.left && wr.bottom > wr.top)
         {
             const LONG lx = (LONG)entry->X - wr.left, ly = (LONG)entry->Y - wr.top;
@@ -5139,7 +5195,7 @@ static BOOL BrokerSlotStale(IN const WINDOW_DATA* e, IN const WGCBRK_SLOT* bs)
 
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
 {
-    entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1;
+    entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1; entry->PwBrokerSourceHwnd = NULL;
     entry->PwBrokerLastId = 0; entry->PwBrokerArenaOff = 0;
     entry->PwDimsLogged = FALSE;   // re-arm the one-shot BROKERDIMS diagnostic per registration
     entry->PwCropFallbackLogged = FALSE;   // ...and the one-shot QGACROPFALLBACK diagnostic
@@ -5238,7 +5294,8 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;  // "not measured yet" until the broker reports
     s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
     MemoryBarrier();
-    s->Hwnd = (UINT64)(ULONG_PTR)BrokerSourceWindow(entry);   // the window that HOLDS the pixels
+    entry->PwBrokerSourceHwnd = BrokerSourceWindow(entry);
+    s->Hwnd = (UINT64)(ULONG_PTR)entry->PwBrokerSourceHwnd;   // the window that HOLDS the pixels
     s->ReqState = WGCBRK_REQUESTED;
     _InterlockedIncrement(&s->ControlSeq);
     _InterlockedIncrement(&h->ControlGen);
@@ -5267,7 +5324,8 @@ BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG 
     const WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
     // Still OUR slot, and still serving. A slot the broker has already torn down, or one that
     // was reassigned, must go through the full registration path.
-    if (s->Hwnd != (UINT64)(ULONG_PTR)entry->Handle) return FALSE;
+    if (s->Hwnd != (UINT64)(ULONG_PTR)(entry->PwBrokerSourceHwnd ? entry->PwBrokerSourceHwnd
+                                                                  : entry->Handle)) return FALSE;
     if (s->ReqState != WGCBRK_REQUESTED) return FALSE;
 
     // The arena buffers are allocated per registration and cannot grow. Keep the slot only when
@@ -5430,7 +5488,7 @@ void BrokerUnregister(IN OUT WINDOW_DATA* entry)
     // DEFERRED: the broker may still publish to this slot until it has handled this unregister, so
     // the regions become reusable on its acknowledgement (R4, WgcArenaReapPending).
     WgcArenaFreeDeferred(off0, off1, bsz, entry->PwBrokerSlot, s->ControlSeq);
-    entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1; entry->PwBrokerArenaOff = 0;
+    entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1; entry->PwBrokerSourceHwnd = NULL; entry->PwBrokerArenaOff = 0;
 }
 
 // Minimum gap between two raise correctives (see the foreground block in AddAllWindows). Without
@@ -5471,7 +5529,10 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
     if (!g_WgcBase || e->PwBrokerSlot < 0 || e->PwBrokerSlot >= WGCBRK_MAX_SLOTS) BFF_NO(L"no-arena-or-slot");
     WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
     WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[e->PwBrokerSlot];
-    if (s->Hwnd != (UINT64)(ULONG_PTR)e->Handle) BFF_NO(L"slot-holds-another-hwnd");
+    // AGAINST THE SOURCE WE REGISTERED, not against this window: a shell surface's slot captures
+    // the window that holds its pixels, so comparing with e->Handle refused every frame.
+    if (s->Hwnd != (UINT64)(ULONG_PTR)(e->PwBrokerSourceHwnd ? e->PwBrokerSourceHwnd : e->Handle))
+        BFF_NO(L"slot-holds-another-hwnd");
     // WHICH not-ACTIVE, because the three mean different things and the field log said only
     // "slot-not-ACTIVE" for all of them. ReqState is ours, AckState is the broker's
     // (wgcbroker_ipc.h:149,154), so REQUESTED-with-FREE-ack is a request of ours the broker has not

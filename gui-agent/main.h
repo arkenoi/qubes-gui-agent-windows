@@ -363,6 +363,13 @@ typedef struct _WINDOW_DATA
     LONG   PwBrokerSlot;      // index into WGCBRK_SLOTS(g_WgcBase); -1 if none
     UINT64 PwBrokerLastId;    // last WGCBRK_SLOT.FrameId consumed (change detection)
     UINT64 PwBrokerArenaOff;  // this window's ring[0] arena offset (for release); 0 if none
+    // THE WINDOW THE SLOT ACTUALLY CAPTURES, which is not always this window. A shell surface is
+    // sourced from the window that HOLDS ITS PIXELS - StartMenuExperienceHost's screen-sized
+    // CoreWindow - and the card is lifted out of that texture by the crop. Recorded here because
+    // two tests ask "is this still OUR slot" by comparing the slot's Hwnd, and comparing it against
+    // this window's own handle refuses every frame the moment the source differs. NULL means the
+    // slot captures this window itself, which is every ordinary window.
+    HWND   PwBrokerSourceHwnd;
 
     // One-shot BROKERHOLD diagnostic emitted: broker active but no per-window frame consumable
     // this pass - the window HOLDS its last content (never the DDA slice) until one arrives.
