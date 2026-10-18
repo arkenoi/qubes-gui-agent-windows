@@ -367,6 +367,13 @@ typedef struct _WINDOW_DATA
     // One-shot BROKERHOLD diagnostic emitted: broker active but no per-window frame consumable
     // this pass - the window HOLDS its last content (never the DDA slice) until one arrives.
     BOOL     PwHoldLogged;
+    // THE STARVATION CLOCK (QgaHoldStarveDue). PwHoldSince is GetTickCount64 when this window's
+    // CURRENT run of holds began, 0 when it is not holding; painted content arriving clears it.
+    // PwStarveReported is the one-shot for QGAHOLDSTARVED and is cleared by the same frame, so a
+    // window that starves, recovers and starves again is reported BOTH times - which the one-shot
+    // BROKERHOLD warning this replaces could not do.
+    ULONGLONG PwHoldSince;
+    BOOL      PwStarveReported;
     // One-shot BROKERDIMS diagnostic emitted: the broker published a frame for this window
     // whose dimensions do not match the slab, so BrokerFreshFrame rejects every such frame
     // (the window then sits in the hold arm with whatever its slab holds - a feed loss, not a

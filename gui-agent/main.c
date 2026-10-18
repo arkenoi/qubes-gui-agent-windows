@@ -2790,7 +2790,11 @@ static BOOL SpawnHelperInSession(IN const WCHAR* args)
                     // Launched into a loaded profile and still running: its writes will land.
                     // Not retried (a second instance would only repeat the same writes).
                     ok = TRUE;
-                    LogWarning("session helper '%s' still running after 3 s - taken as applied", args);
+                    // TAKEN AS APPLIED is a success disposition, stated at this very site: the
+                    // helper launched into a loaded profile and its writes will land. Jev:
+                    // noise=0.64..0.70 expected=0.25..0.32 defect=0.00. A helper that EXITS
+                    // non-zero keeps its warning immediately below.
+                    LogInfo("session helper '%s' still running after 3 s - taken as applied", args);
                 }
                 else
                     LogWarning("session helper '%s' exited with code %lu - not applied, will retry",
@@ -12906,6 +12910,12 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 if (PwConsumeBrokerFrame(entry, &pwRect, &holdWhy))
                 {
                     // fed from its own broker frame (copied now, or already current)
+                    // A FED WINDOW IS NOT STARVING: the run of holds ends here, so the clock
+                    // disarms and QGAHOLDSTARVED can arm again for a LATER run. This is the reset
+                    // that keeps the healthy-feed population (589 of 594 measured W lines) silent
+                    // without needing the reason string to be trusted.
+                    entry->PwHoldSince = 0;
+                    entry->PwStarveReported = FALSE;
                 }
                 // DIRECT-REQUIRED HOLD - this arm is the fall-through blocker, and the gate is
                 // ELIGIBILITY (DirectRequired), not availability (WgcBrokerActive). We are here
@@ -12941,6 +12951,24 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // for ever - a later hold on the same window for slot-holds-another-hwnd or
                     // dims-mismatch-STUCK would never be said. So the quiet arm returns without
                     // touching it, and the latch is spent only by a line that is actually written.
+                    // THE CLOCK, ARMED ON THE FIRST HOLD OF A RUN. QGAHOLDSTARVED - not the
+                    // one-shot line below - is now the detector for the user-visible consequence:
+                    // a hold that OUTLASTS its bound with no new painted content. It is not
+                    // one-shot over the window's life, only over the current run of holds, so a
+                    // window that starves, recovers and starves again is reported both times.
+                    if (entry->PwHoldSince == 0)
+                        entry->PwHoldSince = GetTickCount64();
+                    if (!entry->PwStarveReported &&
+                        QgaHoldStarveDue(entry->PwHoldSince, entry->PwSliceContentTick,
+                                         GetTickCount64(), (ULONGLONG)QGA_HOLD_STARVE_MS))
+                    {
+                        entry->PwStarveReported = TRUE;
+                        LogError("QGAHOLDSTARVED hwnd 0x%x slot=%d why=%s: held %llu ms with no new "
+                            L"frame - the window is on screen showing STALE PIXELS",
+                            (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+                            holdWhy ? holdWhy : L"unset",
+                            (ULONGLONG)(GetTickCount64() - entry->PwHoldSince));
+                    }
                     if (!entry->PwHoldLogged && !QgaHoldReasonIsNormal(holdWhy))
                     {
                         entry->PwHoldLogged = TRUE;
@@ -12979,14 +13007,24 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         // demoting it would remove the last sign of a user-visible defect. The
                         // real answer is a per-window clock that reports a hold beyond a bound;
                         // until that exists this line is not quieted.
+                        // DEMOTED, AND ONLY NOW THAT THE CONDITION THIS COMMENT SET IS MET. It
+                        // said: "The real answer is a per-window clock that reports a hold beyond a
+                        // bound; until that exists this line is not quieted." QGAHOLDSTARVED above
+                        // IS that clock - it runs from the later of hold-start and last painted
+                        // content, so the 589-of-594 healthy-feed holds reset it and never report,
+                        // while a hold that outlasts QGA_HOLD_STARVE_MS is an ERROR naming the
+                        // stale pixels. The previous demotion attempt (2026-10-17, Jev 1.00 on a
+                        // brief that was wrong) offered QGADIRECTSUPPRESS as the net; that line is
+                        // gated on a window that NEVER received a frame, so it could not cover a
+                        // window that was fed and stopped. This one is gated on exactly that.
                         else
-                            LogWarning("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
+                            LogInfo("BROKERHOLD hwnd 0x%x holding last content rect=%d,%d,%d,%d "
                                 L"brokerActive=%d sourced=%d slot=%d why=%s (direct required: "
-                                L"composite fallback refused)",
+                                L"composite fallback refused; QGAHOLDSTARVED reports it past %u ms)",
                                 (DWORD)(ULONG_PTR)entry->Handle,
                                 pwRect.left, pwRect.top, pwRect.right, pwRect.bottom,
                                 WgcBrokerActive(), entry->PwBrokerSourced, entry->PwBrokerSlot,
-                                holdWhy ? holdWhy : L"unset");
+                                holdWhy ? holdWhy : L"unset", (unsigned)QGA_HOLD_STARVE_MS);
                     }
                 }
                 // Agent-side slice (normal fallback / broker-inactive): copy the changed region of
@@ -15491,7 +15529,10 @@ static ULONG WINAPI WatchForEvents(void)
         // unrevoked ON PURPOSE to dodge the xenbus revoke-vs-unmap race (FINDINGS 2026-08-05 cont 9),
         // nothing bounds how many, and anyone auditing grant lifetime needs to see it at the default level.
         // An exit by design, see above.
-        LogWarning("A6LEAK daemon still alive and mapping, skipping all revokes");
+        // THE GUARD WORKING IS NOT A FAULT. Skipping the revokes is the designed outcome when the
+        // daemon still holds the mapping - revoking under it is the xenbus revoke-vs-unmap race
+        // this exists to avoid. Jev over this site: noise=0.68 expected=0.16 defect=0.03.
+        LogInfo("A6LEAK daemon still alive and mapping, skipping all revokes");
     }
 
     PwShutdown();

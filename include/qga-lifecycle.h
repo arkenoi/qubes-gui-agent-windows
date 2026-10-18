@@ -994,6 +994,44 @@ static __inline QGA_CARD_RULE QgaCardRuleForSurface(IN int kind, IN BOOL isMenuP
  * WHY A PREDICATE AND NOT A STRING TEST AT THE CALL SITE: so the offline suite can drive every
  * reason through it, and so a reason added later is LOUD by default rather than silently matching.
  */
+/* HOW LONG A HELD WINDOW MAY SHOW STALE PIXELS BEFORE IT IS A DECLARED FAULT.
+ *
+ * THIS IS THE DETECTOR THE BROKERHOLD WARNING WAS STANDING IN FOR, badly. That line is one-shot
+ * per window, so a window the broker never feeds again showed stale pixels indefinitely with
+ * nothing further said - and Jev, asked whether a one-shot warning is a usable starvation
+ * detector, said 0.15. The same call said "revert until a starvation detector exists" 0.60 and
+ * "stale pixels are user-visible" 0.70. The comment at the emitter has said twice that the real
+ * answer is a per-window clock that reports a hold beyond a bound. This is that clock.
+ *
+ * A FRAME RESETS IT. The clock runs from the LATER of "the hold began" and "painted content last
+ * landed", so a window that is fed, holds briefly, and is fed again never declares anything -
+ * which is the 589-of-594 healthy-feed population that made the warning noise in the first place.
+ * Only a hold that OUTLASTS the bound with no new content is a fault, and then it is an ERROR
+ * naming the consequence the user can see.
+ *
+ * 10 s, the same order as DIRECT_WINDOW_GRACE_MS: long enough that no measured healthy hold on
+ * this rig reaches it (cold-boot broker launch is 10.8-11.6 s on an AppVM, but that window is
+ * WITHHELD, not held with stale content - it has no painted frame to go stale), short enough that
+ * a starved window is reported while the session is still the one that starved it.
+ */
+#define QGA_HOLD_STARVE_MS 10000u
+
+/* NO DEFECT KNOB HERE, deliberately: the owner's standing rule is to ask before adding one, and
+ * both facts this predicate reads are plain arguments the offline suite can drive directly. */
+static __inline BOOL QgaHoldStarveDue(IN unsigned long long holdSince, IN unsigned long long lastContent,
+                                      IN unsigned long long now, IN unsigned long long boundMs)
+{
+    unsigned long long from;
+    if (holdSince == 0)
+        return FALSE;                       /* not holding: no clock, nothing to declare */
+    if (lastContent == 0)
+        return FALSE;                       /* never had painted content: that is QGADIRECTSUPPRESS's
+                                             * population, on QgaWindowFaultDue's clock - a window
+                                             * with nothing on screen cannot show STALE pixels */
+    from = (lastContent > holdSince) ? lastContent : holdSince;
+    return (BOOL)(now > from && (now - from) >= boundMs);
+}
+
 static __inline BOOL QgaHoldReasonIsNormal(IN const WCHAR* why)
 {
     if (!why)
