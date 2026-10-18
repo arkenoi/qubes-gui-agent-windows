@@ -1447,7 +1447,12 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
         status = IDXGIOutputDuplication_MapDesktopSurface(ctx->duplication, &ctx->frame.rect);
         if (FAILED(status))
         {
-            win_perror2(status, "duplication->MapDesktopSurface()");
+            // Same split as the acquire/dirty-rects/release sides: a call ON THE DUPLICATION OBJECT
+            // can return the routine stale signal, and the recovery path is its single reporter.
+            if (status != DXGI_ERROR_ACCESS_LOST && status != DXGI_ERROR_ACCESS_DENIED)
+                win_perror2(status, "duplication->MapDesktopSurface()");
+            else
+                LogDebug("duplication went stale at MapDesktopSurface (0x%x)", status);
             goto fail2;
         }
 
@@ -1516,7 +1521,18 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
     status = IDXGIOutputDuplication_GetFrameDirtyRects(ctx->duplication, dr_size, ctx->frame.dirty_rects, &dr_size);
     if (FAILED(status))
     {
-        win_perror2(status, "GetFrameDirtyRects");
+        // THE SAME CALL, TWICE, AND ONLY THE FIRST ONE WAS GUARDED. The comment thirty lines above
+        // says "this path was missed when they were fixed" and then fixed exactly one of its two
+        // sites: the size query. This is the real read, and between the two the duplication can go
+        // stale just as easily - so it carried on rendering 0x887A0026 through FormatMessage as
+        // "The keyed mutex was abandoned", a string about something not involved at all.
+        // MEASURED on campaign 20261018-103039's clean cell, which is how it was found: the ONE
+        // undeclared error line in that capture, error_lines_undeclared = 1 against a max of 0, and
+        // absent from the previous campaign - a flaky timing window, not a constant.
+        if (status != DXGI_ERROR_ACCESS_LOST && status != DXGI_ERROR_ACCESS_DENIED)
+            win_perror2(status, "GetFrameDirtyRects");
+        else
+            LogDebug("duplication went stale at GetFrameDirtyRects (0x%x)", status);
         goto fail4;
     }
 
@@ -1643,7 +1659,10 @@ static HRESULT ReleaseFrame(IN OUT CAPTURE_CONTEXT* ctx)
         status = IDXGIOutputDuplication_UnMapDesktopSurface(ctx->duplication);
         if (FAILED(status))
         {
-            win_perror2(status, "duplication->UnMapDesktopSurface");
+            if (status != DXGI_ERROR_ACCESS_LOST && status != DXGI_ERROR_ACCESS_DENIED)
+                win_perror2(status, "duplication->UnMapDesktopSurface");
+            else
+                LogDebug("duplication went stale at UnMapDesktopSurface (0x%x)", status);
             goto end;
         }
         ctx->frame.mapped = FALSE;
@@ -1654,7 +1673,12 @@ static HRESULT ReleaseFrame(IN OUT CAPTURE_CONTEXT* ctx)
         status = IDXGIOutputDuplication_UnMapDesktopSurface(ctx->duplication);
         ctx->frame.peek_mapped = FALSE;
         if (FAILED(status))
-            win_perror2(status, "duplication->UnMapDesktopSurface (region signature)");   // the frame is released anyway
+        {
+            if (status != DXGI_ERROR_ACCESS_LOST && status != DXGI_ERROR_ACCESS_DENIED)
+                win_perror2(status, "duplication->UnMapDesktopSurface (region signature)");   // the frame is released anyway
+            else
+                LogDebug("duplication went stale at UnMapDesktopSurface (region signature) (0x%x)", status);
+        }
     }
 
     status = IDXGIResource_Release(ctx->frame.texture);
