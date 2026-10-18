@@ -1675,6 +1675,7 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
         ULONGLONG waitStart = GetTickCount64();
         ULONG polls = 0;
         BOOL offered = FALSE;
+        BOOL secureSkip = FALSE;
         for (;;)
         {
             polls++;
@@ -1683,13 +1684,50 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
                 offered = TRUE;
                 break;
             }
+            // THE PRE-FLIGHT CANNOT SUCCEED ON THE SECURE DESKTOP, so do not spend the deadline
+            // finding that out. MEASURED, campaign 20261018-123812, upgrade cell, one thread:
+            //   161936.279  secure-desktop ENTERED (input desktop 'Winlogon')
+            //   161937.153  reload-returned sinceobtain=47 ms      <- the wait starts
+            //   161949.252  RESWAIT 5120x1440 not offered within 12000 ms (deadline; 74 polls)
+            //   161949.252  secure-desktop LEFT (input desktop 'Default')
+            // 74 probes over twelve seconds, every one of them while the input desktop was Winlogon,
+            // and the mode became available in the same millisecond the secure desktop was left. A
+            // healthy run is polls=2 at sinceobtain=125 ms.
+            //
+            // AND THE FIRST EXPLANATION OF THIS WAS WRONG, which is why the sequence is quoted in
+            // full. I read the closing "from=Winlogon,to=Default" as a thread stranded on a stale
+            // desktop and added an AttachToInputDesktop() inside this loop (Jev 0.72/0.85 on that
+            // brief). The entry at 161936.279 refutes it: the thread attached TO Winlogon a second
+            // BEFORE the wait began and held the input desktop throughout, so there was no mismatch
+            // and re-attaching could only return to the same desktop. That change is reverted.
+            //
+            // NOT A SILENCE, AND NOT THE STUCK-AT-LOGON GUARD. The skip is stated at Info below with
+            // the reason; a mode that is still not offered once the desktop is ordinary keeps its
+            // RESWAIT warning unchanged; and an apply that fails reports its own status on the
+            // apply-failed path. A guest genuinely stuck at the sign-in screen is caught where it
+            // always was - the harness's session deadline plus its screen verdict, which is what
+            // found PWFUSE42 (findings/issues.md) - not by this pre-flight, which only runs when a
+            // resize was requested in the first place.
+            if (g_OnSecureDesktop)
+            {
+                secureSkip = TRUE;
+                break;
+            }
             ULONGLONG elapsed = GetTickCount64() - waitStart;
             if (elapsed >= EXACT_MODE_WAIT_TIMEOUT_MS)
                 break;
             Sleep(elapsed < 500 ? 15 : (elapsed < 2000 ? 50 : EXACT_MODE_WAIT_STEP_MS));
         }
 
-        if (!offered)
+        if (secureSkip)
+        {
+            // Said, not swallowed: which desktop stopped the probe, and that the apply follows.
+            LogInfo("RESWAIT %lux%lu pre-flight skipped after %lu poll(s): the input desktop is the "
+                L"secure desktop, where CDS_TEST cannot see the mode - applying without it "
+                L"(the apply reports its own status)", width, height, polls);
+            RecordExactWaitExpiry(width, height);
+        }
+        else if (!offered)
         {
             // A DEADLINE IS NOT A STATEMENT ABOUT THE FUTURE. "mode-never-appeared" claimed the mode
             // would never come, and on 2026-10-08 it came 1.4 s later: the duplication adopted
