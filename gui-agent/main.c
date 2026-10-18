@@ -3511,11 +3511,33 @@ static void BrokerReportDeaf(void)
         if (qr != g_SlotQuietSeen[i])
         {
             if (s->Hwnd != 0 && qr > g_SlotQuietSeen[i])
-                // The broker recreated its WGC session after a poke went unanswered: either a key whose change WGC did not
-                // deliver, or a session that stopped delivering.
-                LogWarning("QGAWGCRECREATE hwnd 0x%llx slot %d: capture session recreated, a key or click got no frame "
-                    L"for %u ms (quiet reroutes %ld, sessions opened %ld)",
-                    (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, qr, s->ChanOpens);
+            {
+                // SAY WHAT THIS CODE READ, NOT WHAT IT GUESSED. The old line claimed "a key or click got no frame",
+                // and the agent reads ONLY this counter out of shared memory: it cannot know a key or click was
+                // involved. It is not even the right attribution - PokeSeq is bumped when the window's pixels
+                // ACTUALLY CHANGED (see its comment in wgcbroker_ipc.h), so what went unanswered is a CONTENT CHANGE.
+                // MEASURED 2026-10-19, release 4.3.37 acceptance, win11-appvm cell, agent pid 4472:
+                //   004653.661  I QGARAISE skipped hwnd 0x30068 - own pixels (sliceFed=1 directRequired=1)
+                //   004657.363  W QGAWGCRECREATE hwnd 0x30068 slot 0: ... a key or click got no frame for 2000 ms
+                //   004704.352  I PwDetachWindow: 0x30068: per-window buffer 3828x1017 detached (slice-fed)
+                // The cell sends NO keys and NO clicks - it maps a Notepad window and photographs it - and the
+                // capture SUCCEEDED at 3828x1017. Jev: claim_supported 0.21, report_what_it_reads 0.86.
+                //
+                // AND THE LEVEL NOW COMES FROM WHETHER A SESSION THAT WAS WORKING STOPPED. A slot that has NEVER
+                // published is the case the recreate was BUILT for - Windows closes a UWP app's first capture item as
+                // it launches (26100.1742: Calculator stayed on its splash until poked) - so the repair working is
+                // not an anomaly. A slot that HAD been publishing and then went quiet is the anomalous one, and it
+                // keeps the warning (fallbacks-are-anomalies applies to the fallback that covers a REGRESSION).
+                const LONG published = s->FramesPublished;
+                if (published > 0)
+                    LogWarning("QGAWGCRECREATE hwnd 0x%llx slot %d: capture session recreated after a content change "
+                        L"went unrendered for %u ms, having published %ld frame(s) (quiet reroutes %ld, sessions opened %ld)",
+                        (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, published, qr, s->ChanOpens);
+                else
+                    LogInfo("QGAWGCRECREATE hwnd 0x%llx slot %d: first capture session published nothing in %u ms and "
+                        L"was recreated (quiet reroutes %ld, sessions opened %ld)",
+                        (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, qr, s->ChanOpens);
+            }
             g_SlotQuietSeen[i] = qr;
         }
         // WINDOWS CLOSED THE WINDOW'S CAPTURE ITEM - said, because the broker now repairs it on its own initiative: it
@@ -4432,6 +4454,27 @@ static void NotifBridgeRestoreSweep(void)
 // every exit path and only suppresses while its dom0 connection is up), so a supervision gap costs dom0-native
 // prettiness, never a lost notification. Gate OFF: the only supervision left is the crash-leftover banner restore sweep.
 static ULONGLONG g_NotifBridgeExitedAt = 0;   // tick of an exit already reported; 0 = none pending
+// A SYSTEM-TERMINATED BRIDGE AWAITING ITS VERDICT. Windows kills the session's processes and delivers
+// WM_ENDSESSION to this agent AFTERWARDS, so HelpersDisarmed() is still false at the moment the exit
+// is seen and the exit reads as an ordering anomaly. MEASURED 2026-10-19, release 4.3.37 acceptance,
+// win10-clean cell, agent pid 3944:
+//   233257.268  W NOTIFBRIDGESYSKILL Windows killed the bridge pid 6448 before announcing session end
+//   233257.319  I QGAENDSESSION Windows is ending this session (shutdown, lParam 0x40000000)
+//   233257.319  I QGAHELPERSDISARM helper launches disarmed (the session is ending)
+// Fifty-one milliseconds. The shutdown WAS in progress; the site's own comment says "if no shutdown
+// was in progress this is an ordering anomaly worth finding", and it had no way to wait and find out.
+// It fired in 2 of 8 cells and each occurrence writes a DURABLE Event Log record (4013). Jev: defect
+// 0.84, defer_verdict 0.95 (over querying SM_SHUTTINGDOWN, 0.05 - which is 0 on a LOGOFF, where this
+// ordering is equally expected).
+// THREE EXITS, and the deadline below is armed ONLY while one is pending (rest-zero):
+//   the session end arrives  -> Info, not a death
+//   the grace expires        -> the anomaly is real, and it is reported with the record
+//   this agent leaves first  -> nothing is said, which is correct: the session was ending
+#define NOTIF_SYSKILL_GRACE_MS 2000u
+static DWORD     g_NotifSysKillPid = 0;    // 0 = no verdict pending
+static DWORD     g_NotifSysKillCode = 0;
+static ULONGLONG g_NotifSysKillAt = 0;
+static ULONGLONG g_NotifSysKillRan = 0;
 static BOOL g_NotifNoPidLogged = FALSE;
 static BOOL g_NotifLaunched = FALSE;           // the ONE launch this agent performs
 // ...PER SESSION, which is what "once" has always meant here and was never written down. The bridge
@@ -4448,6 +4491,37 @@ static void NotifBridgeSupervise(void)
 {
     if (!g_NotifBridge) { NotifBridgeRestoreSweep(); return; }
     ULONGLONG now = GetTickCount64();
+    // RESOLVE A DEFERRED SYSKILL VERDICT FIRST (the three exits are named at g_NotifSysKillPid). This runs
+    // before the early returns below, so a pending verdict is never stranded by a later state of the bridge.
+    if (g_NotifSysKillPid)
+    {
+        // The three-way decision is QgaSysKillVerdict (qga-lifecycle.h), where it is tested offline
+        // with its own defect knob - not an inline comparison that no test can reach.
+        const QGA_SYSKILL_VERDICT _skv =
+            QgaSysKillVerdict(HelpersDisarmed() ? 1 : 0, g_NotifSysKillAt, now, NOTIF_SYSKILL_GRACE_MS);
+        if (_skv == QGA_SYSKILL_TEARDOWN)
+        {
+            // The session end arrived after the kill: ordinary teardown ordering, and no death record.
+            LogInfo("NOTIFBRIDGE bridge pid %lu was ended with the session (code %lu); the session end followed "
+                L"%I64u ms later, so it is a teardown, not a death",
+                g_NotifSysKillPid, g_NotifSysKillCode, now - g_NotifSysKillAt);
+            g_NotifSysKillPid = 0;
+        }
+        else if (_skv == QGA_SYSKILL_ANOMALY)
+        {
+            // No session end followed: the ordering this line was written to catch.
+            LogWarning("NOTIFBRIDGESYSKILL Windows killed the bridge pid %lu and no session end followed within "
+                L"%u ms (code %lu) - an ordering anomaly",
+                g_NotifSysKillPid, (unsigned)NOTIF_SYSKILL_GRACE_MS, g_NotifSysKillCode);
+            // 4013, not 4003: durable in the Application log, and not read by the dom0 reporter. This is the
+            // site measured firing twice on 2026-10-10, each time as a "major error" toast on the owner's desk.
+            DeathEventReportTeardown(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", g_NotifSysKillPid,
+                g_NotifSysKillCode, g_NotifSysKillRan,
+                L"Windows ended it with the session. gui-agent log line NOTIFBRIDGESYSKILL; bridge.log in "
+                L"Qubes Logs has its own record.");
+            g_NotifSysKillPid = 0;
+        }
+    }
     // PROCESS EXIT FIRST: the validated handle sits in the main loop's wait array, so an exit wakes the loop and lands
     // here at once. Consume the signal here or the signalled handle would re-wake the loop on every pass.
     BOOL bridgeExited = FALSE;
@@ -4470,16 +4544,14 @@ static void NotifBridgeSupervise(void)
                     g_NotifBridgePid, exitCode);
             else
             {
-                // The system terminated the bridge before this agent was told its session was ending: recorded as a
-                // teardown, not a death. If no shutdown was in progress this is an ordering anomaly worth finding.
-                LogWarning("NOTIFBRIDGESYSKILL Windows killed the bridge pid %lu before announcing session end, a teardown "
-                    L"(0x40010004)", g_NotifBridgePid);
-                // 4013, not 4003: durable in the Application log, and not read by the dom0 reporter. This is the
-                // site measured firing twice on 2026-10-10, each time as a "major error" toast on the owner's desk.
-                DeathEventReportTeardown(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", g_NotifBridgePid, exitCode,
-                    g_NotifLastLaunch != 0 ? now - g_NotifLastLaunch : DEATHEVENT_RAN_UNKNOWN,
-                    L"Windows ended it with the session. gui-agent log line NOTIFBRIDGESYSKILL; bridge.log in "
-                    L"Qubes Logs has its own record.");
+                // The system terminated the bridge before this agent was told its session was ending. WHETHER THAT IS
+                // AN ANOMALY IS NOT KNOWN YET: the fact that decides it - WM_ENDSESSION - arrives tens of ms later.
+                // Deferred to the resolver at the top of this function (see g_NotifSysKillPid); nothing is logged and
+                // no durable record is written until one of its three exits is taken.
+                g_NotifSysKillPid = g_NotifBridgePid;
+                g_NotifSysKillCode = exitCode;
+                g_NotifSysKillAt = now;
+                g_NotifSysKillRan = (g_NotifLastLaunch != 0) ? now - g_NotifLastLaunch : DEATHEVENT_RAN_UNKNOWN;
             }
             g_NotifBridgePid = 0;
             return;
@@ -4700,9 +4772,30 @@ static void NotifBridgeSupervise(void)
                 else
                 {
                     CloseHandle(probe);
-                    LogWarning("QGANOTIFPID published pid %lu IS running but is not notifhost.exe from the install "
-                        L"dir in session %lu - ignored (the file is user-writable, so this looks like a forged pid).",
-                        hbPid, sid);
+                    // THE SAME TEST THE GONE-PID BRANCH ABOVE ALREADY APPLIES, for the same reason:
+                    // a pid this agent never validated is not ours to pronounce on. A RUNNING pid
+                    // that is not our image is far more often a PREDECESSOR's published pid whose
+                    // NUMBER has since been reused - Windows allocates pids sequentially and reuses
+                    // them quickly - than a forgery. MEASURED 2026-10-19, release 4.3.37 acceptance,
+                    // win11-upgrade cell, agent pid 4824:
+                    //   003405.655  I NOTIFHOST launched via Task Scheduler (user session 1)
+                    //   003407.461  W QGANOTIFPID published pid 8720 IS running but is not
+                    //                 notifhost.exe ... looks like a forged pid
+                    //   003412.899  I NOTIFBRIDGE ready (pid 8416 published 8500 ms after the launch)
+                    // 8720 was published by the PRE-UPGRADE helper and reused; nothing was forged,
+                    // and the warning accused the guest of tampering 1.8 s after our own launch.
+                    // Jev: defect 0.91, forgery_claim 0.16 (the code cannot tell the two apart),
+                    // apply_sibling_fix 0.87.
+                    if (g_NotifBridgePid == hbPid)
+                        // This one WAS ours and now resolves to a different image - the pid was
+                        // replaced under us, which is the case the forgery wording was written for.
+                        LogWarning("QGANOTIFPID pid %lu was ready here and is no longer notifhost.exe from the "
+                            L"install dir in session %lu - the pid was replaced", hbPid, sid);
+                    else
+                        // Not ours to judge: a predecessor's published pid, reused by an unrelated
+                        // process. Keep waiting for the pid our own launch publishes.
+                        LogInfo("QGANOTIFPID published pid %lu is not notifhost.exe and was never ready here - a "
+                            L"predecessor's pid, reused; still waiting for the pid our launch publishes", hbPid);
                 }
             }
             else if (hbPid == 0 && !g_NotifNoPidLogged)
@@ -4747,6 +4840,14 @@ static void NotifBridgeSupervise(void)
 static ULONGLONG BridgeNextDue(void)
 {
     const ULONGLONG now = GetTickCount64();
+    // A PENDING SYSKILL VERDICT IS A FAILURE STATE'S BOUNDED TIMER, which is the one kind this function
+    // arms (nothing at rest): without it the grace could only expire on an unrelated wake.
+    if (g_NotifSysKillPid)
+    {
+        const ULONGLONG at = g_NotifSysKillAt + NOTIF_SYSKILL_GRACE_MS;
+        if (at > now) return at;
+        return now;   // already due: wake now and let the resolver decide
+    }
     if (!g_NotifBridge)
         return (g_NotifRestorePending && g_NotifNextPoll > now) ? g_NotifNextPoll : 0;
     if (g_NotifBridgeProc || !g_NotifLaunchPending || g_NotifNotReadyLogged)

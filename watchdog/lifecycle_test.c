@@ -303,6 +303,23 @@ int main(void)
     /* ---- QGADESLICEDOWN: a zeroed clock is NOT ARMED (the 2026-10-11 false-toast defect) ---- */
     /* The exact state measured on win11-app: the hold zeroed both values, the agent had been up 46 s,
      * and the old test `now >= nextWarn` fired because zero is in the past. */
+    /* ---- NOTIFBRIDGESYSKILL: the verdict waits for the fact that decides it (2026-10-19) ---- */
+    /* MEASURED win10-clean, agent pid 3944: Windows killed the bridge at 233257.268 and told the
+     * agent the session was ending at 233257.319 - 51 ms later - so "were we told?" was false at the
+     * exit and a durable Event Log record was written for an ordinary teardown. */
+    check("syskill: nothing pending is no verdict",
+          QgaSysKillVerdict(0, 0, 999999, 2000) == QGA_SYSKILL_PENDING);
+    check("syskill: inside the grace with no session end yet is PENDING - the 51 ms case says nothing",
+          QgaSysKillVerdict(0, 233257268ULL, 233257319ULL, 2000) == QGA_SYSKILL_PENDING);
+    check("syskill: the session end arriving makes it a TEARDOWN, not a death",
+          QgaSysKillVerdict(1, 233257268ULL, 233257319ULL, 2000) == QGA_SYSKILL_TEARDOWN);
+    check("syskill: a session end at the LAST moment of the grace still wins",
+          QgaSysKillVerdict(1, 1000, 1000 + 1999, 2000) == QGA_SYSKILL_TEARDOWN);
+    check("syskill: the grace expiring with no session end is the ANOMALY the warning is for",
+          QgaSysKillVerdict(0, 1000, 1000 + 2000, 2000) == QGA_SYSKILL_ANOMALY);
+    check("syskill: and it stays the anomaly afterwards",
+          QgaSysKillVerdict(0, 1000, 60000, 2000) == QGA_SYSKILL_ANOMALY);
+
     check("deslice: held clock (both zero) is NOT due, however long the agent has been up",
           QgaDesliceWarnDue(0, 0, 46250) == FALSE);
     check("deslice: a down-clock with no warn tick is NOT due",

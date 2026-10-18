@@ -1169,3 +1169,46 @@ static __inline BOOL QgaWindowFaultDue(IN unsigned long long registeredAt, IN un
 #endif
     return (BOOL)(now > from && (now - from) >= graceMs);
 }
+
+/* ---------------------------------------------------------------------------------------------
+ * A SYSTEM-TERMINATED HELPER'S VERDICT IS NOT KNOWN AT THE EXIT. Windows kills a session's
+ * processes and delivers WM_ENDSESSION to us AFTERWARDS, so "were we told the session was ending?"
+ * is false at the moment the exit is seen and the exit reads as an ordering anomaly. MEASURED
+ * 2026-10-19, release 4.3.37 acceptance, win10-clean, agent pid 3944:
+ *     233257.268  W NOTIFBRIDGESYSKILL Windows killed the bridge pid 6448 before announcing session end
+ *     233257.319  I QGAENDSESSION Windows is ending this session (shutdown, lParam 0x40000000)
+ * Fifty-one milliseconds, and the site's own comment said "if no shutdown was in progress this is
+ * an ordering anomaly worth finding" - it had no way to wait and find out. It fired in 2 of 8 cells
+ * and each occurrence writes a DURABLE Event Log record. Jev: defect 0.84, defer_verdict 0.95 (over
+ * querying SM_SHUTTINGDOWN, 0.05 - that metric is 0 on a LOGOFF, where the ordering is the same).
+ *
+ * THREE EXITS, and nothing is reported until one is taken:
+ *   PENDING  - still inside the grace and no session end yet: say nothing
+ *   TEARDOWN - the session end arrived: ordinary ordering, Info, no death record
+ *   ANOMALY  - the grace expired with no session end: the case the warning exists for
+ * The caller's fourth exit is its own: an agent that leaves before the grace expires reports
+ * nothing, which is correct, because the session was ending.
+ */
+typedef enum _QGA_SYSKILL_VERDICT {
+    QGA_SYSKILL_PENDING  = 0,
+    QGA_SYSKILL_TEARDOWN = 1,
+    QGA_SYSKILL_ANOMALY  = 2
+} QGA_SYSKILL_VERDICT;
+
+static __inline QGA_SYSKILL_VERDICT QgaSysKillVerdict(IN int sessionEnding, IN unsigned long long killedAt,
+                                                      IN unsigned long long now, IN unsigned long long graceMs)
+{
+    if (killedAt == 0)
+        return QGA_SYSKILL_PENDING;        /* nothing pending: no verdict to give */
+    if (sessionEnding)
+        return QGA_SYSKILL_TEARDOWN;       /* the fact that decides it arrived */
+#ifdef QGA_LIFECYCLE_DEFECT_SYSKILLNOW
+    (void)graceMs; (void)now;              /* DEFECT: decided at the exit, before the session end can
+                                            * arrive - the false anomaly measured 2026-10-19 */
+    return QGA_SYSKILL_ANOMALY;
+#else
+    if (now > killedAt && (now - killedAt) >= graceMs)
+        return QGA_SYSKILL_ANOMALY;        /* the grace expired and nothing said the session was ending */
+    return QGA_SYSKILL_PENDING;
+#endif
+}

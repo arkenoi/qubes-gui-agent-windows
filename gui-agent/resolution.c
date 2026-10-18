@@ -48,6 +48,13 @@
 // SetVideoModeExact for why.
 #define EXACT_MODE_WAIT_TIMEOUT_MS 12000
 #define EXACT_MODE_WAIT_STEP_MS    250
+// THE APPLY'S OWN SETTLING WINDOW, used only when nothing has confirmed the mode is offered yet.
+// The driver's mode set goes live a moment AFTER its reload returns, so an apply issued immediately
+// can be refused by a mode that is about to exist. MEASURED 2026-10-19, release 4.3.37 acceptance,
+// win11-upgrade cell, agent pid 8132 (quoted in full at the retry below): the apply ran 58 ms after
+// `QIDD ioctl-reload ok` and returned DISP_CHANGE_FAILED; the same mode applied 1.6 s later.
+#define EXACT_MODE_APPLY_SETTLE_MS      3000
+#define EXACT_MODE_APPLY_SETTLE_STEP_MS 250
 
 // parameters for the resolution change thread
 typedef struct _RESOLUTION_THREAD_PARAMS
@@ -631,7 +638,10 @@ ULONG EnsureQubesIddSoloWaiting(IN DWORD timeoutMs)
     return status;
 }
 
-static ULONG SetVideoModeInternal(IN ULONG width, IN ULONG height)
+// settleMs: how long a REFUSED apply may be retried before the refusal is the answer. 0 = the
+// caller knows the mode is offered (or does not want a retry), so the first refusal is final and
+// reported as an error - the behaviour this function always had.
+static ULONG SetVideoModeInternal(IN ULONG width, IN ULONG height, IN ULONG settleMs)
 {
     if (!IS_RESOLUTION_VALID(width, height))
     {
@@ -652,6 +662,68 @@ static ULONG SetVideoModeInternal(IN ULONG width, IN ULONG height)
     devMode.dmFields = DM_PELSWIDTH | DM_PELSHEIGHT;
 
     ULONG status = ChangeDisplaySettings(&devMode, 0);
+    // A REFUSAL IS NOT A VERDICT WHILE THE MODE SET IS STILL GOING LIVE. The driver publishes the
+    // mode set and reloads it; the reload RETURNS before Windows offers the mode, so an apply issued
+    // in that gap is refused by a mode that is about to exist. MEASURED 2026-10-19, release 4.3.37
+    // acceptance, win11-upgrade cell, agent pid 8132, from its own log:
+    //   003947.450  I QIDD ioctl-reload ok
+    //   003947.508  I RESWAIT pre-flight skipped: the input desktop is the secure desktop
+    //   003947.508  I New resolution: 5120 x 1440
+    //   003947.997  E ChangeDisplaySettings failed: 0xffffffff        <- 58 ms after the reload
+    //   003947.997  W NEVEREXIT adopted 1920x1080 as the current screen size
+    //   003949.585  I RESEXACT 5120x1440 replug=0                     <- the SAME mode, 1.6 s later
+    // Two error lines and 1.6 s at the wrong resolution, for a mode that was fine. The pre-flight
+    // skip (added 2026-10-18 to stop a 12 s stall on the sign-in screen) is what exposed it: the
+    // skipped poll had been the only thing giving the reload time to land. Previous campaign:
+    // 0 skips, 0 refusals; this one: 1 skip, 1 refusal, same instance. So the retry lives HERE, at
+    // the apply, where the condition is - not back in the pre-flight, which cannot see the mode on
+    // the secure desktop at all. Jev: fix retry_apply 0.81 (over restoring the poll, 0.00), level
+    // demote_when_recovered 0.91.
+    // ONLY A REFUSAL THAT A SETTLING MODE SET CAN CAUSE IS RETRIED, and the refusing status is
+    // carried into every line below. Retrying ANY status would be concealment: DISP_CHANGE_BADFLAGS,
+    // _BADPARAM, _NOTUPDATED and _RESTART are verdicts about the request or the registry, not about
+    // a mode that is about to exist, so they stay final and report on the first attempt exactly as
+    // before. _FAILED (the measured 0xffffffff) and _BADMODE are the two a not-yet-live mode set
+    // produces. Jev, reviewing this diff, scored settle_hides_a_failure 0.66 against the earlier
+    // version that retried everything and printed no status - this is that answer.
+    const ULONG firstStatus = status;
+    const BOOL settleable = (status == (ULONG)DISP_CHANGE_FAILED || status == (ULONG)DISP_CHANGE_BADMODE);
+    if (DISP_CHANGE_SUCCESSFUL != status && settleMs && settleable)
+    {
+        const ULONGLONG start = GetTickCount64();
+        ULONG attempts = 1;
+        while (GetTickCount64() - start < settleMs)
+        {
+            Sleep(EXACT_MODE_APPLY_SETTLE_STEP_MS);
+            attempts++;
+            status = ChangeDisplaySettings(&devMode, 0);
+            if (DISP_CHANGE_SUCCESSFUL == status)
+                break;
+        }
+        // The recovery is NOT silent (fallbacks-are-anomalies): it names the wait it needed AND what
+        // was refused, so a driver that starts needing seconds - or starts refusing for a different
+        // reason - is visible before it becomes a failure.
+        // WARNING, NOT INFO, AND THE REASON IS THE GATE. Jev, asked what the settling window makes
+        // invisible: gate_cannot_see_info 0.86 - "the recovery is reported at INFO, and this
+        // project's release gate grades only lines whose writer declared WARNING or ERROR, so a
+        // guest that systematically needs seconds of retries can never fail the gate, and the
+        // condition becomes permanently invisible". The two sibling counters that were supposed to
+        // cover this class (DirectSuppressed, BrokerDeaths) are published to the registry and NO
+        // committed consumer reads either of them, so a third published number would have repeated
+        // that gap rather than closed it.
+        // NOT AN ERROR EITHER (Jev: demote_when_recovered 0.91): nothing of ours failed and the user
+        // never sees the wrong mode. WARNING is the owner's "not quite normal, yet workable", which
+        // is exactly what a mode set that needed 1.6 s to go live is. It carries a ledger row with
+        // this receipt, so it is accounted and diagnosed rather than blocking.
+        if (DISP_CHANGE_SUCCESSFUL == status)
+            LogWarning("RESSETTLE %lux%lu applied on attempt %lu after %I64u ms - first refused 0x%x, the mode set was not live yet",
+                width, height, attempts, GetTickCount64() - start, firstStatus);
+        else
+            // The window expired with the mode still refused: that IS the product failing, and the
+            // error below says so with the status and the bound it gave up after.
+            LogWarning("RESSETTLE %lux%lu still refused after %lu attempt(s) in %u ms (first 0x%x, last 0x%x)",
+                width, height, attempts, settleMs, firstStatus, status);
+    }
     if (DISP_CHANGE_SUCCESSFUL != status)
     {
         LogError("ChangeDisplaySettings failed: 0x%x", status);
@@ -1610,6 +1682,10 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
     }
 
     BOOL replugged = FALSE;
+    // Has anything CONFIRMED the mode is offered? TRUE here because the only way past the checks
+    // above without an obtain is IsExactModeAvailable() having said yes. It becomes the pre-flight's
+    // own answer when an obtain runs, and it decides whether a refused apply gets a settling window.
+    BOOL modeConfirmed = TRUE;
     ULONGLONG m0Start = 0; // M0BLINK obtain-start stamp; 0 = no obtain needed
     g_ExactTargetW = width;
     g_ExactTargetH = height;
@@ -1774,9 +1850,16 @@ static ULONG SetVideoModeExact(IN ULONG width, IN ULONG height, IN BOOL allowSna
         }
 
         replugged = TRUE;   // reached on BOTH paths now: the apply is attempted either way
+        // The pre-flight's verdict, carried to the apply. FALSE on both exits that confirm nothing -
+        // the secure-desktop skip and the deadline - which are exactly the two that end in
+        // "applying anyway" with no evidence the mode is live.
+        modeConfirmed = offered;
     }
 
-    ULONG status = SetVideoModeInternal(width, height);
+    // No confirmation that the mode is offered -> let a refused apply settle (see the window in
+    // SetVideoModeInternal). A confirmed mode that is then refused is a contradiction, not a race,
+    // and keeps reporting on the first refusal.
+    ULONG status = SetVideoModeInternal(width, height, modeConfirmed ? 0u : EXACT_MODE_APPLY_SETTLE_MS);
     if (status != ERROR_SUCCESS)
     {
         LogWarning("RESKEEP %lux%lu-unavailable keeping %lux%lu reason=apply-failed-0x%lx",
@@ -1956,7 +2039,9 @@ ULONG SetVideoMode(IN ULONG width, IN ULONG height, IN const WCHAR* source)
         return ERROR_SUCCESS;
     }
 
-    ULONG status = SetVideoModeInternal(width, height);
+    // No settling window: this path applies a mode SelectSupportedMode picked from the modes the
+    // driver already offers, so a refusal here is not a mode that is still going live.
+    ULONG status = SetVideoModeInternal(width, height, 0u);
     if (ERROR_SUCCESS != status)
     {
         g_SeamlessMode = FALSE;

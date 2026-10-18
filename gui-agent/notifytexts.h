@@ -98,8 +98,8 @@ static const QerrText QerrTexts[] = {
      * Log line QGABROKERDIED. */
     { "broker-died", "gui-agent", "broker-died", QERR_SEV_DEGRADED, "gui-agent.exe", NULL,
       "The notification and menu capture helper stopped serving",
-      "Task Scheduler restarts it (up to three times); until then menus, modern apps and notifications do not appear in dom0.",
-      "Cause: the broker exited or stopped answering after it was ready.",
+      "Task Scheduler restarts it up to three times; nothing it captures reaches dom0 until then.",
+      "Cause: it exited or stopped answering after it was ready.",
       QERR_GUI_AGENT_LOG ", line QGABROKERDIED", NULL },
 
     /* wgcbroker.exe is installed but has not been running for over 30 s on a system that needs it (log line
@@ -107,16 +107,16 @@ static const QerrText QerrTexts[] = {
      * wgcbroker logs have the sequence. */
     { "deslice-down-present", "gui-agent", "deslice-down", QERR_SEV_ACTION, "gui-agent.exe", NULL,
       "The notification and menu capture helper is not running",
-      "Menus, modern apps and notifications do not appear in dom0 until it is back.",
-      "Cause: wgcbroker.exe is installed but has not run for over 30 s.",
+      "Nothing of ours restarts it; it comes back when the GUI agent next starts.",
+      "Cause: wgcbroker.exe is installed, but its launch produced no broker.",
       QERR_GUI_AGENT_LOG ", line QGADESLICEDOWN", NULL },
 
     /* the same escalation when the binary is not in the install directory at all: a packaging gap, not a
      * runtime fault (log line QGADESLICEDOWN) */
     { "deslice-down-missing", "gui-agent", "deslice-down", QERR_SEV_ACTION, "gui-agent.exe", NULL,
       "The notification and menu capture helper is missing",
-      "Menus, modern apps and notifications do not appear in dom0 until the package is reinstalled.",
-      "Cause: wgcbroker.exe is missing from the install directory.",
+      "Reinstall Qubes Windows Tools to get it back.",
+      "Cause: wgcbroker.exe is not in the install directory.",
       QERR_GUI_AGENT_LOG ", line QGADESLICEDOWN", NULL },
 
     /* A secure desktop (sign-in, lock, UAC) has been the input desktop for over 30 s (log line QGADESKSTUCK).

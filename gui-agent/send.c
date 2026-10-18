@@ -146,12 +146,33 @@ static BOOL SanitizeWireGeometry(IN HWND window, IN const WCHAR *messageName,
         ULONG count = ++g_GeomClamps;
         if (count <= 20 || (count % 1000) == 0)
         {
+            // THE LEVEL FOLLOWS WHAT WAS ACTUALLY CLAMPED, because only one of the two cases is worth a
+            // warning and the comment above already says this is "not a failure".
+            //   SIZE clamped  -> a window wider or taller than the wire limit; dom0 will render it
+            //                    narrowed, and that is worth seeing.
+            //   POSITION only -> a window parked off-screen, which is what Windows does with hidden
+            //                    and placeholder windows (SW_HIDE parks at -32000). Routine.
+            // MEASURED 2026-10-19, release 4.3.37 acceptance, win10-reinstall and win10-upgrade cells:
+            //   GEOMCLAMP msg=MSG_CREATE hwnd=0x60042 (-31993,-32000) 146x28 -> (-16384,-6144) 146x28
+            // 146x28 in and 146x28 out - the size was never touched. Four such warnings, in two cells,
+            // and they blocked the campaign gate as unaccounted. Jev over this site: defect 0.01
+            // (handled 0.63, overlogged 0.36), so the condition is right and only the level was wrong.
             // dom0's clamp is gui-daemon's (xside.c:2939-2946 when this was written): a reference for
             // the reader of the line, not a thing to print on every occurrence.
-            LogWarning("GEOMCLAMP msg=%s hwnd=0x%x (%d,%d) %dx%d -> (%d,%d) %dx%d "
-                "(limit %dx%d); %u so far",
-                messageName, window, *x, *y, (int)*width, (int)*height,
-                cx, cy, w, h, MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT, count);
+            const BOOL sizeClamped = ((uint32_t)w != *width || (uint32_t)h != *height);
+            if (sizeClamped)
+                LogWarning("GEOMCLAMP msg=%s hwnd=0x%x (%d,%d) %dx%d -> (%d,%d) %dx%d "
+                    "(limit %dx%d); %u so far",
+                    messageName, window, *x, *y, (int)*width, (int)*height,
+                    cx, cy, w, h, MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT, count);
+            else
+                // DEBUG, not INFO: this is a per-WINDOW line on a routine condition, and the log policy
+                // (tools/tests/log-policy-selftest.sh, no_routine_per_window_info) puts those at DEBUG so
+                // an idle guest writes nothing. The counter above still counts every occurrence.
+                LogDebug("GEOMCLAMP msg=%s hwnd=0x%x off-screen (%d,%d) -> (%d,%d), %dx%d kept "
+                    "(limit %dx%d); %u so far",
+                    messageName, window, *x, *y, cx, cy, (int)*width, (int)*height,
+                    MAX_WINDOW_WIDTH, MAX_WINDOW_HEIGHT, count);
         }
         *x = cx;
         *y = cy;
