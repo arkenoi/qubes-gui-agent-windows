@@ -1857,6 +1857,26 @@ ULONG ToggleMap(IN const WINDOW_DATA* entry)
 // fills WINDOW_DATA if successful
 // if *windowData is NULL, the function allocates a new struct and sets the pointer
 // if *windowData is not NULL, the function updates the supplied struct
+// A MEASUREMENT THAT DID NOT LAND IS NOT A FAULT, and three call sites needed to agree about
+// which statuses mean that. Two of them spelled the pair out again; the third - the TrackWindows
+// caller - never got it, so a transient geometry race surfaced there as a fresh ERROR under a third
+// function's name, two frames above where it happened, AND the window was marked for deletion.
+// MEASURED on acceptance run 39767068509, win10-upgrade:
+// "TrackWindows: UpdateWindowData failed with error 0xd: The data is invalid."
+//
+// WHERE THE STATUS COMES FROM: GetRealWindowRect loses a DWM/monitor geometry race on a window
+// between its enumeration and its measurement - inverted or zero DWM extended-frame bounds with no
+// usable GetWindowRect fallback (a cloaked or mid-transition shell surface, or a zero-geometry
+// infrastructure window such as an IME, tooltip or DDE window), or a stale monitor handle that
+// fails GetMonitorInfo twice through MonitorFromWindow - and returns ERROR_INVALID_DATA. The status
+// then travels up through GetWindowData and UpdateWindowData UNCHANGED, because each demotes only
+// its own sentence and neither resets the return value.
+static BOOL WindowNotMeasurableThisPass(IN ULONG status)
+{
+    return status == ERROR_INVALID_DATA ||
+           status == (ULONG)HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE);
+}
+
 ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 {
     WINDOW_DATA* entry = NULL;
@@ -1890,8 +1910,7 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         // this function instead of the call that actually failed.
         // Measured: fixing the swallow above turned 64 silent garbage announcements into 65 ERROR
         // lines per 40 s, which would simply move the noise rather than remove it.
-        if (status == (ULONG)HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE) ||
-            status == ERROR_INVALID_DATA)
+        if (WindowNotMeasurableThisPass((ULONG)status))
         {
             LogDebug("0x%x: not measurable this pass (0x%x)", window, status);
             return (ULONG)status;
@@ -9198,8 +9217,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // here too: GetRealWindowRect already logged that case WITH the offending rectangle, and
         // before the fix above it never reached this line at all; it must not arrive as a flood
         // now that it does.
-        if (status == (ULONG)HRESULT_FROM_WIN32(ERROR_INVALID_HANDLE) ||
-            status == ERROR_INVALID_DATA)
+        if (WindowNotMeasurableThisPass(status))
             LogDebug("0x%x: not measurable this pass (0x%x)", windowData->Handle, status);
         else
             win_perror2(status, "GetWindowData");
@@ -10014,9 +10032,22 @@ static ULONG TrackWindows(OUT TRACK_STATS* stats)
             phaseStatus = UpdateWindowData(entry);
             if (phaseStatus != ERROR_SUCCESS)
             {
-                win_perror2(phaseStatus, "UpdateWindowData");
-                entry->DeletePending = TRUE;
-                // TODO: exit if there was a vchan failure and we not just failed to get window data
+                // THE TODO THAT STOOD HERE ASKED FOR EXACTLY THIS DISTINCTION: "exit if there was
+                // a vchan failure and we not just failed to get window data". A window that could
+                // not be measured this pass is KEPT and remeasured; marking it DeletePending
+                // dropped it from tracking over a momentary DWM geometry race, which is a tracking
+                // defect, not a logging one, and the more serious of the two.
+                if (WindowNotMeasurableThisPass(phaseStatus))
+                {
+                    LogDebug("0x%x: not measurable this pass (0x%x) - KEPT for the next pass",
+                        entry->Handle, phaseStatus);
+                }
+                else
+                {
+                    win_perror2(phaseStatus, "UpdateWindowData");
+                    entry->DeletePending = TRUE;
+                    // TODO: exit if there was a vchan failure and we not just failed to get window data
+                }
             }
 
             entry = nextEntry;
@@ -10034,8 +10065,17 @@ static ULONG TrackWindows(OUT TRACK_STATS* stats)
             phaseStatus = UpdateWindowData(entry);
             if (phaseStatus != ERROR_SUCCESS)
             {
-                win_perror2(phaseStatus, "UpdateWindowData");
-                entry->DeletePending = TRUE;
+                // Same split as the resync arm above, and for the same reason.
+                if (WindowNotMeasurableThisPass(phaseStatus))
+                {
+                    LogDebug("0x%x: not measurable this pass (0x%x) - KEPT for the next pass",
+                        entry->Handle, phaseStatus);
+                }
+                else
+                {
+                    win_perror2(phaseStatus, "UpdateWindowData");
+                    entry->DeletePending = TRUE;
+                }
             }
         }
     }
