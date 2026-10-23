@@ -725,8 +725,3 @@ void PwInvalidateFramebuffer(void);
 // when an async crop measurement resolves).
 void PokeWindowTracking(void);
 void PokeWindowTrackingFor(IN HWND window);
-
-// A HELPER'S LAUNCH PRECONDITION CHANGED - a console session arrived, or the shell window appeared.
-// Wakes the main loop so BrokerSupervise/NotifBridgeSupervise run NOW rather than on the next timer.
-// Thread-safe; a no-op before Init created the event (the pre-loop supervise pass covers that window).
-void HelperLaunchEligibilityChanged(IN const WCHAR *why);
