@@ -458,6 +458,107 @@ static __inline const WCHAR *QgaExitReasonName(IN DWORD code)
  * still reported: the clock is armed at the launch (g_WgcLastLaunch), so its duration is true, and a
  * guest with no shell at all is QGADESKSTUCK's condition, not this one.
  */
+/* ---------------------------------------------------------------------------------------------
+ * WHERE THE DOWN-CLOCK IS ANCHORED WHEN IT RE-ARMS.
+ *
+ * The clock is cleared the moment the broker validates ready, and armed again on the first pass
+ * that finds it not alive. The question this answers is what tick that second arming counts from.
+ *
+ * THE DEFECT, MEASURED 2026-10-23 on win11r-sup running 4.3.37.1066, from the agent's own log:
+ *     20:57:25  WgcLaunch: WGCBROKER launched via Task Scheduler, user session 1
+ *     20:57:39  BrokerSupervise: WGCBROKER ready (pid 3000 validated)
+ *     21:00:52.734  QGABROKEREXIT de-slice broker process EXITED - detected by process wait
+ *     21:00:52.763  QGADESLICEDOWN "not running for 210 s"      <- 29 ms after the detection
+ *     21:02:23  WGCBROKER ready (pid 8124 validated)            <- the relaunch SUCCEEDS
+ * The broker had been serving for 193 of those "210 s". The arming branch anchored at
+ * g_WgcLastLaunch, which does not slide (one launch per agent life, asserted at its assignment
+ * site), so after ANY healthy period it re-armed at a tick minutes in the past and nextWarn was
+ * ALREADY EXPIRED. The 30 s grace exists precisely so a relaunch can end the outage without
+ * bothering the user, and it was skipped entirely - the complaint fired in the same supervise pass
+ * as the detection, printing a duration that counted the time the broker was healthy.
+ * With this anchor the report would have been due at 21:01:22, and the relaunch at 21:02:23 would
+ * have cleared the clock first, so nothing would have been sent.
+ *
+ * NOT A REGRESSION FROM A REVERT, checked: the version reverted in 21aec24 anchored on
+ * `g_WgcLastLaunch ? g_WgcLastLaunch : now` as well. The staleness is older than both.
+ *
+ * THE LAUNCH ANCHOR IS STILL RIGHT FOR THE CASE IT WAS ADDED FOR. A broker that is launched and
+ * NEVER becomes ready has no healthy period to exclude, so its outage genuinely starts at the
+ * launch (measured 2026-10-08: the shell took 27 s, the complaint fired 1 s before ready). That is
+ * what `readyAt == 0` distinguishes - g_BrokerReadyAt is set once, when an instance validates, and
+ * is never cleared, so non-zero means "this agent has had a working broker".
+ * Jev: sound 0.84.
+ */
+static __inline unsigned long long QgaDesliceAnchor(IN int launched, IN unsigned long long lastLaunch,
+                                                    IN unsigned long long readyAt, IN unsigned long long now)
+{
+#ifdef QGA_LIFECYCLE_DEFECT_STALEANCHOR
+    (void)readyAt;   /* DEFECT: re-arm at the original launch even after a healthy run - fires instantly */
+    return (launched && lastLaunch) ? lastLaunch : now;
+#else
+    if (launched && lastLaunch && readyAt == 0)
+        return lastLaunch;   /* launched and never ready: the outage does start at the launch */
+    return now;              /* it was serving, so THIS outage starts now */
+#endif
+}
+/* ---------------------------------------------------------------------------------------------
+ * ONE SITUATION IS ONE DOM0 NOTIFICATION.
+ *
+ * When the broker DIED, the death reporter already tells dom0 - by name, with the pid and the exit
+ * code - and that row is the actionable one. The de-slice complaint then says the same thing worse
+ * ("has not been running for N s"), and the owner's standing rule is "no doubles, nothing lost": a
+ * double is P1.
+ *
+ * MEASURED 2026-10-23, one injected broker death producing TWO dom0 rows two seconds apart:
+ *     21:00:52.973  PlatLog: NOTIFYERR gui-agent.deslice-down sent to dom0 (#1 this boot)
+ *     21:01:01      qwt-deaths.log: DEATH #1 notified to dom0 as wgcbroker.death-1
+ * The owner saw both and asked whether it was expected. Jev, given the two rows and this file's own
+ * secure-desktop precedent: suppress the de-slice complaint, confidence 1.00.
+ *
+ * THIS SUPPRESSES THE NOTIFICATION ONLY. The caller still writes the DesliceBrokerDown config flag
+ * that health-check and acceptance read, and still logs QGADESLICEDOWN at ERROR, so the condition
+ * stays visible to every instrument - what goes away is the second toast, not the evidence.
+ * Same shape as the secure-desktop hold beside it, where QGADESKSTUCK owns the condition.
+ */
+/* ---------------------------------------------------------------------------------------------
+ * A GRACEFUL SHUTDOWN IS NOT A FAULT, AND MUST NOT EMIT AN ERROR.
+ *
+ * Owner, 2026-10-23: "graceful shutdown should NOT emit error". This file already states the
+ * contract at HelpersDisarm(): "once set, no helper is launched into this session any more and a
+ * helper's exit while it is set is EXPECTED (the session's teardown, or our own stop) - INFO, not a
+ * death". The de-slice report never asked it.
+ *
+ * MEASURED 2026-10-23 on win11r-sup (4.3.37.1066):
+ *     21:00:52.763  QGADESLICEDOWN ... at ERROR, and DesliceBrokerDown=1 written
+ *     21:00:52.973  NOTIFYERR gui-agent.deslice-down sent to dom0
+ *     21:01:01.766  ControlHandlerEx: preshutdown - the agent will not be restarted from here on
+ * i.e. an ERROR, a config flag that health-check and acceptance FAIL on, and a client-visible toast,
+ * nine seconds before the machine went down on purpose. The helper was gone because the guest was
+ * going away.
+ *
+ * ALL THREE ARE SKIPPED when this is true, not just the toast: the ERROR line (the owner's words),
+ * the DesliceBrokerDown flag (a false 1 on a healthy guest is what makes health-check fail), and the
+ * dom0 row. Outside a teardown nothing changes - a real outage on a running guest still reports at
+ * ERROR with its flag and its row.
+ */
+static __inline BOOL QgaDesliceTeardownExcused(IN int helpersDisarmed, IN int sessionEnding)
+{
+#ifdef QGA_LIFECYCLE_DEFECT_SHUTDOWNERROR
+    (void)helpersDisarmed; (void)sessionEnding;
+    return FALSE;    /* DEFECT: an ERROR, a flag and a toast while the guest is shutting down */
+#else
+    return (BOOL)(helpersDisarmed || sessionEnding);
+#endif
+}
+static __inline BOOL QgaDesliceOwnedByDeath(IN unsigned long long diedAt)
+{
+#ifdef QGA_LIFECYCLE_DEFECT_DOUBLETOAST
+    (void)diedAt;
+    return FALSE;    /* DEFECT: complain AS WELL AS reporting the death - two toasts for one event */
+#else
+    return (BOOL)(diedAt != 0);   /* a death is being reported for this outage; that row owns it */
+#endif
+}
 static __inline BOOL QgaDesliceWarnDue(IN unsigned long long downSince, IN unsigned long long nextWarn,
                                        IN unsigned long long now)
 {

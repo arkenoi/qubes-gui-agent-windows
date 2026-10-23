@@ -3945,7 +3945,7 @@ static void BrokerSupervise(void)
     }
     else if (!g_BrokerDownSince)
     {
-        const ULONGLONG anchor = (g_WgcLaunched && g_WgcLastLaunch) ? g_WgcLastLaunch : now;
+        const ULONGLONG anchor = QgaDesliceAnchor(g_WgcLaunched ? 1 : 0, g_WgcLastLaunch, g_BrokerReadyAt, now);
         g_BrokerDownSince = anchor;
         g_BrokerNextWarn = anchor + DESLICE_FIRST_WARN_MS;
     }
@@ -3964,6 +3964,18 @@ static void BrokerSupervise(void)
     // broker could not have been launched, and `now >= 0` made that hold FIRE the report instead of
     // deferring it - one false dom0 toast per cold boot, with the agent's uptime printed as the
     // outage. Measured 2026-10-11; the predicate is tested offline with its own defect knob.
+    // GRACEFUL SHUTDOWN IS NOT A FAULT (owner 2026-10-23: "graceful shutdown should NOT emit error").
+    // Helpers are disarmed as the FIRST act of the end-session handshake, and this file's own contract
+    // at HelpersDisarm says a helper's exit while disarmed is EXPECTED - INFO, not a death. This
+    // branch therefore skips all three outputs: the ERROR line, the DesliceBrokerDown flag that
+    // health-check fails on, and the dom0 row. Measured: an ERROR + flag + toast went out 9 s before
+    // `preshutdown` on a guest that was shutting down on purpose. See QgaDesliceTeardownExcused.
+    else if (QgaDesliceTeardownExcused(HelpersDisarmed() ? 1 : 0, LifecycleSessionEnding() ? 1 : 0))
+    {
+        LogDebug("QGADESLICEDOWN not reported while the session is ending / helpers are disarmed "
+            L"(down %I64u s so far) - a helper gone during a teardown is expected",
+            (now - g_BrokerDownSince) / 1000);
+    }
     else if (QgaDesliceWarnDue(g_BrokerDownSince, g_BrokerNextWarn, now))
     {
         g_BrokerNextWarn = now + DESLICE_REWARN_MS;
@@ -4002,7 +4014,17 @@ static void BrokerSupervise(void)
         // per boot regardless of the 120 s re-warn cadence above; the text names the cause the same
         // way the log line does (one row per cause in notifytexts.h), and points at the log for
         // everything else.
-        QerrReportText(QerrTextFind(binPresent ? "deslice-down-present" : "deslice-down-missing"), NULL, NULL);
+        // ONE SITUATION, ONE DOM0 ROW. The flag and the ERROR line above are unconditional - every
+        // instrument still sees the outage - but the dom0 notification is skipped when a DEATH for
+        // this broker is already being reported, because that row names the exe, the pid and the
+        // exit code and is the actionable one. See QgaDesliceOwnedByDeath (measured: one injected
+        // death produced wgcbroker.death-1 AND gui-agent.deslice-down two seconds apart; Jev 1.00).
+        if (QgaDesliceOwnedByDeath(g_BrokerDiedAt))
+            LogInfo("QGADESLICEDOWN dom0 row suppressed: the death report for this broker owns this outage "
+                L"(died %I64u s ago) - the flag and the line above still stand",
+                (now - g_BrokerDiedAt) / 1000);
+        else
+            QerrReportText(QerrTextFind(binPresent ? "deslice-down-present" : "deslice-down-missing"), NULL, NULL);
     }
 
     // THE ONE LAUNCH PER AGENT LIFE (HELPER LIFECYCLE above): once a console session with a shell exists, and never

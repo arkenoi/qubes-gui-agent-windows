@@ -333,6 +333,40 @@ int main(void)
     check("deslice: armed and past the deadline is due",
           QgaDesliceWarnDue(1000, 31000, 120000) == TRUE);
 
+    /* THE ANCHOR. Measured 2026-10-23: a broker ready at 20:57:39 and killed at 21:00:52 was
+       reported as "not running for 210 s" and the complaint fired 29 ms after the detection,
+       because the clock re-armed at the launch tick (20:57:25) whose +30 s deadline had long
+       passed. Ticks below are ms, in the shape of that capture. */
+    check("deslice anchor: launched and NEVER ready still anchors at the launch (true outage)",
+          QgaDesliceAnchor(1, 100000, 0, 160000) == 100000);
+    check("deslice anchor: once it HAS been ready, a later outage anchors at NOW, not the launch",
+          QgaDesliceAnchor(1, 100000, 114000, 307000) == 307000);
+    check("deslice anchor: and that is what restores the 30 s grace a relaunch can use",
+          QgaDesliceWarnDue(QgaDesliceAnchor(1, 100000, 114000, 307000),
+                            QgaDesliceAnchor(1, 100000, 114000, 307000) + 30000, 307000) == FALSE);
+    check("deslice anchor: the stale anchor was due IMMEDIATELY - the defect, stated as a test",
+          QgaDesliceWarnDue(100000, 100000 + 30000, 307000) == TRUE);
+    check("deslice anchor: no launch yet anchors at now (nothing could have been running)",
+          QgaDesliceAnchor(0, 0, 0, 55000) == 55000);
+
+    /* ONE SITUATION, ONE DOM0 ROW. Measured 2026-10-23: one injected broker death produced BOTH
+       `gui-agent.deslice-down` and `wgcbroker.death-1`, two seconds apart. Jev 1.00 that the
+       de-slice row is the one to drop. */
+    check("deslice double: while a death is being reported, the de-slice row is owned by it",
+          QgaDesliceOwnedByDeath(307000) == TRUE);
+    check("deslice double: with no death in flight the de-slice row is the only report, so it goes",
+          QgaDesliceOwnedByDeath(0) == FALSE);
+
+    /* GRACEFUL SHUTDOWN IS NOT A FAULT (owner 2026-10-23: "graceful shutdown should NOT emit
+       error"). Measured: an ERROR line, the DesliceBrokerDown flag and a dom0 toast all went out
+       9 s before `preshutdown` on a guest that was shutting down deliberately. */
+    check("deslice teardown: helpers disarmed excuses it - that is the end-session handshake's first act",
+          QgaDesliceTeardownExcused(1, 0) == TRUE);
+    check("deslice teardown: a session ending excuses it too (logoff and fast-user-switch included)",
+          QgaDesliceTeardownExcused(0, 1) == TRUE);
+    check("deslice teardown: on a running guest nothing is excused - a real outage still reports",
+          QgaDesliceTeardownExcused(0, 0) == FALSE);
+
     /* ---- "it is our shell", not a hardcoded name (owner 2026-10-11) ---- */
     check("shell: explorer is always a shell, even with no configured value read",
           QgaIsSessionShellImage(L"explorer.exe", L"") == TRUE);
