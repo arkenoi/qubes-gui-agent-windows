@@ -3037,12 +3037,19 @@ void HelpersRearm(void)
 // an agent's FIRST secure frame, 2 s after its start. Never cleared: the question is "has this instance ever seen
 // a shell", not "is one up now" (the sites that need the live answer keep the HWND they get).
 static volatile LONG g_ShellSeen = 0;
+// WHEN the shell was first seen, on the same clock as BrokerSupervise's `now` (GetTickCount64).
+// The de-slice down-clock is held until the broker's launch is ISSUED, and this is what lets that
+// hold say how long it has been holding - without it, a launch that never goes out is silent.
+static ULONGLONG g_ShellSeenTick = 0;
 static HWND ShellWindowNow(void)
 {
     const HWND shell = GetShellWindow();
     if (shell && !g_ShellSeen && InterlockedExchange(&g_ShellSeen, 1) == 0)
+    {
+        g_ShellSeenTick = GetTickCount64();
         // From here on a lock can be asserted: the session has reached a shell this instance has seen.
         LogInfo("QGASHELLSEEN shell window is up, hwnd=0x%p", shell);
+    }
     return shell;
 }
 static BOOL ShellSeenSinceStart(void)
@@ -3635,6 +3642,7 @@ static BOOL NotifyWouldInterruptStartup(void)
     return FALSE;
 }
 static BOOL g_WgcLaunched = FALSE;      // the ONE launch this agent performs (HELPER LIFECYCLE above)
+static BOOL g_WgcLaunchStallSaid = FALSE;  // QGABROKERLAUNCHNOTISSUED said once per agent life
 // THE PID OF A PROCESS WITH THIS IMAGE NAME, or 0. Two callers, both about UAC:
 //   - classifying a SECURE DESKTOP we are stuck on (owner, 2026-10-08: "if it sits on the uac
 //     prompt we need to know what path brought us there and how to handle it properly"), because
@@ -3889,6 +3897,16 @@ static void BrokerSupervise(void)
     // fallback stays quiet ONLY when the operator asked for it.
     #define DESLICE_FIRST_WARN_MS 30000
     #define DESLICE_REWARN_MS 120000
+    // THE LAUNCH-PENDING WINDOW, and it is deliberately NOT DESLICE_FIRST_WARN_MS.
+    // It bounds the hold below: how long a shell may be up with no launch issued before that is
+    // reported as an outage. It must clear the real shell-to-launch latency with margin, because a
+    // deadline that lands ON that latency reproduces the very defect this fixes - a report fired
+    // while the launch is in flight. MEASURED 2026-10-23: that gap was 28.4 s on one subject and
+    // 27.0 s on the other, i.e. just under DESLICE_FIRST_WARN_MS, so using 30 s here would put the
+    // deadline inside the window where a normal launch still arrives. 90 s is three times the report
+    // deadline and over three times the measured latency; a launch that has not gone out by then is
+    // not late, it is not coming.
+    #define DESLICE_LAUNCH_PENDING_MS 90000
     // NOT WHILE THE INPUT DESKTOP IS SECURE. Nothing can be captured then - this agent freezes the
     // frame path for exactly that reason - so a broker that is not running is not a fault, it is
     // the consequence of a guest sitting at the sign-in or lock screen, and QGADESKSTUCK is already
@@ -3933,18 +3951,78 @@ static void BrokerSupervise(void)
     //     g_AgentStartTick`, so holding the clock at zero here makes it fall back to the agent's
     //     start tick - which is what the old Init-time anchor amounted to. BRK_STARTING/BRK_DOWN
     //     therefore behave exactly as before; only this report's deadline moves.
-    if (!ShellWindowNow() && !g_WgcLaunched)
+    // THE CLOCK IS NOT COUNTED BEFORE THE AGENT HAS ASKED FOR A BROKER.
+    // The hold used to require BOTH conditions - `!ShellWindowNow() && !g_WgcLaunched` - so on a
+    // guest whose shell appears EARLY but whose launch guard is not satisfiable yet, the clock armed
+    // at the first poll with `now` and its deadline could expire before the launch was ever issued.
+    // MEASURED 2026-10-23 on two subjects, and it reached the client both times:
+    //     064605.351  the arm (shell up, no broker, no launch yet)
+    //     064633.799  WgcLaunch: WGCBROKER launched via Task Scheduler   <- +28.4 s
+    //     064635.351  QGADESLICEDOWN "EXPECTED but not running for 30 s" <- the complaint
+    //     064635.400  BrokerSupervise: WGCBROKER ready (pid 8632 validated)  <- 49 ms later
+    // The comment above this report already states the intent - "the clock is ANCHORED AT THE
+    // LAUNCH ... once the launch happens g_WgcLastLaunch is the anchor" - and the arm branch honours
+    // it only when the launch has ALREADY happened. Nothing re-anchored it afterwards, and the arm
+    // branch is `else if (!g_BrokerDownSince)`, so the 28.4 s head start stood.
+    // "Has not been running for 30 s" can only mean 30 s since we asked it to run: before the launch
+    // there is nothing to be down, however long the shell has been up. So the hold is now on
+    // `!g_WgcLaunched` alone, which is the condition that actually makes the report meaningless.
+    // A client-visible alert for a condition that was not there is P1 regardless of whether the 30 s
+    // it quoted was arithmetically true - that framing was argued and rejected.
+    if (!g_WgcLaunched)
     {
-        // Not a fault and not a grace period: there is no session to run it in (the broker is launched into the
-        // user's session, so its absence before a shell exists is no fault). The guest having no shell is its own
-        // condition and QGADESKSTUCK owns reporting it.
-        if (g_BrokerDownSince)
-            // The down-clock is held: the broker cannot be launched without a shell to run it under.
-            LogDebug("QGADESLICEDOWN down time not counted before the shell window is up");
-        g_BrokerDownSince = 0; g_BrokerNextWarn = 0;
+        // THE HOLD IS BOUNDED, because an unbounded one would be a SILENCE. Three states, not two:
+        //   * no shell yet, or a shell up for less than DESLICE_LAUNCH_PENDING_MS - HELD. The broker
+        //     is launched into the user's session, so its absence before a shell exists is no fault
+        //     (QGADESKSTUCK owns that condition), and for the pending window after a shell appears
+        //     the launch is simply still on its way - measured at 27-28 s on the two subjects.
+        //     Nothing has asked the broker to run, so there is nothing to call down. THIS IS THE
+        //     WINDOW THE MEASURED FALSE TOAST CAME FROM.
+        //   * a shell up longer than the PENDING window with no launch issued - REPORTED, anchored at
+        //     the shell. The launch guard (session id, or helpers disarmed) has not fired, and the user's
+        //     consequence is identical to a dead broker: no menus and no toasts. So the dom0 report
+        //     still goes out - widening the hold must not cost the user-facing notification - and a
+        //     one-shot W names the blocked guard, which is the fact the log could not supply before.
+        //   * launched - anchored at the launch, in the branch below.
+        const BOOL shellUp = ShellWindowNow() != NULL;
+        const BOOL pendingTooLong = shellUp && g_ShellSeenTick && (now - g_ShellSeenTick) >= DESLICE_LAUNCH_PENDING_MS;
+        if (!pendingTooLong)
+        {
+            if (g_BrokerDownSince)
+                // The down-clock is held: nothing has asked the broker to run yet.
+                LogDebug("QGADESLICEDOWN down time not counted before the launch is issued (%s)",
+                    shellUp ? "shell up, launch not issued yet" : "no shell window yet");
+            g_BrokerDownSince = 0; g_BrokerNextWarn = 0;
+        }
+        else
+        {
+            // Said ONCE per agent life, and only here: it names WHY no launch went out, which the
+            // 28.4 s gap in the measured trace could not be read off any log line.
+            if (!g_WgcLaunchStallSaid)
+            {
+                g_WgcLaunchStallSaid = TRUE;
+                LogWarning("QGABROKERLAUNCHNOTISSUED shell up %I64u s and the de-slice broker launch has not been "
+                    "issued (session=0x%x disarmed=%d) - reporting it as a de-slice outage, which is what the user sees",
+                    (now - g_ShellSeenTick) / 1000, sid, HelpersDisarmed() ? 1 : 0);
+            }
+            if (!g_BrokerDownSince)
+            {
+                // ANCHORED AT THE SHELL, the earliest moment a launch could have gone out, so the
+                // duration the report prints is true. The due time is the PENDING window, which has
+                // just elapsed - so this is due on this very pass rather than one deadline later,
+                // and it can never be due while a launch of normal latency is still arriving.
+                g_BrokerDownSince = g_ShellSeenTick;
+                g_BrokerNextWarn = g_ShellSeenTick + DESLICE_LAUNCH_PENDING_MS;
+            }
+        }
     }
     else if (!g_BrokerDownSince)
     {
+        // THE PRE-LAUNCH CASE IS HANDLED ABOVE, by the hold - so g_WgcLaunched is true here and
+        // g_WgcLastLaunch is set at its one assignment site. What is still decided here is WHICH of
+        // the two post-launch anchors applies: the launch itself while the broker has never been
+        // ready, or `now` once it has (see QgaDesliceAnchor - without that, a broker that died
+        // after a healthy run re-armed at a launch tick minutes old and complained instantly).
         const ULONGLONG anchor = QgaDesliceAnchor(g_WgcLaunched ? 1 : 0, g_WgcLastLaunch, g_BrokerReadyAt, now);
         g_BrokerDownSince = anchor;
         g_BrokerNextWarn = anchor + DESLICE_FIRST_WARN_MS;
