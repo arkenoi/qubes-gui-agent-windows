@@ -2,6 +2,7 @@
  * workarea - guest work-area synchronization. See workarea.h.
  */
 #include <windows.h>
+#include <wtsapi32.h>   // WTSRegisterSessionNotification: session arrival is a PUSH, not a poll
 #include <stdio.h>
 
 #include "common.h"
@@ -447,6 +448,19 @@ static LRESULT CALLBACK WaWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg)
     {
+    case WM_WTSSESSION_CHANGE:
+        // A HELPER'S LAUNCH PRECONDITION MAY NOW HOLD. The de-slice broker and the notification host
+        // are launched into the user's session and need WTSGetActiveConsoleSessionId to resolve; the
+        // agent used to discover that only on its next TIMED wake, and while the broker was down the
+        // only timer armed was the QGADESLICEDOWN deadline - so the complaint paced the launch and the
+        // broker came up 27-29 s after Init (measured 2026-10-23, two subjects). Signal, do not
+        // decide: BrokerSupervise/NotifBridgeSupervise run on the wake and own the guard.
+        if (wp == WTS_CONSOLE_CONNECT || wp == WTS_SESSION_LOGON || wp == WTS_SESSION_UNLOCK)
+        {
+            LogDebug("WM_WTSSESSION_CHANGE(%u): a helper launch precondition may have changed", (unsigned)wp);
+            HelperLaunchEligibilityChanged(L"WTS session change");
+        }
+        break;
     case WM_SETTINGCHANGE:
         if (wp == SPI_SETWORKAREA)
         {
@@ -592,6 +606,17 @@ void WorkAreaCreateListener(void)
         return;
     }
     g_WaListener = h;
+    // THE SESSION-CHANGE PUSH LIVES HERE because this is the agent's only message window.
+    // NOTIFY_FOR_THIS_SESSION, not FOR_ALL_SESSIONS: the agent runs IN the user session, and
+    // WTS_CONSOLE_CONNECT for this session is exactly the transition that makes
+    // WTSGetActiveConsoleSessionId resolve for a helper launch. A failure is LOUD, not silent: it
+    // costs the push, and a first launch then falls back to the de-slice report cadence - which is
+    // the defect this registration exists to remove.
+    if (!WTSRegisterSessionNotification(h, NOTIFY_FOR_THIS_SESSION))
+    {
+        win_perror("WTSRegisterSessionNotification(workarea listener)");
+        LogError("no session-change push: a helper's first launch may wait for the de-slice report cadence");
+    }
     LogDebug("work-area listener window %p created", h);
 }
 
@@ -599,6 +624,8 @@ void WorkAreaDestroyListener(void)
 {
     if (!g_WaListener)
         return;
+    // Paired with the registration in WorkAreaCreateListener; before the window goes away.
+    WTSUnRegisterSessionNotification(g_WaListener);
     if (!DestroyWindow(g_WaListener))
     {
         // Loud on purpose: the window-event thread would still own a window, so every later

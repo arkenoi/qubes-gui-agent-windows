@@ -307,6 +307,18 @@ static ULONGLONG g_WgcLastLaunch = 0;      // throttle: don't relaunch while one
 static ULONGLONG g_AgentStartTick = 0;     // set at Init; bounds BRK_STARTING (see BrokerState)
 static ULONGLONG g_BrokerDownSince = 0;    // wall time the broker went (or started) DOWN while eligible; 0 = up/ok
 static ULONGLONG g_BrokerNextWarn = 0;     // next QGADESLICEDOWN warning is due (loud-persistent cadence)
+// MOVED HERE from beside WgcLaunch, because BrokerNextDue - which is ABOVE that site - now reads it:
+// the pre-launch wake exists only while this is FALSE. The HELPER LIFECYCLE block beside WgcLaunch
+// is still what describes the one-launch-per-agent-life rule.
+static BOOL g_WgcLaunched = FALSE;         // the ONE launch this agent performs
+static BOOL g_WgcLaunchStallSaid = FALSE;  // QGABROKERLAUNCHNOTISSUED said once per agent life
+// AUTO-RESET: a helper's launch precondition changed. This replaces a TIMER with an EVENT. The
+// launch of the de-slice broker needs an active console session id and a shell window; the agent
+// used to notice a change only on its next timed wake, and while the broker was down the ONLY wake
+// armed was the QGADESLICEDOWN deadline - so the complaint timer was the launch's start signal and
+// the broker came up 27-29 s after Init (measured 2026-10-23 on two subjects). Same idiom as the
+// toast-hold verdict event: the thing that knows signals, the pass that decides runs on the wake.
+static HANDLE g_HelperEligibleEvent = NULL;
 // Machine-readable de-slice health, published under the BASE Qubes Tools config key
 // (HKLM\SOFTWARE\Invisible Things Lab\Qubes Tools\DesliceBrokerDown - the free-function write
 // scope, same as VCHAN_RESTARTS) so health-check / acceptance can assert it without parsing the
@@ -3011,6 +3023,15 @@ BOOL HelpersDisarmed(void)
 {
     return InterlockedCompareExchange(&g_HelpersDisarmed, 0, 0) != 0;
 }
+
+void HelperLaunchEligibilityChanged(IN const WCHAR *why)
+{
+    HANDLE h = g_HelperEligibleEvent;
+    if (!h)
+        return;   // before Init created it; the pre-loop supervise pass covers that window
+    LogDebug("helper launch precondition changed (%s) - waking the loop", why ? why : L"?");
+    SetEvent(h);
+}
 void HelpersDisarm(IN const WCHAR *why)
 {
     // A helper's exit after this point is the session's teardown or our own stop: graded INFO, never a death (R1 above).
@@ -3049,6 +3070,9 @@ static HWND ShellWindowNow(void)
         g_ShellSeenTick = GetTickCount64();
         // From here on a lock can be asserted: the session has reached a shell this instance has seen.
         LogInfo("QGASHELLSEEN shell window is up, hwnd=0x%p", shell);
+        // ...and a helper's launch precondition just became true: wake the loop instead of letting
+        // the first launch wait for an unrelated timer.
+        HelperLaunchEligibilityChanged(L"shell window appeared");
     }
     return shell;
 }
@@ -3402,6 +3426,12 @@ static BOOL BrokerAckOverdue(IN ULONGLONG now, OUT int* slotOut, OUT ULONGLONG* 
 // which keeps its bounded timers (design C, "Cost") - the relaunch throttle and the next QGADESLICEDOWN. Never a past
 // deadline: a relaunch that is due but cannot happen (no console session, no shell yet) waits for the window event
 // that brings the shell, not for a spin.
+// The de-slice report's deadlines, at file scope because BOTH the report (BrokerSupervise) and the
+// pre-launch wake (BrokerNextDue, above it) read them - two copies that must agree is a drift
+// hazard, and the whole defect here was one timer standing in for another.
+#define DESLICE_FIRST_WARN_MS 30000
+#define DESLICE_REWARN_MS 120000
+#define DESLICE_LAUNCH_PENDING_MS 90000
 static ULONGLONG BrokerNextDue(void)
 {
     if (!g_WgcBroker || g_OsBuild < 26100 || !PwEnabled() || !g_WgcBase) return 0;
@@ -3425,8 +3455,22 @@ static ULONGLONG BrokerNextDue(void)
         }
         return due;
     }
-    // No launch throttle any more (HELPER LIFECYCLE): the one launch happens on the first eligible wake, and nothing
-    // relaunches - only the QGADESLICEDOWN cadence needs the loop awake while the broker is down.
+    // THE ONE LAUNCH MUST NOT WAIT FOR THE COMPLAINT TIMER. "The one launch happens on the first
+    // eligible wake" was true and was the defect: while the broker is down and unlaunched, the ONLY
+    // wake this function armed was g_BrokerNextWarn - the QGADESLICEDOWN deadline - so if the launch
+    // guard (`sid != 0xFFFFFFFF && ShellWindowNow() && !HelpersDisarmed()`) was not satisfiable on
+    // the pass that noticed, the launch waited for the complaint to come due. MEASURED 2026-10-23 on
+    // two subjects: WgcLaunch at Init+29.0 s and Init+27.0 s against DESLICE_FIRST_WARN_MS of 30 s -
+    // the launch latency WAS the warning deadline, which is also why the report landed within 2 s of
+    // the launch on both. Half a minute with no menus and no toasts after the shell is up is the
+    // user-visible defect; the report firing next to it was the symptom.
+    // SO THE LAUNCH IS GATED ON THE EVENT, NOT ON A DELAY. Nothing is armed here for it: the two
+    // inputs that can turn the guard true both PUSH now - WM_WTSSESSION_CHANGE on the agent's
+    // listener window (a console session arrived) and the shell-seen latch (the shell appeared) -
+    // and both call HelperLaunchEligibilityChanged, which signals g_HelperEligibleEvent. The loop
+    // waits on that handle while a first launch is pending, so the launch happens on the transition
+    // instead of at the next deadline. A timer here, however short, would be the same antipattern in
+    // smaller units.
     if (g_BrokerNextWarn > now && (!due || g_BrokerNextWarn < due)) due = g_BrokerNextWarn;
     return due;
 }
@@ -3641,8 +3685,6 @@ static BOOL NotifyWouldInterruptStartup(void)
     }
     return FALSE;
 }
-static BOOL g_WgcLaunched = FALSE;      // the ONE launch this agent performs (HELPER LIFECYCLE above)
-static BOOL g_WgcLaunchStallSaid = FALSE;  // QGABROKERLAUNCHNOTISSUED said once per agent life
 // THE PID OF A PROCESS WITH THIS IMAGE NAME, or 0. Two callers, both about UAC:
 //   - classifying a SECURE DESKTOP we are stuck on (owner, 2026-10-08: "if it sits on the uac
 //     prompt we need to know what path brought us there and how to handle it properly"), because
@@ -3895,18 +3937,15 @@ static void BrokerSupervise(void)
     // health-check / acceptance harness fails on. A deliberate opt-out (WgcBroker=0)
     // never reaches here - g_WgcBroker is false and BrokerSupervise returns at the top - so a quiet
     // fallback stays quiet ONLY when the operator asked for it.
-    #define DESLICE_FIRST_WARN_MS 30000
-    #define DESLICE_REWARN_MS 120000
     // THE LAUNCH-PENDING WINDOW, and it is deliberately NOT DESLICE_FIRST_WARN_MS.
     // It bounds the hold below: how long a shell may be up with no launch issued before that is
-    // reported as an outage. It must clear the real shell-to-launch latency with margin, because a
-    // deadline that lands ON that latency reproduces the very defect this fixes - a report fired
-    // while the launch is in flight. MEASURED 2026-10-23: that gap was 28.4 s on one subject and
-    // 27.0 s on the other, i.e. just under DESLICE_FIRST_WARN_MS, so using 30 s here would put the
-    // deadline inside the window where a normal launch still arrives. 90 s is three times the report
-    // deadline and over three times the measured latency; a launch that has not gone out by then is
-    // not late, it is not coming.
-    #define DESLICE_LAUNCH_PENDING_MS 90000
+    // reported as an outage. The 27-29 s shell-to-launch latency it was first sized against was
+    // ITSELF THE DEFECT - the launch was waiting for the complaint deadline, fixed in BrokerNextDue -
+    // so this is no longer a tolerance for normal latency. With the pending wake in place the launch
+    // goes out about a second after its preconditions hold, and this bound exists only for a launch
+    // that never becomes possible at all: 90 s is three times the report deadline, long enough that
+    // it can never land on a real launch, and QGABROKERLAUNCHNOTISSUED names the blocked guard when
+    // it does fire.
     // NOT WHILE THE INPUT DESKTOP IS SECURE. Nothing can be captured then - this agent freezes the
     // frame path for exactly that reason - so a broker that is not running is not a fault, it is
     // the consequence of a guest sitting at the sign-in or lock screen, and QGADESKSTUCK is already
@@ -14888,6 +14927,13 @@ static ULONG WINAPI WatchForEvents(void)
         // held for its verdict is re-examined the moment the verdict exists - no poll, no timer. NULL when the hold
         // is inactive on this run. AFTER the broker's frame event on purpose: WaitForMultipleObjects prefers the
         // lower index, and a verdict must never take priority over a frame (review #17).
+        // A HELPER'S LAUNCH PRECONDITION CHANGED. Armed ONLY while a first launch is still pending, so
+        // it costs nothing once both helpers are up. This is what replaced the timer that used to pace
+        // the launch: while the broker was down the only wake armed was the QGADESLICEDOWN deadline, so
+        // the complaint was its own start signal. No case in the switch - the supervisors run on every
+        // wake, which is all this handle has to cause.
+        if (g_HelperEligibleEvent && (!g_WgcLaunched || !g_NotifLaunched) && eventCount < MAXIMUM_WAIT_OBJECTS)
+            watchedEvents[eventCount++] = g_HelperEligibleEvent;
         verdictEventIdx = -1;
         if (ToastHoldVerdictEvent() && eventCount < MAXIMUM_WAIT_OBJECTS)
         {
@@ -16463,6 +16509,22 @@ static ULONG Init(void)
     // WM_DISPLAYCHANGE or Explorer SPI_SETWORKAREA broadcast would otherwise enter an
     // uninitialized CRITICAL_SECTION). CreateThread orders this write for the new thread.
     WorkAreaLockInit();
+
+    // AND THE LAUNCH-ELIGIBILITY EVENT MUST EXIST BEFORE THAT THREAD DOES, for the same reason as
+    // the lock above: both of its signalling paths live on the window-event thread - the work-area
+    // listener's WM_WTSSESSION_CHANGE and the shell-seen latch - and HelperLaunchEligibilityChanged
+    // is a no-op while the handle is NULL. Created here, a WTS_CONSOLE_CONNECT that arrives before
+    // the main loop is waiting is not lost: an auto-reset event stays signalled until a wait takes
+    // it. Created later (it first was, in WatchForEvents) that notification is DROPPED and the
+    // launch falls back to the report cadence - the exact defect this event removes.
+    // Jev flagged the window at race-exists 0.36 (scratchpad/jev-eventgate-out.json); this is it.
+    g_HelperEligibleEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (!g_HelperEligibleEvent)
+    {
+        // Not fatal, not silent: without it a first launch waits for the de-slice report cadence.
+        win_perror("CreateEvent(helper launch eligibility)");
+        LogError("no launch-eligibility event: a helper's first launch may wait for a timer");
+    }
 
     // Must be running before the main loop starts waiting on g_WindowEventSignal.
     status = StartWindowEventThread();
