@@ -88,8 +88,14 @@ int main(void)
     check("compose: the record is an ERROR, never a warning", ev.Type == EVENTLOG_ERROR_TYPE);
     check("compose: the id is the caller's", ev.EventId == DEATHEVENT_ID_GUI_AGENT);
     check("compose: %1 is the rendered text", ev.Strings[0] == ev.Text);
+    // THE SHIPPED WORDING, from deathevent.h's own format strings: "- after %s. ", not
+    // "- after running %s. ". agent fc94490 ("Say it in plain English, once") reworded the composer
+    // and these four text legs were never updated; the suite is not in tools/tests/offline-suites.txt,
+    // so nothing ran them and the rot stood. Compared over the literal's own length, so a future
+    // rewording fails on the text and not on a hand-counted prefix.
+    const WCHAR *openExp = L"The GUI agent (gui-agent.exe, PID 1234) exited without being asked to - exit code 0xC0000409 - after 0:12:34 (754000 ms). ";
     check("compose: text opens with the human name, then the exe and pid in brackets (the dom0 style)",
-          wcsncmp(ev.Text, L"The GUI agent (gui-agent.exe, PID 1234) exited without being asked to - exit code 0xC0000409 - after running 0:12:34 (754000 ms). ", 120) == 0);
+          wcsncmp(ev.Text, openExp, wcslen(openExp)) == 0);
     check("compose: text names the exe", has(ev.Text, L"gui-agent.exe"));
     check("compose: text names the pid", has(ev.Text, L"PID 1234"));
     check("compose: text carries the exit code as 0x%08X", has(ev.Text, L"0xC0000409"));
@@ -127,7 +133,7 @@ int main(void)
     check("unknown: exit code unknown -> %4 is the word", wcscmp(ev.Strings[3], L"unknown") == 0);
     check("unknown: text says exit code unknown", has(ev.Text, L"exit code unknown"));
     check("unknown: run time unknown -> %5 is the word", wcscmp(ev.Strings[4], L"unknown") == 0);
-    check("unknown: text says an unknown time", has(ev.Text, L"after running an unknown time"));
+    check("unknown: text says an unknown time", has(ev.Text, L"after an unknown time"));
     DeathEventCompose(&ev, DEATHEVENT_ID_WGCBROKER, L"wgcbroker.exe", 77, 0, 0, NULL);
     check("zero: exit code 0 is a real code (a clean exit nobody asked for), not unknown", wcscmp(ev.Strings[3], L"0x00000000") == 0);
     check("zero: 0 ms is a real run time, not unknown", wcscmp(ev.Strings[4], L"0") == 0);
@@ -140,7 +146,7 @@ int main(void)
     check("hang: %4 is the word hung", wcscmp(ev.Strings[3], L"hung") == 0);
     check("hang: text says it stopped answering and was ended by the GUI agent",
           has(ev.Text, L"The notification and menu capture helper (wgcbroker.exe, PID 4100) stopped answering and was ended by the GUI agent"));
-    check("hang: text says there is no exit code, and how long it ran", has(ev.Text, L"a hang, so there is no exit code - after running 0:02:05 (125000 ms)"));
+    check("hang: text says there is no exit code, and how long it ran", has(ev.Text, L"no exit code, a hang - after 0:02:05 (125000 ms)"));
     check("hang: text does NOT say it exited", !has(ev.Text, L"exited without being asked to"));
     check("hang: text does NOT say exit code unknown", !has(ev.Text, L"exit code unknown"));
     check("hang: the other fields are untouched (exe, pid, run time, detail)",
@@ -205,7 +211,7 @@ int main(void)
           has(g_strings[0], L"The notification bridge") && has(g_strings[0], L"notifhost.exe") &&
           has(g_strings[0], L"PID 4321") && has(g_strings[0], L"0x40010004"));
     check("teardown: the text says Windows ended it with the session",
-          has(g_strings[0], L"was ended by Windows when the session was torn down"));
+          has(g_strings[0], L"ended by Windows with the session"));
     check("teardown: and it NEVER claims anything died or is a major error",
           !has(g_strings[0], L"died") && !has(g_strings[0], L"major error") &&
           !has(g_strings[0], L"without being asked to"));
