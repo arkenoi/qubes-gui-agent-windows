@@ -3761,6 +3761,19 @@ static void BrokerSupervise(void)
         {
             _InterlockedExchange(&g_BrokerReady, 1);
             g_BrokerReadyAt = now;
+            // "0 ON READY", WHICH IS WHAT Init's COMMENT ALREADY PROMISES AND NOTHING DELIVERED.
+            // DesliceBrokerDown is PERSISTED config, written 1 (or 2, binary missing) on the
+            // hard-fail path. Init only zeroes it when the broker is NOT expected - "so acceptance
+            // never reads a stale value from a prior config" - and explicitly leaves the expected
+            // case to "BrokerSupervise (0 on ready, 1/2 on the hard-fail path)". But both clears
+            // below are gated on THIS boot's clock (g_BrokerDownSince / g_BrokerNextWarn), so an
+            // eligible guest whose broker comes up cleanly and never armed the clock wrote the flag
+            // NOWHERE and kept whatever a previous boot left. A guest that had one real outage then
+            // read as broken for ever, to the health check and to acceptance, while being healthy.
+            // Owner, 2026-10-24, predicting it: "i expect at least one logical defect in startup and
+            // shutdown process too". The flag is OWNED here now: ready means 0, unconditionally,
+            // once per broker start.
+            (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
 
             // A fresh instance answers every slot on its first pass: requests left outstanding by the previous one get
             // a fresh clock rather than being charged to this one.
