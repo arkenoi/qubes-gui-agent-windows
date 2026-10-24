@@ -12,7 +12,16 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  27u  /* 27: ReqCardValid - a zero-initialised slot is not a card at (0,0);
+#define WGCBRK_ABI_VERSION  28u  /* 28: CropWinValid - the SAME ambiguity as ReqCardValid in the
+                                  *     other direction: the broker writes CropWinX/Y only when
+                                  *     GetWindowRect succeeds, so a failure left them zero and the
+                                  *     agent's QGACROPFALLBACK read a healthy window as mis-cropped
+                                  *     on three cells of acceptance run 40037710497. Appended; take
+                                  *     the new sizeof(WGCBRK_SLOT) from the compiler, which
+                                  *     tools/tests/wgcbroker-layout-selftest.sh does - the padding
+                                  *     ABI 26 left over was consumed by ReqCardValid at 27, so this
+                                  *     one does grow the struct;
+                                  * 27: ReqCardValid - a zero-initialised slot is not a card at (0,0);
                                   *     the >= 0 test made the broker override a good crop with (0,0).
                                   *     Appended at offset 3468, which FILLS the padding ABI 26
                                   *     already carried, so sizeof(WGCBRK_SLOT) STAYS 3472 - it does
@@ -505,6 +514,27 @@ typedef struct _WGCBRK_SLOT {
      * A sentinel inside the value's own range is not a sentinel. This flag is written by the agent
      * on every registration AND every retarget, next to the fields it describes. */
     volatile LONG     ReqCardValid;
+    /* ABI 28: IS CropWinX/Y MEANINGFUL? 1 = yes, 0 = the broker had no window rect. THE SAME
+     * AMBIGUITY AS ReqCardValid, IN THE OTHER DIRECTION, and it produced the same false alarm.
+     *
+     * The broker publishes the origin only when GetWindowRect succeeds, so on failure CropWinX/Y
+     * keep what they held - zero on a fresh slot - and the agent's QGACROPFALLBACK, which computes
+     * `ReqCard - CropWin`, subtracts ZERO from a SCREEN coordinate and reports a healthy window as
+     * mis-cropped. MEASURED on acceptance run 40037710497 (4.3.37.1073), the ONLY breach in each of
+     * win11-clean, win11-reinstall and win11-appvm: `QGACROPFALLBACK hwnd=0x310232 card outside the
+     * capture - cropped 0,0 not 4740,1251`, where 4740,1251 is the card's real screen position -
+     * the same log carries `rect=4724,1221,5120,1392` for that window and `insets l=16 t=30`, and
+     * 4724+16, 1221+30 is exactly it. GetWindowRect was failing for that handle: the agent logged
+     * `inverted DWM bounds (5120,1392)-(5120,1392) and no usable GetWindowRect - rejecting` three
+     * times in the second before. Jev on the cause: cropwin-unwritten 1.00, card-position-garbage
+     * 0.00; on this fix shape, abi-validity-flag 0.86 against a sentinel at 0.11.
+     *
+     * THE COMMENT IN THE BROKER CLAIMED THIS WAS ALREADY CLOSED - "the origin is published
+     * unconditionally and the compare becomes exact in both directions" (2026-10-18). It was not
+     * unconditional: it was conditional on haveRect. That fix closed the "the derivation never ran"
+     * path and left "GetWindowRect failed" open, with the identical symptom. Written by the BROKER
+     * on every publish that reaches the crop step. */
+    volatile LONG     CropWinValid;
 } WGCBRK_SLOT;
 
 /* ABI 18: WGCBRK_HEADER.BrokerStage codes (bits 8+; the low 8 bits are the slot). */

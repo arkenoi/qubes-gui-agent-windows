@@ -5820,14 +5820,42 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
     // refused - the card is outside the captured texture - and it kept the racy inset, which is how
     // this surface published 31 frames of one colour while every counter said the capture was
     // healthy. Loud, because the alternative is a wrong rectangle that looks like a dead capture.
+    // AND CropWinX/Y MUST BE MEANINGFUL (ABI 28). The broker writes the origin only when
+    // GetWindowRect succeeds; on failure the fields keep their zero-initialised value, and
+    // `ReqCard - 0` is a SCREEN coordinate compared against a window-relative crop. That is not a
+    // mis-crop, it is an unknown origin, and reporting it as the first cost three cells of
+    // acceptance run 40037710497 their only breach: `cropped 0,0 not 4740,1251` on a toast whose
+    // card really was at 4740,1251 (the same log carries rect=4724,1221,5120,1392 and insets
+    // l=16 t=30), while the agent's own GetRealWindowRect was logging `no usable GetWindowRect -
+    // rejecting` for that handle. Jev: cropwin-unwritten 1.00 against card-position-garbage 0.00.
+    // The unknown-origin case is still RECORDED, at Debug and one-shot, because a crop derived from
+    // an inset is the pre-ABI-25 behaviour and is correct for a window nobody can place - but it is
+    // not the same event, and a warning that cannot be told apart from a real mis-crop is how the
+    // real one would get declared away.
     if (!e->PwCropFallbackLogged && s->ReqCardValid)
     {
-        const LONG wantX = s->ReqCardX - s->CropWinX, wantY = s->ReqCardY - s->CropWinY;
-        if (s->CropUsedX != wantX || s->CropUsedY != wantY)
+        if (!s->CropWinValid)
         {
             e->PwCropFallbackLogged = TRUE;
-            LogWarning("QGACROPFALLBACK hwnd=0x%x card outside the capture - cropped %d,%d not %d,%d",
-                       (DWORD)(ULONG_PTR)e->Handle, s->CropUsedX, s->CropUsedY, wantX, wantY);
+            LogDebug("QGACROPNOORIGIN hwnd=0x%x the broker has no window rect, so the crop is the "
+                     "agent's own inset (card %d,%d; used %d,%d)",
+                     (DWORD)(ULONG_PTR)e->Handle, s->ReqCardX, s->ReqCardY, s->CropUsedX, s->CropUsedY);
+        }
+        else
+        {
+            const LONG wantX = s->ReqCardX - s->CropWinX, wantY = s->ReqCardY - s->CropWinY;
+            if (s->CropUsedX != wantX || s->CropUsedY != wantY)
+            {
+                e->PwCropFallbackLogged = TRUE;
+                // THE INPUTS, NOT ONLY THE DIFFERENCE. The first version printed `cropped %d,%d not
+                // %d,%d`, where the second pair is `ReqCard - CropWin` - so the line that raised
+                // "is this a real card position or garbage?" could not answer it, and the answer
+                // had to be reconstructed from two other lines in the same log.
+                LogWarning("QGACROPFALLBACK hwnd=0x%x card outside the capture - cropped %d,%d not "
+                           "%d,%d (card %d,%d; window origin %d,%d)",
+                           (DWORD)(ULONG_PTR)e->Handle, s->CropUsedX, s->CropUsedY, wantX, wantY,
+                           s->ReqCardX, s->ReqCardY, s->CropWinX, s->CropWinY);
+            }
         }
     }
 
