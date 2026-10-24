@@ -4112,6 +4112,23 @@ static void BrokerSupervise(void)
     {
         g_WgcLaunched = TRUE;
         g_WgcLastLaunch = now;
+        // A NEW LAUNCH RESTARTS THE GRACE, and only the deadline moves - not the outage's start.
+        // MEASURED 2026-10-24, acceptance run 40037710497 win11-reinstall, on a build that already
+        // carried the pre-launch hold and the post-healthy anchor:
+        //     09:31:53  gui-agent pid 6524 starts and ADOPTS the broker left over from the previous
+        //               session, so g_BrokerReadyAt is set - this agent has had a working broker
+        //     09:32:09  that broker is gone with its session; the clock arms at `now` (correct: it
+        //               HAD been ready, so the outage starts now, not at some older launch)
+        //     09:32:15  a NEW launch is issued                      <- nothing re-anchored to it
+        //     09:32:39  QGADESLICEDOWN "not running for 30 s" at ERROR + a dom0 row
+        //     09:32:43  WGCBROKER ready (pid 8388 validated)        <- 4 s too late
+        // The new broker was given 24 s of its 30, because the deadline was counted from the moment
+        // the OLD one vanished. The 30 s exists so a launch can succeed without bothering the user,
+        // and a launch that has just gone out is exactly when that grace is owed.
+        // g_BrokerDownSince is deliberately NOT moved: the report's duration must stay true, so a
+        // broker that never comes up still says how long it has really been missing.
+        if (g_BrokerDownSince)
+            g_BrokerNextWarn = now + DESLICE_FIRST_WARN_MS;
         // ZERO THE SHARED PID, so "ready" can only mean the NEW instance published one - the same trap that made a
         // stale heartbeat certify a corpse as alive (measured 2026-09-08) - and every request clock starts fresh.
         WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
