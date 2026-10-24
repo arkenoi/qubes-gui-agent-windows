@@ -3648,6 +3648,23 @@ static BOOL g_WgcLaunchStallSaid = FALSE;  // QGABROKERLAUNCHNOTISSUED said once
 // again (Task Scheduler's recovery can bring it back without us asking, ADR-supervision 4) or a new
 // launch being issued. Never by time: a latch that expires is the defect it replaces.
 static BOOL g_BrokerStoodDown = FALSE;
+// HOW LONG A HOLD ACTUALLY LASTS, which nothing measured. Owner, 2026-10-24: "window holds that
+// stay longer than expected are very, very real product defect if they are authentic". He is right
+// and we could not have told: the ONLY line that carries a hold's duration is QGAHOLDSTARVED, whose
+// bound is QGA_HOLD_STARVE_MS (10 s), and it has been emitted ZERO times in every capture on this
+// rig. So a 150 ms hold and a 9.5 s hold were indistinguishable, and a 9.5 s held menu or toast is
+// exactly the defect he names. The per-window detail that would have shown it is at Debug, and
+// Debug is NOT EMITTED at the default LogLevel (measured: 0 D lines against 986 I in a real cell),
+// so it is absent from the evidence rather than merely quiet.
+// BUCKETS, NOT A NEW THRESHOLD. Nothing is gated on these - they describe the distribution so the
+// bound can be chosen FROM data instead of picked ("a bar you pick is not a measurement"). Reported
+// as ONE aggregate at most once a minute, the QGALEDGERSUM pattern, so there is no per-window noise.
+static LONG64 g_HoldRuns = 0;        // hold runs that RESOLVED (a frame arrived)
+static LONG64 g_HoldTotalMs = 0;     // their sum, so the mean is derivable
+static LONG64 g_HoldMaxMs = 0;       // the longest single resolved hold
+static LONG64 g_HoldOver250 = 0;     // ... of which over 250 ms
+static LONG64 g_HoldOver1s = 0;      // ... over 1 s
+static LONG64 g_HoldOver3s = 0;      // ... over 3 s: a user would see this one
 // THE PID OF A PROCESS WITH THIS IMAGE NAME, or 0. Two callers, both about UAC:
 //   - classifying a SECURE DESKTOP we are stuck on (owner, 2026-10-08: "if it sits on the uac
 //     prompt we need to know what path brought us there and how to handle it properly"), because
@@ -7851,6 +7868,14 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
                     (LONG64)g_PwLedgerEngineDamage, (LONG64)g_C8DrainVchanInput,
                     (LONG64)g_C8WorkAreaApplied, (LONG64)g_C8InputDesktop,
                     (LONG64)g_C8NonSeamlessDone, (LONG64)g_C8MapHoldRelease);
+            // AND THE HOLD DISTRIBUTION, same cadence, only when there is something to say - a
+            // desktop with no holds must not add a line a minute. max is the one that matters: a
+            // single long hold is a visible defect even when the mean is fine.
+            if (g_HoldRuns)
+                LogInfo("QGAHOLDSUM\truns=%lld\tmaxMs=%lld\ttotalMs=%lld"
+                        "\tover250=%lld\tover1s=%lld\tover3s=%lld",
+                        (LONG64)g_HoldRuns, (LONG64)g_HoldMaxMs, (LONG64)g_HoldTotalMs,
+                        (LONG64)g_HoldOver250, (LONG64)g_HoldOver1s, (LONG64)g_HoldOver3s);
         }
     }
     EnsureOnInputDesktop();
@@ -13207,6 +13232,16 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // disarms and QGAHOLDSTARVED can arm again for a LATER run. This is the reset
                     // that keeps the healthy-feed population (589 of 594 measured W lines) silent
                     // without needing the reason string to be trusted.
+                    if (entry->PwHoldSince)
+                    {
+                        const ULONGLONG heldMs = GetTickCount64() - entry->PwHoldSince;
+                        InterlockedIncrement64(&g_HoldRuns);
+                        InterlockedExchangeAdd64(&g_HoldTotalMs, (LONG64)heldMs);
+                        if ((LONG64)heldMs > g_HoldMaxMs) g_HoldMaxMs = (LONG64)heldMs;
+                        if (heldMs > 250)  InterlockedIncrement64(&g_HoldOver250);
+                        if (heldMs > 1000) InterlockedIncrement64(&g_HoldOver1s);
+                        if (heldMs > 3000) InterlockedIncrement64(&g_HoldOver3s);
+                    }
                     entry->PwHoldSince = 0;
                     entry->PwStarveReported = FALSE;
                 }
