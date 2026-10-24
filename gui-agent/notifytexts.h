@@ -103,11 +103,24 @@ static const QerrText QerrTexts[] = {
       QERR_GUI_AGENT_LOG ", line QGABROKERDIED", NULL },
 
     /* wgcbroker.exe is installed but has not been running for over 30 s on a system that needs it (log line
-     * QGADESLICEDOWN): the de-slice path is down and nothing of ours relaunches it. The gui-agent and
-     * wgcbroker logs have the sequence. */
+     * QGADESLICEDOWN): the de-slice path is down. The gui-agent and wgcbroker logs have the sequence.
+     *
+     * THE NEXT-STEP LINE WAS FALSE, and the owner received it. It said "Nothing of ours restarts it; it
+     * comes back when the GUI agent next starts", which contradicts docs/ADR-supervision.md 4 - a
+     * task-launched helper comes back through Task Scheduler's restart settings - AND main.c's own comment
+     * at the recovery path, "Task Scheduler restarted it (this agent relaunches nothing)". The sibling row
+     * deslice-down-died has said the true thing all along; this one is now the same sentence. "Nothing of
+     * ours relaunches it" is true of the AGENT (ADR-supervision 5) and was wrongly written as true of the
+     * product. Measured cost: the row reached the owner on a guest where a launch had already succeeded
+     * 4 s later, so both the condition AND the advice were wrong (findings/issues.md
+     * DESLICEDOWNFIRESWHILETHELAUNCHISINFLIGHT).
+     *
+     * WHEN THIS CAN STILL FIRE, after the stand-down latch (QgaDesliceSupervisionHeld): the broker was
+     * launched and never became ready. A deliberate stand-down no longer reaches here at all, and a death
+     * is reported by the death reporter instead (QgaDesliceOwnedByDeath). */
     { "deslice-down-present", "gui-agent", "deslice-down", QERR_SEV_ACTION, "gui-agent.exe", NULL,
       "The notification and menu capture helper is not running",
-      "Nothing of ours restarts it; it comes back when the GUI agent next starts.",
+      "Task Scheduler restarts it up to three times; nothing it captures reaches dom0 until then.",
       "Cause: wgcbroker.exe is installed, but its launch produced no broker.",
       QERR_GUI_AGENT_LOG ", line QGADESLICEDOWN", NULL },
 

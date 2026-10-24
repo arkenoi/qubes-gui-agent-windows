@@ -502,6 +502,55 @@ static __inline unsigned long long QgaDesliceAnchor(IN int launched, IN unsigned
 #endif
 }
 /* ---------------------------------------------------------------------------------------------
+ * A GRACEFUL STAND-DOWN IS ULTIMATE UNTIL SOMETHING STARTS IT AGAIN.
+ *
+ * Owner, 2026-10-24: "the proper fix is when the broker is told to go down, it stays down, no
+ * timer, no supervisor until next rearm" and "of course graceful shutdown should be ultimate until
+ * something starts it".
+ *
+ * WHAT WAS WRONG. BrokerSupervise already recognises a deliberate stand-down - QgaDecideHelperExit
+ * returns QGA_HELPER_EXPECTED_DISARMED, the caller logs "not a death" and returns - but it returned
+ * only from THAT pass. On the next wake g_BrokerReady is already 0, so the whole was-ready branch is
+ * skipped, control reaches `else if (!g_BrokerDownSince)`, the clock arms, and the complaint begins
+ * against a broker nobody wants running. QgaDesliceTeardownExcused did not cover it either: that
+ * holds while the session is ending or helpers are disarmed, and a broker stopped on purpose while
+ * the session continues is neither.
+ *
+ * So the stand-down has to be a LATCH, not a per-pass decision. While it is held there is no clock,
+ * no deadline, no re-warn and no dom0 row - supervision is not running at all. It clears on exactly
+ * one event: a new launch being issued. That is the "until next rearm" in the owner's words, and it
+ * is the only thing that can clear it - not a timer, not the shell appearing, not the broker being
+ * seen absent again.
+ *
+ * WHY A LATCH IS SAFE HERE. A broker that was never stood down is unaffected: stoodDown is 0 and
+ * this predicate holds nothing. A broker that genuinely dies is unaffected: QgaDecideHelperExit
+ * returns QGA_HELPER_DEATH, the latch is never set, and the death report and the de-slice clock both
+ * run as before. The only condition it silences is the one the agent itself asked for, which is the
+ * condition that was never a fault.
+ *
+ * IT IS NOT A MUTE. The caller still logs the stand-down, and it still clears the DesliceBrokerDown
+ * config flag that health-check and acceptance read - a flag left at 1 over a deliberate stop is a
+ * guest that reads as broken for ever. What goes away is a complaint about an absence that was
+ * requested, not the record of it.
+ */
+static __inline int QgaDesliceSupervisionHeld(IN int stoodDown, IN unsigned long long downSince,
+                                              IN unsigned long long now)
+{
+#ifdef QGA_LIFECYCLE_DEFECT_STANDDOWNEXPIRES
+    /* DEFECT: the hold lapses once the first warn interval has passed, so the complaint comes back
+     * on its own - which is the shape measured BEFORE the latch, where the stand-down held only for
+     * the pass that detected it. */
+    return (stoodDown && (downSince == 0 || (now - downSince) < 30000ULL)) ? 1 : 0;
+#else
+    /* TIME CANNOT END A STAND-DOWN, and taking no account of it is the whole decision: the inputs
+     * are accepted and deliberately unused so that a future reader cannot reintroduce a deadline
+     * here without deleting these lines. Only an event clears the latch, in the caller - a launch
+     * being issued, or the broker being seen alive - never the clock. */
+    (void)downSince; (void)now;
+    return stoodDown ? 1 : 0;
+#endif
+}
+/* ---------------------------------------------------------------------------------------------
  * ONE SITUATION IS ONE DOM0 NOTIFICATION.
  *
  * When the broker DIED, the death reporter already tells dom0 - by name, with the pid and the exit

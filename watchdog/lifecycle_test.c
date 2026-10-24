@@ -349,6 +349,31 @@ int main(void)
     check("deslice anchor: no launch yet anchors at now (nothing could have been running)",
           QgaDesliceAnchor(0, 0, 0, 55000) == 55000);
 
+    /* A GRACEFUL STAND-DOWN IS ULTIMATE until something starts it. Owner, 2026-10-24: "of course
+       graceful shutdown should be ultimate until something starts it" and "when the broker is told
+       to go down, it stays down, no timer, no supervisor until next rearm". The defect it replaces:
+       BrokerSupervise recognised the deliberate stand-down and returned from THAT pass only, so the
+       next wake found g_BrokerReady already 0, skipped the was-ready branch, armed the clock and
+       complained about a broker nobody wanted running. The latch's EVENTS live in main.c (set at the
+       non-death exit, cleared when the broker is seen alive or a launch is issued); what is pure, and
+       what is asserted here, is that NOTHING ABOUT TIME can end it. */
+    check("stand-down: held while nothing has started it",
+          QgaDesliceSupervisionHeld(1, 0, 0) == 1);
+    check("stand-down: STILL held an hour later - time cannot end it, which is the whole decision",
+          QgaDesliceSupervisionHeld(1, 1000, 1000 + 3600000ULL) == 1);
+    check("stand-down: still held long past the first warn interval (the pre-latch lapse point)",
+          QgaDesliceSupervisionHeld(1, 1000, 1000 + 30001ULL) == 1);
+    check("stand-down: a broker that was never stood down is supervised normally",
+          QgaDesliceSupervisionHeld(0, 0, 500000) == 0);
+    check("stand-down: and not held for a never-stood-down broker however long it has been down",
+          QgaDesliceSupervisionHeld(0, 1000, 1000 + 3600000ULL) == 0);
+    /* AND IT MUST NOT SILENCE A REAL OUTAGE: the only thing the latch gates is the condition the
+       agent itself asked for. A death keeps its own path - QgaDecideHelperExit returns
+       QGA_HELPER_DEATH, the latch is never set, and the clock and the report run as before. */
+    check("stand-down: a death is not a stand-down, so it is still supervised",
+          QgaDecideHelperExit(0, 1, 0xC0000005u) == QGA_HELPER_DEATH &&
+          QgaDesliceSupervisionHeld(0, 1000, 1000 + 60000ULL) == 0);
+
     /* ONE SITUATION, ONE DOM0 ROW. Measured 2026-10-23: one injected broker death produced BOTH
        `gui-agent.deslice-down` and `wgcbroker.death-1`, two seconds apart. Jev 1.00 that the
        de-slice row is the one to drop. */

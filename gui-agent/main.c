@@ -3643,6 +3643,11 @@ static BOOL NotifyWouldInterruptStartup(void)
 }
 static BOOL g_WgcLaunched = FALSE;      // the ONE launch this agent performs (HELPER LIFECYCLE above)
 static BOOL g_WgcLaunchStallSaid = FALSE;  // QGABROKERLAUNCHNOTISSUED said once per agent life
+// TOLD TO GO DOWN, SO IT STAYS DOWN (QgaDesliceSupervisionHeld). Set when the broker's exit is a
+// deliberate stand-down rather than a death; cleared ONLY by an event - the broker being seen alive
+// again (Task Scheduler's recovery can bring it back without us asking, ADR-supervision 4) or a new
+// launch being issued. Never by time: a latch that expires is the defect it replaces.
+static BOOL g_BrokerStoodDown = FALSE;
 // THE PID OF A PROCESS WITH THIS IMAGE NAME, or 0. Two callers, both about UAC:
 //   - classifying a SECURE DESKTOP we are stuck on (owner, 2026-10-08: "if it sits on the uac
 //     prompt we need to know what path brought us there and how to handle it properly"), because
@@ -3767,6 +3772,7 @@ static void BrokerSupervise(void)
             g_BrokerDownSince = 0; g_BrokerNextWarn = 0;
             (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
         }
+        g_BrokerStoodDown = FALSE;    // running, whoever started it - a LATER outage is reportable again
         WgcArenaReapPending(FALSE);   // regions whose unregister the broker has acknowledged (R4)
         BrokerReportDeaf();
         return;
@@ -3775,6 +3781,20 @@ static void BrokerSupervise(void)
     // enforce autologon with one user, so neither occurs), a CRASH is essentially the only way a ready broker dies,
     // which makes this the realistic case - and since 2026-10-07 nothing here relaunches it: Task Scheduler does
     // (restart-on-failure), or nothing does, and the record below is what says it happened.
+    // A GRACEFUL STAND-DOWN IS ULTIMATE: no clock, no deadline, no re-warn, no dom0 row, until
+    // something starts it. Placed after the alive branch (which clears the latch) and before every
+    // arming branch below, because the defect was that the stand-down held only for the pass that
+    // detected it - the next wake found g_BrokerReady already 0, skipped the was-ready branch,
+    // reached `else if (!g_BrokerDownSince)` and armed the clock against a broker nobody wanted
+    // running. g_BrokerReady was already exchanged to 0 on the pass that set the latch, so returning
+    // here cannot leave a dead broker suppressing windows. Owner 2026-10-24: "of course graceful
+    // shutdown should be ultimate until something starts it".
+    if (QgaDesliceSupervisionHeld(g_BrokerStoodDown ? 1 : 0, g_BrokerDownSince, now))
+    {
+        LogDebug("QGADESLICESTOODDOWN supervision held: the broker was told to go down and nothing has "
+            L"started it since - no clock, no deadline, no report");
+        return;
+    }
     if (_InterlockedExchange(&g_BrokerReady, 0) != 0)
     {
         // qga-lifecycle.h holds the decision and the offline suite holds its rows; `brokerExited` is FALSE on the
@@ -3798,6 +3818,17 @@ static void BrokerSupervise(void)
                 DeathEventReportTeardown(DEATHEVENT_ID_WGCBROKER, L"wgcbroker.exe", (DWORD)pidBefore,
                     brokerExitCode, g_BrokerReadyAt != 0 ? now - g_BrokerReadyAt : DEATHEVENT_RAN_UNKNOWN,
                     L"Windows ended it with the session. gui-agent log line WGCBROKERSYSKILL.");
+            }
+            // THE STAND-DOWN LATCHES HERE, for EITHER non-death verdict: this block is the one place
+            // that knows the absence was asked for, and everything below treats an absent broker as a
+            // fault. The down-clock goes with it, and so does DesliceBrokerDown - a flag left at 1
+            // over a deliberate stop makes health-check and acceptance read a healthy guest as broken
+            // for ever.
+            g_BrokerStoodDown = TRUE;
+            if (g_BrokerDownSince || g_BrokerNextWarn)
+            {
+                g_BrokerDownSince = 0; g_BrokerNextWarn = 0;
+                (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
             }
             if (g_WgcBrokerProc) { CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
                                    _InterlockedExchange(&g_WgcBrokerPidValidated, 0); }
@@ -4112,6 +4143,10 @@ static void BrokerSupervise(void)
     {
         g_WgcLaunched = TRUE;
         g_WgcLastLaunch = now;
+        // AND THIS IS THE REARM. A launch is the event the stand-down latch waits for: "no timer, no
+        // supervisor until next rearm" (owner, 2026-10-24). Supervision resumes from here, so a broker
+        // that was deliberately stopped and is now being started again is supervised normally.
+        g_BrokerStoodDown = FALSE;
         // A NEW LAUNCH RESTARTS THE GRACE, and only the deadline moves - not the outage's start.
         // MEASURED 2026-10-24, acceptance run 40037710497 win11-reinstall, on a build that already
         // carried the pre-launch hold and the post-healthy anchor:
