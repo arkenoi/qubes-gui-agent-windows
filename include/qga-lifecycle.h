@@ -1168,9 +1168,21 @@ static __inline QGA_CARD_RULE QgaCardRuleForSurface(IN int kind, IN BOOL isMenuP
 
 /* NO DEFECT KNOB HERE, deliberately: the owner's standing rule is to ask before adding one, and
  * both facts this predicate reads are plain arguments the offline suite can drive directly. */
+/* WHY THIS HAS A KNOB, added 2026-10-24. QGAHOLDSTARVED has been emitted ZERO times in every capture
+ * on this rig, and that zero was about to be used as the evidence that a BROKERHOLD hold is a benign
+ * transient - 117 of 117 of them carry why=slot-ack-pending and none ever outlasted this bound. Jev
+ * scored that reasoning 0.49: a never-fired detector cannot distinguish a condition that does not
+ * happen from a detector that cannot fire. This predicate had NO test at all, so the zero meant
+ * nothing. It means something now. */
 static __inline BOOL QgaHoldStarveDue(IN unsigned long long holdSince, IN unsigned long long lastContent,
                                       IN unsigned long long now, IN unsigned long long boundMs)
 {
+#ifdef QGA_LIFECYCLE_DEFECT_STARVENEVERDUE
+    /* DEFECT: the inert detector - exactly the shape a zero emitted-count cannot tell apart from a
+     * condition that never occurs. */
+    (void)holdSince; (void)lastContent; (void)now; (void)boundMs;
+    return FALSE;
+#else
     unsigned long long from;
     if (holdSince == 0)
         return FALSE;                       /* not holding: no clock, nothing to declare */
@@ -1180,6 +1192,7 @@ static __inline BOOL QgaHoldStarveDue(IN unsigned long long holdSince, IN unsign
                                              * with nothing on screen cannot show STALE pixels */
     from = (lastContent > holdSince) ? lastContent : holdSince;
     return (BOOL)(now > from && (now - from) >= boundMs);
+#endif
 }
 
 static __inline BOOL QgaHoldReasonIsNormal(IN const WCHAR* why)

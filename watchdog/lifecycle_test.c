@@ -349,6 +349,26 @@ int main(void)
     check("deslice anchor: no launch yet anchors at now (nothing could have been running)",
           QgaDesliceAnchor(0, 0, 0, 55000) == 55000);
 
+    /* THE STARVATION DETECTOR, WHOSE ZERO FIRINGS WERE ABOUT TO BE USED AS EVIDENCE.
+       QGAHOLDSTARVED has been emitted 0 times in every capture on this rig, and BROKERHOLD holds
+       occur 117 times (all why=slot-ack-pending), so "the hold is a benign transient" rested entirely
+       on this predicate having never said otherwise - while the predicate had no test at all. Jev
+       scored that 0.49: a never-fired detector cannot be told apart from one that cannot fire. The
+       bound is QGA_HOLD_STARVE_MS = 10000 ms; ticks below are ms. */
+    check("starve: holding, content older than the bound - THE FIRING CASE",
+          QgaHoldStarveDue(1000, 1000, 1000 + 10000, 10000) == TRUE);
+    check("starve: one ms inside the bound is NOT due",
+          QgaHoldStarveDue(1000, 1000, 1000 + 9999, 10000) == FALSE);
+    check("starve: not holding at all declares nothing",
+          QgaHoldStarveDue(0, 5000, 100000, 10000) == FALSE);
+    check("starve: a window that never had painted content cannot show STALE pixels (QGADIRECTSUPPRESS owns it)",
+          QgaHoldStarveDue(1000, 0, 1000 + 60000, 10000) == FALSE);
+    check("starve: content arriving AFTER the hold began restarts the clock from the content",
+          QgaHoldStarveDue(1000, 9000, 9000 + 9999, 10000) == FALSE &&
+          QgaHoldStarveDue(1000, 9000, 9000 + 10000, 10000) == TRUE);
+    check("starve: a clock that went backwards is not due (now <= from)",
+          QgaHoldStarveDue(50000, 50000, 40000, 10000) == FALSE);
+
     /* A GRACEFUL STAND-DOWN IS ULTIMATE until something starts it. Owner, 2026-10-24: "of course
        graceful shutdown should be ultimate until something starts it" and "when the broker is told
        to go down, it stays down, no timer, no supervisor until next rearm". The defect it replaces:
