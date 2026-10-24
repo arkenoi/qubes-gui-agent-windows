@@ -15940,15 +15940,19 @@ static ULONG WINAPI WatchForEvents(void)
     }
 }
 
-static DWORD GetDomainName(OUT char *nameBuffer, IN DWORD nameLength)
+// TAKES THE SESSION, DOES NOT OPEN ONE. Owner, 2026-10-24: "reuse the connection whenever possible".
+// There is no graceful close in the qubesdb protocol - it is QDB_CMD_{READ,WRITE,RM,LIST,MULTIREAD,
+// WATCH,UNWATCH} and no goodbye - so every close costs the daemon one `W pipe_thread_client: QpsRead
+// from client N failed: 109`, and the only lever is fewer sessions. Init opens ONE and passes it here.
+// The caller still treats a failed open as a hard failure (watchdog respawn), which is the
+// distinction GetGuiDomainId's comment below depends on.
+static DWORD GetDomainName(IN qdb_handle_t qdb, OUT char *nameBuffer, IN DWORD nameLength)
 {
     DWORD status = ERROR_SUCCESS;
-    qdb_handle_t qdb = NULL;
     char *domainName = NULL;
 
-    qdb = qdb_open(NULL);
     if (!qdb)
-        return win_perror("qdb_open");
+        return win_perror2(ERROR_INVALID_HANDLE, "GetDomainName: no qubesdb session");
 
     domainName = qdb_read(qdb, "/name", NULL);
     if (!domainName)
@@ -15965,22 +15969,23 @@ static DWORD GetDomainName(OUT char *nameBuffer, IN DWORD nameLength)
 
 cleanup:
     qdb_free(domainName);
-    if (qdb)
-        qdb_close(qdb);
+    /* the session belongs to Init, which closes it after the last reader */
 
     return status;
 }
 
-static DWORD GetGuiDomainId(OUT USHORT* gid)
+// TAKES THE SESSION (see GetDomainName). THE FAILED-OPEN DISTINCTION IS PRESERVED AT THE CALLER:
+// Init's qdb_open failure is still win_perror + a hard failure with the watchdog's respawn, and it is
+// still a DIFFERENT outcome from the key being absent, which is QGA_EXIT_NO_GUI_DOMAIN below. Reading
+// this function alone no longer shows that, so it is said here.
+static DWORD GetGuiDomainId(IN qdb_handle_t qdb, OUT USHORT* gid)
 {
     DWORD status = ERROR_SUCCESS;
-    qdb_handle_t qdb = NULL;
     char *string_id = NULL;
     int id = 0;
 
-    qdb = qdb_open(NULL);
     if (!qdb)
-        return win_perror("qdb_open");
+        return win_perror2(ERROR_INVALID_HANDLE, "GetGuiDomainId: no qubesdb session");
 
     string_id = qdb_read(qdb, "/qubes-gui-domain-xid", NULL);
     if (!string_id)
@@ -16010,8 +16015,7 @@ static DWORD GetGuiDomainId(OUT USHORT* gid)
 
 cleanup:
     qdb_free(string_id);
-    if (qdb)
-        qdb_close(qdb);
+    /* the session belongs to Init, which closes it after the last reader */
 
     return status;
 }
@@ -16459,7 +16463,14 @@ static ULONG Init(void)
         }
         if (uacOff) free(uacOff);
     }
-    qdb_close(gateQdb);   // last dom0 service gate read
+    // NOT CLOSED HERE ANY MORE. This was "last dom0 service gate read", and it was - but
+    // GetDomainName and GetGuiDomainId then opened a session each of their own, a hundred lines
+    // below, inside this same single-threaded Init. Three sessions where one does, and each close
+    // costs the daemon a WARNING it has no protocol way to avoid (owner, 2026-10-24: "reuse the
+    // connection whenever possible"). The session now lives until the last reader and is closed
+    // there, on every path: no `return` or `goto` exists between here and that point (asserted by
+    // tools/tests/lifecycle-selftest.sh), and the six gate-read failure arms above close it
+    // themselves before returning.
 
     DWORD stagingGrant;
     status = CfgReadDword(moduleName, REG_CONFIG_STAGING_VALUE, &stagingGrant, NULL);
@@ -16532,7 +16543,7 @@ static ULONG Init(void)
         // try to continue
     }
 
-    status = GetDomainName(g_DomainName, RTL_NUMBER_OF(g_DomainName));
+    status = GetDomainName(gateQdb, g_DomainName, RTL_NUMBER_OF(g_DomainName));
     if (ERROR_SUCCESS != status)
     {
         LogWarning("Failed to read domain name, using host name");
@@ -16553,7 +16564,10 @@ static ULONG Init(void)
         }
     }
 
-    status = GetGuiDomainId(&g_GuiDomainId);
+    status = GetGuiDomainId(gateQdb, &g_GuiDomainId);
+    // THE ONE CLOSE, and it is BEFORE the status check so no path leaks the session: the next line
+    // returns on failure. Last reader of Init's qubesdb session.
+    qdb_close(gateQdb);
     if (status != ERROR_SUCCESS)
         return status;
 

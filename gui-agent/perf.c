@@ -316,8 +316,26 @@ void PerfInit(void)
     // logging - with no guest-side registry surgery. Same dom0-owned pattern as
     // enableWinKey/gui-fullscreen: dom0 wins over the registry base in BOTH directions
     // ("0" forces the diagnostics off); absent keeps the base. Read once here at Init.
+    // ONE SESSION FOR EVERY READ IN THIS FUNCTION. Owner, 2026-10-24: "can we make qubesdb
+    // interaction more graceful without abruptly ending the connection? is there normal close
+    // channel?" and "reuse the connection whenever possible".
+    // THERE IS NO GRACEFUL CLOSE, so reuse is the only lever. The wire protocol is exactly
+    // QDB_CMD_{READ,WRITE,RM,LIST,MULTIREAD,WATCH,UNWATCH} with no goodbye, so qdb_close has
+    // nothing to send: on Windows it FlushFileBuffers(write_pipe) then CloseHandle on both pipes,
+    // and the daemon's reader - blocked in a read on that pipe - gets ERROR_BROKEN_PIPE and logs
+    // `W pipe_thread_client: QpsRead from client N failed: 109`. One WARNING per session,
+    // structurally, and it cannot be made polite from this side.
+    // MEASURED (win11-reinstall of run 40037710497): 60 connects -> 58 disconnects -> 58 warnings,
+    // strict 1:1:1, and EVERY connect line says `connected (1 total)` - never two clients at once,
+    // which is the proof that nothing anywhere held a handle. Twelve land in 4.0 s at this agent's
+    // Init, and PerfInit opened TWO of them by itself, a hundred lines apart, both single-threaded
+    // Init-time reads. One handle serves both; it is closed once, at the end of this function.
+    qdb_handle_t initQdb = qdb_open(NULL);
+    if (!initQdb)
+        LogWarning("QGAQDBINIT could not open qubesdb for the Init-time reads - each is skipped and "
+            "the dom0-owned switches keep their registry or default values");
     {
-        qdb_handle_t qdb = qdb_open(NULL);
+        qdb_handle_t qdb = initQdb;
         if (qdb)
         {
             char *dv = qdb_read(qdb, "/qubes-service/gui-agent-debug", NULL);
@@ -332,7 +350,7 @@ void PerfInit(void)
                     "(perf frames + proto traces + debug level)", dv, dbg ? L"ON" : L"OFF");
                 free(dv);
             }
-            qdb_close(qdb);
+            /* not closed here - one session spans both Init reads (closed at the end) */
         }
     }
 
@@ -419,7 +437,7 @@ void PerfInit(void)
         // shell - OpenShell and friends - where the Super key is how the user opens their menu and
         // swallowing it makes the shell unusable.
         {
-            qdb_handle_t qdb = qdb_open(NULL);
+            qdb_handle_t qdb = initQdb;   /* the same session as the read above */
             if (qdb)
             {
                 // Same dom0-owned pattern as enableWinKey: `service.`-prefixed features are the
@@ -443,7 +461,8 @@ void PerfInit(void)
                     LogInfo("QGABLOCKWIN qubesdb enableWinKey=%S -> block %s", v, blk ? L"on" : L"off");
                     free(v);
                 }
-                qdb_close(qdb);
+                /* not closed here: this block is two conditionals deep, so closing the shared
+                 * session here would leak it on every path that skips the block. */
             }
         }
 
@@ -584,6 +603,10 @@ void PerfInit(void)
         g_PerfFreq, g_PerfEveryN, qpcCostNs, QGA_PERF_DEFAULT, sink);
     LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,drq,upd,enu,rem,dmg,snd,tot,dr,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwoff,pwocc,pwnofg,pwovl,pwfirst,pwchg,frdrop,ddacap,ddmov,ddgeo,ddoff,ddlay,ddfg,ddovl,log (times in microseconds)",
         PERF_RECORD_VERSION);
+
+    // THE ONE CLOSE, on the single exit every caller reaches. qdb_close is a no-op on NULL, so
+    // the could-not-open case above needs no guard.
+    qdb_close(initQdb);
 }
 
 void PerfNoteSkippedFrame(void)
