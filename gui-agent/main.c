@@ -10636,6 +10636,16 @@ static HWND g_LastPopupDamageWindow = NULL;
 // per-window buffer and send the matching window-relative damage. Clips to the screen,
 // the window rect, and the granted buffer geometry; silently skips when the frame is
 // not mapped (content then arrives with the next mapped frame).
+// A copy the primitive REFUSED to make. Counted, not silent: PwLedgerCopies is incremented on
+// entry (it is the "did the primitive fire" discriminator that PwLedgerNone depends on), so a
+// refusal has to be recorded somewhere or the global invariant reads it as a copy nobody
+// claimed. Returning FALSE from here keeps each refusal site a single statement.
+static __inline BOOL PwLedgerRefuse(IN OUT WINDOW_DATA* entry)
+{
+    if (entry) entry->PwLedgerRefused++;
+    return FALSE;
+}
+
 // Source-parameterized slice copy. srcOrigin is the SCREEN coordinate that maps to source
 // pixel (0,0): (0,0) for the full-screen desktop mirror (screen-relative indexing, the legacy
 // behavior), or (entry->X, entry->Y) for a WGC broker frame (window-relative). The DESTINATION
@@ -10650,25 +10660,25 @@ static BOOL PwSliceCopyAndDamageSrc(IN OUT WINDOW_DATA* entry, IN const BYTE* sr
     if (entry) entry->PwLedgerCopies++;
 
     if (!srcBase || srcPitch <= 0 || !entry->PwBuffer)
-        return FALSE;
+        return PwLedgerRefuse(entry);
 
     RECT screenR = { 0, 0, (LONG)min(g_ScreenWidth, g_FbWidth), (LONG)min(g_ScreenHeight, g_FbHeight) };
     RECT winR = { entry->X, entry->Y,
                   entry->X + (int)entry->PwWidth, entry->Y + (int)entry->PwHeight };
     RECT r;
     if (!IntersectRect(&r, area, &winR))
-        return FALSE;
+        return PwLedgerRefuse(entry);
     if (!IntersectRect(&r, &r, &screenR))
-        return FALSE;
+        return PwLedgerRefuse(entry);
 
     int relX = r.left - entry->X;
     int relY = r.top - entry->Y;
     int w = r.right - r.left;
     int h = r.bottom - r.top;
     if (relX < 0 || relY < 0 || w <= 0 || h <= 0)
-        return FALSE;
+        return PwLedgerRefuse(entry);
     if ((ULONG)(relX + w) > entry->PwWidth || (ULONG)(relY + h) > entry->PwHeight)
-        return FALSE; // buffer geometry changed underneath; next full copy repaints
+        return PwLedgerRefuse(entry); // buffer geometry changed underneath; next full copy repaints
 
     const BYTE* src = srcBase +
         (size_t)(r.top - srcOriginY) * srcPitch + (size_t)(r.left - srcOriginX) * 4;
@@ -10718,7 +10728,7 @@ static BOOL PwBrokerCopyDiff(IN OUT WINDOW_DATA* entry, IN const BYTE* srcBase, 
 {
     if (entry) entry->PwLedgerCopies++;
     if (!srcBase || srcPitch <= 0 || !entry->PwBuffer)
-        return FALSE;
+        return PwLedgerRefuse(entry);
     // The SCREEN, not the published desktop image (g_FbWidth/g_FbHeight): this source is the window's own frame, and on
     // 26100+ in seamless no desktop image is published at all (rest-zero S2), so those read 0 and clipped every copy to
     // nothing - every window held black, then declared (QGADIRECTSUPPRESS 8 of 8, rz3 on w11-ds, 2026-10-01). While a
@@ -10727,15 +10737,15 @@ static BOOL PwBrokerCopyDiff(IN OUT WINDOW_DATA* entry, IN const BYTE* srcBase, 
     RECT winR = { entry->X, entry->Y, entry->X + (int)entry->PwWidth, entry->Y + (int)entry->PwHeight };
     RECT r;
     if (!IntersectRect(&r, area, &winR) || !IntersectRect(&r, &r, &screenR))
-        return FALSE;
+        return PwLedgerRefuse(entry);
     const int relX = r.left - entry->X;
     const int relY = r.top - entry->Y;
     const int w = r.right - r.left;
     const int h = r.bottom - r.top;
     if (relX < 0 || relY < 0 || w <= 0 || h <= 0)
-        return FALSE;
+        return PwLedgerRefuse(entry);
     if ((ULONG)(relX + w) > entry->PwWidth || (ULONG)(relY + h) > entry->PwHeight)
-        return FALSE; // buffer geometry changed underneath; the next full frame repaints
+        return PwLedgerRefuse(entry); // buffer geometry changed underneath; the next full frame repaints
     const BYTE* src = srcBase + (size_t)relY * srcPitch + (size_t)relX * 4;
     BYTE* dst = (BYTE*)entry->PwBuffer + ((size_t)relY * entry->PwWidth + (size_t)relX) * 4;
     const size_t rowBytes = (size_t)w * 4;
@@ -11767,17 +11777,21 @@ static void PwLedgerAccount(IN OUT WINDOW_DATA* entry)
     entry->PwLedgerCopiesPrev = entry->PwLedgerCopies;
     // The invariant is now GLOBAL rather than per-pass: every copy the primitive performed must be
     // claimed by exactly one source counter. An excess means a call site nobody instrumented.
-    if (entry->PwLedgerCopies <= attributed)
+    // REFUSALS ARE ACCOUNTED FOR, NOT ATTRIBUTED. PwLedgerCopies counts entries into the copy
+    // primitives; the source counters count copies that completed. The difference is the
+    // refusals, and until they were counted every refused copy read as an uninstrumented site
+    // (QGALEDGERGAP hwnd=0x1021c copies=4 attributed=3, acceptance 40142194040, 2026-10-25).
+    if (entry->PwLedgerCopies <= attributed + entry->PwLedgerRefused)
         return;
-    entry->PwLedgerUnattributed = entry->PwLedgerCopies - attributed;
+    entry->PwLedgerUnattributed = entry->PwLedgerCopies - attributed - entry->PwLedgerRefused;
     if (!entry->PwLedgerUnattributedLogged)
     {
         entry->PwLedgerUnattributedLogged = TRUE;
         // Stage 1 cannot be accepted while this fires; the gap names the window class to go and find it in.
-        LogWarning("QGALEDGERGAP hwnd=0x%x class=%d copies=%llu attributed=%llu unattributed=%llu, "
-            "a pixel copy site is not instrumented",
+        LogWarning("QGALEDGERGAP hwnd=0x%x class=%d copies=%llu attributed=%llu refused=%llu "
+            "unattributed=%llu, a pixel copy site is not instrumented",
             (DWORD)(ULONG_PTR)entry->Handle, (int)entry->PwLedgerClass,
-            entry->PwLedgerCopies, attributed, entry->PwLedgerUnattributed);
+            entry->PwLedgerCopies, attributed, entry->PwLedgerRefused, entry->PwLedgerUnattributed);
     }
 }
 
@@ -11788,13 +11802,14 @@ void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason)
     if (!entry || !entry->PwLedgerFramesSeen) return;
     LogDebug("QGALEDGER\thwnd=0x%x\tclass=%d\treason=%S\tseen=%llu\tbrokerWgc=%llu\tbrokerPw=%llu"
             "\tddaSlice=%llu\tddaOwned=%llu\tdragSlice=%llu"
-            "\tsynth=%llu\tnone=%llu\tcopies=%llu\tengineFed=%d\tengineDamageTotal=%lld"
+            "\tsynth=%llu\tnone=%llu\tcopies=%llu\trefused=%llu\tengineFed=%d\tengineDamageTotal=%lld"
             "\tunattributed=%llu",
             (DWORD)(ULONG_PTR)entry->Handle, (int)entry->PwLedgerClass, reason ? reason : L"-",
             entry->PwLedgerFramesSeen, entry->PwLedgerBrokerWgc, entry->PwLedgerBrokerPw,
             entry->PwLedgerDdaSlice, entry->PwLedgerDdaOwned, entry->PwLedgerDragSlice,
             entry->PwLedgerSynth,
-            entry->PwLedgerNone, entry->PwLedgerCopies, entry->PwLedgerEngineFed ? 1 : 0,
+            entry->PwLedgerNone, entry->PwLedgerCopies, entry->PwLedgerRefused,
+            entry->PwLedgerEngineFed ? 1 : 0,
             (LONG64)g_PwLedgerEngineDamage, entry->PwLedgerUnattributed);
 }
 
@@ -11822,7 +11837,11 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
         entry->PwSliceNeedsFull = FALSE;
         entry->PwBrokerLastId = bid;
         if (entry->PwBrokerFrames < 0xFFFFFFFFu) entry->PwBrokerFrames++;
-        PwBrokerCopyDiff(entry, bsrc, bpitch, &pwRect);
+        // The RETURN VALUE is load-bearing: the attribution below must count a frame that
+        // actually landed, not an attempt. Discarding it counted refused copies as delivered
+        // broker frames - the mirror image of QGALEDGERGAP, and the quieter one, because an
+        // inflated success breaches nothing (PWLEDGERCOUNTSATTEMPTS, 2026-10-25).
+        const BOOL brokerCopied = PwBrokerCopyDiff(entry, bsrc, bpitch, &pwRect);
         // Buffer is complete for this window: square off DWM's black rounded
         // corners before the content check judges it.
         FlattenBufferCorners(entry);
@@ -11844,8 +11863,11 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
             const WGCBRK_SLOT* ls = (g_WgcBase && entry->PwBrokerSlot >= 0 &&
                                      entry->PwBrokerSlot < WGCBRK_MAX_SLOTS)
                 ? &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot] : NULL;
-            if (ls && ls->TickPw) entry->PwLedgerBrokerPw++;
-            else                    entry->PwLedgerBrokerWgc++;
+            // A refusal is already counted by PwLedgerRefuse inside the primitive; counting it
+            // here as well would claim a frame that never reached the granted buffer.
+            if (!brokerCopied)         { /* refused: counted as a refusal, not as a frame */ }
+            else if (ls && ls->TickPw) entry->PwLedgerBrokerPw++;
+            else                       entry->PwLedgerBrokerWgc++;
         }
         if (firstBrokerFrame)
         {

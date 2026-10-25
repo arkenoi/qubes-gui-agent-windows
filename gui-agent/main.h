@@ -614,6 +614,10 @@ typedef struct _WINDOW_DATA
     //     for them. They are OUT OF SCOPE for stage 1 and the scope statement says so, rather than
     //     being represented by a zero.
     ULONG64 PwLedgerSynth;               // C6: synth composite patched into the owner's buffer
+    // C7: the primitive was ENTERED and refused by its own precondition - no pixels moved.
+    // Not a source: it is the difference between an attempt and a copy, and without it every
+    // refusal read as an uninstrumented copy site (QGALEDGERGAP on a toast, 2026-10-25).
+    ULONG64 PwLedgerRefused;
     ULONG64 PwLedgerNone;                // mapped, pass ran, nothing filled it
     ULONG64 PwLedgerUnattributed;        // INVARIANT BREACH: a copy site is not instrumented
     BOOL    PwLedgerUnattributedLogged;  // one loud line per window, not a flood
