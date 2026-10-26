@@ -4260,7 +4260,9 @@ static void BrokerSupervise(void)
         // distinct launch->ready pairs across 440 distinct gui-agent logs on this rig the spread is
         // min 0.17, median 4.85, p90 13.24, p99 22.83, max 31.33 s, and exactly ONE exceeds 30 s - by
         // 1.33 s, which is inside that jitter. There is no measurement here that convicts the 30 s.
-        g_WgcLastLaunch = GetTickCount64();
+        // THE STAMPS ARE TAKEN WHERE THE LAUNCH FINISHES, NOT HERE - see below. This position is
+        // BEFORE WgcLaunch(), which is the call that registers the task and starts it, so a tick
+        // taken here is "about to launch", not "launched".
         // AND THIS IS THE REARM. A launch is the event the stand-down latch waits for: "no timer, no
         // supervisor until next rearm" (owner, 2026-10-24). Supervision resumes from here, so a broker
         // that was deliberately stopped and is now being started again is supervised normally.
@@ -4292,15 +4294,39 @@ static void BrokerSupervise(void)
         // Fixing g_WgcLastLaunch moved the ANCHOR (the duration the report prints) and left the
         // DEADLINE on the stale value, because they are two assignments in two places and only one
         // was read. Both are now the same fresh tick.
-        if (g_BrokerDownSince)
-            g_BrokerNextWarn = GetTickCount64() + DESLICE_FIRST_WARN_MS;
+        const BOOL _rearmGrace = (g_BrokerDownSince != 0);
         // ZERO THE SHARED PID, so "ready" can only mean the NEW instance published one - the same trap that made a
         // stale heartbeat certify a corpse as alive (measured 2026-09-08) - and every request clock starts fresh.
         WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
         for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
             if (g_SlotCtlSince[i]) g_SlotCtlSince[i] = now;
         // A failed launch is not retried - no relaunch loop (owner 2026-10-07); QGADESLICEDOWN keeps saying so.
-        if (WgcLaunch()) g_WgcSession = sid;
+        const BOOL _launched = WgcLaunch();
+        // THE LAUNCH IS ISSUED WHEN WgcLaunch RETURNS, and that is the only tick that can anchor
+        // "has not been running for N s". MEASURED 2026-10-26 by the metering branch, which is the
+        // only reason this was found - two fixes and a review had already accepted the wrong story:
+        //     171613.827  QGAMETERDESLICEARM pass_now=101390 fresh=101390 armed=0 downsince=0
+        //     171615.024  QGAMETERHELPERTASK Qubes-WgcBroker total=672 ms xml=32 ms schtasks1=640 ms retry=0
+        // pass_now == fresh, to the millisecond, because BOTH stamps sat ABOVE WgcLaunch() - so
+        // "take a fresh GetTickCount64() instead of the pass's stale `now`" changed nothing at all.
+        // WgcLaunch() is what calls HelperTaskRegister, and the registration is the cost: 640 of
+        // 672 ms is the schtasks SUBPROCESS (xml=32 ms, retry=0), and on the boot that produced the
+        // false dom0 report that same subprocess took 7.524 s.
+        // THE ARITHMETIC OF THE ORIGINAL BREACH, which this finally explains. On the launching pass
+        // the pre-launch hold has zeroed g_BrokerDownSince, so the rearm below it was SKIPPED
+        // (armed=0 downsince=0 above proves it). The deciding value is therefore g_WgcLastLaunch,
+        // read by QgaDesliceAnchor on the NEXT pass: 161025.83 (stamped before the work) + 30 s =
+        // 161055.83, and QGADESLICEDOWN fired at 161055.834 while the registration had only
+        // finished at 161033.348. Stamping after the call moves the deadline to 161063.35, past the
+        // 161059.387 session end that was the real reason the broker never reported ready.
+        g_WgcLastLaunch = GetTickCount64();
+        // AND A NEW LAUNCH RESTARTS THE GRACE from the same instant, for the case the pre-launch
+        // hold does NOT cover: a broker that died after a healthy run leaves g_BrokerDownSince set,
+        // so this branch is live and must use the post-launch tick too. g_BrokerDownSince is
+        // deliberately NOT moved - the report's duration must stay true.
+        if (_rearmGrace)
+            g_BrokerNextWarn = g_WgcLastLaunch + DESLICE_FIRST_WARN_MS;
+        if (_launched) g_WgcSession = sid;
         // The de-slice broker's one launch failed and is not retried; QGADESLICEDOWN says so until the next GUI
         // agent start.
         else LogError("QGABROKERLAUNCHFAIL launch failed, no menus or toasts until restart");
