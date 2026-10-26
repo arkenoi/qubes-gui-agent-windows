@@ -4172,7 +4172,38 @@ static void BrokerSupervise(void)
     if (!g_WgcLaunched && !HelpersDisarmed() && sid != 0xFFFFFFFF && ShellWindowNow())
     {
         g_WgcLaunched = TRUE;
-        g_WgcLastLaunch = now;
+        // A FRESH TICK, NOT THE PASS'S `now`. `now` is sampled once at the top of BrokerSupervise,
+        // and the launch below does real blocking work before it happens - HelperTaskRegister writes
+        // the task XML to disk and drives schtasks, which is a subprocess. So `now` is already stale
+        // here by exactly that work, and it was the anchor the de-slice grace counted from: the
+        // broker got charged for time before anyone had asked it to run.
+        // MEASURED 2026-10-26, acceptance run 40297264818 cell win11-reinstall, agent 4.3.37.1123
+        // pid 6444, from the agent's own log:
+        //     151104.590  QGASHELLSEEN shell window is up            <- the pass's `now`
+        //     151106.258  QGAHELPERTASK Qubes-WgcBroker registered and started
+        //     151106.266  WgcLaunch: WGCBROKER launched                <- the real launch, +1.676 s
+        //     151134.633  QGADESLICEDOWN "not running for 30 s"        <- 30.043 s after 151104.590
+        //     151137.596  BrokerSupervise: WGCBROKER ready (pid 4620 validated)
+        // The report's own arithmetic names the anchor: 34.633 - 04.590 = 30.043, so the deadline was
+        // counted from the shell tick, not from the launch 1.676 s later. The comment above this
+        // report asserts "g_WgcLastLaunch does NOT slide ... assigned at exactly one site", which is
+        // true and is not the bug - it does not slide, it is STALE, and a stale anchor shortens the
+        // grace by however long the registration took.
+        // AND 1.676 s IS ENOUGH TO DECIDE IT, because the deadline is not a continuous test: the
+        // loop schedules its wake AT g_BrokerNextWarn (see the `due` computation where that global is
+        // read), so the report is evaluated at that one tick and then not again until something wakes
+        // the loop. With the stale anchor the deadline was 151134.58 and the wake at 151134.633 fired
+        // it; with the launch as the anchor the deadline is 151136.266, and the next observation of
+        // the broker - 151137.596 - already has it READY, which clears the clock. The 30 s window is
+        // not what was wrong here. It was never 30 s: it was 28.4 s of a 30 s grace.
+        // NOT A CASE FOR MOVING THE DEADLINE, and that was tried and dropped: every "ready" tick in
+        // the log is a DISCOVERY time, not the broker's readiness - the agent learns the broker is up
+        // only when it validates the pid the broker published into the shared section - so each
+        // measured launch->ready is an upper bound inflated by up to one wake interval. Over 229
+        // distinct launch->ready pairs across 440 distinct gui-agent logs on this rig the spread is
+        // min 0.17, median 4.85, p90 13.24, p99 22.83, max 31.33 s, and exactly ONE exceeds 30 s - by
+        // 1.33 s, which is inside that jitter. There is no measurement here that convicts the 30 s.
+        g_WgcLastLaunch = GetTickCount64();
         // AND THIS IS THE REARM. A launch is the event the stand-down latch waits for: "no timer, no
         // supervisor until next rearm" (owner, 2026-10-24). Supervision resumes from here, so a broker
         // that was deliberately stopped and is now being started again is supervised normally.
