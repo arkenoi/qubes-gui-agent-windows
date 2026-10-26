@@ -14484,7 +14484,23 @@ static ULONG StartFrameProcessingWithRetry(IN HANDLE newFrameEvent, IN HANDLE ca
                 LogInfo("A7RETRY capture initialized after %d retries", attempt);
             return ERROR_SUCCESS;
         }
-        if (status != 0x887A0026 && status != 0x887A0005)
+        // 0x80070005 IS E_ACCESSDENIED, AND IT IS A DESKTOP-SWITCH TRANSIENT LIKE THE OTHER TWO.
+        // MEASURED, cell WIN11-appvm of campaign rel-40243956400-r2 (2026-10-26), the agent's
+        // SECOND instance, 2.6 s after its own birth line:
+        //   .104700.506 E GetDuplication: output->DuplicateOutput() failed with error 0x80070005
+        //   .104700.516 E StartFrameProcessing: CaptureInitialize failed with error 0x80070005
+        //   .104700.523 E A7DEGRADED entering degraded state: capture init failed (0x80070005)
+        //   .104705.668 I A7DEGRADED recovered: capture restarted
+        // Nothing changed in those 5.1 s but the clock: the degraded path's FIRST retry succeeded.
+        // Because E_ACCESSDENIED was not in this set, the loop broke on attempt 1 and never spent
+        // its 7.5 s budget (10 x 750 ms), which covers the 5.1 s this took. The cost of that was
+        // three ERROR lines plus a degraded entry on a guest whose capture was fine, and it FAILED
+        // the cell: error_lines_undeclared 4 (max 0) and signatures_unclassified 4 (max 0).
+        // The A7RETRY warning this now writes instead is already a classified, baselined signature
+        // (normal-operation 0.94, max_per_boot 2) whose reason says the recovery line is the
+        // discriminator - so a capture that NEVER initialises still fails, here after 7.5 s with
+        // the same degraded ERROR as before.
+        if (status != 0x887A0026 && status != 0x887A0005 && status != 0x80070005)
             break; // not a known-transient DXGI failure
         LogWarning("A7RETRY transient capture init failure 0x%x, attempt %d", status, attempt + 1);
     }
