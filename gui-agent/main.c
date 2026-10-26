@@ -3140,6 +3140,13 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
     DWORD wr = 0;
     size_t len = 0;
     BOOL ok;
+    // METERING BRANCH ONLY - never merged to main. Which of the three phases spends the seconds:
+    // building/writing the task XML, the schtasks /create subprocess, or the retry arm's Sleep(500)
+    // plus a second subprocess. Measured so far: schtasks1 is 640 of 672 ms and 172 of 172 ms, with
+    // xml 32/0 ms and retry=0 - so it is the subprocess, and the 7.524 s case is the same call slow.
+    const ULONGLONG _mt0 = GetTickCount64();
+    ULONGLONG _mt1 = 0, _mt2 = 0, _mt3 = 0;
+    int _mretry = 0;
 
     if (!xml) return FALSE;
     XmlEscapeInto(xExe, RTL_NUMBER_OF(xExe), exePath);
@@ -3209,6 +3216,7 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
     ok = WriteFile(h, bom, 2, &wr, NULL) && WriteFile(h, xml, (DWORD)(len * sizeof(WCHAR)), &wr, NULL);
     CloseHandle(h);
     free(xml);
+    _mt1 = GetTickCount64();                     /* METERING: XML built and on disk */
     if (!ok)
     {
         win_perror("WriteFile(task xml)");
@@ -3219,6 +3227,7 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
     DWORD rc = 0;
     WCHAR why[512] = L"";
     ok = WgcRunSchtasks(cmd, &rc, why, RTL_NUMBER_OF(why));
+    _mt2 = GetTickCount64();                     /* METERING: first schtasks /create returned */
     if (!ok)
     {
         // ONE BOUNDED RETRY, because this failure was MEASURED TRANSIENT and treating it as
@@ -3233,8 +3242,12 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
         LogWarning("QGAHELPERTASK schtasks /create /xml failed for %s (rc=%lu: %s) - retrying once",
             taskName, rc, why[0] ? why : L"schtasks said nothing");
         Sleep(500);
+        _mretry = 1;
         ok = WgcRunSchtasks(cmd, &rc, why, RTL_NUMBER_OF(why));
     }
+    _mt3 = GetTickCount64();
+    LogInfo("QGAMETERHELPERTASK %s total=%I64u ms xml=%I64u ms schtasks1=%I64u ms retry=%d tail=%I64u ms",
+        taskName, _mt3 - _mt0, _mt1 - _mt0, _mt2 - _mt1, _mretry, _mt3 - _mt2);
     DeleteFileW(file);
     if (!ok)
         // THE REASON IS IN THE LINE NOW. It used to carry neither the exit code nor schtasks' own
@@ -4326,6 +4339,15 @@ static void BrokerSupervise(void)
         // deliberately NOT moved - the report's duration must stay true.
         if (_rearmGrace)
             g_BrokerNextWarn = g_WgcLastLaunch + DESLICE_FIRST_WARN_MS;
+        // METERING BRANCH ONLY. THE WHOLE POINT OF THIS LINE IS THE FIRST TWO FIELDS DIFFERING.
+        // On the previous metering build, with the stamps still above WgcLaunch(), it printed
+        // pass_now=101390 fresh=101390 - identical, which is what proved those fixes inert. Now
+        // `post` is taken after WgcLaunch() returns, so post-pass_now MUST equal the registration
+        // cost QGAMETERHELPERTASK reports on the same boot. If they are still equal, this fix is
+        // inert too and the next reader should believe the numbers over the commit message.
+        LogInfo("QGAMETERDESLICEARM pass_now=%I64u post=%I64u delta=%I64u ms armed=%I64u rearm=%d downsince=%I64u readyat=%I64u launched=%d",
+            now, g_WgcLastLaunch, g_WgcLastLaunch - now, g_BrokerNextWarn, _rearmGrace ? 1 : 0,
+            g_BrokerDownSince, g_BrokerReadyAt, _launched ? 1 : 0);
         if (_launched) g_WgcSession = sid;
         // The de-slice broker's one launch failed and is not retried; QGADESLICEDOWN says so until the next GUI
         // agent start.
