@@ -303,10 +303,23 @@ static LONG      g_SlotClosedSeen[WGCBRK_MAX_SLOTS];
 // asserts 0 (M7).
 #define REG_CONFIG_WGC_DEAF_VALUE L"WgcDeaf"
 static DWORD     g_WgcDeafCount = 0;
-static ULONGLONG g_WgcLastLaunch = 0;      // throttle: don't relaunch while one is starting
+// THE DE-SLICE DEADLINE'S ANCHOR, and no longer just a throttle. It began as "don't relaunch while
+// one is starting", where being roughly recent was enough; agent 8168655 then made it the value
+// "has not been running for 30 s" is measured from without touching this write site, and a throttle's
+// looseness became a false dom0 report. Stamped with a FRESH GetTickCount64() at its one assignment
+// site, not the supervise pass's `now` - see the launch block for the 7.524 s that cost.
+static ULONGLONG g_WgcLastLaunch = 0;
 static ULONGLONG g_AgentStartTick = 0;     // set at Init; bounds BRK_STARTING (see BrokerState)
 static ULONGLONG g_BrokerDownSince = 0;    // wall time the broker went (or started) DOWN while eligible; 0 = up/ok
 static ULONGLONG g_BrokerNextWarn = 0;     // next QGADESLICEDOWN warning is due (loud-persistent cadence)
+// TOLD TO GO DOWN, SO IT STAYS DOWN (QgaDesliceSupervisionHeld). Set when the broker's absence is
+// ASKED FOR rather than a fault - a deliberate stand-down, or helper launches being disarmed for a
+// session end / this agent's exit; cleared ONLY by an event - the broker being seen alive again
+// (Task Scheduler's recovery can bring it back without us asking, ADR-supervision 4), a new launch
+// being issued, or the disarm itself being undone in HelpersRearm. Never by time: a latch that
+// expires is the defect it replaces. DECLARED HERE, beside the clock it suppresses, because
+// HelpersRearm is defined far above the supervisor and must be able to clear it.
+static BOOL g_BrokerStoodDown = FALSE;
 // Machine-readable de-slice health, published under the BASE Qubes Tools config key
 // (HKLM\SOFTWARE\Invisible Things Lab\Qubes Tools\DesliceBrokerDown - the free-function write
 // scope, same as VCHAN_RESTARTS) so health-check / acceptance can assert it without parsing the
@@ -3023,6 +3036,13 @@ void HelpersRearm(void)
     if (InterlockedExchange(&g_HelpersDisarmed, 0) != 0)
         // Helper launches are allowed again: the end of the session was cancelled.
         LogInfo("QGAHELPERSREARM helpers re-armed, the session end was cancelled");
+    // AND THE SUPERVISOR IS BACK ON DUTY. The disarm stands the de-slice supervisor down (no clock,
+    // no deadline, no report), and that stand-down must not outlive the disarm that caused it: the
+    // launch block issues one launch per agent life, so after a cancelled session end no new launch
+    // can clear the latch and only the broker being seen ALIVE would - which is precisely the case
+    // that does not happen when the broker really died in that window. The outage is reportable
+    // again from here; the clock re-arms on the next supervise pass.
+    g_BrokerStoodDown = FALSE;
     EtwProxyRearm();
 }
 
@@ -3643,11 +3663,6 @@ static BOOL NotifyWouldInterruptStartup(void)
 }
 static BOOL g_WgcLaunched = FALSE;      // the ONE launch this agent performs (HELPER LIFECYCLE above)
 static BOOL g_WgcLaunchStallSaid = FALSE;  // QGABROKERLAUNCHNOTISSUED said once per agent life
-// TOLD TO GO DOWN, SO IT STAYS DOWN (QgaDesliceSupervisionHeld). Set when the broker's exit is a
-// deliberate stand-down rather than a death; cleared ONLY by an event - the broker being seen alive
-// again (Task Scheduler's recovery can bring it back without us asking, ADR-supervision 4) or a new
-// launch being issued. Never by time: a latch that expires is the defect it replaces.
-static BOOL g_BrokerStoodDown = FALSE;
 // HOW LONG A HOLD ACTUALLY LASTS, which nothing measured. Owner, 2026-10-24: "window holds that
 // stay longer than expected are very, very real product defect if they are authentic". He is right
 // and we could not have told: the ONLY line that carries a hold's duration is QGAHOLDSTARVED, whose
@@ -4030,6 +4045,48 @@ static void BrokerSupervise(void)
     // `!g_WgcLaunched` alone, which is the condition that actually makes the report meaningless.
     // A client-visible alert for a condition that was not there is P1 regardless of whether the 30 s
     // it quoted was arithmetically true - that framing was argued and rejected.
+    // A TEARDOWN STANDS THE SUPERVISOR DOWN, through the SAME latch the deliberate-stop path uses -
+    // not a second mechanism, and not a read-time excuse. QgaDesliceTeardownExcused below only
+    // suppresses the OUTPUT of a pass that has already armed and come due: it cannot stop the clock,
+    // it cannot stop the 120 s re-warn cadence, and it is not on the path that writes
+    // DesliceBrokerDown. The latch that does all three was reachable ONLY from inside
+    // `_InterlockedExchange(&g_BrokerReady, 0) != 0`, i.e. only for a broker that had ONCE BEEN
+    // READY - so a broker that never became ready because the machine was powering off left the
+    // supervisor fully armed, which is the state that was measured.
+    // MEASURED 2026-10-26 on win11r-dsm (gui-agent ver=4.3.37.1125):
+    //     161033.348  WgcLaunch: WGCBROKER launched
+    //     161055.834  E QGADESLICEDOWN "not running for 30 s" ... DesliceBrokerDown=1
+    //     161056.155  W NOTIFYERR gui-agent.deslice-down sent to dom0 (#1 this boot)
+    //     161059.387  QGAENDSESSION Windows is ending this session -> HelpersDisarm
+    // There was no WM_QUERYENDSESSION on that boot, so at 161055.834 nothing in the process yet knew
+    // a shutdown was coming and THIS latch could not have fired in time: the fresh tick at the
+    // launch rearm is what gives the signal time to arrive. What this closes is the rest of it. Once
+    // the signal does arrive the supervisor stops supervising instead of merely staying quiet, and
+    // DesliceBrokerDown goes back to 0 - which matters beyond this boot, because Init zeroes that
+    // flag only on an INELIGIBLE guest ("when the broker is NOT expected ... = 0"), so a 1 written
+    // during a teardown rides out the power cycle and the next boot reads a healthy guest as broken
+    // until its own broker goes ready.
+    // THE LATCH IS CLEARED BY AN EVENT, NEVER BY TIME (QgaDesliceSupervisionHeld): the broker seen
+    // alive, a launch being issued, or - for THIS arm specifically - HelpersRearm. That last one is
+    // required, not tidiness: a launch cannot be issued while disarmed (the launch block below
+    // carries its own `!HelpersDisarmed()` guard) and it is one launch per agent life anyway, so
+    // after a CANCELLED session end no launch can clear this and only a LIVE broker would - which is
+    // exactly the case that does not arise when the broker really died in that window. Without the
+    // clear in HelpersRearm the stand-down outlives its cause and a genuine outage goes unreported
+    // for the rest of the agent's life. Scored 0.95 as the strongest objection to this change before
+    // it was committed, and closed here rather than argued away.
+    if (!g_BrokerStoodDown && HelpersDisarmed())
+    {
+        g_BrokerStoodDown = TRUE;
+        if (g_BrokerDownSince || g_BrokerNextWarn)
+        {
+            g_BrokerDownSince = 0; g_BrokerNextWarn = 0;
+            (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
+        }
+        LogInfo("QGADESLICESTOODDOWN supervision stands down: helper launches are disarmed (the session is ending, "
+            "or this agent is exiting), so the broker's absence is asked for - no clock, no deadline, no report");
+        return;
+    }
     if (!g_WgcLaunched)
     {
         // THE HOLD IS BOUNDED, because an unbounded one would be a SILENCE. Three states, not two:
@@ -4223,8 +4280,20 @@ static void BrokerSupervise(void)
         // and a launch that has just gone out is exactly when that grace is owed.
         // g_BrokerDownSince is deliberately NOT moved: the report's duration must stay true, so a
         // broker that never comes up still says how long it has really been missing.
+        // A FRESH TICK HERE TOO, for the same reason as g_WgcLastLaunch above - and this is the one
+        // that actually decides when the report fires, which the anchor fix alone did not.
+        // MEASURED 2026-10-26 on win11r-dsm, a quick-upgrade smoke of the package built WITH the
+        // anchor fix (gui-agent ver=4.3.37.1125, package 4.3.37+agent.8d3d657eb6a5):
+        //     161025.824  QGASHELLSEEN shell window is up
+        //     161033.348  WgcLaunch: WGCBROKER launched            <- +7.524 s of registration work
+        //     161055.834  QGADESLICEDOWN "not running for 30 s"
+        // 161055.834 - 161025.824 = 30.010 s: the deadline was still counted from the pass's `now`,
+        // sampled before HelperTaskRegister, so the grace this rearm exists to GIVE was 7.5 s short.
+        // Fixing g_WgcLastLaunch moved the ANCHOR (the duration the report prints) and left the
+        // DEADLINE on the stale value, because they are two assignments in two places and only one
+        // was read. Both are now the same fresh tick.
         if (g_BrokerDownSince)
-            g_BrokerNextWarn = now + DESLICE_FIRST_WARN_MS;
+            g_BrokerNextWarn = GetTickCount64() + DESLICE_FIRST_WARN_MS;
         // ZERO THE SHARED PID, so "ready" can only mean the NEW instance published one - the same trap that made a
         // stale heartbeat certify a corpse as alive (measured 2026-09-08) - and every request clock starts fresh.
         WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
