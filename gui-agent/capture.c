@@ -25,6 +25,7 @@
 #include "resolution.h" // M0BLINK obtain-start stamp (instrumentation only)
 #include "faultinject.h"
 #include "qga-lifecycle.h"   // QgaCaptureSlowIsNormal: the first seconds of a slow pass are not a warning
+#include "grantowner.h"      // the staging grant is issued from the MAIN thread; see grantowner.h
 
 #include <log.h>
 
@@ -117,7 +118,7 @@ static DWORD WINAPI CaptureThread(void* param);
 // (FINDINGS.md measured grant costs) - and against the livelock above.
 typedef struct _STAGING_GRANT
 {
-    PXENCONTROL_CONTEXT xc; // dedicated handle, never closed by capture teardown
+    GRANT_OWNER* grant;     // dedicated handle on its OWN thread, never closed by capture teardown
     BYTE* buffer;           // VirtualAlloc'd, page-aligned
     size_t size;            // bytes == page_count * PAGE_SIZE
     size_t page_count;
@@ -774,7 +775,7 @@ static void XcLogger(IN XENCONTROL_LOG_LEVEL logLevel, IN const char* function, 
 // per-geometry path there is no staging grant and the refs are always sent, so it is always live.
 BOOL CaptureScreenGrantLive(void)
 {
-    return g_StagingGrant ? (g_Staging.xc != NULL) : TRUE;
+    return g_StagingGrant ? (g_Staging.grant != NULL) : TRUE;
 }
 
 // GRANT THE EXISTING BUFFER, IN PLACE. Entering non-seamless needs the desktop grant, and the
@@ -792,19 +793,18 @@ BOOL CaptureStagingGrantNow(void)
 {
     if (!g_StagingGrant)   return FALSE;  // direct-map build: the refs are always live
     if (!g_Staging.handle) return FALSE;  // no buffer yet - CaptureInitialize will make a granted one
-    if (g_Staging.xc)      return TRUE;   // already granted
+    if (g_Staging.grant)   return TRUE;   // already granted
 
-    PXENCONTROL_CONTEXT xc = NULL;
-    DWORD status = XcOpen(XcLogger, &xc);
-    if (status != ERROR_SUCCESS || !xc)
+    GRANT_OWNER* owner = NULL;
+    DWORD status = GoOpen(L"staging", XcLogger, LogGetLevel(), &owner);
+    if (status != ERROR_SUCCESS || !owner)
     {
         win_perror2(status, "XcOpen (staging grant-in-place)");
         return FALSE;
     }
-    XcSetLogLevel(xc, LogGetLevel());
 
     void* handle = NULL;
-    status = XcGnttabPermitForeignAccess2(xc,
+    status = GoPermitForeignAccess(owner,
         g_GuiDomainId,
         g_Staging.buffer,
         (ULONG)g_Staging.page_count,
@@ -816,11 +816,11 @@ BOOL CaptureStagingGrantNow(void)
     if (status != ERROR_SUCCESS)
     {
         win_perror2(status, "XcGnttabPermitForeignAccess2 (staging grant-in-place)");
-        XcClose(xc);
+        GoClose(&owner);
         return FALSE;
     }
 
-    g_Staging.xc = xc;
+    g_Staging.grant = owner;
     g_Staging.handle = handle;
     LogInfo("STAGING granted IN PLACE %lu pages - desktop monitor plugged with NO capture replug",
         (ULONG)g_Staging.page_count);
@@ -973,7 +973,7 @@ static BOOL StagingEnsure(void)
         // stay zeroed and are never sent (SendScreenGrants is suppressed under the same
         // flag); xc==NULL marks the ungranted state for the exit path.
         ZeroMemory(refs, page_count * sizeof(ULONG));
-        g_Staging.xc = NULL;
+        g_Staging.grant = NULL;
         g_Staging.buffer = buffer;
         g_Staging.size = size;
         g_Staging.page_count = page_count;
@@ -986,19 +986,18 @@ static BOOL StagingEnsure(void)
         return TRUE;
     }
 
-    PXENCONTROL_CONTEXT xc = NULL;
-    DWORD status = XcOpen(XcLogger, &xc);
-    if (status != ERROR_SUCCESS || !xc)
+    GRANT_OWNER* owner = NULL;
+    DWORD status = GoOpen(L"staging", XcLogger, LogGetLevel(), &owner);
+    if (status != ERROR_SUCCESS || !owner)
     {
         win_perror2(status, "XcOpen (staging)");
         free(refs);
         VirtualFree(buffer, 0, MEM_RELEASE);
         return FALSE;
     }
-    XcSetLogLevel(xc, LogGetLevel());
 
     void* handle = NULL;
-    status = XcGnttabPermitForeignAccess2(xc,
+    status = GoPermitForeignAccess(owner,
         g_GuiDomainId,
         buffer,
         (ULONG)page_count,
@@ -1010,14 +1009,14 @@ static BOOL StagingEnsure(void)
     if (status != ERROR_SUCCESS)
     {
         win_perror2(status, "XcGnttabPermitForeignAccess2 (staging)");
-        XcClose(xc);
+        GoClose(&owner);
         free(refs);
         VirtualFree(buffer, 0, MEM_RELEASE);
         return FALSE;
     }
     assert(handle == buffer);
 
-    g_Staging.xc = xc;
+    g_Staging.grant = owner;
     g_Staging.buffer = buffer;
     g_Staging.size = size;
     g_Staging.page_count = page_count;
@@ -1045,7 +1044,7 @@ void CaptureStagingRevokeOnExit(void)
     if (!g_Staging.handle)
         return;
 
-    if (!g_Staging.xc)
+    if (!g_Staging.grant)
     {
         // P2NOGRANT: nothing was granted - plain local release, no revoke handshake.
         LogInfo("STAGING ungranted buffer released on exit (%lu pages)", (ULONG)g_Staging.page_count);
@@ -1055,7 +1054,7 @@ void CaptureStagingRevokeOnExit(void)
         return;
     }
 
-    ULONG status = XcGnttabRevokeForeignAccess(g_Staging.xc, g_Staging.handle);
+    ULONG status = GoRevokeForeignAccess(g_Staging.grant, g_Staging.handle);
     if (status != ERROR_SUCCESS)
     {
         // dom0 still maps the pages (daemon alive or wedged). Best effort by design:
@@ -1067,7 +1066,9 @@ void CaptureStagingRevokeOnExit(void)
     }
 
     LogInfo("STAGING revoked on exit (%lu pages)", (ULONG)g_Staging.page_count);
-    XcClose(g_Staging.xc);
+    // Ends the owner thread, which is what releases the grant; the revoke above already
+    // succeeded, so this is the ordinary close.
+    GoClose(&g_Staging.grant);
     free(g_Staging.refs);
     VirtualFree(g_Staging.buffer, 0, MEM_RELEASE);
     ZeroMemory(&g_Staging, sizeof(g_Staging));

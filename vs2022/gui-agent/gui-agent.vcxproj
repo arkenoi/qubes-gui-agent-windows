@@ -25,6 +25,7 @@
     <ClCompile Include="..\..\gui-agent\debug.c" />
     <ClCompile Include="..\..\gui-agent\xorg-keymap.c" />
     <ClCompile Include="..\..\gui-agent\perwindow.c" />
+    <ClCompile Include="..\..\gui-agent\grantowner.c" />
     <ClCompile Include="..\..\gui-agent\toastcrop.c" />
     <ClCompile Include="..\..\gui-agent\toasthold.c" />
     <ClCompile Include="..\..\gui-agent\etwproxy.c" />

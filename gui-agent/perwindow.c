@@ -15,6 +15,7 @@
 #include "pwcarry.h"
 #include "perf.h"
 #include "faultinject.h"
+#include "grantowner.h"
 
 #include <log.h>
 #include <config.h>
@@ -29,7 +30,11 @@ extern BOOL g_VchanClientConnected; // main.c
 
 static BOOL g_PwOn = FALSE;                   // config + WGC support + init success
 static uint32_t g_PwDaemonVersion = 0;        // learned from MSG_VERSION
-static PXENCONTROL_CONTEXT g_PwXc = NULL;
+// THE HANDLE IS OWNED BY ITS OWN THREAD, not by whoever happens to call. A permit-foreign-access
+// IRP stays pending for the life of the grant and dies with the thread that issued it, and these
+// slabs are never revoked - so granting them from the main thread pinned a permanent IRP to the
+// same thread that later calls libvchan_close. See grantowner.h.
+static GRANT_OWNER* g_PwGrant = NULL;
 
 // Grants whose windows are gone/resized, awaiting successful revocation. Revoke fails
 // with a busy status while the gui domain still maps the segment; the daemon releases
@@ -103,14 +108,13 @@ void PwInit(void)
             LogWarning("WGC support probe failed 0x%x - proceeding, real attach decides", probe);
     }
 
-    DWORD status = XcOpen(PwXcLogger, &g_PwXc);
-    if (status != ERROR_SUCCESS || !g_PwXc)
+    DWORD status = GoOpen(L"per-window", PwXcLogger, LogGetLevel(), &g_PwGrant);
+    if (status != ERROR_SUCCESS || !g_PwGrant)
     {
         win_perror2(status, "per-window capture disabled: XcOpen");
-        g_PwXc = NULL;
+        g_PwGrant = NULL;
         return;
     }
-    XcSetLogLevel(g_PwXc, LogGetLevel());
 
     // CAPTURE WORKERS - decided ONCE here, never revisited. Every capture is a PrintWindow that
     // blocks on the TARGET window's own UI thread, so a single worker lets one slow application
@@ -134,8 +138,7 @@ void PwInit(void)
     if (status != ERROR_SUCCESS)
     {
         win_perror2(status, "per-window capture disabled: WcInit");
-        XcClose(g_PwXc);
-        g_PwXc = NULL;
+        GoClose(&g_PwGrant);
         return;
     }
 
@@ -158,11 +161,9 @@ void PwShutdown(void)
     PwRevokeTick();
     if (g_PwPending)
         LogWarning("A6LEAK per-window grants left unrevoked at shutdown, dom0 still maps them");
-    if (g_PwXc)
-    {
-        XcClose(g_PwXc);
-        g_PwXc = NULL;
-    }
+    // Closing the owner ENDS its thread, and every grant it made dies with that thread by the
+    // xeniface contract - so this stays last, after the one revoke attempt above.
+    GoClose(&g_PwGrant);
 }
 
 BOOL PwEnabled(void)
@@ -303,9 +304,9 @@ static PW_SLAB* PwSlabAcquire(IN ULONG pageCount)
         return NULL;
     }
 
-    ULONG status = XcGnttabPermitForeignAccess2(g_PwXc, g_GuiDomainId, slab->Buffer, capacity,
-                                                0, 0, XENIFACE_GNTTAB_READONLY,
-                                                &slab->Shared, slab->Refs);
+    ULONG status = GoPermitForeignAccess(g_PwGrant, g_GuiDomainId, slab->Buffer, capacity,
+                                         0, 0, XENIFACE_GNTTAB_READONLY,
+                                         &slab->Shared, slab->Refs);
     if (status != ERROR_SUCCESS)
     {
         win_perror2(status, "XcGnttabPermitForeignAccess2(slab)");
@@ -376,14 +377,14 @@ BOOL PwRevokePending(void)
 
 void PwRevokeTick(void)
 {
-    if (!g_PwXc)
+    if (!g_PwGrant)
         return;
     EnterCriticalSection(&g_PwPendingLock);
     PW_PENDING_REVOKE** link = &g_PwPending;
     while (*link)
     {
         PW_PENDING_REVOKE* p = *link;
-        DWORD status = XcGnttabRevokeForeignAccess(g_PwXc, p->Shared);
+        DWORD status = GoRevokeForeignAccess(g_PwGrant, p->Shared);
         if (status == ERROR_SUCCESS)
         {
             *link = p->Next;
