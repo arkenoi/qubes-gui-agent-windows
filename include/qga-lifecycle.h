@@ -608,6 +608,21 @@ static __inline BOOL QgaDesliceOwnedByDeath(IN unsigned long long diedAt)
     return (BOOL)(diedAt != 0);   /* a death is being reported for this outage; that row owns it */
 #endif
 }
+/* The first deadline after a death: the scheduler's whole restart budget while it still owes one, else the usual grace. */
+static __inline unsigned long long QgaDesliceDeathGraceMs(IN int restartOwed, IN unsigned long deaths,
+                                                          IN unsigned long restartCount,
+                                                          IN unsigned long long budgetMs,
+                                                          IN unsigned long long firstWarnMs)
+{
+    return (restartOwed && deaths <= restartCount) ? budgetMs : firstWarnMs;
+}
+/* A broker start seen inside the window re-anchors the deadline there; downSince is not moved, so the reported duration stays true. */
+static __inline unsigned long long QgaDesliceRestartRearm(IN int armed, IN unsigned long long nextWarn,
+                                                          IN unsigned long long restartTick,
+                                                          IN unsigned long long firstWarnMs)
+{
+    return armed ? (restartTick + firstWarnMs) : nextWarn;
+}
 static __inline BOOL QgaDesliceWarnDue(IN unsigned long long downSince, IN unsigned long long nextWarn,
                                        IN unsigned long long now)
 {

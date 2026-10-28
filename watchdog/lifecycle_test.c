@@ -348,6 +348,28 @@ int main(void)
           QgaDesliceWarnDue(100000, 100000 + 30000, 307000) == TRUE);
     check("deslice anchor: no launch yet anchors at now (nothing could have been running)",
           QgaDesliceAnchor(0, 0, 0, 55000) == 55000);
+    /* A restart seen at 120000 inside a window armed at 100000 moves the deadline 130000 -> 150000, so the
+       broker that recovers is not reported at the old one; an unarmed clock is left alone. */
+    check("deslice restart: a start seen inside the window re-anchors, so a recovered broker is not reported",
+          QgaDesliceWarnDue(100000, QgaDesliceRestartRearm(1, 130000, 120000, 30000), 130001) == FALSE);
+    check("deslice restart: with no clock armed there is no deadline to move",
+          QgaDesliceRestartRearm(0, 0, 120000, 30000) == 0);
+    /* Measured 2026-10-23: a death at 52734 ms was complained about 29 ms later while Task Scheduler's
+       restart validated at +91 s. An exit-code death gets the scheduler's whole budget as its first
+       deadline; the hold ends at the first start seen, or at the budget. */
+    check("restart hold: an exit-code death with restarts left gets the whole restart budget",
+          QgaDesliceDeathGraceMs(1, 1, 3, 240000, 30000) == 240000);
+    check("restart hold: the measured 91 s relaunch is INSIDE the hold - no report",
+          QgaDesliceWarnDue(52734, 52734 + QgaDesliceDeathGraceMs(1, 1, 3, 240000, 30000), 52734 + 91000) == FALSE);
+    check("restart hold: a start seen at +91 s ends it early and gives the restarted broker its own 30 s",
+          QgaDesliceRestartRearm(1, 52734 + 240000, 52734 + 91000, 30000) == 52734 + 121000);
+    check("restart hold: dead for good still reports AT the budget, anchored at the death",
+          QgaDesliceWarnDue(52734, 52734 + 240000, 52734 + 240000) == TRUE);
+    check("restart hold: a hang or a clean exit owes no restart - the usual 30 s",
+          QgaDesliceDeathGraceMs(0, 1, 3, 240000, 30000) == 30000);
+    check("restart hold: the third death is still restartable, the fourth is not",
+          QgaDesliceDeathGraceMs(1, 3, 3, 240000, 30000) == 240000 &&
+          QgaDesliceDeathGraceMs(1, 4, 3, 240000, 30000) == 30000);
 
     /* THE STARVATION DETECTOR, WHOSE ZERO FIRINGS WERE ABOUT TO BE USED AS EVIDENCE.
        QGAHOLDSTARVED has been emitted 0 times in every capture on this rig, and BROKERHOLD holds

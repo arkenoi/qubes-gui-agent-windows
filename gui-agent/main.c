@@ -289,6 +289,7 @@ static LONG      g_WgcBrokerPidRejected = 0;   // last BrokerPid that failed val
 // publishing its own pid. Written only where the validation succeeds, cleared where the handle is
 // closed.
 static volatile LONG g_WgcBrokerPidValidated = 0;
+static LONG g_WgcBrokerPidSeen = 0;        // last published broker pid accounted for, so a restart is observable
 // R1/R4 (docs/DESIGN-rest-zero-capture.md D): per slot, the ControlSeq this agent last wrote and when, until the
 // broker's CtlAck catches up (0 = nothing outstanding). Unanswered for WGCBRK_ACK_DEADLINE_MS = a hung broker.
 static LONG      g_SlotCtlWant[WGCBRK_MAX_SLOTS];
@@ -3017,8 +3018,14 @@ static BOOL WgcRunSchtasks(const WCHAR* argtail, OUT DWORD *exitCode, OUT WCHAR 
 // first act of the end-session handshake (lifecycle.c): once set, no helper is launched into this session any more
 // and a helper's exit while it is set is EXPECTED (the session's teardown, or our own stop) - INFO, not a death.
 static volatile LONG g_HelpersDisarmed = 0;
-#define HELPER_TASK_RESTART_INTERVAL L"PT1M"   // Task Scheduler's minimum
-#define HELPER_TASK_RESTART_COUNT    L"3"
+#define HELPER_TASK_RESTART_INTERVAL_MIN 1     // Task Scheduler's minimum
+#define HELPER_TASK_RESTART_COUNT_N      3
+#define HELPER_TASK_WSTR_(x) L ## #x
+#define HELPER_TASK_WSTR(x)  HELPER_TASK_WSTR_(x)
+#define HELPER_TASK_RESTART_INTERVAL L"PT" HELPER_TASK_WSTR(HELPER_TASK_RESTART_INTERVAL_MIN) L"M"
+#define HELPER_TASK_RESTART_COUNT    HELPER_TASK_WSTR(HELPER_TASK_RESTART_COUNT_N)
+// The scheduler's whole restart budget plus one interval of margin; the XML below is built from the same numbers.
+#define HELPER_TASK_RESTART_BUDGET_MS ((HELPER_TASK_RESTART_COUNT_N + 1) * HELPER_TASK_RESTART_INTERVAL_MIN * 60000ULL)
 
 BOOL HelpersDisarmed(void)
 {
@@ -3746,9 +3753,17 @@ static void BrokerSupervise(void)
     // signals the frame event, so this runs on that wake. The pid field is user-writable, so a pid that does not
     // validate is one loud line per pid; without a handle a broker's exit cannot be waited on. An instance Task
     // Scheduler restarted after a failure is adopted exactly here: it publishes its pid like the first one.
+    const LONG publishedPid = WGCBRK_HDR(g_WgcBase)->BrokerPid;
+    ULONGLONG restartSeenTick = 0;
+    // A new published pid IS an observed broker start, whether or not this pass can adopt it.
+    if (publishedPid != 0 && publishedPid != g_WgcBrokerPidSeen)
+    {
+        g_WgcBrokerPidSeen = publishedPid;
+        restartSeenTick = GetTickCount64();
+    }
     if (!brokerExited && !g_WgcBrokerProc && g_WgcSession == sid)
     {
-        LONG pid = WGCBRK_HDR(g_WgcBase)->BrokerPid;
+        LONG pid = publishedPid;
         if (pid != 0 && pid != g_WgcBrokerPidRejected)
         {
             g_WgcBrokerProc = WgcOpenBrokerProcess((DWORD)pid, sid);
@@ -3973,6 +3988,10 @@ static void BrokerSupervise(void)
     // fallback stays quiet ONLY when the operator asked for it.
     #define DESLICE_FIRST_WARN_MS 30000
     #define DESLICE_REWARN_MS 120000
+    // A start observed inside the window moves the deadline, so a restart that recovers is never reported.
+    if (restartSeenTick)
+        g_BrokerNextWarn = QgaDesliceRestartRearm(g_BrokerDownSince != 0, g_BrokerNextWarn,
+                                                  restartSeenTick, DESLICE_FIRST_WARN_MS);
     // THE LAUNCH-PENDING WINDOW, and it is deliberately NOT DESLICE_FIRST_WARN_MS.
     // It bounds the hold below: how long a shell may be up with no launch issued before that is
     // reported as an outage. It must clear the real shell-to-launch latency with margin, because a
@@ -4143,7 +4162,10 @@ static void BrokerSupervise(void)
         // after a healthy run re-armed at a launch tick minutes old and complained instantly).
         const ULONGLONG anchor = QgaDesliceAnchor(g_WgcLaunched ? 1 : 0, g_WgcLastLaunch, g_BrokerReadyAt, now);
         g_BrokerDownSince = anchor;
-        g_BrokerNextWarn = anchor + DESLICE_FIRST_WARN_MS;
+        // An exit-code death is one Task Scheduler restarts, so its first deadline is the restart budget.
+        g_BrokerNextWarn = anchor + QgaDesliceDeathGraceMs((brokerExited && brokerExitCode != 0) ? 1 : 0,
+                               g_BrokerDeaths, HELPER_TASK_RESTART_COUNT_N,
+                               HELPER_TASK_RESTART_BUDGET_MS, DESLICE_FIRST_WARN_MS);
     }
     // SKIP THE REPORT, NOT THE REST OF THE FUNCTION. An early return here would also skip the launch
     // block below, and a secure desktop can be a passing UAC prompt on a guest whose shell is up -
