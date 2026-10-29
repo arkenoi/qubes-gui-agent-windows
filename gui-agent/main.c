@@ -14516,7 +14516,11 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
             SetLastError(gle);
             return gle;
         }
-        return win_perror2(gle, "CaptureInitialize");
+        // THE INVARIANT: a NULL capture NEVER returns ERROR_SUCCESS. win_perror2 returns the code
+        // it is given, so a zero here made this function report success to the A7 retry loop, which
+        // then returned ERROR_SUCCESS with *capture still NULL. CaptureInitialize now always sets a
+        // non-zero status; this keeps the invariant true even if some future path does not.
+        return win_perror2(gle ? gle : ERROR_FUNCTION_FAILED, "CaptureInitialize");
     }
 
     ULONG status;

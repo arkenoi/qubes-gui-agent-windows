@@ -1086,38 +1086,60 @@ CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event)
         // fail this capture generation, not the process - the caller's A7 degraded
         // path keeps the vchan alive and retries the init.
         LogError("out of memory allocating CAPTURE_CONTEXT");
+        SetLastError(ERROR_OUTOFMEMORY);   // same rule as the fail: label - NULL carries a status
         return NULL;
     }
 
     InitializeCriticalSection(&ctx->frame.lock);
     InitializeCriticalSection(&ctx->stale_lock); // A6: parked-grant list
 
+    // THE STATUS THIS FAILURE CARRIES, captured AT the failure. Every `goto fail` sets it; the
+    // fail: label restores it after CaptureTeardown, which clobbers the thread's last error.
+    DWORD fail_status = ERROR_SUCCESS;
+    HRESULT hr;
+
     DWORD status = XcOpen(XcLogger, &ctx->xc);
     if (status != ERROR_SUCCESS)
     {
         win_perror2(status, "Failed to open xencontrol handle");
+        fail_status = status;
         goto fail;
     }
 
     if (!ctx->xc)
+    {
+        fail_status = ERROR_INVALID_HANDLE;   // XcOpen said OK and handed back nothing
         goto fail;
+    }
 
     XcSetLogLevel(ctx->xc, LogGetLevel()); // XC log levels are the same as ours
     ctx->adapter = GetAdapter();
     if (!ctx->adapter)
+    {
+        fail_status = GetLastError();
         goto fail;
+    }
 
     ctx->device = GetDevice(ctx->adapter);
     if (!ctx->device)
+    {
+        fail_status = GetLastError();
         goto fail;
+    }
 
     ctx->output = GetOutput(ctx->adapter);
     if (!ctx->output)
+    {
+        fail_status = GetLastError();
         goto fail;
+    }
 
     ctx->duplication = GetDuplication(ctx->output, ctx->device, &ctx->width, &ctx->height);
     if (!ctx->duplication)
+    {
+        fail_status = GetLastError();
         goto fail;
+    }
 
     // STAGING: adopt the persistent staging grant when enabled and the geometry fits
     // its capacity. framebuffer/grant_refs become ALIASES of the module-lifetime
@@ -1144,11 +1166,21 @@ CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event)
     }
 
     // get one frame to acquire framebuffer map (staging: to fill the staging buffer)
-    if (FAILED(GetFrame(ctx, 5*FRAME_TIMEOUT)))
+    // KEEP THE HRESULT. Both of these used to discard it and let the caller read GetLastError(),
+    // which CaptureTeardown below then reset - see the fail: label.
+    hr = GetFrame(ctx, 5*FRAME_TIMEOUT);
+    if (FAILED(hr))
+    {
+        fail_status = (DWORD)hr;
         goto fail;
+    }
 
-    if (FAILED(ReleaseFrame(ctx)))
+    hr = ReleaseFrame(ctx);
+    if (FAILED(hr))
+    {
+        fail_status = (DWORD)hr;
         goto fail;
+    }
 
     ctx->frame_event = frame_event;
     ctx->ready_event = CreateEvent(NULL, FALSE, FALSE, NULL);
@@ -1158,8 +1190,17 @@ CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event)
     return ctx;
 
 fail:
+    // A NULL RETURN MUST CARRY A NON-ZERO STATUS. Measured on win10-appvm, acceptance campaign
+    // rel-40774674227 (2026-10-29): this returned NULL with last error 0, so StartFrameProcessing
+    // logged "CaptureInitialize failed with error 0x0: The operation completed successfully" AND
+    // returned ERROR_SUCCESS - the retry loop then reported capture initialised while *capture was
+    // NULL. CaptureTeardown releases COM objects and closes handles, any of which resets the
+    // thread's last error, so the status is carried in fail_status and restored AFTER teardown.
+    if (fail_status == ERROR_SUCCESS)
+        fail_status = ERROR_FUNCTION_FAILED;   // a path that failed without recording why
     CaptureTeardown(ctx);
-    LogVerbose("end (%x)", GetLastError());
+    SetLastError(fail_status);
+    LogVerbose("end (%x)", fail_status);
     return NULL;
 }
 
