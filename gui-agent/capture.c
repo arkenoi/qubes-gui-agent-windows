@@ -37,10 +37,8 @@
 // TODO: configure timeout through registry config (milliseconds)
 #define FRAME_TIMEOUT 1000
 
-// How long the capture thread lets the main loop chew on one frame before declaring it
-// wedged and forcing the full reinitialization (which destroys and re-announces every
-// window - user-visible, so this is a last resort, not a latency bound).
-#define CAPTURE_READY_WEDGE_MS 15000
+// CAPTURE_READY_WEDGE_MS lives in capture.h: it is the budget any main-loop work must stay
+// inside, so code OUTSIDE this file that runs on the main loop must be able to measure against it.
 
 // A6: how long a superseded screen grant waits for dom0's MSG_WINDOW_DUMP_ACK before
 // the capture thread falls back to retrying the revocation on its own (design 2.1).

@@ -165,3 +165,14 @@ size_t CaptureGrantPageCount(IN const CAPTURE_CONTEXT* ctx);
 // Failure (dom0 still maps the pages) is logged and the buffer leaked - the
 // process is exiting.
 void CaptureStagingRevokeOnExit(void);
+
+// How long the capture thread lets the main loop chew on one frame before declaring it
+// wedged and forcing the full reinitialization (which destroys and re-announces every
+// window - user-visible, so this is a last resort, not a latency bound).
+//
+// IN THE HEADER because it is not only capture's business (2026-10-29): it is the budget
+// EVERY piece of main-loop work must stay inside, and work in other files was overrunning
+// it unmeasured - a helper launch in etwproxy.c blocked the loop 14-17 s and tripped this,
+// which cost the guest its whole desktop. Anything timing itself against the budget must
+// read the same number, not a copy of it.
+#define CAPTURE_READY_WEDGE_MS 15000

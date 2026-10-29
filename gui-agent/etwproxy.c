@@ -107,7 +107,12 @@
 #include <strsafe.h>
 
 #include "qga-lifecycle.h"   // QgaDecideHelperExit: the system's own kill is not a death
+#include "capture.h"         // CAPTURE_READY_WEDGE_MS - the budget main-loop work must stay inside
 #include "etwproxy.h"
+
+// A single main-loop call that eats this much of the capture wedge budget is reported. Derived
+// from the budget, not tuned to an observed run: a third of the time the whole loop pass has.
+#define ETWPROXY_SLOW_CALL_MS (CAPTURE_READY_WEDGE_MS / 3)
 #include "deathevent.h"
 
 // windows-utils
@@ -817,8 +822,29 @@ static void EtwProxyTryLaunchLocked(void)
     // No LoadUserProfile (the proxy needs no HKCU, sec 10.14.4); environment from the
     // proxy token so ProgramData etc. resolve (etwproxy falls back to C:\ProgramData
     // if they do not - env is comfort, not correctness).
+    // TIMED, BECAUSE THIS LAUNCH STALLS THE MAIN LOOP AND NOBODY COULD SAY WHICH CALL (2026-10-29).
+    // EtwProxyPoke runs this launch on the gui-agent main loop ("Main-loop thread only", below).
+    // Measured across three acceptance runs, the gap between the last provider-enable line and the
+    // "launched" line was 14.2 s / 15.2 s / 16.5 s whenever the launch happened under a Winlogon
+    // secure desktop, against 0.14-0.27 s on a normal desktop. The capture watchdog measures that
+    // same main loop and arms at CAPTURE_READY_WEDGE_MS = 15000, so this stall trips it, the reinit
+    // sends on a vchan whose daemon has gone, the agent restarts, and the guest is left with no
+    // desktop at all (rel-40817518835 win11de-uc; same signature rel-39678937221, rel-39880114972).
+    // Only TWO calls lie between those two log lines and the evidence cannot separate them, so each
+    // is timed and anything slow enough to matter is said at WARNING. CreateEnvironmentBlock is the
+    // standing suspect - it talks to the user-profile service, which is precisely what is busy
+    // during a logon, and its failure is already handled ("env is comfort, not correctness") - but
+    // SUSPECTED IS NOT MEASURED, and the fix must not be chosen before this says which one it is.
+    // Threshold is derived from the wedge, not tuned to a run: a third of the budget the stall must
+    // stay inside. Reported once per launch, and a launch is rare.
     LPVOID env = NULL;
+    const ULONGLONG envStart = GetTickCount64();
     (void)CreateEnvironmentBlock(&env, token, FALSE);
+    const ULONGLONG envMs = GetTickCount64() - envStart;
+    if (envMs >= ETWPROXY_SLOW_CALL_MS)
+        LogWarning("ETWPROXYSLOW CreateEnvironmentBlock took %I64u ms on the main loop "
+            L"(wedge budget %u ms) - this is the stall that costs the guest its desktop",
+            envMs, (unsigned)CAPTURE_READY_WEDGE_MS);
 
     STARTUPINFOW si;
     ZeroMemory(&si, sizeof(si));
@@ -832,10 +858,16 @@ static void EtwProxyTryLaunchLocked(void)
     PROCESS_INFORMATION pi;
     ZeroMemory(&pi, sizeof(pi));
     // CREATE_SUSPENDED -> assign to job -> resume: the proxy never runs outside the job.
+    const ULONGLONG createStart = GetTickCount64();
     BOOL created = CreateProcessAsUserW(token, NULL, cmd, NULL, NULL, FALSE,
                                         CREATE_SUSPENDED | CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
                                         env, NULL, &si, &pi);
     DWORD createGle = created ? 0 : GetLastError();
+    const ULONGLONG createMs = GetTickCount64() - createStart;
+    if (createMs >= ETWPROXY_SLOW_CALL_MS)
+        LogWarning("ETWPROXYSLOW CreateProcessAsUser took %I64u ms on the main loop "
+            L"(wedge budget %u ms) - this is the stall that costs the guest its desktop",
+            createMs, (unsigned)CAPTURE_READY_WEDGE_MS);
     if (env)
         DestroyEnvironmentBlock(env);
     CloseHandle(token);
