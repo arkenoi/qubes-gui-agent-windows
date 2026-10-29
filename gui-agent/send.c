@@ -425,9 +425,21 @@ static void ClearWindowCreatedLocked(IN HWND window)
     }
 }
 
-// TRUE if this message may go out. Screen-scoped messages (window == NULL, which the
-// protocol carries as window 0) are always allowed - the daemon requires no CREATE for
-// those. Call inside the g_VchanCriticalSection hold that would emit the message.
+// TRUE if this message may go out. Call inside the g_VchanCriticalSection hold that
+// would emit the message.
+//
+// SCREEN-SCOPED MESSAGES ARE GATED TOO (2026-10-29). This used to wave window == NULL
+// (the protocol's window 0) through unconditionally, on the stated premise that "the
+// daemon requires no CREATE for those". THAT PREMISE IS FALSE. xside.c:731 creates
+// remote2local empty, its ONLY insertion is handle_create (xside.c:2952), and the
+// dispatcher (xside.c:3942-3957) looks window 0 up exactly like any other id and
+// exit(1)s when it is absent - with no dialog and no VERIFY. dom0 then runs
+// atexit(vchan_close) -> libvchan_close() -> cli_live = 0, which is what the guest reads
+// back as open=0, and qvm_start_daemon.py starts a gui-daemon only on domain-start, so
+// NOTHING respawns it: the qube keeps qrexec and has no desktop until it is restarted.
+// Screen MAP, screen HINTS and the desktop WMNAME all reach the wire outside the
+// per-window gate, so an ordering change ahead of CREATE(0) would kill dom0 that way.
+// Ordered correctly today; this makes the ordering enforced rather than assumed.
 // A reconnecting gui-daemon starts with an empty window table, so everything the previous
 // one was told is worthless: without this the set would vouch for windows the new daemon
 // has never seen, which is the exact condition it exits on. Call before sending anything
@@ -450,7 +462,10 @@ void SendResetCreatedWindows(void)
 
 static BOOL MaySendForWindowLocked(IN HWND window, IN const WCHAR *messageName)
 {
-    if (!window || IsWindowCreatedLocked(window))
+    if (!window)
+        return g_ScreenCreated;   // CREATE(0) must have gone out first; see above
+
+    if (IsWindowCreatedLocked(window))
         return TRUE;
 
     // A window in this state is already broken, and sending the message would make gui-daemon
@@ -799,7 +814,8 @@ ULONG SendScreenHints(void)
     header.type = MSG_WINDOW_HINTS;
 
     EnterCriticalSection(&g_VchanCriticalSection);
-    status = VCHAN_SEND_MSG(header, hintsMsg, L"MSG_WINDOW_HINTS screen");
+    status = MaySendForWindowLocked(NULL, L"MSG_WINDOW_HINTS screen")
+        ? VCHAN_SEND_MSG(header, hintsMsg, L"MSG_WINDOW_HINTS screen") : TRUE;
     LeaveCriticalSection(&g_VchanCriticalSection);
 
     return status ? ERROR_SUCCESS : VchanLastSendError();
@@ -880,7 +896,7 @@ ULONG SendWindowMap(IN const WINDOW_DATA *windowData OPTIONAL)
             windowData ? windowData->Width : 0, windowData ? windowData->Height : 0);
 
     EnterCriticalSection(&g_VchanCriticalSection);
-    if (windowData && !MaySendForWindowLocked(windowData->Handle, L"MSG_MAP"))
+    if (!MaySendForWindowLocked(windowData ? windowData->Handle : NULL, L"MSG_MAP"))
     {
         LeaveCriticalSection(&g_VchanCriticalSection);
         return ERROR_SUCCESS;

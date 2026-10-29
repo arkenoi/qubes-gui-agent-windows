@@ -131,6 +131,14 @@ BOOL g_LocalScreenDestroyed = FALSE;
 //     message before CREATE(0) hits gui-daemon's "msg without CREATE" exit(1).
 static BOOL g_ScreenAnnounced = FALSE;
 
+// A gui-daemon connected at some point in THIS process. g_VchanClientConnected cannot
+// answer that: VchanGiveUpLocked clears it the moment it declares the daemon gone, so on
+// the GUIDESKTOPLOST path (daemon exits mid-boot, VCHANWEDGE, agent restarts) the exit
+// path read it as FALSE and logged "no client ever connected" about a connection that had
+// one. The registry value VchanHadClient answers it ACROSS processes and is already used
+// for that; this is the in-process fact, which is the one the exit line needs.
+static BOOL g_VchanHadClient = FALSE;
+
 // used to determine whether our window in fullscreen mode should be borderless
 // (when resolution is smaller than host's)
 // Live desktop image (the granted DDA framebuffer) and its pitch, refreshed every
@@ -15628,6 +15636,7 @@ static ULONG WINAPI WatchForEvents(void)
                 // missing gui feature when the real answer is that dom0's gui-daemon for this qube
                 // exited and did not restart.
                 (void)CfgWriteDword(NULL, REG_CONFIG_HAD_CLIENT_VALUE, 1, NULL);
+                g_VchanHadClient = TRUE;
 
                 // This daemon knows about no windows yet; forget what the previous one
                 // was told before any per-window message can be gated against it.
@@ -16114,7 +16123,20 @@ static ULONG WINAPI WatchForEvents(void)
         libvchan_cleanup(g_Vchan);
         // Withdrawn before the exit (libvchan_cleanup above), so a daemon starting later cannot connect to a
         // dead ring.
-        LogInfo("VCHAN no client ever connected, the announcement is withdrawn");
+        //
+        // TWO DIFFERENT FACTS, AND THIS LINE USED TO REPORT ONLY THE FIRST. closeVchan is
+        // g_VchanClientConnected, which VchanGiveUpLocked clears when it declares the daemon
+        // gone - so a connection that HAD a client and lost it arrives here and was reported
+        // as "no client ever connected". That is the GUIDESKTOPLOST path, and the false line
+        // is the reason a total loss of the user's desktop reads as a normal exit: dom0's
+        // gui-daemon exited, and qvm_start_daemon.py only starts one on domain-start, so the
+        // qube keeps answering qrexec and has no desktop until it is restarted.
+        // Two calls, not a ternary: the log macros paste an L onto the format literal.
+        if (g_VchanHadClient)
+            LogError("VCHAN the gui-daemon that was connected is gone and dom0 does not respawn it - "
+                "this qube has NO DESKTOP until it is restarted; the announcement is withdrawn");
+        else
+            LogInfo("VCHAN no client ever connected, the announcement is withdrawn");
     }
     LeaveCriticalSection(&g_VchanCriticalSection);
 
