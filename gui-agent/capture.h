@@ -176,3 +176,13 @@ void CaptureStagingRevokeOnExit(void);
 // which cost the guest its whole desktop. Anything timing itself against the budget must
 // read the same number, not a copy of it.
 #define CAPTURE_READY_WEDGE_MS 15000
+
+// THE SECOND ARM, and it exists because the first one is no longer a duration.
+// CAPTURE_READY_WEDGE_MS is now measured against the MAIN LOOP'S OWN PROGRESS
+// (g_MainLoopTick), which makes it immune to host speed: a loop that is merely slow keeps
+// ticking and is never called wedged, however slow the machine. That predicate cannot see
+// one pathology - a loop that wakes and ticks but never services frames. This ceiling can.
+// It is deliberately far above anything host-speed scaling can reach (8x), because it must
+// never be the arm that fires on a slow machine; its only job is the case the progress term
+// is blind to. A desktop frozen this long is broken on any machine.
+#define CAPTURE_LIVELOCK_CEILING_MS (8 * CAPTURE_READY_WEDGE_MS)

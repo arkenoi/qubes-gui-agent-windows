@@ -1902,7 +1902,25 @@ static DWORD WINAPI CaptureThread(void* param)
         // that reset; a stop request must also be honored here or StopFrameProcessing's
         // thread-exit wait pays the full wedge budget.
         {
+            // WEDGED IS NOT SLOW, AND A DURATION CANNOT TELL THEM APART. This used to fire on
+            // elapsed time alone, so on a slower host it declared a healthy main loop wedged and
+            // answered with a reinit - which destroys and re-announces the screen window and is
+            // exactly the window in which a stray window-0 message makes dom0's gui-daemon
+            // exit(1) (send.c MaySendForWindowLocked, findings/issues.md GUIDESKTOPLOST). The
+            // measured slow pass in run 38994277148 was 1-3 s against this 15 s budget: on a host
+            // ~5x slower that is 5-15 s, i.e. ON the old threshold, so the destructive arm would
+            // have fired on NORMAL operation.
+            //
+            // Raising the number was the wrong fix: it would delay detection of a real block on
+            // every host while still being a guess about how slow "slow" is. Progress is the
+            // property. The main loop bumps g_MainLoopTick on every wake, and while we are here
+            // it HAS a frame event pending (set just above, and watchedEvents[1] in main.c), so a
+            // live loop is guaranteed to wake and tick. No tick for a whole budget therefore
+            // means blocked, not slow - at any host speed, with no calibration. This is the same
+            // shape BrokerSupervise already uses for the broker (main.c g_BrokerProgressAt).
             DWORD waitedMs = 0;
+            DWORD stalledMs = 0;                                                // no main-loop progress for this long
+            LONG64 lastTick = InterlockedCompareExchange64(&g_MainLoopTick, 0, 0);
             DWORD wait;
             while (TRUE)
             {
@@ -1927,10 +1945,33 @@ static DWORD WINAPI CaptureThread(void* param)
                 }
 
                 waitedMs += FRAME_TIMEOUT;
-                if (waitedMs >= CAPTURE_READY_WEDGE_MS)
+
+                const LONG64 tick = InterlockedCompareExchange64(&g_MainLoopTick, 0, 0);
+                if (tick != lastTick)
                 {
-                    LogWarning("main loop wedged: frame not processed after %lu ms, reinitializing",
-                        waitedMs);
+                    lastTick = tick;
+                    stalledMs = 0;      // the loop is going round; whatever else is true, it is not blocked
+                }
+                else
+                {
+                    stalledMs += FRAME_TIMEOUT;
+                }
+
+                // Two arms, and the log says WHICH, because they mean different things to whoever
+                // reads it: the first is something blocking the loop (the ETW launch was one, see
+                // etwproxy.c), the second is a loop that runs but never gets to the frame.
+                const WCHAR* wedgeWhy = NULL;
+                if (stalledMs >= CAPTURE_READY_WEDGE_MS)
+                    wedgeWhy = L"the main loop has not ticked";
+                else if (waitedMs >= CAPTURE_LIVELOCK_CEILING_MS)
+                    wedgeWhy = L"the main loop is ticking but has not taken the frame";
+
+                if (wedgeWhy)
+                {
+                    LogWarning("main loop wedged: %s - frame not processed after %lu ms "
+                        L"(no progress for %lu ms, budget %u, ceiling %u), reinitializing",
+                        wedgeWhy, waitedMs, stalledMs,
+                        (unsigned)CAPTURE_READY_WEDGE_MS, (unsigned)CAPTURE_LIVELOCK_CEILING_MS);
                     status = ERROR_TIMEOUT;
                     ReleaseFrame(capture);
                     SetEvent(capture->error_event);
@@ -1947,12 +1988,17 @@ static DWORD WINAPI CaptureThread(void* param)
                 // warning on normal operation. QgaCaptureSlowIsNormal splits on HALF THE WEDGE -
                 // derived from the wedge, not from what was measured, so nothing here is tuned to
                 // make a campaign pass - and a pass that does cross it is loud again unchanged.
+                // "(wedge at 15000)" would now be a false statement: waitedMs no longer decides
+                // anything, stalledMs does. Reporting the figure that governs - and both
+                // thresholds - keeps a reader from concluding a 20 s pass was about to be reaped.
                 if (QgaCaptureSlowIsNormal(waitedMs, CAPTURE_READY_WEDGE_MS))
-                    LogInfo("main loop slow: frame not processed after %lu ms (wedge at %u)",
-                        waitedMs, CAPTURE_READY_WEDGE_MS);
+                    LogInfo("main loop slow: frame not processed after %lu ms, no main-loop progress for %lu ms "
+                        L"(blocked at %u, ceiling %u)",
+                        waitedMs, stalledMs, (unsigned)CAPTURE_READY_WEDGE_MS, (unsigned)CAPTURE_LIVELOCK_CEILING_MS);
                 else
-                    LogWarning("main loop slow: frame not processed after %lu ms (wedge at %u)",
-                        waitedMs, CAPTURE_READY_WEDGE_MS);
+                    LogWarning("main loop slow: frame not processed after %lu ms, no main-loop progress for %lu ms "
+                        L"(blocked at %u, ceiling %u)",
+                        waitedMs, stalledMs, (unsigned)CAPTURE_READY_WEDGE_MS, (unsigned)CAPTURE_LIVELOCK_CEILING_MS);
             }
         }
 

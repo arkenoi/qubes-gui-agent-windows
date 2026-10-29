@@ -442,6 +442,14 @@ static volatile BOOL g_DesktopDumpNeeded = FALSE;
 static volatile ULONGLONG g_NonSeamlessPendingSince = 0;
 static volatile ULONGLONG g_FrameCount = 0;
 
+// MAIN-LOOP LIVENESS, not a frame counter. Bumped on EVERY return from the main loop's
+// WaitForMultipleObjects, whatever woke it and including WAIT_TIMEOUT, so it answers one
+// question only: is the loop still going round? The capture wedge needs that and cannot get
+// it from g_FrameCount or from ready_event, both of which only move when a frame is
+// PROCESSED - the very thing the wedge is waiting for, so either would restate the
+// condition instead of discriminating it.
+volatile LONG64 g_MainLoopTick = 0;
+
 // THE DESKTOP SURFACE IS A MONITOR WE PLUG AND UNPLUG (owner, 2026-09-24: "we just plug and
 // unplug a new monitor if we grant the switch. at same moment we map and unmap what we need").
 //
@@ -15257,6 +15265,9 @@ static ULONG WINAPI WatchForEvents(void)
 
         // Wait for events.
         signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, waitTimeout);
+        // Unconditionally, and before the attribution block below, which is skipped when the
+        // broker's shared page is absent. Liveness must not depend on the broker existing.
+        InterlockedIncrement64(&g_MainLoopTick);
         // M1 attribution (ABI 21): what woke the loop, counted where the peek can read it.
         if (g_WgcBase)
         {

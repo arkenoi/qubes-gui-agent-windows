@@ -111,6 +111,10 @@ void PwLedgerEmit(IN const struct _WINDOW_DATA* entry, IN const WCHAR* reason);
 extern volatile LONG64 g_PwLedgerEngineDamage;   // engine deliveries, all windows
 // C8: control logic that currently runs on the capture tick. A zero is the useful answer - it
 // means stage 4 need not re-home that item before the capture can be deleted.
+// Main-loop liveness tick (main.c). Read by the capture wedge to tell a BLOCKED main loop
+// from a merely slow one; see CAPTURE_READY_WEDGE_MS in capture.h.
+extern volatile LONG64 g_MainLoopTick;
+
 extern volatile LONG64 g_C8DrainVchanInput;
 extern volatile LONG64 g_C8WorkAreaApplied;
 extern volatile LONG64 g_C8InputDesktop;
