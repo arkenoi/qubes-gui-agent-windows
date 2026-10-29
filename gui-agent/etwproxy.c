@@ -183,6 +183,9 @@ typedef enum
     EPS_IDLE,           // armed, not running: launch as soon as a console user exists
     EPS_RUNNING,        // proxy alive, exit-wait registered
     EPS_DEAD,           // exited, or a launch step failed: NOT relaunched this agent life (owner, 2026-10-07)
+    EPS_LAUNCHING,      // a worker thread is running the launch (see EtwProxyLaunchThread).
+                        // Appended, not inserted after EPS_IDLE, so no existing enumerator's
+                        // value changes.
     EPS_PARKED,         // permanent for this boot (account absent / logon denied / token
                         // drift / rc 5 / rc 9)
 } ETWPROXY_STATE;
@@ -196,8 +199,12 @@ static HANDLE           g_Job;
 static HANDLE           g_Proc;
 static HANDLE           g_Wait;         // RegisterWaitForSingleObject handle
 static ULONGLONG        g_LaunchTick;
-static BOOL             g_Disarmed;     // the session is ending (HelpersDisarm): no launch, and an exit is expected
+// Set WITHOUT g_Lock (InterlockedExchange) since 2026-10-29: the launch now runs on a worker that
+// holds g_Lock for as long as the launch takes, and Disarm/Rearm are called from the main loop.
+// A single LONG needs no lock to publish, and every reader already reads it inside the lock.
+static volatile LONG    g_Disarmed;     // the session is ending (HelpersDisarm): no launch, and an exit is expected
 static ULONGLONG        g_NextPoke;     // Poke throttle (main-loop thread only)
+static HANDLE           g_LaunchThread; // the one-shot worker that runs the launch off the main loop
 static WCHAR            g_ClientSid[192]; // SID string the running proxy was launched with
 static BOOL             g_SessLive;     // this agent started the ETW session and owns stopping it
 static BOOL             g_CensusLogged; // token group/priv census printed once per boot
@@ -673,12 +680,23 @@ static HANDLE EtwProxyBuildJob(void)
 //      ProcessTrace only - proxy-side, in tools/notifhost/etwproxy.cpp.
 static void EtwProxyTryLaunchLocked(void)
 {
-    if (g_State != EPS_IDLE || g_Shutdown || g_Disarmed)
+    // EPS_LAUNCHING is the worker's own state, set by Poke before it spawned us. Both paths
+    // below that leave the proxy unlaunched WITHOUT parking it must hand the state back to
+    // EPS_IDLE, or no later Poke would ever try again.
+    if ((g_State != EPS_IDLE && g_State != EPS_LAUNCHING) || g_Shutdown || g_Disarmed)
+    {
+        if (g_State == EPS_LAUNCHING)
+            g_State = EPS_IDLE;
         return;
+    }
 
     WCHAR clientSid[RTL_NUMBER_OF(g_ClientSid)];
     if (!EtwProxyClientSid(clientSid, RTL_NUMBER_OF(clientSid)))
-        return;   // no console user session yet - Poke retries on the existing loop pass
+    {
+        if (g_State == EPS_LAUNCHING)
+            g_State = EPS_IDLE;
+        return;   // no console user session yet - Poke retries on a later loop pass
+    }
 
     // (2 first half) credentials: generate + set + prove, in memory only.
     const char* parkReason = NULL;
@@ -1066,6 +1084,37 @@ void EtwProxyInit(BOOL bridgeEnabled)
     // Gate off: fully inert. No account access, no session, no logs, no timers.
 }
 
+// ---- the launch worker: THE reason the launch is no longer on the main loop ----------
+// GUIDESKTOPLOST (findings/issues.md). EtwProxyTryLaunchLocked was called straight from
+// EtwProxyPoke, which runs on the gui-agent main loop, and the launch was measured at
+// 14.2 / 15.2 / 16.5 s across three acceptance runs whenever it happened under a Winlogon
+// secure desktop, against 0.14-0.27 s on a normal desktop. The capture watchdog measures
+// that same main loop and arms at CAPTURE_READY_WEDGE_MS = 15000, so the launch tripped it
+// and the reinit that follows sends UNMAP(0)/DESTROY(0) and re-announces the screen - the
+// window in which a stray window-0 message makes gui-daemon exit(1) and the qube loses its
+// desktop for the rest of the boot.
+//
+// WHICH call stalls is still not measured: ETWPROXYSLOW was added to separate
+// CreateEnvironmentBlock from CreateProcessAsUserW and has not fired yet (the 2026-10-29
+// cycle saw 0.347 / 1.780 / 0.065 s). This fix does not need to know. EtwProxyLogon's
+// LogonUserW talks to LSA and is just as plausible a stall as either, and moving the whole
+// launch off the loop covers all of them. The instrument stays in and will still name the
+// call when it next fires.
+//
+// The worker HOLDS g_Lock for the whole launch, so every *Locked invariant in the launch
+// body is unchanged - nothing about the launch itself was restructured. What changed is
+// that no main-loop entry point blocks on that lock any more: Poke uses
+// TryEnterCriticalSection, Disarm/Rearm no longer take the lock at all, and Shutdown joins
+// this thread OUTSIDE the lock before it tears anything down.
+static DWORD WINAPI EtwProxyLaunchThread(LPVOID unused)
+{
+    UNREFERENCED_PARAMETER(unused);
+    EnterCriticalSection(&g_Lock);
+    EtwProxyTryLaunchLocked();
+    LeaveCriticalSection(&g_Lock);
+    return 0;
+}
+
 void EtwProxyPoke(void)
 {
     if (!g_Inited || !g_Enabled)
@@ -1076,11 +1125,47 @@ void EtwProxyPoke(void)
         return;
     g_NextPoke = now + ETWPROXY_POKE_MS;
 
-    EnterCriticalSection(&g_Lock);
+    // NEVER BLOCK HERE. The worker holds g_Lock for the whole launch, which is exactly the
+    // 14-17 s this change exists to keep off the main loop - waiting for it would reproduce
+    // the stall in the caller. A missed poke costs one ETWPROXY_POKE_MS interval.
+    if (!TryEnterCriticalSection(&g_Lock))
+        return;
+
     if (!g_Shutdown)
     {
         if (g_State == EPS_IDLE)
-            EtwProxyTryLaunchLocked();
+        {
+            // REAP THE PREVIOUS WORKER BEFORE SPAWNING ANOTHER. The launch body hands the state
+            // back to EPS_IDLE when there is no console user yet, so before logon this branch is
+            // reached once per ETWPROXY_POKE_MS and would otherwise CloseHandle a worker that may
+            // still be between its LeaveCriticalSection and its return. Closing a live thread's
+            // handle is legal but it is not a join, and it loses the only way to tell whether one
+            // is still out there. WAIT_OBJECT_0 means it has exited and the handle is ours to
+            // close; anything else means leave it alone and try again on the next poke - we hold
+            // the lock it wants, so a worker still inside the body cannot be making progress now
+            // anyway. Costs one poke interval in a case that only happens before logon.
+            if (g_LaunchThread)
+            {
+                if (WaitForSingleObject(g_LaunchThread, 0) != WAIT_OBJECT_0)
+                {
+                    LeaveCriticalSection(&g_Lock);
+                    return;
+                }
+                CloseHandle(g_LaunchThread);
+                g_LaunchThread = NULL;
+            }
+            g_State = EPS_LAUNCHING;
+            g_LaunchThread = CreateThread(NULL, 0, EtwProxyLaunchThread, NULL, 0, NULL);
+            if (!g_LaunchThread)
+            {
+                // No worker available. Launching inline risks the stall; NOT launching loses the
+                // notification bridge for the whole agent life. Take the stall - it is the
+                // pre-2026-10-29 behaviour and it is recoverable, and say so, because a guest
+                // that cannot spawn a thread has a bigger problem than this one.
+                win_perror("CreateThread(etwproxy launch) - launching on the main loop instead");
+                EtwProxyTryLaunchLocked();
+            }
+        }
         else if (g_State == EPS_RUNNING)
         {
             // Console user changed: the pipe DACL admits exactly the launched SID, so a proxy serving
@@ -1111,12 +1196,23 @@ void EtwProxyShutdown(void)
     EnterCriticalSection(&g_Lock);
     g_Shutdown = TRUE;
     HANDLE wait = g_Wait;   g_Wait = NULL;
+    HANDLE launcher = g_LaunchThread;   g_LaunchThread = NULL;
     LeaveCriticalSection(&g_Lock);
 
     // Phase 2: blocking drain OUTSIDE the lock (the callback takes it; holding it
     // here would deadlock). After this returns no callback is running or pending.
     if (wait)
         UnregisterWaitEx(wait, INVALID_HANDLE_VALUE);
+
+    // Same reason, same shape: the worker takes g_Lock, so joining it under the lock would
+    // deadlock. It must be joined BEFORE phase 3, or a launch still in flight would publish
+    // g_Job/g_Proc after the teardown below had already run and leave the proxy alive.
+    // g_Shutdown is set, so a worker that has not passed its guard yet returns immediately.
+    if (launcher)
+    {
+        WaitForSingleObject(launcher, INFINITE);
+        CloseHandle(launcher);
+    }
 
     // Phase 3: tear the proxy down, then the session (the agent owns its lifecycle now:
     // stop at shutdown, stale reap at next start covers the crash path). TerminateJobObject
@@ -1149,16 +1245,12 @@ void EtwProxyDisarm(void)
 {
     if (!g_Inited)
         return;
-    EnterCriticalSection(&g_Lock);
-    g_Disarmed = TRUE;
-    LeaveCriticalSection(&g_Lock);
+    InterlockedExchange(&g_Disarmed, 1);
 }
 
 void EtwProxyRearm(void)
 {
     if (!g_Inited)
         return;
-    EnterCriticalSection(&g_Lock);
-    g_Disarmed = FALSE;
-    LeaveCriticalSection(&g_Lock);
+    InterlockedExchange(&g_Disarmed, 0);
 }
