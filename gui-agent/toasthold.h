@@ -75,6 +75,11 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry);
 void ToastHoldNoteChanged(IN HWND window);
 
 // Drop the window's state (RemoveWindow). HWNDs are recycled; a stale hold would hide the next one.
+// A gate release left dom0 holding a frame from before the hold. Returns TRUE ONCE for the window that
+// owes a repaint; the caller must then repaint it from its VISIBLE region, never the whole window (see
+// toasthold.c for the occlusion-bleed review finding this exists to respect).
+BOOL ToastHoldTakeRepaintOwed(IN HWND window);
+
 void ToastHoldEvict(IN HWND window);
 
 // TRUE when the hold already tracks this window (main.c applies its size rule only to a window it does not

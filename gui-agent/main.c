@@ -6385,6 +6385,36 @@ static BOOL ToastHeldByBridge(IN OUT WINDOW_DATA* entry)
     }
     const BOOL held = ToastHoldDecide(entry) != ThDecShow;
     entry->ToastHoldOwned = held;
+    // A gate release inside that decision leaves dom0 holding a frame from before the hold, and nothing
+    // else re-sends the current content - so that frame must be replaced, or dom0 would show the PREVIOUS
+    // toast's pixels in a window the guest has already repainted with the next one. That is the very
+    // misattribution rule 5 existed to prevent, so the debt is not optional.
+    //
+    // WHICH FEED THE WINDOW IS ON DECIDES WHERE IT IS PAID, and the two cases are genuinely different:
+    //   * per-window capture (NOT slice-fed): the window's frame comes from its own WGC capture and
+    //     contains only its own pixels, so a full-window damage cannot bleed anything into it. Paid HERE,
+    //     at once - which also makes payment unconditional, because this runs on the tracking pass rather
+    //     than on the arrival of a capture frame.
+    //   * slice-fed: the content comes from the COMPOSITED desktop, where the pixels under a higher
+    //     window belong to that window. A full-window send would hand this window their pixels - the
+    //     bleed that "corrupts a menu's host window on hover" - so it is paid from the region-aware
+    //     release below, which sends rgnVisible. That payment waits for the next capture frame; on a
+    //     direct-capable guest at rest none arrives (CaptureAcquireTimeout returns INFINITE), so a slice
+    //     -fed banner can hold dom0's pre-hold frame until the next paint. Recorded in ADR-toasts 10.
+    if (ToastHoldTakeRepaintOwed(entry->Handle))
+    {
+        if (entry->PwSliceFed)
+        {
+            entry->ToastRepaintOwed = TRUE;
+        }
+        else
+        {
+            const ULONG rs = SendWindowDamageEvent(entry->Handle, 0, 0,
+                (int)entry->Width, (int)entry->Height);
+            if (ERROR_SUCCESS != rs)
+                win_perror2(rs, "SendWindowDamageEvent (toast gate release)");
+        }
+    }
     return held;
 }
 
@@ -14334,14 +14364,22 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             daemonHoldDamage = TRUE;
             entry->DaemonDamageHeld = TRUE;
         }
-        else if (entry->DaemonDamageHeld)
+        else if (entry->DaemonDamageHeld || entry->ToastRepaintOwed)
         {
             // Drive ended: repaint what was withheld - but only the VISIBLE part.
             // A full-window send here would hand this window the pixels of anything
             // stacked above it (the occlusion bleed the region arithmetic below
             // exists to prevent; review finding). rgnVisible is already this window
             // minus the area claimed by higher windows.
+            //
+            // ToastRepaintOwed rides the same release for the same reason: the toast
+            // frame gate (ADR-toasts 10) held this window's frames, so dom0 is holding
+            // a frame from before the hold and needs the current content once. It is
+            // paid HERE and not from toasthold.c precisely so that it gets rgnVisible -
+            // a banner is slice-fed, so the bleed above is not excluded for it either.
+            // Deliberately NOT read by the drive-end settle, which sends the whole window.
             entry->DaemonDamageHeld = FALSE;
+            entry->ToastRepaintOwed = FALSE;
             DWORD needed = GetRegionData(rgnVisible, 0, NULL);
             if (needed > rgnDataSize)
             {

@@ -85,6 +85,10 @@ typedef struct _TH_ENTRY
     // ToastHoldDecide - a decided banner arms nothing, so without a bound a refused identity read would
     // leave a mapped banner frozen on a stale frame until its window was destroyed.
     ULONGLONG SwapGateSince;
+    // One repaint owed to dom0 after a gate release: dom0 is holding a frame from before the hold and
+    // nothing else re-sends the current content. Collected by main.c (ToastHoldTakeRepaintOwed) and paid
+    // from its region-aware release, so the repaint is this window MINUS whatever is stacked above it.
+    BOOL      RepaintOwed;
     ULONGLONG LastUse;
 } TH_ENTRY;
 
@@ -506,14 +510,14 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // toast-hold-grade.py keys on 'PARTIAL match'.
     // SWAP-EDGE GATING, the other half of the decision (ADR-toasts 10; toasthold-core.h sets GateFrames).
     // The gate lives in send.c because that is where every frame passes; it is applied here because this is
-    // where the pre-emption is decided. OUTSIDE g_ThLock on purpose: the release forces a full-window damage,
-    // which is a vchan write, and this module never sends under its own lock.
+    // where the pre-emption is decided. Outside g_ThLock, like every other send-side call this module
+    // makes, and no vchan write happens here at all: the release only RECORDS the repaint it owes, and
+    // main.c pays it from the visible region (see the release branch below).
     //
-    // ORDER MATTERS ON RELEASE: ungate FIRST, then repaint. The repaint goes through the very function the
-    // gate drops frames in, so a repaint issued while still gated would be the frame the gate eats, and
-    // "ungated" would mean "frozen". Expiry needs no case of its own: past TH_HOLD_BOUND_MS /
-    // TH_PREEMPT_WINDOW_MS the core's PreemptWanted is 0, so it arrives here as GateFrames == 0 and takes
-    // this same release path.
+    // A RELEASE WITHOUT THE REPAINT WOULD MEAN "FROZEN", NOT "UNGATED": held frames left dom0 with a
+    // stale frame and nothing else re-sends the current content, so the debt is not optional. Expiry
+    // needs no case of its own - past TH_HOLD_BOUND_MS / TH_PREEMPT_WINDOW_MS the core's PreemptWanted is
+    // 0, so it arrives here as GateFrames == 0 and takes this same release path.
     BOOL gateFallback = FALSE;
     if (out.GateFrames)
     {
@@ -535,17 +539,27 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         SendWindowFrameUngate(entry->Handle, &framesHeld))
     {
         // Held frames left dom0 with the last one it received, and nothing else re-sends the current
-        // content - so the ungate owes this window one full-window damage. main.c's repaint idiom.
+        // content, so the ungate OWES this window a repaint. It is RECORDED here and sent by main.c's
+        // region-aware release, which repaints rgnVisible - this window minus whatever is stacked above
+        // it - instead of being sent from here as a full-window damage.
         //
-        // THE PAIR THE GRADER READS. QGATOASTGATE is the one family for gate transitions, and both ends
-        // come from the two places that move it: gated here or at the swap edge on the hook thread,
-        // resumed here. A window is dom0-visible-but-not-showing-its-own-content exactly between a
-        // `frames gated` and the next `frames resumed` for that hwnd, which is what lets a forwarded
-        // toast that swapped in behind a closed gate be told apart from one that was really shown twice.
-        LogInfo("QGATOASTGATE hwnd=0x%x frames resumed after %u held: the window carries a window-path toast "
-            "again and has been repainted in full, because dom0 was holding a frame from before the gate",
-            hw, framesHeld);
-        SendWindowDamageEvent(entry->Handle, 0, 0, (int)entry->Width, (int)entry->Height);
+        // WHY NOT FROM HERE. A full-window send is what main.c's drive-end settle does, so it looked like
+        // the idiom to copy. But main.c's OTHER release of that same hold, the one with the region
+        // arithmetic at hand, deliberately does not: "a full-window send here would hand this window the
+        // pixels of anything stacked above it (the occlusion bleed the region arithmetic below exists to
+        // prevent; review finding)" - and the loop above it names the symptom, corrupting a menu's host
+        // window on hover. The framebuffer is the COMPOSITED desktop and a banner is slice-fed
+        // (QGAHELDDEFER slicefed=1), so nothing about a toast excludes that bleed. Jev 0.98 for the
+        // visible region against 0.02 for the full window with the trade merely recorded.
+        //
+        // Not DaemonDamageHeld either: that flag is consumed by BOTH releases, so setting it would not
+        // guarantee the region-aware one, and it is driven by drag state - a drag in progress would defer
+        // this toast's repaint for as long as the drag lasted.
+        EnterCriticalSection(&g_ThLock);
+        TH_ENTRY* owed = ThFindLocked(entry->Handle);
+        if (owed)
+            owed->RepaintOwed = TRUE;
+        LeaveCriticalSection(&g_ThLock);
     }
     // A HELD OR SUPPRESSED WINDOW KEEPS ITS GATE, deliberately. Only a decision to SHOW opens it. An
     // unmapped window has no frames worth forwarding, and releasing the gate on the same pass that unmaps
@@ -696,6 +710,23 @@ void ToastHoldNoteChanged(IN HWND window)
             "its frames are held until a fresh identity read says which toast it now carries",
             (DWORD)(ULONG_PTR)window);
     }
+}
+
+// Collected by main.c's tracking pass, which owns WINDOW_DATA and the visible-region arithmetic. One
+// shot: the debt is cleared as it is taken, so a pass that reads it is the pass that pays it.
+BOOL ToastHoldTakeRepaintOwed(IN HWND window)
+{
+    BOOL owed = FALSE;
+    if (!g_ThLockInit || !window) return FALSE;
+    EnterCriticalSection(&g_ThLock);
+    TH_ENTRY* e = ThFindLocked(window);
+    if (e && e->RepaintOwed)
+    {
+        e->RepaintOwed = FALSE;
+        owed = TRUE;
+    }
+    LeaveCriticalSection(&g_ThLock);
+    return owed;
 }
 
 void ToastHoldEvict(IN HWND window)

@@ -1087,11 +1087,14 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
         return ERROR_SUCCESS; // dropped on purpose; not an error the caller can act on
     }
 
-    // Swap-edge gating: this window's frames are held while its banner is pre-empted (see the gate
-    // above). Dropped on purpose, the same shape as the refusal above, but logged at INFO - a held
-    // frame is the design working, not an anomaly for the log sweep to raise. The hold is bounded by
-    // the core's pre-emption window, and the ungate forces a full-window repaint, so a gated window
-    // cannot stay frozen. Placed after the negative check so a bad rect is still reported as bad.
+    // Swap-edge gating: this window's frames are held while its banner is pre-empted or mid-swap (see
+    // the gate above). Dropped on purpose, the same shape as the refusal above - but COUNTED, NOT
+    // LOGGED: a gated window drops frames at capture rate, and a per-window line at that rate is what
+    // log policy refuses (tools/tests/log-policy-selftest.sh no_routine_per_window_info). The count is
+    // reported once, on the ungate, as `after N held`. Both ends are bounded - the core's pre-emption
+    // window and the glue's own TH_HOLD_BOUND_MS on the swap gate - and the ungate forces a full-window
+    // repaint, so a gated window cannot stay frozen. Placed after the negative check so that a bad rect
+    // is still reported as bad rather than silently absorbed by the gate.
     if (window)
     {
         for (int i = 0; i < SEND_FRAME_GATES; i++)

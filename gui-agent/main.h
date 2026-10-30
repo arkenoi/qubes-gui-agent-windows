@@ -314,6 +314,12 @@ typedef struct _WINDOW_DATA
     // window's OLD screen region). Cleared by the one full-window settle repaint that
     // fires when the drive ends.
     BOOL  DaemonDamageHeld;
+    // One full repaint owed to dom0 because the toast frame gate held this window's frames and dom0 is
+    // still holding a frame from before the hold (toasthold.c, ADR-toasts 10). Consumed ONLY by the
+    // region-aware release in WatchForEvents, which repaints rgnVisible - never by the drive-end settle,
+    // which sends the whole window. A full-window send would hand this window the pixels of anything
+    // stacked above it, which is the bleed that corrupts a menu's host window on hover.
+    BOOL  ToastRepaintOwed;
 
     // FROZEN ANCHOR (WM-managed shell surfaces, ShellManaged != none). dom0 owns this
     // window's PLACEMENT: the guest HWND is never moved (it must keep painting at its
