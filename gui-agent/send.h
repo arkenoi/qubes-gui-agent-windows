@@ -85,5 +85,22 @@ ULONG SendWindowUnmap(IN HWND window);
 ULONG SendWindowMap(IN const WINDOW_DATA *windowData OPTIONAL); // if windowData == 0, use the whole screen
 ULONG SendWindowConfigure(HANDLE window, int x, int y, int width, int height, BOOL popup);
 ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN int height);
+
+// Swap-edge frame gate (ADR-toasts 10). While a toast banner is pre-empted its window stays mapped
+// and dom0 keeps the frame it has, but SendWindowDamageEvent forwards none of that window's new
+// frames. Both are idempotent and lock-free; see send.c for why the frame path takes no lock.
+//   Gate   -> TRUE if the window is gated after the call. FALSE means NO SLOT WAS FREE, and the
+//             caller must then fall back to unmapping the banner: leaving it mapped and ungated
+//             would show the queued toast's pixels as the displayed one's.
+//   Ungate -> TRUE if the window WAS gated, in which case the caller owes it a full-window
+//             SendWindowDamageEvent at once - held frames left dom0 with a stale one and nothing
+//             else will re-send the current content. framesHeld, when given, receives how many
+//             frames were actually dropped: reported once here rather than once per frame, which
+//             is both the log policy and the measurement of what the gate held back.
+#define SEND_GATE_REFUSED 0   // no slot was free - the caller must unmap instead of leaving it mapped
+#define SEND_GATE_NEW     1   // this call closed the gate (log the swap here, not on every re-assert)
+#define SEND_GATE_ALREADY 2   // it was already closed
+int  SendWindowFrameGate(IN HWND window);
+BOOL SendWindowFrameUngate(IN HWND window, OUT ULONG *framesHeld OPTIONAL);
 ULONG SendWindowName(IN HWND window, IN const WCHAR *caption OPTIONAL);
 ULONG SendProtocolVersion(void);

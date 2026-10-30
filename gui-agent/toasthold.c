@@ -28,6 +28,7 @@
 // call of the agent lives in toastcrop.c; this module receives the card's three raw texts from the
 // worker through toastcrop.h's TOAST_CARD_TEXTS contract and applies them (ToastHoldApplyIdentity).
 #include "main.h"
+#include "send.h"   // SendWindowFrameGate / Ungate: swap-edge gating holds frames in send.c
 #include "toasthold.h"
 #include "toastcrop.h"
 
@@ -79,6 +80,11 @@ typedef struct _TH_ENTRY
     BOOL      NotBanner;
     BOOL      NoCardLogged;   // one QGATOASTIDENT line per window for an unreadable card
     ULONGLONG Due;            // deadline armed for this window (0 = none)
+    // Swap-edge frame gate: the tick at which the hook thread closed it, 0 when it did not. The gate
+    // itself lives in send.c; this is the glue's own BOUND on it, and the reason one is needed is in
+    // ToastHoldDecide - a decided banner arms nothing, so without a bound a refused identity read would
+    // leave a mapped banner frozen on a stale frame until its window was destroyed.
+    ULONGLONG SwapGateSince;
     ULONGLONG LastUse;
 } TH_ENTRY;
 
@@ -462,9 +468,30 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         }
     }
 
+    // THE SWAP GATE'S OWN BOUND. ToastHoldNoteChanged closes the frame gate on the hook thread the moment a
+    // shown banner's window changes - earlier than any decision, which is the point. But a DECIDED banner
+    // arms no deadline and main.c takes it out of the re-check sweep (see this file's header), so the only
+    // thing that would bring it back through here is a completed identity read - and a read can be refused
+    // by the worker's queue or give up after TH_READ_RETRY_MAX failures. That would leave a MAPPED banner
+    // gated with nothing to reopen it: frozen on a stale frame until its window is destroyed, a worse
+    // failure than the loss this whole change fixes. So the gate is bounded here, in the glue that owns it,
+    // and the bound is armed as a deadline below so a pass is guaranteed to come and lift it.
+    BOOL swapGateHold = FALSE;
+    if (e->SwapGateSince)
+    {
+        if (out.Decision != ThDecShow || out.GateFrames)
+            e->SwapGateSince = 0;        // the core governs the gate now: held, suppressed, or pre-empted
+        else if (now - e->SwapGateSince < TH_HOLD_BOUND_MS)
+            swapGateHold = TRUE;         // still inside the bound: keep dom0 on the frame it has
+        else
+            e->SwapGateSince = 0;        // bound spent - fall through to the ungate-and-repaint below
+    }
+
     e->Due = out.Due;
     if (armRetry)
         e->Due = ThMinTick(e->Due, retryAt);
+    if (swapGateHold)
+        e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
     ThRecomputeDueLocked();
     LeaveCriticalSection(&g_ThLock);
 
@@ -477,6 +504,54 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // toast; it is accepted only as the sole candidate carrying that sender+title (toastident.h), and
     // the way to diagnose one is to compare s/t/m here with the bridge's HOLD line for this id.
     // toast-hold-grade.py keys on 'PARTIAL match'.
+    // SWAP-EDGE GATING, the other half of the decision (ADR-toasts 10; toasthold-core.h sets GateFrames).
+    // The gate lives in send.c because that is where every frame passes; it is applied here because this is
+    // where the pre-emption is decided. OUTSIDE g_ThLock on purpose: the release forces a full-window damage,
+    // which is a vchan write, and this module never sends under its own lock.
+    //
+    // ORDER MATTERS ON RELEASE: ungate FIRST, then repaint. The repaint goes through the very function the
+    // gate drops frames in, so a repaint issued while still gated would be the frame the gate eats, and
+    // "ungated" would mean "frozen". Expiry needs no case of its own: past TH_HOLD_BOUND_MS /
+    // TH_PREEMPT_WINDOW_MS the core's PreemptWanted is 0, so it arrives here as GateFrames == 0 and takes
+    // this same release path.
+    BOOL gateFallback = FALSE;
+    if (out.GateFrames)
+    {
+        const int claim = SendWindowFrameGate(entry->Handle);
+        if (claim == SEND_GATE_NEW)
+            LogInfo("QGATOASTGATE hwnd=0x%x frames gated reason=preempt: a newer toast's record is queued "
+                "behind this shown banner, so dom0 keeps the frame it has until that toast is identified", hw);
+        if (claim == SEND_GATE_REFUSED)
+        {
+            // Every gate slot taken. Fall back to rule 5 and withdraw the banner: a loss, which is bad,
+            // rather than the queued toast's pixels shown inside the window dom0 was told is this one,
+            // which is worse. Never fail open to forwarding the frames.
+            out.Decision = ThDecHold;
+            gateFallback = TRUE;
+        }
+    }
+    ULONG framesHeld = 0;
+    if (!out.GateFrames && !swapGateHold && out.Decision == ThDecShow &&
+        SendWindowFrameUngate(entry->Handle, &framesHeld))
+    {
+        // Held frames left dom0 with the last one it received, and nothing else re-sends the current
+        // content - so the ungate owes this window one full-window damage. main.c's repaint idiom.
+        //
+        // THE PAIR THE GRADER READS. QGATOASTGATE is the one family for gate transitions, and both ends
+        // come from the two places that move it: gated here or at the swap edge on the hook thread,
+        // resumed here. A window is dom0-visible-but-not-showing-its-own-content exactly between a
+        // `frames gated` and the next `frames resumed` for that hwnd, which is what lets a forwarded
+        // toast that swapped in behind a closed gate be told apart from one that was really shown twice.
+        LogInfo("QGATOASTGATE hwnd=0x%x frames resumed after %u held: the window carries a window-path toast "
+            "again and has been repainted in full, because dom0 was holding a frame from before the gate",
+            hw, framesHeld);
+        SendWindowDamageEvent(entry->Handle, 0, 0, (int)entry->Width, (int)entry->Height);
+    }
+    // A HELD OR SUPPRESSED WINDOW KEEPS ITS GATE, deliberately. Only a decision to SHOW opens it. An
+    // unmapped window has no frames worth forwarding, and releasing the gate on the same pass that unmaps
+    // would reopen it for exactly the instant between the two - which is the leak the swap-edge gate above
+    // exists to close. The slot comes back at ToastHoldEvict when the window is destroyed.
+
     if (logPartial)
         LogWarning("QGATOASTIDENT hwnd=0x%x PARTIAL match taken (same sender+title, message differs); "
             L"ident=%016llx s=%016llx t=%016llx m=%016llx id=%lu", hw, hc, hs, ht, hm, (ULONG)notifForLog);
@@ -534,16 +609,31 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             L"for its own verdict (the window stays unmapped until then)", hw, hc, hs, ht, hm);
         break;
     case ThEvPreemptStart:
-        // The pre-empted banner is not lost to the user: it stays in the guest's Notification Center, and the
-        // window is re-mapped once the queued toast resolves to window or its deadline passes. The first 220
-        // normalized characters of this line are a log-sweep baseline key (log-sweep-baseline.json,
-        // log-sweep.py normalize()), so only its tail is reworded here.
-        LogWarning("QGATOASTPREEMPT hwnd=0x%x unmapped: a bridge-bound or still-pending toast (id=%lu) is queued behind the displayed "
-            L"banner and would paint into this window in place; the displayed window-path banner loses the rest of its dom0 "
-            L"display, shown again when the queued toast resolves or at its deadline", hw, (ULONG)preemptNotif);
+        // THE BANNER KEEPS THE DISPLAY IT HAS. dom0 holds the frame it was given - which is this toast,
+        // correctly attributed - while the shared banner window is repainted underneath with the queued
+        // toast's content dom0 never sees; this window's frames resume when that toast resolves or at its
+        // deadline. Rule 5 used to UNMAP here, and because ThCorePreemptBy fires as soon as an unconsumed
+        // newer record exists the banner was withdrawn seconds before that toast's content arrived and never
+        // came back (run 40407378739: shown 680 ms, remapped=0).
+        //
+        // toast-hold-grade.py reads " unmapped:" on this line as a WITHDRAWAL (kv["what"]), so the fallback
+        // line carries that word and the held line must never acquire it. Levels differ on purpose: a held
+        // frame is the design working, a lost gate slot is an anomaly. Both are declared level-agnostically
+        // in log-sweep-baseline.json, because keying a declaration to a level that later moved is what made
+        // the A6LEAK entries match nothing for eleven days.
+        if (gateFallback)
+            LogWarning("QGATOASTPREEMPT hwnd=0x%x unmapped: a bridge-bound or still-pending toast (id=%lu) is queued behind "
+                "the displayed banner, and NO FRAME-GATE SLOT WAS FREE to hold this window's frames instead - so the banner "
+                "is withdrawn (rule 5 fallback) and loses the rest of its dom0 display", hw, (ULONG)preemptNotif);
+        else
+            LogInfo("QGATOASTPREEMPT hwnd=0x%x frames held: a bridge-bound or still-pending toast (id=%lu) is queued behind "
+                "the displayed banner and would paint into this window in place; the banner stays mapped showing the toast "
+                "dom0 was told it carries, and its frames resume when that toast resolves or at its deadline",
+                hw, (ULONG)preemptNotif);
         break;
     case ThEvPreemptEnd:
-        LogInfo("QGATOASTPREEMPT hwnd=0x%x re-mapped after %llu ms: the queued toast resolved to window (or its window passed)",
+        LogInfo("QGATOASTPREEMPT hwnd=0x%x frames resumed after %llu ms: the queued toast resolved to window (or its window "
+            "passed); the window was repainted in full, because dom0 was holding a frame from before the hold",
             hw, out.HeldMs);
         break;
     default:
@@ -563,11 +653,49 @@ void ToastHoldNoteChanged(IN HWND window)
 {
     if (!g_ThActive || !window || g_ThEntryCount == 0) return;
     const ULONGLONG now = GetTickCount64();
+    BOOL gateSwap = FALSE;
     EnterCriticalSection(&g_ThLock);
     TH_ENTRY* e = ThFindLocked(window);
     if (e)
+    {
         ThRequestReadLocked(e, now);
+        // THE SWAP EDGE ITSELF, and the reason this fix is named after it (ADR-toasts 10: forward none of
+        // that window's new frames until a fresh identity read shows which toast it carries). This event is
+        // the EARLIEST thing the agent learns about the shared banner window being repainted with different
+        // content - it arrives here, on the hook thread, ahead of the tracking pass that will decide. The
+        // pre-emption gate alone does not cover the swap: its bound can lapse before the queued toast
+        // actually takes the window (measured timeline: pre-empted 1.039, bound out 4.045, repainted 5.50),
+        // and then the swap frame goes out and a forwarded toast is on screen in BOTH places for as long as
+        // it takes the tracking pass to unmap - which is the double the owner's rule names first.
+        //
+        // ONLY FOR A SETTLED, SHOWN BANNER. A banner sliding in is in Holding and unmapped, and gating a
+        // window whose every move event lands here would hold the frames of its own animation and then
+        // force a repaint on release - a stutter and a repaint storm. Decided-and-shown is the state in
+        // which a change notice means content, not motion.
+        gateSwap = (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecShow);
+        if (gateSwap)
+        {
+            // Arm the bound AND wake the main loop. Without this the gate would be closed by a thread
+            // that never decides anything, on a banner that arms nothing - see ToastHoldDecide's bound.
+            if (e->SwapGateSince == 0)
+                e->SwapGateSince = now;
+            e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
+            ThRecomputeDueLocked();
+        }
+    }
     LeaveCriticalSection(&g_ThLock);
+
+    // Outside the lock: this module never calls into send.c under g_ThLock. The gate itself is lock-free,
+    // so it is safe on the hook thread, which must never block (the 2026-08-12 input stall).
+    if (gateSwap && SendWindowFrameGate(window) == SEND_GATE_NEW)
+    {
+        // The third timestamp needed to measure the leak this closes: this line, the content-changed line
+        // from the tracking pass, and the unmap. The gap between the first two is how long the gate was
+        // the only thing standing between a swapped-in forwarded toast and dom0.
+        LogInfo("QGATOASTGATE hwnd=0x%x frames gated at the swap edge: this shown banner's window changed, and "
+            "its frames are held until a fresh identity read says which toast it now carries",
+            (DWORD)(ULONG_PTR)window);
+    }
 }
 
 void ToastHoldEvict(IN HWND window)
@@ -586,6 +714,10 @@ void ToastHoldEvict(IN HWND window)
     }
     ThRecomputeDueLocked();
     LeaveCriticalSection(&g_ThLock);
+    // A window destroyed while its frames were held must not leave its handle in a gate slot: the slot
+    // would be spent for the life of the process, and a recycled HWND would be born gated. No repaint
+    // here - the window is gone, and there is nothing left to repaint.
+    SendWindowFrameUngate(window, NULL);
 }
 
 void ToastHoldSetBridgeUp(IN BOOL up)

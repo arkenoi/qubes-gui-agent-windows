@@ -37,6 +37,9 @@
  *   TOASTHOLD_DEFECT_NOBOUND           a hold never fails open (a lost toast instead of a late one)
  *   TOASTHOLD_DEFECT_FAILCLOSED        doubt suppresses instead of showing
  *   TOASTHOLD_DEFECT_NOPREEMPT         a queued bridge-bound toast no longer pre-empts (the flash)
+ *   TOASTHOLD_DEFECT_PREEMPT_UNMAPS    rule 5 restored: a pre-emption UNMAPS the displayed banner instead of
+ *                                      gating its frames - the banner is withdrawn seconds before the queued
+ *                                      toast's content arrives and never comes back (TOASTPREEMPTLOSESBANNER)
  *   TOASTHOLD_DEFECT_PREEMPT_IDENTGATE pre-emption ends while an identity read is in flight: the in-place
  *                                      swap's own event queues a read, so the swap pass MAPS the window while
  *                                      the bridged toast paints (review blocker #1; TestReviewProbe step 3)
@@ -517,12 +520,16 @@ static void TestMachine(void)
     Check("machine: (setup) shown", out.Decision == ThDecShow);
     in = In(1, IA, 1, 1, 14, TH_VERDICT_WINDOW, 1, t0 + 5000);
     ThCoreDecide(&c, &in, t0 + 1000, &out);
-    Check("machine: a queued bridge-bound toast PRE-EMPTS the mapped banner (unmapped before the swap)", out.Decision == ThDecHold && out.Event == ThEvPreemptStart && out.Reason == ThReasonPreempt && out.Due == t0 + 5000);
+    /* SWAP-EDGE GATING (ADR-toasts 10): the banner STAYS MAPPED and its frames are gated. The old
+     * expectation here was ThDecHold - rule 5's unmap - which is the defect: the pre-emption fires on the
+     * mere existence of a newer record, measured 4.47 s before that toast's content arrived, and the banner
+     * was withdrawn and never came back. TOASTHOLD_DEFECT_PREEMPT_UNMAPS restores it. */
+    Check("machine: a queued bridge-bound toast GATES the mapped banner's frames (it stays mapped)", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvPreemptStart && out.Reason == ThReasonPreempt && out.Due == t0 + 5000);
     ThCoreDecide(&c, &in, t0 + 1500, &out);
-    Check("machine: pre-emption is quiet while it lasts", out.Decision == ThDecHold && out.Event == ThEvNone);
+    Check("machine: the gate is quiet, and still closed, while the pre-emption lasts", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvNone);
     in = In(1, IA, 1, 1, 14, TH_VERDICT_WINDOW, 0, 0);
     ThCoreDecide(&c, &in, t0 + 2000, &out);
-    Check("machine: the queued toast resolved to window -> re-mapped (PreemptEnd)", out.Decision == ThDecShow && out.Event == ThEvPreemptEnd && out.HeldMs == 1000);
+    Check("machine: the queued toast resolved to window -> frames resume (PreemptEnd, gate open)", out.Decision == ThDecShow && !out.GateFrames && out.Event == ThEvPreemptEnd && out.HeldMs == 1000);
 
     /* 11. a suppressed banner is never pre-empted into anything else */
     memset(&c, 0, sizeof(c));
@@ -579,29 +586,29 @@ static void TestReviewProbe(void)
     t += 1000;
     in = In(1, 0xA, 1, 1, 1, TH_VERDICT_WINDOW, 1, t + 14000);
     ThCoreDecide(&c, &in, t, &out);
-    Check("probe 2: record B (bridge) queued behind -> pre-empted (HOLD, unmapped)", out.Decision == ThDecHold && out.Event == ThEvPreemptStart);
+    Check("probe 2: record B (bridge) queued behind -> pre-empted (SHOWN, frames gated)", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvPreemptStart);
 
     /* 3a. the glue's new contract: a read in flight does NOT make the identity unknown - and it computes
      *     PreemptWanted on every pass. */
     t += 4000;
     in = In(1, 0xA, 1, 1, 1, TH_VERDICT_WINDOW, 1, t + 10000);
     ThCoreDecide(&c, &in, t, &out);
-    Check("probe 3a: the swap pass with the last reading standing and pre-emption still wanted -> HOLD", out.Decision == ThDecHold && out.Event == ThEvNone);
+    Check("probe 3a: the swap pass with the last reading standing and pre-emption still wanted -> GATED", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvNone);
     /* 3b. an identity-less pass (a banner whose card never read, shown by fail-open) with pre-emption WANTED
      *     holds (the PREEMPT_IDENTGATE defect ignores PreemptWanted without an identity and maps it)... */
     in = In(0, 0, 1, 0, 0, 0, 1, t + 10000);
     ThCoreDecide(&c, &in, t + 1, &out);
-    Check("probe 3b: an identity-less pass with pre-emption wanted -> HOLD", out.Decision == ThDecHold && out.Event == ThEvNone && c.Preempting);
+    Check("probe 3b: an identity-less pass with pre-emption wanted -> GATED", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvNone && c.Preempting);
     /* 3c. ...and an identity-less pass with pre-emption NO LONGER wanted ENDS it - the glue computes
      *     PreemptWanted on every pass, so nothing else may keep a pre-emption alive (review N1: a term that
      *     did made it permanent for a banner whose card never read). */
     in = In(0, 0, 1, 0, 0, 0, 0, 0);
     ThCoreDecide(&c, &in, t + 2, &out);
-    Check("probe 3c: an identity-less pass with pre-emption no longer wanted ENDS it -> SHOW, PreemptEnd, no deadline", out.Decision == ThDecShow && out.Event == ThEvPreemptEnd && !c.Preempting && out.Due == 0);
+    Check("probe 3c: an identity-less pass with pre-emption no longer wanted ENDS it -> SHOW, gate OPEN, PreemptEnd, no deadline", out.Decision == ThDecShow && !out.GateFrames && out.Event == ThEvPreemptEnd && !c.Preempting && out.Due == 0);
     /* back to the pre-empted state for the rest of the probe */
     in = In(1, 0xA, 1, 1, 1, TH_VERDICT_WINDOW, 1, t + 10000);
     ThCoreDecide(&c, &in, t + 3, &out);
-    Check("probe 3d: pre-empted again (setup)", out.Decision == ThDecHold && out.Event == ThEvPreemptStart);
+    Check("probe 3d: pre-empted again (setup)", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvPreemptStart);
 
     t += 150;
     in = In(1, 0xB, 1, 1, 2, TH_VERDICT_BRIDGE, 0, 0);
@@ -798,11 +805,14 @@ static void TestReviewProbe3(void)
     t += 1000;
     in = In(0, 0, 1, 0, 0, 0, 1, t + 15000);
     ThCoreDecide(&c, &in, t, &out);
-    Check("probe3 3: a newer bridge record -> pre-empted with the record's deadline", out.Decision == ThDecHold && out.Due == t + 15000);
+    Check("probe3 3: a newer bridge record -> pre-empted with the record's deadline, frames gated", out.Decision == ThDecShow && out.GateFrames && out.Due == t + 15000);
     t += 15001;
     in = In(0, 0, 1, 0, 0, 0, 0, 0);
     ThCoreDecide(&c, &in, t, &out);
-    Check("probe3 4: the record's window passed -> SHOW again (pre-emption ENDS; no deadline left)", out.Decision == ThDecShow && out.Event == ThEvPreemptEnd && out.Due == 0);
+    /* THE BOUND LAPSING IS THE UNGATE-AND-REPAINT PATH (Jev 0.81): past TH_PREEMPT_WINDOW_MS the glue stops
+     * wanting the pre-emption, so it arrives here as a plain SHOW with the gate open, and the glue forces a
+     * full-window repaint. No case of its own, and a gate that outlived its bound cannot freeze a window. */
+    Check("probe3 4: the record's window passed -> SHOW again, gate OPEN (pre-emption ENDS; no deadline left)", out.Decision == ThDecShow && !out.GateFrames && out.Event == ThEvPreemptEnd && out.Due == 0);
     t += 600000;
     ThCoreDecide(&c, &in, t, &out);
     Check("probe3 5: ten minutes later still SHOW, nothing armed", out.Decision == ThDecShow && out.Event == ThEvNone && out.Due == 0);
@@ -949,6 +959,7 @@ static void TestConsumedAndNotBanner(void)
 int main(void)
 {
 #if defined(TOASTIDENT_DEFECT_NOFOLD) || defined(TOASTIDENT_DEFECT_ORDERONLY) || defined(TOASTIDENT_DEFECT_VERDICTOVERRIDE) || \
+    defined(TOASTHOLD_DEFECT_PREEMPT_UNMAPS) || \
     defined(TOASTHOLD_DEFECT_NOBOUND) || defined(TOASTHOLD_DEFECT_FAILCLOSED) || defined(TOASTHOLD_DEFECT_NOPREEMPT) || \
     defined(TOASTHOLD_DEFECT_PREEMPT_IDENTGATE) || defined(TOASTHOLD_DEFECT_SUPPRESS_FINAL) || \
     defined(TOASTHOLD_DEFECT_NORECLAIM) || defined(TOASTHOLD_DEFECT_NOIDENT_IGNORES_BRIDGE) || \

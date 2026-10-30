@@ -186,6 +186,11 @@ typedef struct _TH_OUTPUT
     ULONGLONG   HeldMs;          /* now - HoldSince (0 when not holding) */
     LONG        ReleaseSeq;      /* a PENDING record reserved for content that turned out to be something
                                     else: the glue un-consumes it so that toast's own banner can still match */
+    int         GateFrames;      /* SWAP-EDGE GATING: this window stays MAPPED and dom0 keeps the frame it has,
+                                    but none of this window's new frames may be forwarded until the gate drops.
+                                    Set only alongside Decision == ThDecShow; the glue holds the frames (send.c)
+                                    and MUST force a full-window repaint when it goes back to 0, or "ungated"
+                                    means "frozen". See ADR-toasts 10. */
 } TH_OUTPUT;
 
 /* ---- the consumed set (records already tied to a banner) ------------------------------------ */
@@ -373,6 +378,7 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
     out->Due = 0;
     out->HeldMs = 0;
     out->ReleaseSeq = 0;
+    out->GateFrames = 0;
 
     /* ---- not a toast banner at all: shown, for good, nothing to hold or pre-empt ---------------- */
     if (in->NotBanner || c->NotBanner)
@@ -585,7 +591,27 @@ decided:
                 c->PreemptSince = now;
                 if (out->Event == ThEvNone) out->Event = ThEvPreemptStart;
             }
+            /* SWAP-EDGE GATING, replacing rule 5's unmap (ADR-toasts 10). Windows toasts reuse ONE banner
+             * window, so a newer toast repaints the window dom0 was told carries this one. Rule 5 unmapped it
+             * to avoid showing B's pixels as A - but ThCorePreemptBy fires as soon as an unconsumed newer
+             * record EXISTS, measured 4.47 s before that toast's content arrived (run 40407378739, id=12 shown
+             * for 680 ms and withdrawn for good). So the cure ran far ahead of the disease and the banner was
+             * simply lost. Instead: keep it MAPPED and hold the window's frames. dom0 keeps the last frame it
+             * received - which IS this toast, correctly attributed - while the shared window is repainted
+             * underneath with content dom0 never sees. Nothing is lost and nothing flashes. The fresh identity
+             * read then decides: a window-path toast ungates (and the glue forces a repaint), a bridge-bound
+             * one is suppressed, which is rule 5's behaviour applied where it is actually justified.
+             *
+             * The hold is bounded by ThCorePreemptBy's own TH_HOLD_BOUND_MS / TH_PREEMPT_WINDOW_MS: past the
+             * bound `wanted` is 0, so control falls into the release branch below - ungate and repaint. A frame
+             * hold that outlived its bound would freeze a real window, which is worse than the loss it fixes. */
+#if defined(TOASTHOLD_DEFECT_PREEMPT_UNMAPS)
+            /* DEFECT: rule 5 restored - the displayed banner is withdrawn instead of having its frames held. */
             out->Decision = ThDecHold;
+#else
+            out->Decision = ThDecShow;
+            out->GateFrames = 1;
+#endif
             out->Reason = ThReasonPreempt;
             out->Due = in->PreemptDue;
             out->HeldMs = now - c->PreemptSince;

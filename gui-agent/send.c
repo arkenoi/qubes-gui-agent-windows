@@ -81,6 +81,84 @@ static ULONG g_GeomDrops;    // MSG_CREATE / MSG_CONFIGURE / MSG_WINDOW_DUMP
 static ULONG g_GeomClamps;   // values rewritten rather than refused
 static ULONG g_DamageDrops;  // MSG_SHMIMAGE
 
+// --- swap-edge frame gate (ADR-toasts 10; toasthold-core.h sets TH_OUTPUT.GateFrames) -------------
+// While a shell toast banner is pre-empted, its window stays MAPPED and dom0 keeps the frame it
+// already has, but none of that window's NEW frames may go out. Windows toasts reuse one banner
+// window, so the queued toast repaints the very window dom0 was told carries the displayed one;
+// forwarding that repaint would show toast B's pixels inside the window announced as toast A.
+// toasthold.c owns the policy and the bound - this file only holds the frames back.
+//
+// WHY HERE. Every frame-forwarding path in the agent passes through SendWindowDamageEvent: the WGC
+// per-window damage callback on the capture thread (perwindow.c) and main.c's repaints. It is the
+// one place the hold is expressible, and the inheritance is provable by there being a single
+// definition rather than by visiting the call sites.
+//
+// WHY LOCK-FREE. It is also the hottest path in the agent - a drag emits hundreds of rects per
+// second, and a per-rect lock acquisition was measured as the dominant tail cost of ProtoTrace
+// itself (580 ms vs 66 ms with it off, FINDINGS 2026-08-12). So the gate is a tiny array of
+// handles, published with an interlocked write from the tracking thread and read with plain loads
+// from the capture thread. No lock on the frame path, ever. A read that races a publish sees the
+// handle one pass early or late, which costs at most one frame either way.
+//
+// FOUR SLOTS, and what happens when they are all taken. Every capture on record pre-empts at most
+// one banner window at a time; four is slack, not a design limit. A failed claim is REPORTED to the
+// caller, which falls back to rule 5 and unmaps - a loss, which is bad, rather than a
+// misattribution, which is worse. Failing open to "forward the frames" is the one thing this must
+// never do.
+#define SEND_FRAME_GATES 4
+static HWND volatile g_FrameGates[SEND_FRAME_GATES];
+// Frames actually dropped per slot. NOT a log line per frame: a gated window is dropping frames at
+// capture rate, and a per-window INFO line at that rate is exactly what log policy refuses
+// (tools/tests/log-policy-selftest.sh no_routine_per_window_info). The count is reported ONCE, on the
+// ungate, which is per toast - and it is also the measurement that says how much the gate really held.
+static volatile LONG g_FrameGateHeld[SEND_FRAME_GATES];
+
+int SendWindowFrameGate(IN HWND window)
+{
+    if (!window)
+        return SEND_GATE_REFUSED;   // whole-desktop damage has no per-window identity (composite path)
+
+    // Idempotent: both callers re-assert the gate - the tracking pass on every pass for as long as
+    // the pre-emption lasts, and the hook thread on every change notice - so a second call must not
+    // consume a second slot. SEND_GATE_NEW tells the caller this call is the one that closed it,
+    // which is what keeps a log line per swap from becoming a log line per mouse-move.
+    for (int i = 0; i < SEND_FRAME_GATES; i++)
+    {
+        if (g_FrameGates[i] == window)
+            return SEND_GATE_ALREADY;
+    }
+    for (int i = 0; i < SEND_FRAME_GATES; i++)
+    {
+        if (InterlockedCompareExchangePointer((PVOID volatile *)&g_FrameGates[i], window, NULL) == NULL)
+        {
+            InterlockedExchange(&g_FrameGateHeld[i], 0);
+            return SEND_GATE_NEW;
+        }
+    }
+    return SEND_GATE_REFUSED;
+}
+
+BOOL SendWindowFrameUngate(IN HWND window, OUT ULONG *framesHeld OPTIONAL)
+{
+    if (framesHeld)
+        *framesHeld = 0;
+    if (!window)
+        return FALSE;
+    for (int i = 0; i < SEND_FRAME_GATES; i++)
+    {
+        // Read the count BEFORE releasing the slot, or a frame still in flight on the capture thread
+        // could land on a slot the next banner has already claimed.
+        const LONG held = g_FrameGateHeld[i];
+        if (InterlockedCompareExchangePointer((PVOID volatile *)&g_FrameGates[i], NULL, window) == window)
+        {
+            if (framesHeld)
+                *framesHeld = (ULONG)held;
+            return TRUE;   // it WAS gated: the caller owes this window a full-window repaint
+        }
+    }
+    return FALSE;
+}
+
 // The evidence hook. The 25H2 negative-geometry case has never been reproduced here (four
 // storm runs, zero occurrences), so when it does recur in the field this line is the only
 // thing that will say which message and which field went wrong.
@@ -1007,6 +1085,23 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
         LogGeometryRefused(&g_DamageDrops, window, L"MSG_SHMIMAGE",
             L"negative damage rect (dom0 xside.c:2261 discards it unseen)", x, y, width, height);
         return ERROR_SUCCESS; // dropped on purpose; not an error the caller can act on
+    }
+
+    // Swap-edge gating: this window's frames are held while its banner is pre-empted (see the gate
+    // above). Dropped on purpose, the same shape as the refusal above, but logged at INFO - a held
+    // frame is the design working, not an anomaly for the log sweep to raise. The hold is bounded by
+    // the core's pre-emption window, and the ungate forces a full-window repaint, so a gated window
+    // cannot stay frozen. Placed after the negative check so a bad rect is still reported as bad.
+    if (window)
+    {
+        for (int i = 0; i < SEND_FRAME_GATES; i++)
+        {
+            if (g_FrameGates[i] == window)
+            {
+                InterlockedIncrement(&g_FrameGateHeld[i]);
+                return ERROR_SUCCESS;   // dropped on purpose, and counted; reported on the ungate
+            }
+        }
     }
 
     // FAULT INJECTION (test builds only): M5's instrument must be seen to fail - the delay precedes the trace line it times.
