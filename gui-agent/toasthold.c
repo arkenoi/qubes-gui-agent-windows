@@ -89,6 +89,12 @@ typedef struct _TH_ENTRY
     // nothing else re-sends the current content. Collected by main.c (ToastHoldTakeRepaintOwed) and paid
     // from its region-aware release, so the repaint is this window MINUS whatever is stacked above it.
     BOOL      RepaintOwed;
+    // TRUE from the moment the swap gate closes until a read COMPLETES for this window. Not the same as
+    // ReadInFlight: a read the worker's queue REFUSED leaves ReadInFlight clear, and keying the hold on
+    // that alone would open the gate on the next pass and let the swap frame out. Keyed on this, a
+    // refused read holds to the bound - which is the safe direction - while a read that lands saying the
+    // content did not change (a move, not a swap) opens the gate at once.
+    BOOL      SwapGateReadPending;
     ULONGLONG LastUse;
 } TH_ENTRY;
 
@@ -485,10 +491,17 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     {
         if (out.Decision != ThDecShow || out.GateFrames)
             e->SwapGateSince = 0;        // the core governs the gate now: held, suppressed, or pre-empted
-        else if (now - e->SwapGateSince < TH_HOLD_BOUND_MS)
-            swapGateHold = TRUE;         // still inside the bound: keep dom0 on the frame it has
+        else if (e->SwapGateReadPending && now - e->SwapGateSince < TH_HOLD_BOUND_MS)
+            swapGateHold = TRUE;         // no read has named the content yet: keep dom0 on the frame it has
         else
-            e->SwapGateSince = 0;        // bound spent - fall through to the ungate-and-repaint below
+            // A read has landed and the content did NOT change - a move, not a swap, so there is nothing
+            // to protect - or the bound is spent. TIED TO THE READ AND NOT TO A TIMER, which is the ADR's
+            // wording ("until a fresh identity read shows which toast it carries") and matters for the
+            // common case: ToastHoldNoteChanged fires on every LOCATIONCHANGE / NAMECHANGE of a tracked
+            // window, so a settled banner that merely moves - or slides out at the end of its life -
+            // would otherwise have its frames held for the full three seconds and appear in dom0 to hang
+            // and then vanish instead of sliding. Median identity-read latency is 218 ms.
+            e->SwapGateSince = 0;
     }
 
     e->Due = out.Due;
@@ -693,6 +706,10 @@ void ToastHoldNoteChanged(IN HWND window)
             // that never decides anything, on a banner that arms nothing - see ToastHoldDecide's bound.
             if (e->SwapGateSince == 0)
                 e->SwapGateSince = now;
+            // Pending until a read COMPLETES - set after ThRequestReadLocked above, so it is TRUE even
+            // when that request was refused, and the gate then holds to its bound instead of opening on
+            // the next pass with the swap frame behind it.
+            e->SwapGateReadPending = TRUE;
             e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
             ThRecomputeDueLocked();
         }
@@ -933,6 +950,9 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
     again = e->ReadDirty && !e->NotBanner;
     e->ReadDirty = FALSE;
     if (again) ThRequestReadLocked(e, now);
+    // A read has now named this window's content, so the swap gate has what it was waiting for - unless
+    // another read was just issued because the content moved again, in which case it keeps waiting.
+    e->SwapGateReadPending = again;
     LeaveCriticalSection(&g_ThLock);
 
     if (logNoCard)
