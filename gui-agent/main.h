@@ -371,7 +371,13 @@ typedef struct _WINDOW_DATA
 
     // WGC broker (24H2+): this sliceFed window's pixels come from the user-session broker's
     // per-HWND WGC capture instead of the composited-desktop slice. See BrokerRegister/
-    // BrokerFreshFrame in main.c. Falls back to the slice whenever no fresh broker frame.
+    // BrokerFreshFrame in main.c. IT DOES NOT FALL BACK TO THE SLICE WHERE DirectRequired():
+    // this said "falls back to the slice whenever no fresh broker frame" until 2026-10-31, which
+    // has been false since the grant de-slice - ProcessNewFrame's sliceFed chain takes the
+    // `else if (DirectRequired())` arm ABOVE both composite-copy arms and HOLDS the window's last
+    // content instead (owner 2026-09-06: "no fallback on a system that supports the direct path"),
+    // and PwNoteCompositeCopy makes a composite copy there a per-window ERROR. The fallback is
+    // real only where the direct path is not eligible: win10, below the 26100 floor, WgcBroker=0.
     // Set for the duration of a RESIZE rebuild when the broker slot can be kept and merely
     // retargeted instead of released and re-acquired. A Win11 menu resizes repeatedly while it
     // opens, and every resize used to release the slot: the broker's Reconcile then CLOSED the

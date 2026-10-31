@@ -11474,22 +11474,38 @@ static BOOL CALLBACK ToastOccWalkProc(HWND window, LPARAM lParam)
 // none arrives"); it does.
 //
 // WHY IT CAN BE PAID FROM HERE AT ALL. A damage event does not need a captured frame: it tells
-// dom0 to re-read a rect of the framebuffer, which for a slice-fed window IS the composited
-// desktop. The only reason the payment lived on the frame path was that rgnVisible is built
-// there - so the region is rebuilt here, from a fresh walk, and the event path can pay too
-// (ProcessWindowEvents takes g_csWatchedWindows and runs TrackWindows, so this runs at rest).
+// dom0 to re-read a rect of THE WINDOW'S OWN GRANTED BUFFER. The only reason the payment lived on
+// the frame path was that rgnVisible is built there - so the region is rebuilt here and the event
+// path can pay too (ProcessWindowEvents takes g_csWatchedWindows and runs TrackWindows, so this
+// runs at rest).
 //
-// THE ANTI-BLEED GUARANTEE IS KEPT, NOT TRADED. The framebuffer is the composited desktop, so the
-// pixels under a higher window belong to that window; a full-window send is what "corrupts a
-// menu's host window on hover" (review finding). So the occluders are SUBTRACTED, exactly as the
-// frame path does with rgnCovered. Where the order cannot be read, self is not in it, or there are
-// more occluders than the budget, this DECLINES and the deferred path stays as it was - never a
+// WHOSE PIXELS THAT BUFFER HOLDS DECIDES WHETHER ANYTHING MUST BE WITHHELD, AND ON THE DIRECT PATH
+// THE ANSWER IS NOTHING. This said "the framebuffer is the composited desktop, so the pixels under
+// a higher window belong to that window" and subtracted unconditionally. That premise is false
+// wherever DirectRequired(): in ProcessNewFrame's sliceFed chain the `else if (DirectRequired())`
+// arm sits ABOVE both composite-copy arms and HOLDS the window's last content rather than falling
+// through (owner 2026-09-06: "no fallback on a system that supports the direct path. just no. fail
+// hard and investigate."), and PwNoteCompositeCopy makes any composite copy that did happen a
+// per-window ERROR, QGACOMPOSITECOPY, which acceptance asserts is absent - zero on run 41173805854
+// boot 062336, and LOG_LEVEL_ERROR is 1, below every configured level, so that zero is a real
+// negative and not a missing instrument. There the buffer carries this window's own per-HWND WGC
+// frames and nothing else: no foreign pixels exist to bleed, and subtracting an occluder would
+// WITHHOLD THE BANNER'S REAL CONTENT from dom0. So the whole window is paid, the walk is not run
+// at all, and the line records src=broker. (It already measured occluders=0 on that boot, so this
+// changes no observed behaviour - it removes machinery that only a retired path justified.)
+//
+// WHERE THE COMPOSITE IS STILL THE SOURCE THE SUBTRACTION STAYS (src=composite). win10, below the
+// 26100 floor and the explicit WgcBroker=0 opt-out all reach PwSliceCopyAndDamage, the pixels under
+// a higher window really do belong to that window, and a full-window send is what "corrupts a
+// menu's host window on hover" (review finding). The occluders are then SUBTRACTED exactly as the
+// frame path does with rgnCovered, and where the order cannot be read, self is not in it, or there
+// are more occluders than the budget, this DECLINES and the deferred path stays as it was - never a
 // full-window shortcut, and never the frame path's region-read fallback either, because declining
-// costs at most today's behaviour. Measured on all five archived boots: no watched window's rect
-// ever intersects the banner's (the banner sits at x=4724..5120 of a 5120x1440 desktop, every
-// other window at x<=1364), so THE RIG CANNOT TELL A CORRECT REGION FROM A WRONG ONE HERE - which
-// is the reason to copy the frame path's arithmetic rather than invent a cheaper test. A maximised
-// or bottom-right window in the field would overlap.
+// costs at most today's behaviour. THE RIG CANNOT TELL A CORRECT REGION FROM A WRONG ONE on that
+// path: measured on all five archived boots no watched window's rect ever intersects the banner's
+// (the banner sits at x=4724..5120 of a 5120x1440 desktop, every other window at x<=1364), which is
+// the reason to copy the frame path's arithmetic rather than invent a cheaper test. A maximised or
+// bottom-right window in the field would overlap.
 //
 // Caller must hold g_csWatchedWindows (the walk reads the watched list).
 static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
@@ -11525,6 +11541,7 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     if (entry->CfgPendingPos || DaemonGeometryUnsettled(entry))
         return FALSE;
 
+    const BOOL direct = DirectRequired();
     RECT occ[PW_MAX_OCCLUDERS];
     TH_OCC_WALK walk;
     walk.self = entry;
@@ -11536,11 +11553,15 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     walk.maxOut = PW_MAX_OCCLUDERS;
     walk.n = 0;
     walk.foundSelf = FALSE;
-    // The callback returns FALSE to stop at self, which makes EnumWindows itself return FALSE with
-    // no error - so foundSelf, not the return value, is what says the walk is usable.
-    (void)EnumWindows(ToastOccWalkProc, (LPARAM)&walk);
-    if (!walk.foundSelf || walk.n < 0)
-        return FALSE;
+    if (!direct)
+    {
+        // The callback returns FALSE to stop at self, which makes EnumWindows itself return FALSE
+        // with no error - so foundSelf, not the return value, is what says the walk is usable.
+        (void)EnumWindows(ToastOccWalkProc, (LPARAM)&walk);
+        if (!walk.foundSelf || walk.n < 0)
+            return FALSE;
+    }
+    // walk.n stays 0 on the direct path, so the region below is the whole window and rects=1.
 
     HRGN rgnVis = CreateRectRgn(walk.rect.left, walk.rect.top, walk.rect.right, walk.rect.bottom);
     HRGN rgnOne = CreateRectRgn(0, 0, 0, 0);
@@ -11585,11 +11606,14 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     if (!sent)
         return FALSE;       // the debt stands; ProcessNewFrame's release still owes it
 
-    LogInfo("QGATOASTREPAINT hwnd=0x%x paid=at-release after %llu ms feed=slice occluders=%d rects=%lu "
+    // src= is not decoration: occluders=0 alone cannot say whether the walk found nothing or was
+    // never run, and that is the difference between "no popup was above the banner" and "the
+    // composite is not this window's source, so nothing could be withheld".
+    LogInfo("QGATOASTREPAINT hwnd=0x%x paid=at-release after %llu ms feed=slice occluders=%d rects=%lu src=%s "
         L"(the visible region was repainted without waiting for a capture frame: dom0 now has this toast's pixels)",
         (DWORD)(ULONG_PTR)entry->Handle,
         (unsigned long long)(entry->ToastRepaintOwedAt ? GetTickCount64() - entry->ToastRepaintOwedAt : 0),
-        walk.n, rects);
+        walk.n, rects, direct ? L"broker" : L"composite");
     entry->ToastRepaintOwed = FALSE;
     entry->ToastRepaintOwedAt = 0;
     entry->ToastRepaintFrameSeen = FALSE;
