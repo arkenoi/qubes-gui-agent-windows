@@ -328,6 +328,9 @@ typedef struct _WINDOW_DATA
      * unpaid debt cannot say WHY: no frame ever arrived (the at-rest case main.c records at the payment
      * site) and a frame that arrived while something else withheld the repaint look identical. */
     BOOL  ToastRepaintFrameSeen;
+    /* One-shot latch for the overdue notice. The debt is retried on every tracking pass, so without
+     * this the notice would repeat for as long as the window lives. */
+    BOOL  ToastRepaintOverdueLogged;
 
     // FROZEN ANCHOR (WM-managed shell surfaces, ShellManaged != none). dom0 owns this
     // window's PLACEMENT: the guest HWND is never moved (it must keep painting at its

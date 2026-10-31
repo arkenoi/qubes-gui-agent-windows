@@ -6415,8 +6415,10 @@ static BOOL ToastHeldByBridge(IN OUT WINDOW_DATA* entry)
             entry->ToastRepaintOwed = TRUE;
             entry->ToastRepaintOwedAt = GetTickCount64();
             entry->ToastRepaintFrameSeen = FALSE;
-            LogInfo("QGATOASTREPAINT hwnd=0x%x owed=deferred feed=slice (the gate's repaint rides the next "
-                L"capture frame; until it lands dom0 keeps the frame from before the hold)",
+            entry->ToastRepaintOverdueLogged = FALSE;
+            LogInfo("QGATOASTREPAINT hwnd=0x%x owed=deferred feed=slice (the debt is recorded here and "
+                L"settled at the end of this tracking pass; only if that declines does it ride the next "
+                L"capture frame, and until then dom0 keeps the frame from before the hold)",
                 (DWORD)(ULONG_PTR)entry->Handle);
         }
         else
@@ -9619,6 +9621,10 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 // Refresh data about a window, send notifications to gui daemon if needed.
 // Marks the window for removal from the list if the new state makes it no longer eligible.
 // Watched windows critical section must be entered.
+// Defined next to the occluder walk it needs; called from UpdateWindowData's exit, which both
+// TrackWindows callers reach with g_csWatchedWindows held.
+static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry);
+
 static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
 {
     ULONG status = ERROR_SUCCESS;
@@ -10390,6 +10396,33 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     status = ERROR_SUCCESS;
 
 end:
+    // The gate's repaint, settled in the SAME pass that incurred it wherever the ordering allows.
+    // At `end:` because this function takes the debt from two arms above (the IsVisible check and
+    // the toastHeld read) and several paths `goto end`, so this one exit catches all of them. It is
+    // a no-op unless a debt is outstanding, so it is also the retry for a debt taken ELSEWHERE -
+    // ToastHeldByBridge is called from AddWindow and the foreground probe too, and those pay on the
+    // next tracking pass rather than this one. A decline leaves the deferred path exactly as it was,
+    // so the worst case is today's behaviour, and `owed=deferred` / `frame=seen` / `paid=` /
+    // `owed=overdue` still say which of them happened.
+    if (!ToastPayRepaintNow(windowData) && windowData->ToastRepaintOwed &&
+        windowData->ToastRepaintOwedAt && !windowData->ToastRepaintOverdueLogged &&
+        GetTickCount64() - windowData->ToastRepaintOwedAt > TH_HOLD_BOUND_MS)
+    {
+        // A DEBT THAT OUTLIVED THE HOLD'S OWN BOUND. Every other way a toast can go wrong is
+        // bounded and logged; this one used to be silent, which is how a whole lost banner reached
+        // a CLEAN grade (the loss is dom0 still showing the PREVIOUS toast, and nothing about a
+        // held frame says so). The notice does not fix it - the retry above does, on the next pass
+        // - but it makes an unpayable debt a line in the log instead of an absence, so the grader
+        // and the log sweep can both see it. frame_seen discriminates the two causes: 0 means no
+        // capture frame ever arrived, 1 means one did and the payment was still withheld.
+        windowData->ToastRepaintOverdueLogged = TRUE;
+        LogWarning("QGATOASTREPAINT hwnd=0x%x owed=overdue after %llu ms feed=slice frame_seen=%d "
+            L"(past the %u ms hold bound dom0 may still be showing the PREVIOUS toast)",
+            (DWORD)(ULONG_PTR)windowData->Handle,
+            (unsigned long long)(GetTickCount64() - windowData->ToastRepaintOwedAt),
+            windowData->ToastRepaintFrameSeen ? 1 : 0, (unsigned)TH_HOLD_BOUND_MS);
+    }
+
     if (!windowData->DeletePending && !ShouldAcceptWindow(windowData))
     {
         LogDebug("0x%x no longer eligible, marking for removal", windowData->Handle);
@@ -11372,6 +11405,196 @@ static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
         e = (WINDOW_DATA*)e->ListEntry.Flink;
     }
     return n;
+}
+
+// WHY NOT PwCollectOccluders / g_ZOrderCaptureValid. Both the ZOrder fields and that flag are
+// written only by CollectZOrder, which runs ONLY inside ProcessNewFrame (main.c). At rest - the
+// exact condition this payment exists for - the last frame may predate the banner entirely, so the
+// stored order is stale and the flag's TRUE is a leftover. A clipping decision taken on a stale
+// order is the failure the g_ZOrderValid comment describes ("claims everything as covered and
+// NOTHING else receives damage"). So the order is read FRESH here, from the window manager, and
+// nothing global is touched: no ZOrder field is written, neither validity flag is set, and the
+// frame loop's own bookkeeping is left exactly as it was.
+//
+// Like ZOrderProc, this relies on EnumWindows yielding top-level windows top-of-z-order first,
+// which is what the existing ordering already depends on.
+typedef struct _TH_OCC_WALK
+{
+    const WINDOW_DATA* self;
+    RECT rect;          // self's screen rect
+    RECT* out;
+    int maxOut;
+    int n;              // -1 once the budget is blown
+    BOOL foundSelf;     // became FALSE->TRUE when the enumeration reached self
+} TH_OCC_WALK;
+
+static BOOL CALLBACK ToastOccWalkProc(HWND window, LPARAM lParam)
+{
+    TH_OCC_WALK* w = (TH_OCC_WALK*)lParam;
+    if (window == w->self->Handle)
+    {
+        w->foundSelf = TRUE;
+        return FALSE;       // everything after this point is BELOW self: stop
+    }
+    // EXACTLY the frame path's rgnCovered membership rule, which is `g_ZOrderValid &&
+    // ClaimsOcclusionArea(entry)` at all three of its accumulation sites - override-redirect popups
+    // and cropped shell toasts, nothing else. Subtracting an ordinary window above would be
+    // STRONGER than the frame path, and main.c says at that site why stronger is wrong here: dom0's
+    // stacking need not agree with the guest's, so withholding a region from the window below can
+    // expose a stale band, and "fixing the general case needs the daemon to learn z-order: a
+    // protocol change, Phase 3, not something to smuggle in here". A popup is the safe case because
+    // it is on top in both by construction. The g_ZOrderValid half of that rule is about trusting
+    // the ORDER, and this walk reads the order fresh instead, which is the stronger claim.
+    WINDOW_DATA* e = FindWindowByHandle(window);
+    RECT hit;
+    if (e && e != w->self && e->IsVisible && !e->IsIconic && !e->DeletePending &&
+        e->Width > 0 && e->Height > 0 && ClaimsOcclusionArea(e))
+    {
+        RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
+        if (IntersectRect(&hit, &other, &w->rect))
+        {
+            if (w->n >= w->maxOut)
+            {
+                w->n = -1;
+                return FALSE;
+            }
+            w->out[w->n++] = hit;
+        }
+    }
+    return TRUE;
+}
+
+// PAY THE TOAST GATE'S REPAINT DEBT NOW, with the exact visible region, instead of leaving it to
+// the next capture frame. THE DEBT WAS BEING LOST: measured on run 41161440735 boot 2, the
+// swap-edge gate held 3 frames for a queued window-path toast, released correctly at 071117.577
+// and recorded `owed=deferred`, and then NO capture frame arrived in the 5.9 s before the window
+// was destroyed (`frame=seen` 0, `paid=` 0 for the whole boot). dom0 kept the PREVIOUS toast's
+// banner, and that toast - not forwarded, verdict=window - was never shown to the user at all.
+// main.c already said this could happen at the payment site ("on a direct-capable guest at rest
+// none arrives"); it does.
+//
+// WHY IT CAN BE PAID FROM HERE AT ALL. A damage event does not need a captured frame: it tells
+// dom0 to re-read a rect of the framebuffer, which for a slice-fed window IS the composited
+// desktop. The only reason the payment lived on the frame path was that rgnVisible is built
+// there - so the region is rebuilt here, from a fresh walk, and the event path can pay too
+// (ProcessWindowEvents takes g_csWatchedWindows and runs TrackWindows, so this runs at rest).
+//
+// THE ANTI-BLEED GUARANTEE IS KEPT, NOT TRADED. The framebuffer is the composited desktop, so the
+// pixels under a higher window belong to that window; a full-window send is what "corrupts a
+// menu's host window on hover" (review finding). So the occluders are SUBTRACTED, exactly as the
+// frame path does with rgnCovered. Where the order cannot be read, self is not in it, or there are
+// more occluders than the budget, this DECLINES and the deferred path stays as it was - never a
+// full-window shortcut, and never the frame path's region-read fallback either, because declining
+// costs at most today's behaviour. Measured on all five archived boots: no watched window's rect
+// ever intersects the banner's (the banner sits at x=4724..5120 of a 5120x1440 desktop, every
+// other window at x<=1364), so THE RIG CANNOT TELL A CORRECT REGION FROM A WRONG ONE HERE - which
+// is the reason to copy the frame path's arithmetic rather than invent a cheaper test. A maximised
+// or bottom-right window in the field would overlap.
+//
+// Caller must hold g_csWatchedWindows (the walk reads the watched list).
+static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
+{
+    if (!entry || !entry->ToastRepaintOwed || !entry->Handle)
+        return FALSE;
+    if (entry->Width == 0 || entry->Height == 0 || !entry->IsVisible || entry->DeletePending)
+        return FALSE;
+
+    // THE DAMAGE HOLD IS NOT OURS TO BREAK. While the daemon dictates this window's geometry (a dom0
+    // WM drag) or a guest-native drag has latched it, position announces are withheld, so dom0's
+    // framebuffer read origin for a slice-fed window is FROZEN at the old position - damage sent now
+    // would make dom0 paint pixels from the window's OLD screen region into it. The frame path's
+    // release withholds damage for exactly these two conditions and repaints at the drive end; so
+    // this declines and leaves the debt to that release, which is the path that knows when the drive
+    // ended. A banner is not normally dragged, so this is the rare arm, not the common one.
+    if (entry->DaemonStreamTick != 0 &&
+        (GetTickCount() - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS)
+        return FALSE;
+    if (g_InputDragFreeze && g_InputDragOriginValid && entry->Handle == g_InputDragWindow &&
+        entry->CfgPendingPos)
+        return FALSE;
+    // The same hazard without a drag: dom0 reads the framebuffer at the origin it was last TOLD,
+    // so any withheld or unlanded position makes a region send paint the wrong part of the desktop.
+    // The frame path answers this by running CfgFlushPendingMove + ApplyPendingDaemonMove
+    // immediately before it builds rgnVisible; this site DECLINES instead, because
+    // ApplyPendingDaemonMove posts a SetWindowPos and calling it from the event path would move
+    // windows at moments nothing moves them today - an unrequested behaviour change to buy a case
+    // that does not arise (a banner's first announce is a full configure, which the position-only
+    // limiter never suppresses, so CfgPendingPos is clear for the toast this fix is for). The debt
+    // then rides the frame path, or the timer-driven settle sweep that already exists for exactly
+    // the no-frame-ever-arrives case.
+    if (entry->CfgPendingPos || DaemonGeometryUnsettled(entry))
+        return FALSE;
+
+    RECT occ[PW_MAX_OCCLUDERS];
+    TH_OCC_WALK walk;
+    walk.self = entry;
+    walk.rect.left = entry->X;
+    walk.rect.top = entry->Y;
+    walk.rect.right = entry->X + (int)entry->Width;
+    walk.rect.bottom = entry->Y + (int)entry->Height;
+    walk.out = occ;
+    walk.maxOut = PW_MAX_OCCLUDERS;
+    walk.n = 0;
+    walk.foundSelf = FALSE;
+    // The callback returns FALSE to stop at self, which makes EnumWindows itself return FALSE with
+    // no error - so foundSelf, not the return value, is what says the walk is usable.
+    (void)EnumWindows(ToastOccWalkProc, (LPARAM)&walk);
+    if (!walk.foundSelf || walk.n < 0)
+        return FALSE;
+
+    HRGN rgnVis = CreateRectRgn(walk.rect.left, walk.rect.top, walk.rect.right, walk.rect.bottom);
+    HRGN rgnOne = CreateRectRgn(0, 0, 0, 0);
+    if (!rgnVis || !rgnOne)
+    {
+        if (rgnVis) DeleteObject(rgnVis);
+        if (rgnOne) DeleteObject(rgnOne);
+        return FALSE;
+    }
+    for (int i = 0; i < walk.n; i++)
+    {
+        SetRectRgn(rgnOne, occ[i].left, occ[i].top, occ[i].right, occ[i].bottom);
+        CombineRgn(rgnVis, rgnVis, rgnOne, RGN_DIFF);
+    }
+
+    BOOL sent = FALSE;
+    ULONG rects = 0;
+    const DWORD needed = GetRegionData(rgnVis, 0, NULL);
+    RGNDATA* rd = needed ? (RGNDATA*)malloc(needed) : NULL;
+    if (rd && GetRegionData(rgnVis, needed, rd) != 0)
+    {
+        const RECT* parts = (const RECT*)rd->Buffer;
+        sent = TRUE;
+        for (DWORD i = 0; i < rd->rdh.nCount; i++)
+        {
+            const ULONG rs = SendWindowDamageEvent(entry->Handle,
+                parts[i].left - entry->X, parts[i].top - entry->Y,
+                parts[i].right - parts[i].left, parts[i].bottom - parts[i].top);
+            if (ERROR_SUCCESS != rs)
+            {
+                win_perror2(rs, "SendWindowDamageEvent (toast gate repaint, at release)");
+                sent = FALSE;
+                break;
+            }
+            rects++;
+        }
+    }
+    free(rd);
+    DeleteObject(rgnOne);
+    DeleteObject(rgnVis);
+
+    if (!sent)
+        return FALSE;       // the debt stands; ProcessNewFrame's release still owes it
+
+    LogInfo("QGATOASTREPAINT hwnd=0x%x paid=at-release after %llu ms feed=slice occluders=%d rects=%lu "
+        L"(the visible region was repainted without waiting for a capture frame: dom0 now has this toast's pixels)",
+        (DWORD)(ULONG_PTR)entry->Handle,
+        (unsigned long long)(entry->ToastRepaintOwedAt ? GetTickCount64() - entry->ToastRepaintOwedAt : 0),
+        walk.n, rects);
+    entry->ToastRepaintOwed = FALSE;
+    entry->ToastRepaintOwedAt = 0;
+    entry->ToastRepaintFrameSeen = FALSE;
+    entry->ToastRepaintOverdueLogged = FALSE;
+    return TRUE;
 }
 
 // Does any part of r lie outside every rect of occ[0..n)? Rectangle subtraction, bounded: past the budget it answers TRUE
@@ -14416,6 +14639,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             entry->ToastRepaintOwed = FALSE;
             entry->ToastRepaintOwedAt = 0;
             entry->ToastRepaintFrameSeen = FALSE;
+            entry->ToastRepaintOverdueLogged = FALSE;
             DWORD needed = GetRegionData(rgnVisible, 0, NULL);
             if (needed > rgnDataSize)
             {
