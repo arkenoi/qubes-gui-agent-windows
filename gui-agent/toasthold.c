@@ -487,12 +487,22 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // failure than the loss this whole change fixes. So the gate is bounded here, in the glue that owns it,
     // and the bound is armed as a deadline below so a pass is guaranteed to come and lift it.
     BOOL swapGateHold = FALSE;
+    // How long the swap gate held dom0 on a stale frame, captured on the pass that ENDS it because both
+    // paths below zero the stamp. Reported on the release line: the gate's success used to be silent, so
+    // the log carried its two closures and never the duration either of them bought.
+    BOOL swapGateEnded = FALSE;
+    ULONGLONG swapGateMs = 0;
     if (e->SwapGateSince)
     {
+        swapGateEnded = TRUE;
+        swapGateMs = now > e->SwapGateSince ? now - e->SwapGateSince : 0;
         if (out.Decision != ThDecShow || out.GateFrames)
             e->SwapGateSince = 0;        // the core governs the gate now: held, suppressed, or pre-empted
         else if (e->SwapGateReadPending && now - e->SwapGateSince < TH_HOLD_BOUND_MS)
+        {
             swapGateHold = TRUE;         // no read has named the content yet: keep dom0 on the frame it has
+            swapGateEnded = FALSE;       // still open, so this pass has no duration to report
+        }
         else
             // A read has landed and the content did NOT change - a move, not a swap, so there is nothing
             // to protect - or the bound is spent. TIED TO THE READ AND NOT TO A TIMER, which is the ADR's
@@ -573,6 +583,29 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         if (owed)
             owed->RepaintOwed = TRUE;
         LeaveCriticalSection(&g_ThLock);
+
+        // THE GATE'S OTHER END, which was never written. log-sweep-baseline.json has declared this line
+        // expected since the gating change ("the tracking pass (reason=preempt, and the resume that forces
+        // the repaint) ... the frames actually dropped are counted and reported as 'after N held' on the
+        // resume line"), toast-hold-grade.py's --selftest fixture synthesises it verbatim, and mapped_at's
+        // contract is to read the GATE PAIR - yet nothing emitted it and `framesHeld` was computed into a
+        // local and thrown away. The cost was a false product FAIL: mapped_at latches `gated` and, with no
+        // resume to clear it, a window gated once at the swap edge reads as never-showing for the rest of
+        // the run. Under this very design the SECOND toast in a shared banner window gets no MAP of its own
+        // - the window is already mapped and what it gets is this release plus the repaint debt above - so
+        // it graded LOST twice on run 41154092416 (id=15, id=26) with no line able to say otherwise.
+        // Not on a pre-empt end: that raises ThEvPreemptEnd, which logs its own resume with its own
+        // duration, and the declaration asks for ONE line per transition.
+        if (out.Event != ThEvPreemptEnd)
+        {
+            if (swapGateEnded)
+                LogInfo("QGATOASTGATE hwnd=0x%x frames resumed after %lu held, swap gate open %llu ms: the window "
+                    L"carries a window-path toast again and has been repainted in full",
+                    hw, (ULONG)framesHeld, (unsigned long long)swapGateMs);
+            else
+                LogInfo("QGATOASTGATE hwnd=0x%x frames resumed after %lu held: the window carries a window-path "
+                    L"toast again and has been repainted in full", hw, (ULONG)framesHeld);
+        }
     }
     // A HELD OR SUPPRESSED WINDOW KEEPS ITS GATE, deliberately. Only a decision to SHOW opens it. An
     // unmapped window has no frames worth forwarding, and releasing the gate on the same pass that unmaps
