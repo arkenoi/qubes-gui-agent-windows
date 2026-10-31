@@ -6403,9 +6403,21 @@ static BOOL ToastHeldByBridge(IN OUT WINDOW_DATA* entry)
     //     -fed banner can hold dom0's pre-hold frame until the next paint. Recorded in ADR-toasts 10.
     if (ToastHoldTakeRepaintOwed(entry->Handle))
     {
+        // THE DEBT'S TWO ENDS, BOTH OF WHICH WERE SILENT. The gate's release only RECORDS this repaint;
+        // until it is paid dom0 is still showing the frame it had before the hold - the PREVIOUS toast. So
+        // "released" and "shown" are different facts, and only the payment carries the second one. The
+        // slice-fed wait is the one that matters: it rides the next capture frame, and on a direct-capable
+        // guest at rest none arrives, which this file already records above as a banner holding dom0's
+        // pre-hold frame until the next paint. That wait had no measurement at all, so a window-path toast
+        // that never reached the screen was indistinguishable from one that did.
         if (entry->PwSliceFed)
         {
             entry->ToastRepaintOwed = TRUE;
+            entry->ToastRepaintOwedAt = GetTickCount64();
+            entry->ToastRepaintFrameSeen = FALSE;
+            LogInfo("QGATOASTREPAINT hwnd=0x%x owed=deferred feed=slice (the gate's repaint rides the next "
+                L"capture frame; until it lands dom0 keeps the frame from before the hold)",
+                (DWORD)(ULONG_PTR)entry->Handle);
         }
         else
         {
@@ -6413,6 +6425,10 @@ static BOOL ToastHeldByBridge(IN OUT WINDOW_DATA* entry)
                 (int)entry->Width, (int)entry->Height);
             if (ERROR_SUCCESS != rs)
                 win_perror2(rs, "SendWindowDamageEvent (toast gate release)");
+            else
+                LogInfo("QGATOASTREPAINT hwnd=0x%x paid=immediate feed=per-window (own capture, so a "
+                    L"full-window damage cannot bleed; dom0 has this toast's pixels)",
+                    (DWORD)(ULONG_PTR)entry->Handle);
         }
     }
     return held;
@@ -14323,6 +14339,19 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         // position once the flood stops, even if the vchan goes quiet.
         ApplyPendingDaemonMove(entry);
 
+        // THE THIRD STATE OF THE REPAINT DEBT, and the one that tells the other two apart. An `owed` with
+        // no `paid` has two completely different causes - no capture frame ever arrived for this window
+        // (what main.c records at the payment site for a direct-capable guest at rest), or frames did
+        // arrive and something else in the chain below withheld the repaint - and they are indistinguishable
+        // from the pair alone. Once per debt, so a frame flood costs one line.
+        if (entry->ToastRepaintOwed && !entry->ToastRepaintFrameSeen)
+        {
+            entry->ToastRepaintFrameSeen = TRUE;
+            LogInfo("QGATOASTREPAINT hwnd=0x%x frame=seen owed_ms=%llu (a capture frame reached this window "
+                L"with the gate's repaint still owed)", (DWORD)(ULONG_PTR)entry->Handle,
+                (unsigned long long)(entry->ToastRepaintOwedAt ? GetTickCount64() - entry->ToastRepaintOwedAt : 0));
+        }
+
         windowRect.left = entry->X;
         windowRect.top = entry->Y;
         windowRect.right = entry->X + (int)entry->Width;
@@ -14379,7 +14408,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             // a banner is slice-fed, so the bleed above is not excluded for it either.
             // Deliberately NOT read by the drive-end settle, which sends the whole window.
             entry->DaemonDamageHeld = FALSE;
+            // Whose debt this release pays: the drag hold and the toast gate share it, and only the toast
+            // half is the one the toast log must account for.
+            const BOOL toastPaid = entry->ToastRepaintOwed;
+            const ULONGLONG toastOwedFor = (toastPaid && entry->ToastRepaintOwedAt)
+                ? GetTickCount64() - entry->ToastRepaintOwedAt : 0;
             entry->ToastRepaintOwed = FALSE;
+            entry->ToastRepaintOwedAt = 0;
+            entry->ToastRepaintFrameSeen = FALSE;
             DWORD needed = GetRegionData(rgnVisible, 0, NULL);
             if (needed > rgnDataSize)
             {
@@ -14413,6 +14449,13 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     goto cleanup;
                 }
             }
+            // The other end of QGATOASTREPAINT owed=deferred. Logged only for the toast half of this
+            // release, and only once - the flag was cleared above - so the pair brackets exactly the
+            // interval dom0 spent on the pre-hold frame.
+            if (toastPaid)
+                LogInfo("QGATOASTREPAINT hwnd=0x%x paid=region after %llu ms feed=slice (the visible region "
+                    L"was repainted: dom0 now has this toast's pixels)",
+                    (DWORD)(ULONG_PTR)entry->Handle, (unsigned long long)toastOwedFor);
         }
 
         // skip windows that aren't in the changed area

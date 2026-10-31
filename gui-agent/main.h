@@ -320,6 +320,14 @@ typedef struct _WINDOW_DATA
     // which sends the whole window. A full-window send would hand this window the pixels of anything
     // stacked above it, which is the bleed that corrupts a menu's host window on hover.
     BOOL  ToastRepaintOwed;
+    /* When ToastRepaintOwed was recorded, so the payment below can state how long dom0 held the
+     * PRE-HOLD frame. A slice-fed banner's repaint waits for the next capture frame, which on a
+     * direct-capable guest at rest may never come (ADR-toasts 10), and that wait was unmeasured. */
+    ULONGLONG ToastRepaintOwedAt;
+    /* Whether any capture frame reached this window while that repaint was still owed. Without it an
+     * unpaid debt cannot say WHY: no frame ever arrived (the at-rest case main.c records at the payment
+     * site) and a frame that arrived while something else withheld the repaint look identical. */
+    BOOL  ToastRepaintFrameSeen;
 
     // FROZEN ANCHOR (WM-managed shell surfaces, ShellManaged != none). dom0 owns this
     // window's PLACEMENT: the guest HWND is never moved (it must keep painting at its
