@@ -600,6 +600,17 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         LogInfo("QGATOASTHOLD hwnd=0x%x state=show ident=%016llx id=%lu held_ms=%llu (verdict=window: the banner is the toast)",
             hw, hc, (ULONG)notifForLog, out.HeldMs);
         break;
+    case ThEvAckConfirmed:
+        // THE HEALTHY END OF A SUPPRESSION, which used to end silently. ack_wait_ms is measured on the
+        // bound's own clock - from this banner's suppression to the pass that read `forwarded` - so the
+        // log finally carries the distribution the FAILURES alone could never show: how close a working
+        // forward runs to TH_FORWARD_BOUND_MS. The two doubles of 41138837627 both failed open on a
+        // forward that SUCCEEDED, so whether that bound sits above or inside the normal path is the open
+        // question, and this is the number that answers it. INFO, not a warning: nothing went wrong.
+        LogInfo("QGATOASTACK hwnd=0x%x ident=%016llx id=%lu ack_wait_ms=%llu bound_ms=%u (dom0 acknowledged the "
+            L"forward: the suppression stands)",
+            hw, hc, (ULONG)notifForLog, out.HeldMs, (UINT)TH_FORWARD_BOUND_MS);
+        break;
     case ThEvShowCorrected:
         // The record turned window after the banner was suppressed: the bridge could not forward the toast after
         // all (the forward failed for good, or dom0 was unreachable), or a dom0 action on it could not be carried

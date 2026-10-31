@@ -646,7 +646,12 @@ static void TestSuppressReopen(void)
     ThCoreDecide(&c, &in, t0, &out);
     in = In(1, 0xD, 1, 1, 4, TH_VERDICT_FORWARDED, 0, 0);
     ThCoreDecide(&c, &in, t0 + 300, &out);
-    Check("reopen: bridge -> forwarded keeps the suppression, quietly, and disarms the forward bound", out.Decision == ThDecSuppress && out.Event == ThEvNone && out.Due == 0);
+    /* NO LONGER quiet: the ack is reported once, for its TIMING (ThEvAckConfirmed -> QGATOASTACK, INFO).
+     * The suppression and the disarmed bound are unchanged - what is added is HeldMs measured from the
+     * suppression, which is the only clock TH_FORWARD_BOUND_MS is actually racing. Without it the log held
+     * the fail-opens and nothing else, so how close a WORKING forward runs to the bound was unmeasurable. */
+    Check("reopen: bridge -> forwarded keeps the suppression, reports the ack's wait, and disarms the forward bound",
+          out.Decision == ThDecSuppress && out.Event == ThEvAckConfirmed && out.HeldMs == 300 && out.Due == 0);
     in = In(1, 0xD, 0, 1, 4, TH_VERDICT_FORWARDED, 0, 0);
     ThCoreDecide(&c, &in, t0 + 900, &out);
     Check("reopen: bridge dies AFTER dom0's ack -> stays suppressed (dom0 has it)", out.Decision == ThDecSuppress && out.Event == ThEvNone);

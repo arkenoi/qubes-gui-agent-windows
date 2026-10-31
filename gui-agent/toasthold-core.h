@@ -127,7 +127,8 @@ typedef enum _TH_EVENT   /* what changed in THIS call, for the glue to log (none
     ThEvPreemptStart,    /* a mapped window-path banner was unmapped for a queued bridge-bound toast */
     ThEvPreemptEnd,      /* ...and re-mapped (the queued toast resolved to window, or its window passed) */
     ThEvShowCorrected,   /* a suppressed banner's record turned `window`: shown after all */
-    ThEvNotBanner        /* the window is not a toast banner (no card after two reads): shown, never held again */
+    ThEvNotBanner,       /* the window is not a toast banner (no card after two reads): shown, never held again */
+    ThEvAckConfirmed     /* dom0 acknowledged the forward: the suppression stands - reported for its TIMING */
 } TH_EVENT;
 
 typedef enum _TH_REASON
@@ -159,6 +160,7 @@ typedef struct _TH_CORE          /* per banner window; zero-initialised = idle *
     ULONGLONG   PreemptSince;
     int         NotBanner;       /* not a toast banner: SHOW for good, nothing is ever held again */
     ULONGLONG   SuppressSince;   /* tick the current SUPPRESS was decided: the forward bound counts from here */
+    int         AckSeen;         /* dom0's ack has been reported once for THIS suppression (ThEvAckConfirmed) */
 } TH_CORE;
 
 typedef struct _TH_INPUT         /* gathered by the glue for one pass */
@@ -338,6 +340,7 @@ TI_INLINE void ThCoreStartHold(TH_CORE* c, ULONGLONG now, UINT64 ident)
     c->Preempting = 0;
     c->PreemptSince = 0;
     c->SuppressSince = 0;
+    c->AckSeen = 0;
 }
 
 TI_INLINE void ThCoreDecideNow(TH_CORE* c, TH_DECISION d, int failedOpen)
@@ -471,6 +474,7 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
         {
             ThCoreDecideNow(c, ThDecSuppress, 0);
             c->SuppressSince = now;
+            c->AckSeen = 0;        /* a fresh suppression: this one's ack has not been reported */
             out->Event = ThEvSuppress;
             goto decided;
         }
@@ -564,6 +568,28 @@ decided:
             else if (c->SuppressSince != 0)
                 out->Due = c->SuppressSince + TH_FORWARD_BOUND_MS;
 #endif
+        }
+        else if (!c->AckSeen && c->SuppressSince != 0)
+        {
+            /* THE ACK IS IN HAND and this suppression stands for good - the only outcome of a hold that
+             * was previously SILENT. Reported once, with the interval TH_FORWARD_BOUND_MS was actually
+             * racing: from the tick this banner was suppressed to the pass that read `forwarded`. That is
+             * the bound's OWN clock, which the bridge's FWDWAIT cannot be (it starts at the verdict, and
+             * when the record was created already carrying one it over-reads by the record-match latency -
+             * about 0.5 s on the measured double; Jev scored the bridge-side field alone 0.39 for deciding
+             * the bound and named this tick the missing measurement at 0.60).
+             * Without it the log holds only the FAILURES (QGATOASTHOLDLATE), so there is no distribution of
+             * how close a HEALTHY ack runs to 3000 ms - and a bound can only be moved against that. */
+            c->AckSeen = 1;   /* latched even when another event owns this pass: the ack IS in hand */
+            /* Never CLOBBER this pass's event (the file's idiom, as PreemptStart/End use). A banner
+             * suppressed straight onto an already-forwarded record - an allowlisted toast acked before its
+             * banner appeared - reports ThEvSuppress with verdict=forwarded on this very pass, and its wait
+             * was zero, so there is nothing for a second line to add. */
+            if (out->Event == ThEvNone)
+            {
+                out->Event = ThEvAckConfirmed;
+                out->HeldMs = now - c->SuppressSince;   /* suppress-relative, as PreemptStart/End do for theirs */
+            }
         }
 #endif
     }
