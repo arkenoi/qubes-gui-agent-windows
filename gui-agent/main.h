@@ -485,6 +485,19 @@ typedef struct _WINDOW_DATA
     // visible black flash) or content->map (hold lead) from these two.
     ULONGLONG PwSliceContentTick;
     ULONGLONG PwSliceMapTick;
+    // QGATOASTFEED (one INFO line per broker registration of a window the toast hold ever owned): what this
+    // registration's feed delivered. TOASTBANNERLOSTONDIRECTPATH, 3 losses: a bridge-suppressed banner reused in place
+    // for a window-verdict toast reached QGADIRECTSUPPRESS with PwSliceContentTick==0 - never painted from CREATE - and
+    // nothing at INFO says whether the broker delivered no frame (refused every pass) or delivered only frames that
+    // fail SlicePainted. Those have different fixes. ToastFeedHeld is sticky for the entry's life (set by
+    // ToastHeldByBridge); the rest are re-armed per registration in BrokerRegister. Field stores only per frame;
+    // the one line is emitted at paint, at the NOT SHOWN declaration, or when the registration ends.
+    BOOL      ToastFeedHeld;
+    BOOL      ToastFeedLogged;
+    ULONGLONG ToastFeedRegTick;      // GetTickCount64 at this registration
+    ULONGLONG ToastFeedFirstTick;    // first broker frame consumed under it; 0 = none
+    DWORD     ToastFeedHeldFrames;   // broker frames consumed while ToastHoldOwned
+    const WCHAR* ToastFeedWhy;       // last BrokerFreshFrame refusal (points at a BFF_NO literal); NULL = none
 
     // Move-only drag fast path (ProcessNewFrame, PrintWindow-fed branch): a pure
     // position change does not alter the window's own content - the per-window buffer

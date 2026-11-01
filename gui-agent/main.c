@@ -5618,8 +5618,57 @@ static BOOL BrokerSlotStale(IN const WINDOW_DATA* e, IN const WGCBRK_SLOT* bs)
                   bs->ReqCropX != cx || bs->ReqCropY != cy);
 }
 
+// QGATOASTFEED: ONE INFO line per broker registration of a window the toast hold ever owned, saying what that
+// registration's feed delivered. TOASTBANNERLOSTONDIRECTPATH: in all 3 recorded losses the banner reached QGADIRECTSUPPRESS
+// with PwSliceContentTick==0 - no painted content from CREATE on - and two causes fit with nothing at INFO to split them:
+//   consumed=0                  BrokerFreshFrame refused every pass; why/ack/fail/pw/route/arrived name the refusal
+//                               (FAILED + pw=1 is the PrintWindow true-black shape; arrived=0 on a WGC channel is a
+//                               session that never delivered)
+//   consumed>0, painted_ms=-1   frames landed and none passed SlicePainted (QGASLICEBLACK's case)
+// held_frames counts the frames consumed while the hold owned the window, i.e. during the suppressed life.
+// painted_ms is relative to THIS registration: PwSliceContentTick is once per window life, so a negative value is content
+// painted under an earlier registration; -1 is never painted.
+// Emitted at first paint (PwNoteSliceContent), at the NOT SHOWN declaration, and where the registration ends (the top of
+// BrokerUnregister, or a BrokerRegister over a live one); latched until BrokerRegister re-arms it. Bounded by
+// registrations, nothing on a timer, silent at rest.
+// THE SLOT HWND IS PRINTED, NOT MATCHED. BrokerRegister writes BrokerSourceWindow() into the slot - the covering shell
+// root for a card it finds one for - while BrokerFreshFrame refuses any slot whose Hwnd is not the window's own
+// (slot-holds-another-hwnd). Guarding the read on Hwnd==window would print ack=-1 for exactly that case and hide it; the
+// agent alone writes a slot's Hwnd and clears PwBrokerSlot when it frees one, so the slot an entry names is its own. The
+// tick block (TickPw, FirstArrivedTick) is the broker's per-OPEN record and is trusted only when TickHwnd names the
+// slot's hwnd: slots are recycled (see the BROKERCHAIN comment in BrokerConsumePass).
+static void ToastFeedReport(IN OUT WINDOW_DATA* e, IN const WCHAR* end)
+{
+    if (!e->ToastFeedHeld || e->ToastFeedLogged || !e->PwSliceFed || !e->PwBrokerSourced)
+        return;
+    e->ToastFeedLogged = TRUE;
+    const ULONGLONG now = GetTickCount64();
+    const int slot = e->PwBrokerSlot;
+    const WGCBRK_SLOT* s = (g_WgcBase && slot >= 0 && slot < WGCBRK_MAX_SLOTS)
+        ? &WGCBRK_SLOTS(g_WgcBase)[slot] : NULL;
+    const UINT64 sh = s ? (UINT64)s->Hwnd : 0;
+    const BOOL ticks = (BOOL)(s && sh != 0 && (UINT64)s->TickHwnd == sh);
+    LogInfo("QGATOASTFEED hwnd=0x%x end=%s reg_ms=%llu consumed=%lu held_frames=%lu first_ms=%lld painted_ms=%lld why=%s "
+        L"slot=%d src=0x%llx ack=%ld fail=0x%08lx fid=%llu pw=%ld route=%ld arrived=%d deaf=%ld",
+        (DWORD)(ULONG_PTR)e->Handle, end,
+        (ULONGLONG)(now - e->ToastFeedRegTick),
+        (unsigned long)e->PwBrokerFrames, (unsigned long)e->ToastFeedHeldFrames,
+        e->ToastFeedFirstTick ? (LONGLONG)(e->ToastFeedFirstTick - e->ToastFeedRegTick) : (LONGLONG)-1,
+        e->PwSliceContentTick ? (LONGLONG)(e->PwSliceContentTick - e->ToastFeedRegTick) : (LONGLONG)-1,
+        e->ToastFeedWhy ? e->ToastFeedWhy : L"none",
+        slot, (unsigned long long)sh,
+        s ? (long)s->AckState : -1L, s ? (unsigned long)s->FailHr : 0UL,
+        s ? (unsigned long long)s->FrameId : 0ULL,
+        ticks ? (long)s->TickPw : -1L, s ? (long)s->Route : -1L,
+        (ticks && s->FirstArrivedTick) ? 1 : 0,
+        s ? (long)s->DeafHolds : -1L);
+}
+
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
 {
+    // perwindow.c's keep path falls back to a registration over a live slot when the retarget fails; that ends the
+    // previous registration's episode, so it is reported before the reset below forgets the slot.
+    if (entry->PwBrokerSourced) ToastFeedReport(entry, L"reregistered");
     entry->PwBrokerSourced = FALSE; entry->PwBrokerSlot = -1;
     entry->PwBrokerLastId = 0; entry->PwBrokerArenaOff = 0;
     entry->PwDimsLogged = FALSE;   // re-arm the one-shot BROKERDIMS diagnostic per registration
@@ -5628,6 +5677,13 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     entry->PwDimsStuck = FALSE;
     entry->PwDirectSuppressed = FALSE;
     entry->PwBrokerFrames = 0;
+    // A new QGATOASTFEED episode per registration attempt (only one that succeeds can report: the line needs
+    // PwBrokerSourced). BrokerRetarget keeps the episode, as it keeps PwBrokerFrames.
+    entry->ToastFeedLogged = FALSE;
+    entry->ToastFeedFirstTick = 0;
+    entry->ToastFeedHeldFrames = 0;
+    entry->ToastFeedWhy = NULL;
+    entry->ToastFeedRegTick = GetTickCount64();
     entry->PwPixSigValid = FALSE;   // a new slot renders its first frame on its own; the next damage pokes
     if (!WgcBrokerActive() || !entry->PwSliceFed) return FALSE;
     if (entry->Width == 0 || entry->Height == 0) return FALSE;
@@ -5894,6 +5950,9 @@ BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
 
 void BrokerUnregister(IN OUT WINDOW_DATA* entry)
 {
+    // Before anything is freed: the line reads the slot. Every end of a registration passes here - DESTROY
+    // (RemoveWindow -> PwDetachWindow), BROKERREREG, a non-keep resize, synth deactivation.
+    if (entry->PwBrokerSourced) ToastFeedReport(entry, L"unregistered");
     if (!g_WgcBase || entry->PwBrokerSlot < 0) { entry->PwBrokerSourced = FALSE; return; }
     WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
     // The regions this slot was given, from the agent's own record (never read back from the shared slot), then forgotten.
@@ -6385,6 +6444,7 @@ static BOOL ToastHeldByBridge(IN OUT WINDOW_DATA* entry)
     }
     const BOOL held = ToastHoldDecide(entry) != ThDecShow;
     entry->ToastHoldOwned = held;
+    if (held) entry->ToastFeedHeld = TRUE;   // sticky: QGATOASTFEED reports every later registration of this banner
     // A gate release inside that decision leaves dom0 holding a frame from before the hold, and nothing
     // else re-sends the current content - so that frame must be replaced, or dom0 would show the PREVIOUS
     // toast's pixels in a window the guest has already repainted with the next one. That is the very
@@ -10276,6 +10336,8 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                     windowData->PwBrokerSourced, windowData->PwBrokerSlot,
                     WgcBrokerActive(), g_DirectSuppressed);
                 DirectSuppressNotifyUser(g_DirectSuppressed);
+                // The line above says "never received a frame" but tests "no PAINTED frame"; this one says which.
+                ToastFeedReport(windowData, L"suppressed");
             }
         }
         else if (cropReady || timedOut)
@@ -11059,6 +11121,7 @@ static void PwNoteSliceContent(IN OUT WINDOW_DATA* entry)
         return;
     }
     entry->PwSliceContentTick = GetTickCount64();
+    ToastFeedReport(entry, L"painted");
     LogDebug("QGASLICECONTENT hwnd=0x%x t=%llu map=%llu flash_ms=%lld nonblack=%lu/%lu hold=%d",
         (DWORD)(ULONG_PTR)entry->Handle, entry->PwSliceContentTick, entry->PwSliceMapTick,
         entry->PwSliceMapTick != 0 ?
@@ -12285,15 +12348,31 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
     // own refusal, which BrokerFreshFrame now states. A hold whose reason reads "unknown" means a
     // path was added without naming itself, which is the state this exists to end.
     if (!entry->PwBrokerSourced) { if (why) *why = L"window-not-sourced"; return FALSE; }
-    if (!WgcBrokerActive())      { if (why) *why = L"broker-not-active";  return FALSE; }
-    if (!BrokerFreshFrame(entry, &bsrc, &bpitch, &bid, why))
+    if (!WgcBrokerActive())
+    {
+        if (why) *why = L"broker-not-active";
+        if (entry->ToastFeedHeld) entry->ToastFeedWhy = L"broker-not-active";
         return FALSE;
+    }
+    // The refusal is always taken (BrokerFreshFrame only stores into it), so QGATOASTFEED can name the last one even
+    // for the BrokerConsumePass caller, which passes why=NULL.
+    const WCHAR* bffWhy = NULL;
+    if (!BrokerFreshFrame(entry, &bsrc, &bpitch, &bid, &bffWhy))
+    {
+        if (why) *why = bffWhy;
+        if (entry->ToastFeedHeld) entry->ToastFeedWhy = bffWhy;
+        return FALSE;
+    }
     if (bid != entry->PwBrokerLastId || entry->PwSliceNeedsFull)
     {
         BOOL firstBrokerFrame = (entry->PwBrokerLastId == 0);
         entry->PwSliceNeedsFull = FALSE;
         entry->PwBrokerLastId = bid;
         if (entry->PwBrokerFrames < 0xFFFFFFFFu) entry->PwBrokerFrames++;
+        // QGATOASTFEED counts, stored here and not at firstBrokerFrame below: PwNoteSliceContent (further down this
+        // branch) can emit the line on this very frame, and first_ms must already be set when it does.
+        if (entry->ToastFeedFirstTick == 0) entry->ToastFeedFirstTick = GetTickCount64();
+        if (entry->ToastHoldOwned && entry->ToastFeedHeldFrames < 0xFFFFFFFFu) entry->ToastFeedHeldFrames++;
         // The RETURN VALUE is load-bearing: the attribution below must count a frame that
         // actually landed, not an attempt. Discarding it counted refused copies as delivered
         // broker frames - the mirror image of QGALEDGERGAP, and the quieter one, because an
