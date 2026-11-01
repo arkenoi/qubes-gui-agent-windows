@@ -12453,10 +12453,12 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
                 {
                     // The reason must not name a cause it has not established.
                     // It used to say "slot-reopened-for-another-window" whenever
-                    // TickHwnd differed - which was FALSE for every menu: menus are
-                    // rejected by WGC and served by polled PrintWindow, a path that
-                    // wrote no ticks at all under ABI 3, so the block simply still
-                    // held an older window's record. Both remain possible now, and
+                    // TickHwnd differed - which was FALSE for every menu of 2026-09:
+                    // WGC rejected them on that build and polled PrintWindow served
+                    // them, a path that wrote no ticks at all under ABI 3, so the
+                    // block simply still held an older window's record (on
+                    // 26300.9457 WGC captures them: all 13 popups measured
+                    // 2026-11-01 read path=wgc below). Both remain possible now, and
                     // this probe cannot tell them apart, so it says exactly that.
                     LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,"
                         "valid=0,reason=%s,consumed_ms=%lld",
@@ -12469,9 +12471,10 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
                 }
                 else if (bs->TickPw)
                 {
-                    // Polled PrintWindow - the path EVERY menu takes.
-                    // fallback_ms: the WGC attempt was abandoned (it cannot
-                    //   succeed for an override-redirect popup) and we fell back.
+                    // Polled PrintWindow - the path a window WGC refused takes
+                    // (every menu in 2026-09; none of 13 popups on 26300.9457,
+                    // measured 2026-11-01 with this line: all path=wgc).
+                    // fallback_ms: the WGC attempt failed and we fell back.
                     // firstpoll_ms: first poll ENTERED. Reconcile opens and polls
                     //   in the SAME loop iteration, so this contains no waiting.
                     // pwret_ms - firstpoll_ms: the synchronous PrintWindow call on
