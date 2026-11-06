@@ -97,7 +97,9 @@ static volatile LONG g_LeaveSession = -1;
 // recovery actions.
 static volatile LONG g_ServiceFailCode = 0;
 
-#define NO_SESSION 0xFFFFFFFFUL
+// One value, defined in include/qga-lifecycle.h: both sides of the going-down latch need it, so it stopped
+// being this file's alone. The name stays, so no call site here changes.
+#define NO_SESSION QGA_NO_SESSION
 
 // StartTargetProcess: nothing was launched because there is no console session yet. Distinct
 // from a launch failure so the caller does not stamp a start it never made.
@@ -606,6 +608,24 @@ DWORD WINAPI WatchdogThread(void *param)
                 launchWanted = FALSE;
                 waitingForSession = FALSE;
             }
+            else if (QgaGoingDownHeld(consoleSession) == 1)
+            {
+                // THE FACT WE WERE NEVER TOLD. This catches what `endedSession` cannot: a service that started
+                // (or restarted) after an agent had already announced its session's end holds no local record of
+                // it, and would launch straight into a session Windows is tearing down. The latch is ADOPTED into
+                // the same two variables the channel sets rather than refusing in parallel, so the refusal, the
+                // logging and - crucially - the SESSION_END_NEVER_HAPPENED_MS recovery below all stay in ONE
+                // place: a second refusal arm with no timer behind it would leave the guest with no GUI until it
+                // rebooted. The next pass takes the arm above.
+                // Only == 1 adopts. A latch that cannot be READ (-1) is not a latch that is held, and must never
+                // stop a launch - an unreadable object would otherwise cost the guest its GUI entirely.
+                LogWarning("QGAWDGOINGDOWN console session %u is published as going down and this service was "
+                    L"never told (no agent of ours announced it here) - adopting it: nothing is launched into "
+                    L"session %u until it ends", consoleSession, consoleSession);
+                endedSession = consoleSession;
+                endedSessionAt = GetTickCount64();
+                continue;
+            }
             else if (IsProcessRunning(exeName, &pid, &sid))
             {
                 // Is the gui agent running already? Our handle is authoritative; without one, a same-named process
@@ -702,6 +722,19 @@ DWORD WINAPI WatchdogThread(void *param)
             const DWORD cs = WTSGetActiveConsoleSessionId();
             LogError("QGAWDSESSIONSTUCK session %u announced its end %u s ago and never ended, launching again (console session %u)",
                 endedSession, (unsigned)(SESSION_END_NEVER_HAPPENED_MS / 1000), cs);
+            // The durable fact goes with it, and MUST: this is the only recovery for a latch whose publisher died
+            // inside a vetoed end (the agent releases its own on the veto it survives, lifecycle.c). Leaving the
+            // latch set here would make the next pass adopt it again and refuse forever - the launch below would
+            // never happen. A release that finds nothing (0) is the normal case when the channel, not the latch,
+            // was what latched this session.
+            {
+                const int rel = QgaGoingDownRelease(endedSession);
+                if (rel < 0)
+                    LogError("QGAWDGOINGDOWN session %u stayed published as going down: launches into it keep "
+                        L"being refused until this guest reboots", endedSession);
+                else if (rel == 1)
+                    LogInfo("QGAWDGOINGDOWN session %u withdrawn with it", endedSession);
+            }
             endedSession = NO_SESSION;
             endedSessionAt = 0;
             launchWanted = TRUE;
@@ -742,6 +775,16 @@ DWORD WINAPI WatchdogThread(void *param)
             // A SESSION LEFT (logoff). The session that announced its end has now ended: a logon that follows -
             // autologon at the sign-in screen, seconds later on these guests - is a new session to launch into.
             DWORD sid = (DWORD)InterlockedCompareExchange(&g_LeaveSession, -1, -1);
+            // THE SESSION IS NO LONGER *GOING* DOWN - IT IS DOWN, so its latch now publishes something false and
+            // is withdrawn. Unconditionally, and NOT inside the arm below: the one case the latch exists for is a
+            // service that was never told this session was ending, and such a service has `endedSession` unset,
+            // so a release conditioned on it would leak exactly the latch that mattered. Windows does not reuse a
+            // session id within a boot, so a leaked one would refuse nothing - but it would outlive every process
+            // in the guest until it rebooted, and it would be a published statement that is untrue. Finding
+            // nothing (0) is the ordinary case: a latch exists only where an agent saw an end announced.
+            if (QgaGoingDownRelease(sid) < 0)
+                LogError("QGAWDGOINGDOWN session %u has ended but its going-down latch could not be withdrawn; it "
+                    L"names a session that no longer exists", sid);
             if (sid == endedSession)
             {
                 LogInfo("QGAWDSESSIONEND session %u has ended (logoff) - a logon into the console session is the next "

@@ -32,6 +32,9 @@ static HANDLE g_Continue = NULL;
 static HANDLE g_Done = NULL;                  // agent -> service: the orderly exit COMPLETED (qga-lifecycle.h)
 static HANDLE g_WindowReady = NULL;           // manual-reset: the window thread has its window (or gave up)
 static HWND g_Window = NULL;
+// The session THIS agent published as going down (QgaGoingDownSet), or QGA_NO_SESSION when nothing was
+// published - a failed publish must not be followed by releasing a latch this agent does not own.
+static DWORD g_GoingDownSession = QGA_NO_SESSION;
 
 DWORD LifecycleLatchExit(IN DWORD code)
 {
@@ -98,6 +101,35 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         LogInfo("QGAENDSESSION Windows is ending this session (%s, lParam 0x%Ix) - helper launches disarmed first, "
             L"then the service is told", logoff ? L"logoff" : L"shutdown", (ULONG_PTR)lp);
         HelpersDisarm(L"the session is ending");
+        // THE DURABLE FORM OF THE SAME FACT, published before anything is told and before any wait, so that it
+        // holds even if this process is terminated inside the wait below - which is what Windows measurably does
+        // (33-826 ms after the shutdown begins, per the header of this file). HelpersDisarm covers launches in
+        // THIS process from here on; the latch covers every other launcher, and this service after a restart,
+        // neither of which can have received the message. Our own session, not the console session: the session
+        // that is ending is mine, and the console session may already be moving.
+        if (!ProcessIdToSessionId(GetCurrentProcessId(), &g_GoingDownSession))
+        {
+            g_GoingDownSession = QGA_NO_SESSION;
+            win_perror("ProcessIdToSessionId(self, going-down latch)");
+        }
+        else
+        {
+            LONG st = 0;
+            if (QgaGoingDownSet(g_GoingDownSession, &st))
+                LogInfo("QGAGOINGDOWN session %u published as going down - no launch into it from any process "
+                    L"until it ends", g_GoingDownSession);
+            else
+            {
+                // A launcher that cannot read the latch falls back to what it had before it existed; say which
+                // call failed so the status is interpretable (0xC0000061 = the privilege is not held).
+                if (st != 0)
+                    LogError("QGAGOINGDOWN could not publish session %u as going down: NT status 0x%08x; launchers "
+                        L"outside this process are not told", g_GoingDownSession, (DWORD)st);
+                else
+                    win_perror("QgaGoingDownSet");
+                g_GoingDownSession = QGA_NO_SESSION;
+            }
+        }
         if (g_Notice)
         {
             if (!SetEvent(g_Notice))
@@ -163,6 +195,28 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         InterlockedExchange(&g_SessionEnding, 0);
         LogWarning("QGAENDSESSION session end CANCELLED, the session continues; helpers re-armed");
         HelpersRearm();
+        // WITHDRAW THE DURABLE FACT, because it has stopped being true and this session keeps its id: a latch
+        // left behind here would refuse every launch into a live session until it logs off. This process is the
+        // one that learns of the veto, straight from Windows, with no service in the path - which is why the
+        // release is here and not only in the service. If this agent dies inside the veto instead, the service's
+        // SESSION_END_NEVER_HAPPENED_MS detector is what clears it (watchdog.c).
+        if (g_GoingDownSession != QGA_NO_SESSION)
+        {
+            const int rel = QgaGoingDownRelease(g_GoingDownSession);
+            if (rel == 1)
+                LogInfo("QGAGOINGDOWN session %u withdrawn - launches into it are allowed again",
+                    g_GoingDownSession);
+            else if (rel == 0)
+                // The end state is the one we wanted, by another route: no latch, so nothing refuses. Said at
+                // WARNING and not ERROR because nothing is broken for the user - but this agent published it
+                // and something else removed it, which is not a path this code knows about.
+                LogWarning("QGAGOINGDOWN session %u was already withdrawn by the time this agent released it - "
+                    L"launches into it are allowed", g_GoingDownSession);
+            else
+                LogError("QGAGOINGDOWN could not withdraw session %u: launches into this LIVE session stay "
+                    L"refused until it logs off", g_GoingDownSession);
+            g_GoingDownSession = QGA_NO_SESSION;
+        }
         if (g_Continue && !SetEvent(g_Continue))
             win_perror("SetEvent(lifecycle continue)");
         return 0;

@@ -58,7 +58,8 @@
 
 #include <windows.h>
 #include <strsafe.h>
-#include <wchar.h>   // wcscmp: QgaHoldReasonIsNormal compares a hold reason
+#include <sddl.h>    // ConvertStringSecurityDescriptorToSecurityDescriptor: the going-down latch's DACL
+#include <wchar.h>   // wcscmp: QgaHoldReasonIsNormal compares a hold reason; wcslen: the latch's NT name
 #include "qga-exitcodes.h"
 
 #define QGA_LIFECYCLE_NAME_FMT      L"Global\\QGA_LIFECYCLE_%lu_%s"
@@ -69,6 +70,53 @@
 // SYSTEM only: the agent runs as SYSTEM in the console session, the service as SYSTEM in session 0. Nothing
 // else may signal "my session is ending" for an agent, or acknowledge it.
 #define QGA_LIFECYCLE_SDDL          L"D:P(A;;GA;;;SY)"
+
+// ---- THE GOING-DOWN LATCH: a durable FACT, where the channel above is a MESSAGE -------------------------
+//
+// WHY A SECOND THING AT ALL. The channel tells the service that this session is ending, and the service
+// remembers it in one local variable of its watchdog thread (`endedSession`). Everything downstream of that
+// depends on having RECEIVED the message - so a launch site in another process, or this same service after a
+// restart inside the shutdown, has no way to know, and starts a process into a session Windows is tearing
+// down. That is the measured defect: the predicate a launch site needs is THAT THE SESSION IS GOING DOWN,
+// not that anybody was told about it. The latch carries the fact itself.
+//
+// WHAT CARRIES IT: a named kernel event created OBJ_PERMANENT, so it outlives the process that observed the
+// end - and the observer here is an agent Windows is about to terminate. Keyed by SESSION, because the fact
+// is about a session and the readers are other processes. MEASURED on win11-acc 2026-11-06: a non-permanent
+// event's name is gone the moment its creating process exits (STATUS_OBJECT_NAME_NOT_FOUND 0xC0000034)
+// while a permanent one still opens; NtMakeTemporaryObject plus the last close removes the name again, which
+// is the release. SYSTEM holds SeCreatePermanentPrivilege (Enabled), which the create needs - without it the
+// create is 0xC0000061 and the caller logs that status rather than reading it as "permanent objects do not
+// work here".
+//
+// WHY NOT THE ALTERNATIVES, each already settled and not to be re-opened: SM_SHUTTINGDOWN reads 0 on a
+// LOGOFF (Jev 0.05 against defer_verdict 0.95); the service's SERVICE_CONTROL_PRESHUTDOWN arrives 4-32 s
+// after the shutdown began, AFTER session 1 has logged off (measured 2026-10-07), far too late to stop a
+// relaunch; QGA_SHUTDOWN_EVENT_NAME runs the OPPOSITE direction (dom0 asking the agent to leave), so it
+// answers a different question and nothing here duplicates it.
+//
+// THE DACL IS SYSTEM-ONLY, exactly like the channel's: the only writer is an agent (SYSTEM in the console
+// session) and the only reader so far is the service (SYSTEM in session 0). The other launch sites would
+// need it widened, and they are NOT wired yet - docs/ADR-supervision.md item 2b holds that scope.
+//
+// A STALE LATCH CANNOT STRAND THE GUEST. A reader consults the latch for the session it is about to launch
+// into, and Windows does not reuse a session id within a boot, so a latch left behind by a session that has
+// really ended is never read again. What a reader must never do is refuse on an UNREADABLE latch: that would
+// strand a guest without a GUI, the opposite of what this protects against, which is why Held() answers -1
+// for "cannot tell" and never folds it into "held" (same reason the single-instance guard is a mutex).
+// "no session" - what WTSGetActiveConsoleSessionId and ProcessIdToSessionId mean by failing. Here because
+// both sides of the latch need it now; watchdog.c's own NO_SESSION is an alias of this one value.
+#define QGA_NO_SESSION              0xFFFFFFFFUL
+#define QGA_GOINGDOWN_NAME_FMT      L"Global\\QGA_GOINGDOWN_%lu"
+// The NT namespace spelling of the same object: Win32's "Global\X" IS "\BaseNamedObjects\X", and the
+// permanent create is the one call that has to go through the NT API to pass OBJ_PERMANENT at all.
+#define QGA_GOINGDOWN_NTNAME_FMT    L"\\BaseNamedObjects\\QGA_GOINGDOWN_%lu"
+#define QGA_GOINGDOWN_SDDL          QGA_LIFECYCLE_SDDL
+// Measured attribute and access values, named here so no call site carries a bare hex number.
+#define QGA_OBJ_PERMANENT           0x00000010UL
+#define QGA_OBJ_CASE_INSENSITIVE    0x00000040UL
+#define QGA_EVENT_ALL_ACCESS        0x001F0003UL   // includes DELETE, which NtMakeTemporaryObject needs
+#define QGA_STATUS_NAME_COLLISION   ((LONG)0xC0000035L)
 
 // THE END-SESSION BUDGETS - failure detectors, never fixes (R4). Windows waits for a WM_QUERYENDSESSION answer
 // (HungAppTimeout, 5 s by default) and for WM_ENDSESSION processing (WaitToKillAppTimeout, 20 s); both of
@@ -83,6 +131,154 @@
 static __inline HRESULT QgaLifecycleObjectName(OUT WCHAR *out, IN size_t cch, IN DWORD agentPid, IN const WCHAR *which)
 {
     return StringCchPrintfW(out, cch, QGA_LIFECYCLE_NAME_FMT, (unsigned long)agentPid, which);
+}
+
+// ---- the latch's three operations ------------------------------------------------------------------------
+//
+// Here, and not in either component's .c, because the agent sets and the service reads and both must agree
+// on the name, the DACL and the meaning - and these two binaries share no source file, so this header IS the
+// shared-code mechanism (QgaSysKillVerdict and the exit table below are here for the same reason). None of
+// the three logs: every caller already has the house logging and says what IT was doing, exactly as the
+// callers of QgaLifecycleObjectName do.
+//
+// OBJECT_ATTRIBUTES is not in windows.h (it lives in winternl.h/ntdef.h), so the two structures the create
+// needs are declared here under our own names - never the system spellings, which would collide the day
+// anything in this tree includes winternl.h. The x64 layout is 4+4pad+8+8+4+4pad+8+8 = 48 bytes, which is
+// what the probe that measured OBJ_PERMANENT passed.
+typedef struct _QGA_UNICODE_STRING
+{
+    unsigned short Length;          // in BYTES, not characters - the trap that makes an NT call fail with a
+    unsigned short MaximumLength;   // status that reads like a real answer
+    WCHAR *Buffer;
+} QGA_UNICODE_STRING;
+
+typedef struct _QGA_OBJECT_ATTRIBUTES
+{
+    DWORD Length;
+    HANDLE RootDirectory;
+    QGA_UNICODE_STRING *ObjectName;
+    DWORD Attributes;
+    void *SecurityDescriptor;
+    void *SecurityQualityOfService;
+} QGA_OBJECT_ATTRIBUTES;
+
+typedef LONG (WINAPI *PFN_QGA_NTCREATEEVENT)(HANDLE *, DWORD, QGA_OBJECT_ATTRIBUTES *, int, unsigned char);
+typedef LONG (WINAPI *PFN_QGA_NTMAKETEMPORARY)(HANDLE);
+
+// The Win32 spelling, which Held() and Release() both open by. Not QgaLifecycleObjectName: that one keys the
+// CHANNEL by agent pid with a channel suffix, and the latch is keyed by SESSION with no suffix.
+static __inline HRESULT QgaGoingDownObjectName(OUT WCHAR *out, IN size_t cch, IN DWORD session)
+{
+    return StringCchPrintfW(out, cch, QGA_GOINGDOWN_NAME_FMT, (unsigned long)session);
+}
+
+// Publish "session <session> is going down". Returns TRUE when the fact is published and SIGNALLED; FALSE
+// with *ntStatus set to the NT status of the failing call, which the caller logs. An existing latch is NOT a
+// failure (0xC0000035): another agent in the same session already published it, and it is opened and signalled
+// so that a latch somebody left unsignalled can never read as "not going down".
+static __inline BOOL QgaGoingDownSet(IN DWORD session, OUT LONG *ntStatus)
+{
+    static PFN_QGA_NTCREATEEVENT pNtCreateEvent = NULL;
+    WCHAR ntName[96], win32Name[96];
+    QGA_UNICODE_STRING us;
+    QGA_OBJECT_ATTRIBUTES oa;
+    PSECURITY_DESCRIPTOR sd = NULL;
+    HANDLE h = NULL;
+    LONG st;
+
+    *ntStatus = 0;
+    if (!pNtCreateEvent)
+        pNtCreateEvent = (PFN_QGA_NTCREATEEVENT)GetProcAddress(GetModuleHandle(L"ntdll.dll"), "NtCreateEvent");
+    if (!pNtCreateEvent)
+        return FALSE;
+    if (FAILED(StringCchPrintfW(ntName, RTL_NUMBER_OF(ntName), QGA_GOINGDOWN_NTNAME_FMT, (unsigned long)session)) ||
+        FAILED(QgaGoingDownObjectName(win32Name, RTL_NUMBER_OF(win32Name), session)))
+        return FALSE;
+    if (!ConvertStringSecurityDescriptorToSecurityDescriptor(QGA_GOINGDOWN_SDDL, SDDL_REVISION_1, &sd, NULL) || !sd)
+        return FALSE;
+
+    us.Buffer = ntName;
+    us.Length = (unsigned short)(wcslen(ntName) * sizeof(WCHAR));
+    us.MaximumLength = (unsigned short)(us.Length + sizeof(WCHAR));
+    ZeroMemory(&oa, sizeof(oa));
+    oa.Length = sizeof(oa);
+    oa.ObjectName = &us;
+    oa.Attributes = QGA_OBJ_PERMANENT | QGA_OBJ_CASE_INSENSITIVE;
+    oa.SecurityDescriptor = sd;
+    // 0 = NotificationEvent (manual-reset), initial state SIGNALLED: the fact is true the moment it exists.
+    st = pNtCreateEvent(&h, QGA_EVENT_ALL_ACCESS, &oa, 0, 1);
+    LocalFree(sd);
+
+    if (st == QGA_STATUS_NAME_COLLISION)
+    {
+        h = OpenEvent(EVENT_MODIFY_STATE, FALSE, win32Name);
+        if (!h)
+            return FALSE;
+        if (!SetEvent(h))
+        {
+            CloseHandle(h);
+            return FALSE;
+        }
+        CloseHandle(h);
+        return TRUE;
+    }
+    if (st != 0)
+    {
+        *ntStatus = st;
+        return FALSE;
+    }
+    // The handle is closed deliberately and at once: OBJ_PERMANENT means the object does NOT need a holder,
+    // and keeping one here would tie the fact's lifetime back to this process - the very thing the latch is
+    // for. Release is QgaGoingDownRelease, which clears the flag again.
+    CloseHandle(h);
+    return TRUE;
+}
+
+// Is session <session> going down? 1 yes, 0 no (no latch, or one that is not signalled), -1 CANNOT TELL.
+// A caller must never read -1 as a refusal: see the stranding note above.
+static __inline int QgaGoingDownHeld(IN DWORD session)
+{
+    WCHAR name[96];
+    HANDLE h;
+    DWORD w;
+
+    if (FAILED(QgaGoingDownObjectName(name, RTL_NUMBER_OF(name), session)))
+        return -1;
+    h = OpenEvent(SYNCHRONIZE, FALSE, name);
+    if (!h)
+        return (GetLastError() == ERROR_FILE_NOT_FOUND) ? 0 : -1;
+    w = WaitForSingleObject(h, 0);
+    CloseHandle(h);
+    if (w == WAIT_OBJECT_0)
+        return 1;
+    return (w == WAIT_TIMEOUT) ? 0 : -1;
+}
+
+// Withdraw the fact: the end was cancelled, or it has finished happening. 1 released, 0 there was no latch,
+// -1 there is one and it could not be removed. The event is RESET BEFORE the flag is cleared, so that a
+// failure of the (never-observed) NtMakeTemporaryObject still leaves a latch that reads as NOT held - a
+// readable false is a far better degradation than a guest with no GUI until it reboots.
+static __inline int QgaGoingDownRelease(IN DWORD session)
+{
+    static PFN_QGA_NTMAKETEMPORARY pNtMakeTemporaryObject = NULL;
+    WCHAR name[96];
+    HANDLE h;
+    int rc = 1;
+
+    if (FAILED(QgaGoingDownObjectName(name, RTL_NUMBER_OF(name), session)))
+        return -1;
+    h = OpenEvent(QGA_EVENT_ALL_ACCESS, FALSE, name);
+    if (!h)
+        return (GetLastError() == ERROR_FILE_NOT_FOUND) ? 0 : -1;
+    if (!ResetEvent(h))
+        rc = -1;
+    if (!pNtMakeTemporaryObject)
+        pNtMakeTemporaryObject = (PFN_QGA_NTMAKETEMPORARY)GetProcAddress(GetModuleHandle(L"ntdll.dll"),
+            "NtMakeTemporaryObject");
+    if (!pNtMakeTemporaryObject || pNtMakeTemporaryObject(h) != 0)
+        rc = -1;
+    CloseHandle(h);
+    return rc;
 }
 
 // ---- THE DECISION ON AN AGENT EXIT (service side) --------------------------------------------------------
