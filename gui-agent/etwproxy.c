@@ -860,8 +860,9 @@ static void EtwProxyTryLaunchLocked(void)
     (void)CreateEnvironmentBlock(&env, token, FALSE);
     const ULONGLONG envMs = GetTickCount64() - envStart;
     if (envMs >= ETWPROXY_SLOW_CALL_MS)
-        LogWarning("ETWPROXYSLOW CreateEnvironmentBlock took %I64u ms on the main loop "
-            L"(wedge budget %u ms) - this is the stall that costs the guest its desktop",
+        LogWarning("ETWPROXYSLOW CreateEnvironmentBlock took %I64u ms on the launch worker "
+            L"(threshold a third of the %u ms capture wedge) - OFF the main loop, so this names "
+            L"the slow call and is not itself a desktop stall",
             envMs, (unsigned)CAPTURE_READY_WEDGE_MS);
 
     STARTUPINFOW si;
@@ -883,8 +884,9 @@ static void EtwProxyTryLaunchLocked(void)
     DWORD createGle = created ? 0 : GetLastError();
     const ULONGLONG createMs = GetTickCount64() - createStart;
     if (createMs >= ETWPROXY_SLOW_CALL_MS)
-        LogWarning("ETWPROXYSLOW CreateProcessAsUser took %I64u ms on the main loop "
-            L"(wedge budget %u ms) - this is the stall that costs the guest its desktop",
+        LogWarning("ETWPROXYSLOW CreateProcessAsUser took %I64u ms on the launch worker "
+            L"(threshold a third of the %u ms capture wedge) - OFF the main loop, so this names "
+            L"the slow call and is not itself a desktop stall",
             createMs, (unsigned)CAPTURE_READY_WEDGE_MS);
     if (env)
         DestroyEnvironmentBlock(env);
