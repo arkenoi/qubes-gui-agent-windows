@@ -100,6 +100,17 @@
 
 // When signaled, causes agent to shutdown gracefully.
 #define QGA_SHUTDOWN_EVENT_NAME L"Global\\QGA_SHUTDOWN"
+// The DACL the WATCHDOG SERVICE creates that event with, before the agent it launches runs, so a
+// stop racing its own launch can still ASK. SY gets GENERIC_ALL because the agent is then no longer
+// the creator: its CreateNamedEvent goes through CreateEvent, which asks for EVENT_ALL_ACCESS and IS
+// access-checked on an object it did not make - and the agent runs as SYSTEM, so this is what still
+// lets it open and wait. AU gets EVENT_MODIFY_STATE|READ_CONTROL|SYNCHRONIZE (0x120002), exactly
+// what the agent's own CreatePublicAcl granted while it was the creator, so the OpenExisting
+// signallers (guest/activate-idd.ps1, packaging/setup/Install-QwtImproved.ps1, the payload README's
+// one-liner - all asking for Modify|Synchronize) keep working unchanged. AU deliberately does NOT
+// get GENERIC_ALL: that would hand every authenticated user WRITE_DAC on this object, which is a
+// security-model change and is not made here.
+#define QGA_SHUTDOWN_SDDL L"D:P(A;;GA;;;SY)(A;;0x120002;;;AU)"
 // Single-instance guard. A MUTEX, not an event, deliberately: mutex ownership is released by
 // the kernel when the owning process dies, so a crashed agent can never lock out its
 // replacement. An event would persist while any handle lived and could strand the qube

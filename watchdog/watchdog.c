@@ -70,6 +70,17 @@ volatile LONG g_ServiceStopping = 0;
 // existed the handler reported STOPPED while the respawn loop was still live, so Stop-Service
 // returned and the loop could relaunch the agent under an installer that had just killed it.
 static HANDLE g_StopEvent = NULL;
+// THE AGENT'S STOP EVENT, CREATED BY THIS SERVICE AND NO LONGER BY THE AGENT, and held for the
+// service's lifetime so the stop path never has to open it by name. MEASURED 2026-11-06 on
+// quick-upgrade win11r-up: the agent creates Global\QGA_SHUTDOWN part-way through its own Init, a
+// PRESHUTDOWN landed in the first milliseconds of a launch this service had just made, the open
+// failed with ERROR_FILE_NOT_FOUND - the agent was ~2-11 ms short of creating it - and so the agent
+// could not be ASKED to exit at all: it was terminated after the full AGENT_STOP_GRACE_MS. 10 s
+// added to the shutdown, its framebuffer grants left held (StopOwnAgent says why that matters) and
+// exit code 0x1 instead of any QGA_EXIT_*. Creating it here removes the window instead of narrowing
+// it; CreateEvent is open-or-create, so the agent's own call still works and simply opens this one.
+// (Jev 2026-11-06: service_creates_the_stop_event_before_resume 0.96, over three rejected shapes.)
+static HANDLE g_AgentStopEvent = NULL;
 // AN ANNOUNCED END THAT NEVER HAPPENS IS AN ANOMALY, NOT A STATE TO SIT IN (2026-10-07, from the Jev review of this
 // change: "a session latched as ending that then continues" scored 0.53 - the hole was real). The latch is normally
 // cleared by the session's logoff or by the agent's own "the end was cancelled" message. Neither can arrive if the end
@@ -314,6 +325,14 @@ DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD
         CloseHandle(pi.hProcess);
         return ERROR_GEN_FAILURE;
     }
+    // A STALE SIGNAL MUST NOT REACH A FRESH AGENT. While the agent created the stop event itself the
+    // object died with it, so every agent got an unsignalled one. This service now holds it for its
+    // whole lifetime, so a set that no agent ever consumed - it had already exited, or was killed
+    // before its main loop waited - would still be signalled and the NEXT agent would exit
+    // immediately, leaving the qube with no GUI. Reset it here, in the one place that is always
+    // crossed on the way to a running agent.
+    if (g_AgentStopEvent)
+        ResetEvent(g_AgentStopEvent);
     if (ResumeThread(pi.hThread) == (DWORD)-1)
     {
         status = win_perror("ResumeThread(agent)");
@@ -355,12 +374,23 @@ DWORD StartTargetProcess(IN WCHAR *exePath, OUT HANDLE *processHandle, OUT DWORD
 static void StopOwnAgent(IN HANDLE agentProcess, IN DWORD agentPid, IN const WCHAR *exeName, IN OUT LIFECYCLE_CHANNEL *ch)
 {
     HANDLE shutdownEvent;
+    BOOL ownedHandle = FALSE;
     DWORD wait;
     DWORD exitCode = 0xFFFFFFFF;
     HANDLE waitHandles[2];
     ULONGLONG deadline = GetTickCount64() + AGENT_STOP_GRACE_MS;
 
-    shutdownEvent = OpenEvent(EVENT_MODIFY_STATE, FALSE, QGA_SHUTDOWN_EVENT_NAME);
+    // THE HANDLE THIS SERVICE ALREADY HOLDS, created in ServiceMain before any agent ran. It is not
+    // opened by name first any more: the agent used to be the creator and makes the object part-way
+    // through its Init, so a stop that raced a launch found nothing and could not ask at all.
+    shutdownEvent = g_AgentStopEvent;
+    if (!shutdownEvent)
+    {
+        // This service's own creation failed (logged there, with the reason). Fall back to what this
+        // did before it existed: by now the agent may have created the object itself.
+        shutdownEvent = OpenEvent(EVENT_MODIFY_STATE, FALSE, QGA_SHUTDOWN_EVENT_NAME);
+        ownedHandle = (shutdownEvent != NULL);
+    }
     if (shutdownEvent)
     {
         if (SetEvent(shutdownEvent))
@@ -368,12 +398,12 @@ static void StopOwnAgent(IN HANDLE agentProcess, IN DWORD agentPid, IN const WCH
                 exeName, agentPid, QGA_SHUTDOWN_EVENT_NAME, AGENT_STOP_GRACE_MS);
         else
             win_perror("SetEvent(" QGA_SHUTDOWN_EVENT_NAME L")");
-        CloseHandle(shutdownEvent);
+        if (ownedHandle)
+            CloseHandle(shutdownEvent);   // never the service's own long-lived handle
     }
     else
     {
-        // The agent creates the event early in its init, so this is an agent that has not got that
-        // far (or is already gone). There is nothing to ask; the wait below decides.
+        // Both the creation and the open failed. There is nothing to ask; the wait below decides.
         win_perror("OpenEvent(" QGA_SHUTDOWN_EVENT_NAME L")");
         LogWarning("service stopping: %s is not open, '%s' (PID %u) cannot be asked to exit - "
             L"waiting on its handle, then terminating it", QGA_SHUTDOWN_EVENT_NAME, exeName, agentPid);
@@ -950,6 +980,33 @@ void WINAPI ServiceMain(IN DWORD argc, IN WCHAR *argv[])
     {
         win_perror("CreateEvent");
         goto cleanup;
+    }
+
+    // The agent's stop event, created HERE: before the control handler is registered and before any
+    // agent has been launched, so it exists ahead of the agent's first instruction and the stop path
+    // always has something to ask. Auto-reset and unsignalled, matching what the agent created for
+    // itself. A failure is deliberately NOT fatal: StopOwnAgent falls back to opening it by name,
+    // which is exactly what it did before this existed, so the service degrades to the old behaviour
+    // rather than refusing to run. That fallback also covers an upgrade, where an OLD agent may
+    // already own the object with a DACL that refuses this service the EVENT_ALL_ACCESS CreateEvent
+    // asks for.
+    {
+        PSECURITY_DESCRIPTOR sd = NULL;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptor(QGA_SHUTDOWN_SDDL, SDDL_REVISION_1, &sd, NULL) && sd)
+        {
+            SECURITY_ATTRIBUTES sa;
+            sa.nLength = sizeof(sa);
+            sa.lpSecurityDescriptor = sd;
+            sa.bInheritHandle = FALSE;
+            g_AgentStopEvent = CreateEvent(&sa, FALSE, FALSE, QGA_SHUTDOWN_EVENT_NAME);
+            if (!g_AgentStopEvent)
+                win_perror("CreateEvent(" QGA_SHUTDOWN_EVENT_NAME L")");
+            LocalFree(sd);
+        }
+        else
+        {
+            win_perror("ConvertStringSecurityDescriptorToSecurityDescriptor(agent stop)");
+        }
     }
 
     g_Status.dwServiceType = SERVICE_WIN32;
