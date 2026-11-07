@@ -524,6 +524,29 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     }
 
     e->Due = out.Due;
+    // A SUPPRESSED BANNER MUST STAY ARMED WHILE IT IS ON SCREEN. THIS IS THE LOST TOAST, and the
+    // register's own reading of it was right: toast-hold S3i on win11r-thold, 2026-11-07, one hold
+    // cycle on hwnd 0x6019e for BOTH toasts of the pair -
+    //     044546.862  hold reason=no-identity bridgeUp=1          <- S3i-1's banner appears
+    //     044547.460  S3i-2 fires (fires.jsonl), 838 ms after S3i-1, i.e. 598 ms INSIDE the hold
+    //     044548.412  state=suppress ident=ca78903c id=10 verdict=bridge held_ms=1547
+    //     044549.191  QGATOASTACK id=10 ack_wait_ms=781
+    //     ...then ZERO ToastHoldDecide lines for 38 s, until S3ii at 044627.424. S3i-2 = LOST.
+    // The bridge HAD turned the second toast's record to the window path at 04:45:48 (`skip id=11 ...
+    // window path; window-only app`), which is precisely the condition the suppress line promises to
+    // act on: "reopened if the record turns window or the bridge dies before dom0's ack". It was never
+    // acted on, because once ThCoreDecide has DECIDED, out.Due is 0 - nothing is armed - and the retry
+    // block above arms only for a FAILED or card-less read. So the only things that could have
+    // re-examined that banner were a window event or the bridge's verdict event, and neither came.
+    // The promise in that log line is only keepable if something wakes the main loop, so a suppressed
+    // banner now carries the ordinary recheck tick for as long as it is tracked; ToastHoldSweep pokes
+    // a pass, ThCoreDecide re-reads the record EVERY pass (it already does - "a decided banner's record
+    // can still move"), and a record that turned window produces the show it owes. The banner is
+    // dropped on RemoveWindow, so this costs a handful of passes over one banner's life and nothing at
+    // rest. S3ii and S3iii were the SAME mixed pairs ~5.1 s apart - after the hold had resolved and the
+    // window event for the next banner arrived - which is why they were never lost and this was.
+    if (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecSuppress)
+        e->Due = ThMinTick(e->Due, now + TH_HOLD_RECHECK_MS);
     if (armRetry)
         e->Due = ThMinTick(e->Due, retryAt);
     if (swapGateHold)
