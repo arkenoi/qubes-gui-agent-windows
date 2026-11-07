@@ -17008,7 +17008,15 @@ static ULONG Init(void)
     status = CfgReadDword(moduleName, REG_CONFIG_SEAMLESS_VALUE, &seamlessMode, NULL);
     if (ERROR_SUCCESS != status)
     {
-        LogWarning("Failed to read '%s' config value, using default (FALSE)", REG_CONFIG_SEAMLESS_VALUE);
+        // THE SAME OPTIONAL-VALUE RULE AS THE CURSOR AND STAGING GATES ABOVE AND BELOW, which this
+        // site was left out of: ERROR_FILE_NOT_FOUND means nobody set it, the default is the answer,
+        // and a warning per boot for it is noise in a log whose cleanliness is the gate condition.
+        // This one also discarded the status, so a real read failure was indistinguishable from an
+        // unset value - it now carries the code like its siblings.
+        if (ERROR_FILE_NOT_FOUND == status)
+            LogDebug("'%s' is not set - using the default (FALSE)", REG_CONFIG_SEAMLESS_VALUE);
+        else
+            LogWarning("Failed to read '%s' config value (0x%x), using default (FALSE)", REG_CONFIG_SEAMLESS_VALUE, status);
         g_SeamlessMode = FALSE;
     }
     else
