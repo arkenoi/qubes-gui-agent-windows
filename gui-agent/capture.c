@@ -648,10 +648,24 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                     L"which is the resolution-change trigger the open P2 (win11-24H2 resolution-change capture freeze) "
                     L"says this same path reports as recovered while the pixels stay stale: recovery returning true does "
                     L"NOT establish that the frames are fresh", attempt + 1);
-                // AND NOW DO SOMETHING ABOUT IT, instead of recording it for the fourth time. The note
-                // above has described this for weeks: a new duplication is handed back, the windows are
-                // KEPT, and dom0 goes on showing the frames it had before the loss, because a kept
-                // window generates no paint of its own - so nothing ever refills them.
+                // AND NOW DO SOMETHING ABOUT IT, instead of recording it again. The note above has
+                // described this for weeks: a new duplication is handed back, the windows are KEPT, and
+                // dom0 goes on showing the frames it had before the loss, because a kept window
+                // generates no paint of its own - so nothing ever refills them.
+                // TWO LABELS IN THE NOTE ABOVE ARE STALE, and they matter for who reads this.
+                //  * "win11-24H2" names a Windows version no longer on this rig (owner, 2026-11-07:
+                //    "we do not have win11 24h2 anymore right?" - correct). Today's reproduction is
+                //    win11-acc on 10.0.26300.9457, i.e. 25H2; 24H2 is 26100.
+                //  * "the still-open P2" is wrong the other way: that entry sits in
+                //    findings/issues-closed.md, closed 2026-10-16, and its line there is TRUNCATED
+                //    mid-word ("those suites sto"), so the record of WHY it was closed does not
+                //    survive in the file. It reproduced today regardless.
+                // AND A GEOMETRY CHANGE IS NOT A TEST ARTEFACT. resolution.c's own sources say when it
+                // happens in ordinary use: `seamless-force` ("Seamless needs the HOST size EXACTLY"),
+                // so every entry into seamless mode is one; `dom0`, whenever the daemon asks the guest
+                // to match - a monitor plugged or unplugged, a dom0 resolution change; `lastapplied` at
+                // guest startup; and `RESDRIFT`, which is what the frozen run logged. So a user who
+                // changes their display setup, or simply boots, can reach the kept-and-stale state.
                 // MEASURED 2026-11-07, failproof-faultinject on win11-acc with NOTHING armed: the guest
                 // adopted 1024x768, 1600x900 and 1920x1080 (AGENTSCREEN agreed each time, PASS), typing
                 // landed in the subject window each time ('TYPED ok', so the suite did not grade it an
