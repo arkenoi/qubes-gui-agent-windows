@@ -75,6 +75,11 @@ typedef struct _TH_ENTRY
     UINT      ReadFails;      // consecutive completed reads that FAILED (any status but OK); bounds the decided-entry retry
     UINT      NoCardReads;    // card-less reads that COUNT: the first, then one requested >= TH_NOCARD_RETRY_MS later (2 = not a banner)
     ULONGLONG NoCardFirstReq; // request tick of the first card-less read
+    // THE SIZE AT THE FIRST CARD-LESS READ, and the size the latest pass saw. A banner still BUILDING
+    // changes size between two reads; a flyout does not. This is what tells them apart - see the
+    // guard in ToastHoldApplyIdentity. 0 = unknown (the guard then does not apply).
+    LONG      NoCardFirstW, NoCardFirstH;
+    LONG      SeenW, SeenH;   // entry->Width/Height as of the last tracking pass (main-loop thread)
     ULONGLONG LastReadAttempt;// tick of the last request ATTEMPT, queued or refused (deadlines anchor here, never in the past)
     UINT      ReadQueueFails; // consecutive attempts the worker's queue refused (back-off)
     BOOL      NotBanner;
@@ -333,6 +338,10 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
 
     EnterCriticalSection(&g_ThLock);
     TH_ENTRY* e = ThGetLocked(entry->Handle);
+    // The geometry this pass sees, kept for the card-less guard in ToastHoldApplyIdentity (the worker
+    // thread has the HWND but not WINDOW_DATA, and must not call into the window code to get it).
+    e->SeenW = (LONG)entry->Width;
+    e->SeenH = (LONG)entry->Height;
 
     in.BridgeUp = (g_ThBridgeUp != 0);
     // The LAST completed reading stands while a new read is in flight: an unknown identity on the pass
@@ -744,17 +753,45 @@ void ToastHoldNoteChanged(IN HWND window)
         // force a repaint on release - a stutter and a repaint storm. Decided-and-shown is the state in
         // which a change notice means content, not motion.
         gateSwap = (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecShow);
-        if (gateSwap)
+        // EVERY DECIDED BANNER ARMS THE DEADLINE, NOT ONLY A SHOWN ONE. This is the toast loss that
+        // kept coming back (findings/issues.md TOASTBANNERLOSTONDIRECTPATH, four times, last on
+        // 2026-11-07 02:45:49Z as toast-hold S3i-2=LOST with its pair 838 ms apart - inside the first
+        // banner's hold). A SUPPRESSED banner arms nothing: ToastHoldDecide leaves Due at 0 once it has
+        // a good read and a decided record (the retry arming above it fires only for a FAILED or
+        // card-less read), and until this change the arming here was inside `if (gateSwap)` - i.e.
+        // shown banners only. So for a suppressed banner whose window was repainted with a NEW toast,
+        // the whole re-examination depended on ThRequestReadLocked's request landing: that request can
+        // be REFUSED (the UIA worker's queue is full -> ReadQueueFails++, nothing in flight), and then
+        // no read ever completes, ToastHoldApplyIdentity never runs, its PokeWindowTrackingFor never
+        // fires, and NO TRACKING PASS EVER LOOKS AT THAT WINDOW AGAIN. The second toast stays unmapped
+        // for as long as the shell displays it and is lost with no decision taken - which is exactly
+        // what "no ToastHoldDecide on the window for the rest of the step" means in the run data.
+        // The hold's own contract (toasthold.h: "a suppressed banner is re-examined on every pass ...
+        // shown after all when the bridge turns its record to `window`") is only reachable if something
+        // wakes the main loop, and for a suppressed banner nothing did.
+        if (e->Core.Phase == ThPhaseDecided)
         {
-            // Arm the bound AND wake the main loop. Without this the gate would be closed by a thread
-            // that never decides anything, on a banner that arms nothing - see ToastHoldDecide's bound.
-            if (e->SwapGateSince == 0)
-                e->SwapGateSince = now;
-            // Pending until a read COMPLETES - set after ThRequestReadLocked above, so it is TRUE even
-            // when that request was refused, and the gate then holds to its bound instead of opening on
-            // the next pass with the swap frame behind it.
-            e->SwapGateReadPending = TRUE;
-            e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
+            if (gateSwap)
+            {
+                // Arm the bound AND wake the main loop. Without this the gate would be closed by a thread
+                // that never decides anything, on a banner that arms nothing - see ToastHoldDecide's bound.
+                if (e->SwapGateSince == 0)
+                    e->SwapGateSince = now;
+                // Pending until a read COMPLETES - set after ThRequestReadLocked above, so it is TRUE even
+                // when that request was refused, and the gate then holds to its bound instead of opening on
+                // the next pass with the swap frame behind it.
+                e->SwapGateReadPending = TRUE;
+                e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
+            }
+            else
+            {
+                // Suppressed (or any other decided banner): no frame gate - its frames are not going out
+                // in the first place, and gating an unmapped window would only owe a repaint on release.
+                // Just the deadline, so ToastHoldSweep pokes a tracking pass and the new content gets a
+                // decision. ThMinTick keeps the EARLIEST deadline, so a burst of change events cannot
+                // push it out; the sweep itself re-arms at TH_HOLD_RECHECK_MS while the banner lives.
+                e->Due = ThMinTick(e->Due, now + TH_HOLD_BOUND_MS);
+            }
             ThRecomputeDueLocked();
         }
     }
@@ -922,9 +959,10 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
     else if (status == TH_READ_OK)
         status = TH_READ_UIAFAIL;
     const ULONGLONG now = GetTickCount64();
-    BOOL again = FALSE, logNoCard = FALSE, changed = FALSE, notBanner = FALSE;
+    BOOL again = FALSE, logNoCard = FALSE, changed = FALSE, notBanner = FALSE, stillGrowing = FALSE;
     UINT64 before = 0, after = 0;
     UINT withoutTitle = 0;
+    LONG e_firstW = 0, e_firstH = 0, e_seenW = 0, e_seenH = 0;   // copied under the lock, for the log below
 
     EnterCriticalSection(&g_ThLock);
     TH_ENTRY* e = ThFindLocked(window);
@@ -969,14 +1007,48 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
             {
                 e->NoCardReads = 1;
                 e->NoCardFirstReq = e->LastReadReq;
+                e->NoCardFirstW = e->SeenW;
+                e->NoCardFirstH = e->SeenH;
             }
             else if (ThCoreNoCardCounts(e->NoCardFirstReq, e->LastReadReq))
             {
-                e->NoCardReads = 2;
-                if (!e->IdentValid)
+                // A WINDOW THAT CHANGED SIZE BETWEEN THE TWO LOOKS IS STILL BUILDING, AND IS NOT A
+                // FLYOUT. THIS IS THE TOAST LOSS, measured 2026-11-07 on win11r-thold (the campaign's
+                // toast-hold run, S3i-2=LOST) from the agent's own log - no screen needed:
+                //   044457.080 CREATE hwnd=0x6019e 396x200 -> ToastHoldDecide hold reason=no-identity
+                //   044457.117 PwAttachWindowCarry 0x6019e 364x157        <- it is still growing
+                //   044457.126 ApplyIdentity: card not readable yet (no-card, read 1)
+                //   044457.357 ToastHoldDecide: "not a toast banner (no NormalToastView in 2 reads,
+                //               364x157) - shown, never held" -> SendWindowMap
+                // The two looks were 250 ms apart, so ThCoreNoCardCounts (review N2's pacing rule)
+                // counted them and the banner was classified a flyout 277 ms after it appeared - while
+                // EVERY toast that run identified needed far longer for its card: held_ms 797, 1390,
+                // 1485, 1547. So the paced-second-look rule, on its own, cannot tell a flyout from a
+                // banner mid-grow; 250 ms was simply never enough, and raising it would hold real
+                // flyouts (volume, Quick Settings, clock) for a second and make them stutter.
+                // The SIZE does tell them apart, and the agent already has it: this banner went
+                // 396x200 -> 364x157 between the looks, while a flyout stands still. A changed size
+                // restarts the count with THIS read as the first look, so the hold continues and the
+                // toast gets its verdict; an unchanged size concludes flyout as fast as before.
+                const BOOL grew = (e->NoCardFirstW > 0 && e->NoCardFirstH > 0 && e->SeenW > 0 && e->SeenH > 0 &&
+                                   (e->SeenW != e->NoCardFirstW || e->SeenH != e->NoCardFirstH));
+                if (grew)
                 {
-                    e->NotBanner = TRUE;   // two paced looks, no card: a flyout, not the banner - ToastHoldDecide shows it
-                    notBanner = TRUE;
+                    e_firstW = e->NoCardFirstW; e_firstH = e->NoCardFirstH;   // the pair the log names
+                    e_seenW = e->SeenW;         e_seenH = e->SeenH;
+                    e->NoCardFirstReq = e->LastReadReq;   // this look becomes the first of a new pair
+                    e->NoCardFirstW = e->SeenW;
+                    e->NoCardFirstH = e->SeenH;
+                    stillGrowing = TRUE;
+                }
+                else
+                {
+                    e->NoCardReads = 2;
+                    if (!e->IdentValid)
+                    {
+                        e->NotBanner = TRUE;   // two paced looks at the SAME size, no card: a flyout - ToastHoldDecide shows it
+                        notBanner = TRUE;
+                    }
                 }
             }
         }
@@ -999,6 +1071,15 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
     e->SwapGateReadPending = again;
     LeaveCriticalSection(&g_ThLock);
 
+    // The guard above, said out loud: a card-less look that did NOT count because the window is still
+    // building. toast-hold-grade.py keys on QGATOASTIDENT, and this is the line that explains a hold
+    // that outlived the pacing interval instead of being released as a flyout.
+    if (stillGrowing)
+        LogInfo("QGATOASTIDENT hwnd=0x%x card-less look does NOT count: the window changed size since the "
+            "first one (%ldx%ld -> %ldx%ld), so it is a banner still building, not a flyout - this look "
+            "becomes the first of a new pair and the hold continues to its %u ms bound",
+            (DWORD)(ULONG_PTR)window, (long)e_firstW, (long)e_firstH, (long)e_seenW, (long)e_seenH,
+            (unsigned)TH_HOLD_BOUND_MS);
     if (logNoCard)
         LogInfo("QGATOASTIDENT hwnd=0x%x card not readable yet (%s, read %u): no NormalToastView / no Title|TitleText block - "
             L"held until a read succeeds, a second card-less read says not-a-banner, or the %u ms bound opens it",
