@@ -321,3 +321,14 @@ void LifecycleStart(void)
     else
         LogInfo("QGALIFECYCLE end-session window %p up before Init; a session end takes the orderly exit", g_Window);
 }
+
+// See lifecycle.h. The process-wide facts are read HERE, once, so no emitter has to know which of them
+// exists: g_SessionEnding is this file's (WM_QUERYENDSESSION until a WM_ENDSESSION(FALSE) cancels it),
+// HelpersDisarmed() is main.c's, and the rule that combines them with the caller's own deliberate-stop
+// fact is include/qga-lifecycle.h's QgaGoingDownSilences - one decision, reachable from every site.
+BOOL LifecycleGoingDown(IN BOOL stopRequested)
+{
+    return QgaGoingDownSilences(stopRequested ? 1 : 0,
+                                HelpersDisarmed() ? 1 : 0,
+                                LifecycleSessionEnding() ? 1 : 0);
+}

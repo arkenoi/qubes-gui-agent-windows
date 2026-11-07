@@ -25,6 +25,7 @@
 #include "resolution.h" // M0BLINK obtain-start stamp (instrumentation only)
 #include "faultinject.h"
 #include "qga-lifecycle.h"   // QgaCaptureSlowIsNormal: the first seconds of a slow pass are not a warning
+#include "lifecycle.h"       // LifecycleGoingDown: the ONE going-down question (ADR-supervision 7)
 #include "grantowner.h"      // the staging grant is issued from the MAIN thread; see grantowner.h
 
 #include <log.h>
@@ -1895,6 +1896,35 @@ static DWORD WINAPI CaptureThread(void* param)
                 if (RecreateDuplication(capture))
                     continue; // recovered in place, window list untouched
 
+                // A STOPPED GENERATION CANNOT BE RECREATED, AND NOTHING REINITIALISES IT. CaptureStop's
+                // FIRST statement is InterlockedExchange(&ctx->stop, 1), before it clears the enable flag,
+                // so once that has run this recreate was never going to succeed: the desktop is being torn
+                // down. MEASURED, 6 of 6 occurrences across rel-42356238859 (win10-clean, win10-reinstall,
+                // win10-appvm) and rel-42366797048 (win10-clean): every one carries
+                // `QGACAPENABLE CLEARED -> 0 (was 1) [CaptureStop]` ~50 ms earlier, a session-end line
+                // before that, and `QGAEXIT ... an expected exit, not a failure` 17-50 ms later. There is
+                // NO instance of this line outside an orderly stop. The LogError below therefore announced
+                // a reinitialisation that never happened and failed three cells of an acceptance run on
+                // `error_lines_undeclared` - the gate's most expensive condition - for correct behaviour.
+                // The line arrived with d8e6c80, which added this in-place recovery; before it the same
+                // event produced the `keyed mutex was abandoned` pair, which the sweep baseline carries as
+                // known-defect. ADR-supervision section 7 decided the rule - an alert for a condition
+                // that was REQUESTED is never actionable - so the question is asked through the ONE shared
+                // decision, LifecycleGoingDown -> QgaGoingDownSilences, and not through this site's own
+                // flag: a session end that disarmed the helpers silences it too, and a sixth site cannot
+                // drift from the other five.
+                // Handled exactly as the abandoned-generation branch below handles its own
+                // wake-up: say so at INFO and leave, with no error_event - the main loop stopped this
+                // generation itself and either starts a new one or is exiting, so it needs no error from a
+                // thread it retired. No frame to release here: the acquire is what failed.
+                if (LifecycleGoingDown(capture->stop != 0))
+                {
+                    LogInfo("QGADDASTOPPEDTEARDOWN duplication lost and NOT recreated - a going-down was "
+                        L"already in progress, nothing is reinitialised, and the main loop that stopped "
+                        L"this generation needs no error from it");
+                    goto exit_thread;
+                }
+
                 LogError("duplication lost and could not be recreated, reinitializing");
             }
             else
@@ -2072,6 +2102,19 @@ end_frame:
                 M0BlinkMark(L"access-lost-noticed-release", 0);
                 if (RecreateDuplication(capture))
                     continue; // recovered in place, window list untouched
+
+                // THE SAME STOPPED-GENERATION CASE, at the site that raises ACCESS_LOST far more often.
+                // Both call sites get it or the fix is half-applied: the acquire side is the one measured
+                // 6 of 6 times at an orderly stop, and this one is reached by the identical sequence
+                // whenever the stop lands while a frame is held. ReleaseFrame is NOT retried here - it is
+                // what just failed.
+                if (LifecycleGoingDown(capture->stop != 0))
+                {
+                    LogInfo("QGADDASTOPPEDTEARDOWN duplication lost on release and NOT recreated - a "
+                        L"going-down was already in progress, nothing is reinitialised, and the main loop "
+                        L"that stopped this generation needs no error from it");
+                    goto exit_thread;
+                }
 
                 LogError("duplication lost on release and could not be recreated, reinitializing");
             }

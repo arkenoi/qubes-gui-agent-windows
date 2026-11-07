@@ -795,6 +795,46 @@ static __inline BOOL QgaDesliceTeardownExcused(IN int helpersDisarmed, IN int se
     return (BOOL)(helpersDisarmed || sessionEnding);
 #endif
 }
+
+/* THE ONE QUESTION EVERY EMITTER ASKS BEFORE IT COMPLAINS THAT SOMETHING IS GONE.
+ *
+ * ADR-supervision section 7 (ACCEPTED 2026-10-24) decided this: "A deliberate stand-down is ultimate:
+ * no clock, no deadline, no report, until something starts it", because "an alert for a condition that
+ * was requested is never actionable". Owner, 2026-11-07: "NEVER complain about anything going down when
+ * it is expected to ... all these messages should be degraded to informational when shutdown is in
+ * progress already".
+ *
+ * WHY THIS EXISTS AS A FUNCTION AND NOT AS A COMMENT AT EACH SITE. The rule had already been applied
+ * FOUR times, by hand, at four sites, each with its own prose and its own hand-rolled condition and no
+ * shared call anywhere: main.c:1269 ("AN EXIT THE AGENT ASKED FOR IS NOT A FALLBACK: this line was
+ * ERROR on every clean exit"), main.c:16525 (A6LEAK, skipping all revokes), main.c:17493
+ * ("WatchForEvents failed with error 0xb7" at ERROR on a requested stop) and tools/log-sweep.py:221
+ * ("A LAUNCH THE SYSTEM REFUSED BECAUSE IT WAS SHUTTING DOWN IS NOT A TASK FAILURE"). A FIFTH site then
+ * reintroduced it: agent d8e6c80 added an in-place DXGI recovery whose failure path logs at ERROR, and
+ * that line failed three of eight cells of rel-42356238859 and one of rel-42366797048 on
+ * error_lines_undeclared - the acceptance gate's most expensive condition - for correct behaviour. Four
+ * local fixes do not compose into a rule; one predicate every site calls does.
+ *
+ * stopRequested is the caller's OWN "I asked for this" fact, because a going-down is not only a session
+ * end: a capture generation retired by CaptureStop (whose first statement is
+ * InterlockedExchange(&ctx->stop, 1)) is just as deliberate, and the thread that notices is just as
+ * wrong to call it a failure. helpersDisarmed and sessionEnding are the process-wide facts the ADR
+ * predicate above already judges - this adds the local one and keeps that judgement in one place.
+ *
+ * WHAT IT DOES NOT SILENCE. ADR-supervision section 1 keeps a DEATH loud: nothing here is reached by a
+ * death report, and a fault on a running guest is unaffected (all three inputs are 0, the predicate
+ * holds nothing). It changes a LEVEL, never a record: the line is still written, with its text, as
+ * information - see LogErrorUnlessGoingDown in gui-agent/lifecycle.h.
+ */
+static __inline BOOL QgaGoingDownSilences(IN int stopRequested, IN int helpersDisarmed, IN int sessionEnding)
+{
+#ifdef QGA_LIFECYCLE_DEFECT_GOINGDOWNCOMPLAINS
+    (void)stopRequested; (void)helpersDisarmed; (void)sessionEnding;
+    return FALSE;    /* DEFECT: an ERROR about an absence that was asked for, at every going-down site */
+#else
+    return (BOOL)(stopRequested || QgaDesliceTeardownExcused(helpersDisarmed, sessionEnding));
+#endif
+}
 static __inline BOOL QgaDesliceOwnedByDeath(IN unsigned long long diedAt)
 {
 #ifdef QGA_LIFECYCLE_DEFECT_DOUBLETOAST

@@ -8,6 +8,7 @@
 #include "main.h"
 #include "workarea.h"
 #include "resolution.h"
+#include "lifecycle.h"   // LifecycleGoingDown: the ONE going-down question (ADR-supervision 7)
 
 #include <log.h>
 #include <config.h>
@@ -394,7 +395,8 @@ static DWORD WINAPI WaWatchThread(PVOID param)
         {
             failures++;
             if (failures == 1 || (failures % WA_QDB_NAG_EVERY) == 0)
-                LogWarning("qdb_open failed (%u consecutive), dom0 work area feed unavailable; retrying in %u ms",
+                // ADR-supervision 7: same feed, the open side. Jev degrade_when_going_down 0.80.
+                LogWarningUnlessGoingDown(FALSE, "qdb_open failed (%u consecutive), dom0 work area feed unavailable; retrying in %u ms",
                     failures, (unsigned)retryMs);
             Sleep(retryMs);
             retryMs = retryMs * 2 > WA_QDB_RETRY_MAX_MS ? WA_QDB_RETRY_MAX_MS : retryMs * 2;
@@ -433,7 +435,8 @@ static DWORD WINAPI WaWatchThread(PVOID param)
             retryMs = retryMs * 2 > WA_QDB_RETRY_MAX_MS ? WA_QDB_RETRY_MAX_MS : retryMs * 2;
         // Warning, not debug: the daemon was serving and stopped - that is a failure of
         // a working component, not a routine event.
-        LogWarning("qubesdb connection lost, reconnecting in %u ms", (unsigned)retryMs);
+        // ADR-supervision 7: at a going-down qubesdb is gone because the qube is. Jev 0.75.
+        LogWarningUnlessGoingDown(FALSE, "qubesdb connection lost, reconnecting in %u ms", (unsigned)retryMs);
         Sleep(retryMs);
     }
 }

@@ -5154,7 +5154,8 @@ static void NotifBridgeSupervise(void)
                     if (g_NotifBridgePid == hbPid)
                         // This one WAS ours and now resolves to a different image - the pid was
                         // replaced under us, which is the case the forgery wording was written for.
-                        LogWarning("QGANOTIFPID pid %lu was ready here and is no longer notifhost.exe from the "
+                        // ADR-supervision 7: a disarmed helper is gone BY REQUEST. Jev 0.80.
+                        LogWarningUnlessGoingDown(FALSE, "QGANOTIFPID pid %lu was ready here and is no longer notifhost.exe from the "
                             L"install dir in session %lu - the pid was replaced", hbPid, sid);
                     else
                         // Not ours to judge: a predecessor's published pid, reused by an unrelated
@@ -9033,7 +9034,8 @@ static void StartOpeningExamine(IN HWND start, IN BOOL surfaceVisible)
                 verdict == QGA_START_RETURN_FOCUS ? L"dom0 focus" : L"shell desktop",
                 how == FOREGROUND_ATTACHED ? L"attached" : L"plain", fgPid);
         else
-            LogError("QGASTARTDISMISS 0x%x: activation to 0x%x refused - foreground held by pid %lu; "
+            // ADR-supervision 7: at a session end there is no shell to hand activation back to. Jev 0.92.
+            LogErrorUnlessGoingDown(FALSE, "QGASTARTDISMISS 0x%x: activation to 0x%x refused - foreground held by pid %lu; "
                 "the hidden menu may take clicks", (DWORD)(ULONG_PTR)start, (DWORD)(ULONG_PTR)target, fgPid);
 
         if (!g_StartDismissNotified)
@@ -13893,7 +13895,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                          GetTickCount64(), (ULONGLONG)QGA_HOLD_STARVE_MS))
                     {
                         entry->PwStarveReported = TRUE;
-                        LogError("QGAHOLDSTARVED hwnd 0x%x slot=%d why=%s: held %llu ms with no new "
+                        // ADR-supervision 7: no frame arrives after a stop WE asked for. Jev 0.89.
+                        LogErrorUnlessGoingDown(FALSE, "QGAHOLDSTARVED hwnd 0x%x slot=%d why=%s: held %llu ms with no new "
                             L"frame - the window is on screen showing STALE PIXELS",
                             (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
                             holdWhy ? holdWhy : L"unset",
@@ -16146,7 +16149,8 @@ static ULONG WINAPI WatchForEvents(void)
             {
                 // KEEP-FATAL: the vchan is genuinely dead / the daemon disconnected -
                 // case (a). Exit is harmless here and the service respawn handles it.
-                LogError("vchan disconnected");
+                // ADR-supervision 7: dom0 closing the vchan IS the going-down. Jev 0.81.
+                LogErrorUnlessGoingDown(FALSE, "vchan disconnected");
                 LifecycleLatchExit(QGA_EXIT_RECONNECT);
                 exitLoop = TRUE;
                 LeaveCriticalSection(&g_VchanCriticalSection);
@@ -16349,7 +16353,8 @@ static ULONG WINAPI WatchForEvents(void)
                 capDeadReported = TRUE;
                 // The capture thread has left (enabled=0) while a capture context is live: dom0's desktop image is
                 // frozen, so capture-error recovery is forced once.
-                LogWarning("QGACAPDEAD capture thread died, desktop image frozen (loops=%d, last loop %I64d ms ago, "
+                // ADR-supervision 7: an absence that was ASKED FOR is not actionable. Jev degrade_when_going_down 0.88.
+                LogWarningUnlessGoingDown(FALSE, "QGACAPDEAD capture thread died, desktop image frozen (loops=%d, last loop %I64d ms ago, "
                     L"inside=%d), recovery forced once",
                     cLoops, cAge, cInside);
                 if (g_CaptureErrorEvent)
@@ -16460,7 +16465,8 @@ static ULONG WINAPI WatchForEvents(void)
     if (g_VchanClientConnected &&
         (!libvchan_is_open(g_Vchan) || VchanGetWriteBufferSize(g_Vchan) < A6_EXIT_RING_HEADROOM))
     {
-        LogWarning("A6EXIT vchan dead or ring full (open=%d, space=%d) - exiting without teardown notifications",
+        // ADR-supervision 7: this is the agent's OWN exit path. Jev degrade_when_going_down 0.79.
+        LogWarningUnlessGoingDown(FALSE, "A6EXIT vchan dead or ring full (open=%d, space=%d) - exiting without teardown notifications",
             libvchan_is_open(g_Vchan), VchanGetWriteBufferSize(g_Vchan));
         EnterCriticalSection(&g_VchanCriticalSection);
         g_VchanClientConnected = FALSE;
