@@ -643,10 +643,39 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                     L"recreated in place after %u attempt(s), windows kept",
                     ctx->width, ctx->height, waitAgo, attempt + 1);
             else if (geometryChanged)
+            {
                 LogError("duplication recreated in place after %u attempt(s) - windows kept - BUT THE GEOMETRY CHANGED, "
                     L"which is the resolution-change trigger the open P2 (win11-24H2 resolution-change capture freeze) "
                     L"says this same path reports as recovered while the pixels stay stale: recovery returning true does "
                     L"NOT establish that the frames are fresh", attempt + 1);
+                // AND NOW DO SOMETHING ABOUT IT, instead of recording it for the fourth time. The note
+                // above has described this for weeks: a new duplication is handed back, the windows are
+                // KEPT, and dom0 goes on showing the frames it had before the loss, because a kept
+                // window generates no paint of its own - so nothing ever refills them.
+                // MEASURED 2026-11-07, failproof-faultinject on win11-acc with NOTHING armed: the guest
+                // adopted 1024x768, 1600x900 and 1920x1080 (AGENTSCREEN agreed each time, PASS), typing
+                // landed in the subject window each time ('TYPED ok', so the suite did not grade it an
+                // instrument failure), and the captured window stayed 996x697 with ONE hash,
+                // 5088e1d307bbff6c, before and after all three changes. Nine of nine pixels-change rows
+                // FAIL. The suite then graded ITSELF INVALID-INSTRUMENT - correctly, a frozen control
+                // cannot attribute a red - so this product freeze has been costing two acceptance
+                // suites their verdict as well as showing the user a window that stopped repainting.
+                // THE REPAIR IS THE ONE ALREADY IN THIS FILE: CaptureDesktopImageWanted's RedrawWindow
+                // over every window, which exists for the same reason (a stale staging copy that no
+                // frame will refill on a desktop at rest). It cannot be called here - it is gated on
+                // g_StagingStale and on window 0 being wanted - so the invalidation itself is what is
+                // reused. ASYNCHRONOUS, deliberately: no RDW_UPDATENOW/ERASENOW, so a hung application
+                // cannot stall the capture thread, which is the constraint that helper documents.
+                // WHAT THIS DOES NOT CLAIM: that the P2 is closed. It removes the stale-frame CAUSE on
+                // the path that reports success; whether the frames then come back is a measurement,
+                // and it belongs to failproof-faultinject's nine rows on the rig - which is now the
+                // run that decides it, not a reading of this code.
+                const BOOL rdw = RedrawWindow(NULL, NULL, NULL,
+                                              RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+                LogInfo("QGADDARECREATE geometry changed, so every window was asked to repaint after the "
+                    L"recreate (RedrawWindow %s) - a kept window paints nothing by itself and dom0 would "
+                    L"otherwise keep the frame it had before the loss", rdw ? L"ok" : L"FAILED");
+            }
             else
             {
                 // COUNTED, NOT REPEATED. The previous note here kept this at WARNING because Info
