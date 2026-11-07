@@ -686,9 +686,21 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                 // run that decides it, not a reading of this code.
                 const BOOL rdw = RedrawWindow(NULL, NULL, NULL,
                                               RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
-                LogInfo("QGADDARECREATE geometry changed, so every window was asked to repaint after the "
-                    L"recreate (RedrawWindow %s) - a kept window paints nothing by itself and dom0 would "
-                    L"otherwise keep the frame it had before the loss", rdw ? L"ok" : L"FAILED");
+                // THE FAILURE GETS ITS OWN LINE, not a word inside the success line. `RedrawWindow %s`
+                // rendered `ok` or `FAILED` into ONE format string, and the sweep normalises both to the
+                // SAME signature - so a repaint that did not happen, which is exactly the defect this
+                // call exists to prevent, would have been reported as the expected recovery and counted
+                // against a baseline entry saying so (Jev file_it 0.98). ERROR, because a kept window
+                // whose repaint failed is a window the user watches stay stale: the clean-error-log gate
+                // is the right place for it, and there is nothing to declare it as expected.
+                if (rdw)
+                    LogInfo("QGADDARECREATE geometry changed, so every window was asked to repaint after "
+                        L"the recreate - a kept window paints nothing by itself and dom0 would otherwise "
+                        L"keep the frame it had before the loss");
+                else
+                    LogError("QGADDAREPAINTFAILED geometry changed and the repaint of every kept window "
+                        L"FAILED (%lu) - the windows are kept and nothing will refill them, which is the "
+                        L"stale-frame defect this repaint exists to prevent", GetLastError());
             }
             else
             {
