@@ -2980,12 +2980,22 @@ static BOOL WgcRunSchtasks(const WCHAR* argtail, OUT DWORD *exitCode, OUT WCHAR 
     }
     if (wr) { CloseHandle(wr); wr = NULL; }   // the child owns the write end now, or the read never ends
     CloseHandle(pi.hThread);
-    // One bounded wait. It used to be taken in 1 s slices to keep the broker's AgentHeartbeat fresh
-    // (a slow schtasks once starved a healthy broker to death, audit 2026-09-08); there is no
-    // heartbeat since rest-zero S4, so nothing here can starve the broker.
+    // ONE BOUNDED WAIT, AND THE CHILD IS ENDED WHEN IT EXPIRES - which it was not until 2026-11-08.
+    // It used to be taken in 1 s slices to keep the broker's AgentHeartbeat fresh (a slow schtasks
+    // once starved a healthy broker to death, audit 2026-09-08); there is no heartbeat since
+    // rest-zero S4, so nothing here can starve the broker.
+    // WHY THE TERMINATE: the ReadFile below is taken whenever the caller asked for schtasks' text,
+    // which is both /create calls in HelperTaskRegister, and an anonymous pipe read blocks while a
+    // WRITER IS STILL OPEN. On expiry the child was left running, holding the write end, so the read
+    // after this "bound" had no deadline at all and the 15 s was not a bound on that path. Ending
+    // the child closes its handle, so the read returns at EOF and the whole call stays bounded.
     const DWORD w = WaitForSingleObject(pi.hProcess, 15000);
     if (w == WAIT_TIMEOUT)
-        LogWarning("schtasks did not finish within 15 s (%s) - treated as failed", argtail);
+    {
+        LogWarning("schtasks did not finish within 15 s (%s) - ending it and treating the call as failed", argtail);
+        (void)TerminateProcess(pi.hProcess, 1);
+        (void)WaitForSingleObject(pi.hProcess, 1000);   // let it die so the pipe's write end closes
+    }
     DWORD ec = 1; GetExitCodeProcess(pi.hProcess, &ec);
     CloseHandle(pi.hProcess);
     if (exitCode) *exitCode = ec;
@@ -3353,9 +3363,10 @@ static BOOL WgcLaunch(void)
 // THE LAUNCH RUNS OFF THE MAIN LOOP (Jev which_change_is_the_fix = move_registration_off_the_loop
 // 0.86, confidence 0.82, 2026-11-08; blocking_loop_is_a_defect 0.85/0.77).
 // WHY, and it is not the de-slice deadline - that was fixed in a93cf137 by stamping the anchor AFTER
-// WgcLaunch() returns. WgcLaunch registers the task with schtasks, a SUBPROCESS. WgcRunSchtasks bounds
-// ONE call with WaitForSingleObject(..., 15000) and HelperTaskRegister retries once after Sleep(500),
-// so the call can hold its caller for about 30.5 s - and its caller is BrokerSupervise, which the main
+// WgcLaunch() returns. WgcLaunch drives schtasks, a SUBPROCESS, THREE times in the worst case: one
+// /delete, then HelperTaskRegister's /create and its one retry after Sleep(500). WgcRunSchtasks bounds
+// each at WaitForSingleObject(..., 15000) and now ends a child that outstays it (+1 s to die), so the
+// call can hold its caller for about 48 s - and its caller is BrokerSupervise, which the main
 // loop invokes at the call site whose own comment reads "every wake, waits for nothing". MEASURED
 // registrations: 0.374, 1.040, 1.676 and 7.524 s; the metering branch broke the 672 ms case down as
 // xml=32 ms, schtasks1=640 ms, retry=0, so the subprocess IS the cost. Two things were paid for it:
@@ -4459,13 +4470,15 @@ static void BrokerShutdown(void)
     // A LAUNCH STILL IN FLIGHT IS WAITED FOR FIRST, bounded, because it and this function both drive
     // schtasks against the SAME task: without this wait a /delete here could overtake the /create
     // there and leave the task registered with the agent gone - which is a broker Task Scheduler
-    // keeps restarting and nothing supervises. The bound is the registration's own worst case (two
-    // WgcRunSchtasks calls at 15 s each plus the 500 ms retry gap) and a second over; an expiry is an
-    // anomaly, said at ERROR, and the disarm below then runs anyway because the task must not
-    // outlive us. This is the only place the agent waits on the launch, and it is the exit path.
+    // keeps restarting and nothing supervises. THE BOUND IS THE REGISTRATION'S OWN WORST CASE, and
+    // that is THREE schtasks calls, not two: WgcLaunch's /delete, then HelperTaskRegister's /create
+    // and its retry - 3 x (15 s wait + 1 s to end a child that outstays it) + the 500 ms retry gap
+    // = 48.5 s, so 50 s. An expiry is an anomaly, said at ERROR, and the disarm below then runs
+    // anyway because the task must not outlive us. This is the only place the agent waits on the
+    // launch, and it is the exit path - where Windows' own session teardown bounds us regardless.
     if (g_WgcLaunchThread)
     {
-        const DWORD lw = WaitForSingleObject(g_WgcLaunchThread, 31000);
+        const DWORD lw = WaitForSingleObject(g_WgcLaunchThread, 50000);
         if (lw != WAIT_OBJECT_0)
             LogError("QGABROKERLAUNCHTHREAD the broker launch had not finished at the agent's exit (wait=0x%lx) - "
                 "disarming the task anyway", lw);
