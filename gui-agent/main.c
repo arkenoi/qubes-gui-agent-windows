@@ -3365,8 +3365,10 @@ static BOOL WgcLaunch(void)
 // WHY, and it is not the de-slice deadline - that was fixed in a93cf137 by stamping the anchor AFTER
 // WgcLaunch() returns. WgcLaunch drives schtasks, a SUBPROCESS, THREE times in the worst case: one
 // /delete, then HelperTaskRegister's /create and its one retry after Sleep(500). WgcRunSchtasks bounds
-// each at WaitForSingleObject(..., 15000) and now ends a child that outstays it (+1 s to die), so the
-// call can hold its caller for about 48 s - and its caller is BrokerSupervise, which the main
+// each at WaitForSingleObject(..., 15000) and now ends a child that outstays it (+1 s to die). The
+// GUARANTEE on how long it holds its caller is therefore 48.5 s - bound arithmetic, not a duration
+// anything here has taken; what it actually COST is the measurement below. Its caller is
+// BrokerSupervise, which the main
 // loop invokes at the call site whose own comment reads "every wake, waits for nothing". MEASURED
 // registrations: 0.374, 1.040, 1.676 and 7.524 s; the metering branch broke the 672 ms case down as
 // xml=32 ms, schtasks1=640 ms, retry=0, so the subprocess IS the cost. Two things were paid for it:
@@ -4470,15 +4472,19 @@ static void BrokerShutdown(void)
     // A LAUNCH STILL IN FLIGHT IS WAITED FOR FIRST, bounded, because it and this function both drive
     // schtasks against the SAME task: without this wait a /delete here could overtake the /create
     // there and leave the task registered with the agent gone - which is a broker Task Scheduler
-    // keeps restarting and nothing supervises. THE BOUND IS THE REGISTRATION'S OWN WORST CASE, and
-    // that is THREE schtasks calls, not two: WgcLaunch's /delete, then HelperTaskRegister's /create
-    // and its retry - 3 x (15 s wait + 1 s to end a child that outstays it) + the 500 ms retry gap
-    // = 48.5 s, so 50 s. An expiry is an anomaly, said at ERROR, and the disarm below then runs
-    // anyway because the task must not outlive us. This is the only place the agent waits on the
-    // launch, and it is the exit path - where Windows' own session teardown bounds us regardless.
+    // keeps restarting and nothing supervises.
+    // THE BOUND IS SIZED ON THE MEASUREMENT, NOT ON STACKED WORST CASES. Measured registrations on
+    // this rig: 0.374, 1.040, 1.676 and 7.524 s. What the code GUARANTEES is 48.5 s - three schtasks
+    // subprocesses (WgcLaunch's /delete, HelperTaskRegister's /create and its retry) at 15 s plus a
+    // second to end a child that outstays it, plus the 500 ms gap - but that is bound arithmetic, a
+    // duration nothing here has ever taken. Waiting it out on the EXIT path would turn a rare
+    // schtasks stall into an agent that hangs on shutdown, and the Service Control Manager's
+    // patience on a stop is shorter than that. So: 20 s, which is 2.7x the slowest registration ever
+    // measured; an expiry is an anomaly, said at ERROR, and the disarm below then runs anyway
+    // because the task must not outlive us. This is the only place the agent waits on the launch.
     if (g_WgcLaunchThread)
     {
-        const DWORD lw = WaitForSingleObject(g_WgcLaunchThread, 50000);
+        const DWORD lw = WaitForSingleObject(g_WgcLaunchThread, 20000);
         if (lw != WAIT_OBJECT_0)
             LogError("QGABROKERLAUNCHTHREAD the broker launch had not finished at the agent's exit (wait=0x%lx) - "
                 "disarming the task anyway", lw);
