@@ -449,6 +449,10 @@ static volatile ULONGLONG g_FrameCount = 0;
 // PROCESSED - the very thing the wedge is waiting for, so either would restate the
 // condition instead of discriminating it.
 volatile LONG64 g_MainLoopTick = 0;
+// The tick at which the loop last returned from its wait. Written beside the increment above it, read by
+// the helper-launch threads: a wake COUNT of 0 is also what one long pass produces, so "how long ago was
+// the loop awake" is the question that has an unconfounded answer. main.c only - nothing outside reads it.
+static volatile ULONGLONG g_MainLoopWakeTick = 0;
 
 // THE DESKTOP SURFACE IS A MONITOR WE PLUG AND UNPLUG (owner, 2026-09-24: "we just plug and
 // unplug a new monitor if we grant the switch. at same moment we map and unmap what we need").
@@ -3395,18 +3399,26 @@ static DWORD WINAPI WgcLaunchThreadProc(IN void* param)
 {
     UNREFERENCED_PARAMETER(param);
     LogInfo("QGATHREAD role=wgclaunch tid=%lu", GetCurrentThreadId());   // M1 instrument - the only SHORT-LIVED role, so restwatch never joins it
-    // The decidable property, measured on the NORMAL path with nothing injected: while a launch is in
-    // flight the loop caps its wake at 250 ms, and the FASTEST registration ever measured here is
-    // 374 ms (the spread is 0.374-7.524 s). So a loop that is free must advance at least one tick
-    // across any real registration, and a loop blocked inside WgcLaunch advances exactly zero -
-    // loop_ticks=0 with registration_ms >= 250 is the defect this fix exists to prevent.
+    // WHAT THESE TWO NUMBERS CAN AND CANNOT SHOW. The first comment here claimed a decidable property -
+    // "the loop caps its wake at 250 ms while a launch is in flight and the fastest registration is
+    // 374 ms, so a free loop must advance at least one tick and a blocked one exactly zero". THAT WAS
+    // WRONG, and the first run to carry the instrument said so: on win11r-sup, registrations of 656 ms and
+    // 516 ms scored loop_ticks=0 while the launch provably ran on this thread (its tid is in the line
+    // above). The cap bounds the WAIT, not the PASS, and the launch is issued below the tick increment, so
+    // the loop must finish a whole pass - tracking, capture, the window walk - before it next reaches that
+    // capped wait; during session start that pass alone can outlast the registration.
+    // So loop_ticks is the loop's wake COUNT during the flight, nothing more, and loop_idle_ms - how long
+    // before the launch finished the loop last returned from its wait - is what answers "was the loop
+    // alive", with no pass-length confound. The proof that the registration left the loop is the tid.
     const ULONGLONG t0 = GetTickCount64();
     const LONG64 loopBefore = InterlockedCompareExchange64(&g_MainLoopTick, 0, 0);
     const BOOL ok = WgcLaunch();
     g_WgcLaunchDoneTick = GetTickCount64();
     const LONG64 loopAfter = InterlockedCompareExchange64(&g_MainLoopTick, 0, 0);
-    LogInfo("QGALAUNCHOFFLOOP ok=%d registration_ms=%I64u loop_ticks=%I64d", ok ? 1 : 0,
-            (ULONGLONG)(g_WgcLaunchDoneTick - t0), (LONG64)(loopAfter - loopBefore));
+    const ULONGLONG wake = g_MainLoopWakeTick;
+    LogInfo("QGALAUNCHOFFLOOP role=wgclaunch ok=%d registration_ms=%I64u loop_ticks=%I64d loop_idle_ms=%I64u",
+            ok ? 1 : 0, (ULONGLONG)(g_WgcLaunchDoneTick - t0), (LONG64)(loopAfter - loopBefore),
+            (ULONGLONG)(g_WgcLaunchDoneTick - wake));
     _InterlockedExchange(&g_WgcLaunchState, ok ? 2 : 3);
     return 0;
 }
@@ -4862,6 +4874,38 @@ static BOOL NotifBridgeLaunch(void)
     return NotifRunInSession(NOTIF_TASK_NAME, args, TRUE);
 }
 
+// THE BRIDGE'S OWN OFF-LOOP LAUNCH SET, mirroring the broker's rather than sharing one mechanism with it
+// (Jev second_parallel_set 0.94): the two reaps write different shared state - the broker's resets per-slot
+// control timestamps, zeroes the shared header's BrokerPid and clears a stand-down latch, this one sets a
+// pending flag, the 60 s anchor and the not-ready latch - and a shared launcher would mean one edit able to
+// break both sites at once.
+// g_NotifLaunchState: 0 idle, 1 in flight, 2 finished and the bridge was launched, 3 finished and it
+// failed, 4 reaped by the loop.
+static volatile LONG g_NotifLaunchState = 0;
+static volatile ULONGLONG g_NotifLaunchDoneTick = 0;   // when the launch FINISHED - the 60 s grace's anchor
+// Kept only so the exit path can wait for a registration still in flight (NotifBridgeShutdown); closed and
+// cleared as soon as the loop reaps the result.
+static HANDLE g_NotifLaunchThread = NULL;
+static DWORD WINAPI NotifLaunchThreadProc(IN void* param)
+{
+    UNREFERENCED_PARAMETER(param);
+    LogInfo("QGATHREAD role=notiflaunch tid=%lu", GetCurrentThreadId());   // M1: short-lived, never joined
+    const ULONGLONG t0 = GetTickCount64();
+    const LONG64 loopBefore = InterlockedCompareExchange64(&g_MainLoopTick, 0, 0);
+    const BOOL ok = NotifBridgeLaunch();
+    g_NotifLaunchDoneTick = GetTickCount64();
+    const LONG64 loopAfter = InterlockedCompareExchange64(&g_MainLoopTick, 0, 0);
+    const ULONGLONG wake = g_MainLoopWakeTick;
+    // loop_ticks counts the loop's wakes during the flight; loop_idle_ms is how long before this launch
+    // finished the loop last returned from its wait. The SECOND is the one that answers "was the loop
+    // alive", because a tick count of 0 is also what one long pass produces - see g_MainLoopWakeTick.
+    LogInfo("QGALAUNCHOFFLOOP role=notiflaunch ok=%d registration_ms=%I64u loop_ticks=%I64d loop_idle_ms=%I64u",
+            ok ? 1 : 0, (ULONGLONG)(g_NotifLaunchDoneTick - t0), (LONG64)(loopAfter - loopBefore),
+            (ULONGLONG)(g_NotifLaunchDoneTick - wake));
+    _InterlockedExchange(&g_NotifLaunchState, ok ? 2 : 3);
+    return 0;
+}
+
 // Second stop channel, reaching a RUNNING bridge: write the ProgramData stop file BridgeMain
 // polls every loop pass (what `notifhost --bridge-stop` does); the bridge exits on it and runs
 // BannerRestoreAll on the way out. schtasks /delete is NOT a clean stop: Task Scheduler ENDS the
@@ -5184,6 +5228,28 @@ static void NotifBridgeSupervise(void)
         g_NotifLastLaunch = now;
         g_NotifNotReadyLogged = FALSE;
     }
+    // REAP AN OFF-LOOP LAUNCH, ON THE LOOP, before any early return below can strand it and before the
+    // READY path reads the flag this sets. The thread publishes exactly two things - a result and the tick
+    // at which the registration finished - and every shared-state write stays here. State 4 is "reaped":
+    // the broker's set stops at 3 because g_WgcLaunched latches its reap, while g_NotifLaunched is already
+    // TRUE from issue time and so cannot serve as that latch.
+    if (g_NotifLaunchState >= 2 && g_NotifLaunchState != 4)
+    {
+        const BOOL _ok = (g_NotifLaunchState == 2);
+        _InterlockedExchange(&g_NotifLaunchState, 4);
+        g_NotifLastLaunch = g_NotifLaunchDoneTick;   // the DONE tick: the 60 s grace starts when the task exists
+        g_NotifLaunchPending = _ok;
+        g_NotifNotReadyLogged = FALSE;
+        if (g_NotifLaunchThread)
+        {
+            CloseHandle(g_NotifLaunchThread);
+            g_NotifLaunchThread = NULL;
+        }
+        // The one launch per agent life is not retried - no relaunch loop (owner 2026-10-07). Not retried:
+        // the notification bridge is down and guest toasts take the window path until the next agent start.
+        if (!_ok)
+            LogError("QGANOTIFLAUNCHFAIL bridge launch failed, toasts show as guest windows");
+    }
     if (g_NotifBridgeProc) return;            // running: nothing to do and nothing armed
     DWORD sid = WTSGetActiveConsoleSessionId();
     // No session or no shell yet: the shell's own window events wake this loop when it comes up.
@@ -5317,14 +5383,31 @@ static void NotifBridgeSupervise(void)
     if (g_NotifLaunched || HelpersDisarmed()) return;
     g_NotifLaunched = TRUE;
     g_NotifLaunchedSession = WTSGetActiveConsoleSessionId();   // which session this one serves
-    g_NotifLastLaunch = now;
     g_NotifBridgeExitedAt = 0;
-    g_NotifLaunchPending = NotifBridgeLaunch();
-    // The one launch per agent life is not retried - no relaunch loop (owner 2026-10-07).
-    if (!g_NotifLaunchPending)
-        // Not retried: the notification bridge is down and guest toasts take the window path until the next
-        // agent start.
-        LogError("QGANOTIFLAUNCHFAIL bridge launch failed, toasts show as guest windows");
+    // OFF THE LOOP, like the broker's (NOTIFLAUNCHBLOCKSTHELOOP): NotifBridgeLaunch reaches schtasks
+    // /delete plus a /create and one retry, which measured 0.374-7.524 s against this agent's 5 s wake
+    // deadline, and this function runs on EVERY wake. The state is claimed BEFORE the thread exists, so a
+    // thread that finishes instantly cannot have its result clobbered by this assignment.
+    //
+    // WHAT IS DELIBERATELY *NOT* SET HERE, both left to the reap:
+    //   g_NotifLastLaunch - the anchor for the 60 s not-ready ERROR. Taking the issue tick would spend the
+    //     registration out of that grace; this is the stale-anchor class of QGADESLICEGRACESTALEANCHOR.
+    //   g_NotifLaunchPending - REQUIRED, not tidiness (Jev must_stay_false 0.83). The READY path's
+    //     staleness test is `hbTick >= g_NotifLastLaunch`, and that anchor is still 0 on a first launch,
+    //     so the guard is vacuous until the reap writes it: a leftover heartbeat from an earlier instance
+    //     in this boot would pass it, and a REUSED pid could then validate as another notifhost.exe -
+    //     exactly the case the comment on that test names.
+    _InterlockedExchange(&g_NotifLaunchState, 1);
+    g_NotifLaunchThread = CreateThread(NULL, 0, NotifLaunchThreadProc, NULL, 0, NULL);
+    if (!g_NotifLaunchThread)
+    {
+        // No thread: run it right here rather than skip the bridge. The state goes back to 0 first so the
+        // proc's own publish is the only writer of 2/3, and the reap below sees it on this same pass.
+        _InterlockedExchange(&g_NotifLaunchState, 0);
+        LogError("QGANOTIFLAUNCHTHREAD CreateThread for the bridge launch failed (%lu) - launching on the "
+            L"main loop instead, which blocks it for the registration", GetLastError());
+        (void)NotifLaunchThreadProc(NULL);
+    }
 }
 
 // The earliest moment the bridge's supervision needs the main loop awake; 0 = nothing armed (the rest state). Bridge
@@ -5358,6 +5441,21 @@ static void NotifBridgeShutdown(void)
     // a reliable channel (OpenProcess(SYNCHRONIZE) on this SYSTEM process is denied to the bridge's limited token).
     if (g_NotifBridge)
     {
+        // A LAUNCH STILL IN FLIGHT OWNS THE TASK. The disarm below is a schtasks /delete, and the thread
+        // may still be inside the /create - the delete would then overtake it and leave a task this agent
+        // believes it removed. BOUNDED AT 20 s, sized on the MEASURED spread (0.374-7.524 s registrations,
+        // 188-953 ms on win11r-sup), not on the stacked 15 s per-call caps: a bound's arithmetic is not a
+        // measurement, and waiting one out on an EXIT path turns a rare stall into an agent that hangs on
+        // shutdown past the SCM's patience.
+        if (g_NotifLaunchThread)
+        {
+            const DWORD _lw = WaitForSingleObject(g_NotifLaunchThread, 20000);
+            if (_lw != WAIT_OBJECT_0)
+                LogError("QGANOTIFLAUNCHTHREAD the bridge launch had not finished 20 s into the exit "
+                    L"(wait %lu) - the task disarm below may race its registration", _lw);
+            CloseHandle(g_NotifLaunchThread);
+            g_NotifLaunchThread = NULL;
+        }
         if (g_NotifLaunched)
             HelperTaskDisarm(NOTIF_TASK_NAME, L"the agent's exit");
         NotifBridgeRequestStop();
@@ -15637,7 +15735,7 @@ static ULONG WINAPI WatchForEvents(void)
         // REPORT: a launch that FAILED would go unsaid until that window expired and then name the
         // wrong reason. Armed only while a launch is in flight - at most the registration's own
         // duration, measured 0.37 to 7.5 s on this rig - and absent at rest.
-        if (g_WgcLaunchState == 1 && (waitTimeout == INFINITE || waitTimeout > 250))
+        if ((g_WgcLaunchState == 1 || g_NotifLaunchState == 1) && (waitTimeout == INFINITE || waitTimeout > 250))
             waitTimeout = 250;
 
         // SLICE-MAP-HOLD WAKE GUARANTEE (see MapDeferWakeSweep): release any expired
@@ -15829,6 +15927,14 @@ static ULONG WINAPI WatchForEvents(void)
         // Unconditionally, and before the attribution block below, which is skipped when the
         // broker's shared page is absent. Liveness must not depend on the broker existing.
         InterlockedIncrement64(&g_MainLoopTick);
+        // ...AND THE MOMENT IT HAPPENED. A tick COUNT cannot tell a blocked loop from one long pass: the
+        // in-flight wake cap bounds the WAIT, not the pass, and a launch is issued further down this body,
+        // so the loop must finish a whole pass before it next reaches that capped wait. MEASURED
+        // 2026-11-09 on win11r-sup: registrations of 656 ms and 516 ms scored loop_ticks=0 on a loop that
+        // was provably not inside the launch (its own thread logged its own tid). A thread asks how long
+        // ago the loop was awake instead, which no pass length can confound. Never 0 when a launch reads
+        // it: every issue site runs after this line in the same pass.
+        g_MainLoopWakeTick = GetTickCount64();
         // M1 attribution (ABI 21): what woke the loop, counted where the peek can read it.
         if (g_WgcBase)
         {
