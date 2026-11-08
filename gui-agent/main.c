@@ -3394,8 +3394,19 @@ static HANDLE g_WgcLaunchThread = NULL;
 static DWORD WINAPI WgcLaunchThreadProc(IN void* param)
 {
     UNREFERENCED_PARAMETER(param);
+    LogInfo("QGATHREAD role=wgclaunch tid=%lu", GetCurrentThreadId());   // M1 instrument - the only SHORT-LIVED role, so restwatch never joins it
+    // The decidable property, measured on the NORMAL path with nothing injected: while a launch is in
+    // flight the loop caps its wake at 250 ms, and the FASTEST registration ever measured here is
+    // 374 ms (the spread is 0.374-7.524 s). So a loop that is free must advance at least one tick
+    // across any real registration, and a loop blocked inside WgcLaunch advances exactly zero -
+    // loop_ticks=0 with registration_ms >= 250 is the defect this fix exists to prevent.
+    const ULONGLONG t0 = GetTickCount64();
+    const LONG64 loopBefore = InterlockedCompareExchange64(&g_MainLoopTick, 0, 0);
     const BOOL ok = WgcLaunch();
     g_WgcLaunchDoneTick = GetTickCount64();
+    const LONG64 loopAfter = InterlockedCompareExchange64(&g_MainLoopTick, 0, 0);
+    LogInfo("QGALAUNCHOFFLOOP ok=%d registration_ms=%I64u loop_ticks=%I64d", ok ? 1 : 0,
+            (ULONGLONG)(g_WgcLaunchDoneTick - t0), (LONG64)(loopAfter - loopBefore));
     _InterlockedExchange(&g_WgcLaunchState, ok ? 2 : 3);
     return 0;
 }
