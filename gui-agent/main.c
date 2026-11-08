@@ -9337,7 +9337,16 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         // is exactly what we want - they count as windowed and are always allowed.
         // FI_GATE_MODE2 reproduces, as a registry value on ONE binary, the defect that
         // diag/sg2-mode2-gate-removed reproduced by building a second one (2026-08-31).
-        if (!FiGateOff(FI_GATE_MODE2) && !(data->Style & WS_CAPTION) && !g_ShowFullscreenScreen)
+        // ...AND A CAPTION WE TOOK OURSELVES STILL COUNTS AS ONE. ADR-windows section 9's seamless
+        // tweak removes WS_CAPTION from guest windows (default on since 4.3.21), so the maximized app
+        // that section 2 calls ALWAYS ALLOWED is accepted on one pass, stripped by us, and then has no
+        // caption left for this test to read: measured on win11-acc at DEBUG, 2026-11-01 10:27:51,
+        // hwnd 0x70094 went style 0x14CF0000 -> 0x140F0000 and was DESTROYed 300 ms after it was
+        // announced - the user watched a window appear and vanish. CaptionWasStripped is the field
+        // that means WE took it; CaptionHidden is also set for a window deliberately LEFT ALONE (an
+        // own-frame app), so reading that one would wave a genuinely borderless window through.
+        if (!FiGateOff(FI_GATE_MODE2) && !(data->Style & WS_CAPTION) && !data->CaptionWasStripped &&
+            !g_ShowFullscreenScreen)
         {
             LogDebug("0x%x: borderless fullscreen (class %s, %ux%u, style 0x%08x) hidden (set service.gui-fullscreen to allow)",
                 data->Handle, data->Class, data->Width, data->Height, data->Style);
