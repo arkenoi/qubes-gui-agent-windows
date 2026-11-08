@@ -3177,6 +3177,8 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
     DWORD wr = 0;
     size_t len = 0;
     BOOL ok;
+    ULONGLONG _mt0 = GetTickCount64(), _mt1 = 0, _mt2 = 0, _mt3 = 0;   /* phase metering, see the line at the end */
+    int _mretry = 0;
 
     if (!xml) return FALSE;
     XmlEscapeInto(xExe, RTL_NUMBER_OF(xExe), exePath);
@@ -3252,10 +3254,12 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
         DeleteFileW(file);
         return FALSE;
     }
+    _mt1 = GetTickCount64();   /* the task XML is built and on disk */
     StringCchPrintfW(cmd, RTL_NUMBER_OF(cmd), L"/create /tn %s /xml \"%s\" /f", taskName, file);
     DWORD rc = 0;
     WCHAR why[512] = L"";
     ok = WgcRunSchtasks(cmd, &rc, why, RTL_NUMBER_OF(why));
+    _mt2 = GetTickCount64();   /* the first schtasks /create returned */
     if (!ok)
     {
         // ONE BOUNDED RETRY, because this failure was MEASURED TRANSIENT and treating it as
@@ -3270,8 +3274,10 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
         LogWarning("QGAHELPERTASK schtasks /create /xml failed for %s (rc=%lu: %s) - retrying once",
             taskName, rc, why[0] ? why : L"schtasks said nothing");
         Sleep(500);
+        _mretry = 1;
         ok = WgcRunSchtasks(cmd, &rc, why, RTL_NUMBER_OF(why));
     }
+    _mt3 = GetTickCount64();   /* registration done, before the temp file goes */
     DeleteFileW(file);
     if (!ok)
         // THE REASON IS IN THE LINE NOW. It used to carry neither the exit code nor schtasks' own
@@ -3284,6 +3290,13 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
         LogInfo("QGAHELPERTASK %s registered from XML and started by its registration trigger%s", taskName,
             resident ? L" (Task Scheduler restart-on-failure " HELPER_TASK_RESTART_INTERVAL L" x" HELPER_TASK_RESTART_COUNT L")"
                      : L" (one-shot, no restart)");
+    // THE THREE PHASES, NAMED. QGALAUNCHOFFLOOP's registration_ms is the TOTAL; this splits it, which is
+    // what HELPERREGISTERCOSTSSECONDSUNEXPLAINED has been missing - it existed only on branch
+    // metering/helper-register-cost (agent 7278694), smoke-only, so no acceptance run ever carried it.
+    // One known reading from that branch: total=672 xml=32 schtasks1=640 retry=0, i.e. the subprocess is
+    // the cost and the XML write is noise. tail is DeleteFile plus the two report branches.
+    LogInfo("QGAMETERHELPERTASK %s total=%I64u ms xml=%I64u ms schtasks1=%I64u ms retry=%d tail=%I64u ms",
+        taskName, _mt3 - _mt0, _mt1 - _mt0, _mt2 - _mt1, _mretry, _mt3 - _mt2);
     return ok;
 }
 
@@ -4476,6 +4489,18 @@ static void BrokerSupervise(void)
         // deliberately NOT moved - the report's duration must stay true.
         if (_rearmGrace)
             g_BrokerNextWarn = g_WgcLastLaunch + DESLICE_FIRST_WARN_MS;
+        // THE ANCHOR, PRINTED, so no run has to do arithmetic on two log timestamps to find out which
+        // clock the grace was counted from. That arithmetic is how QGADESLICEGRACESTALEANCHOR survived
+        // several fixes: nothing printed the deadline it had actually armed. pass_now is the tick this
+        // supervision pass sampled at its top - the STALE one the defect used; done is the tick the
+        // registration finished, which is what g_WgcLastLaunch now takes; armed is the deadline that
+        // came out of it. armed - done == DESLICE_FIRST_WARN_MS on every rearm is the decidable
+        // property, readable on an ORDINARY run with no trigger and no injected delay. Ported from
+        // branch metering/helper-register-cost (agent 7278694), which never carried a cut.
+        LogInfo("QGAMETERDESLICEARM pass_now=%I64u done=%I64u armed=%I64u grace_from_done=%I64d "
+            L"downsince=%I64u", now, g_WgcLaunchDoneTick, g_BrokerNextWarn,
+            _rearmGrace ? (LONG64)(g_BrokerNextWarn - g_WgcLaunchDoneTick) : (LONG64)-1,
+            g_BrokerDownSince);
         if (_launched) g_WgcSession = sid;
         // The de-slice broker's one launch failed and is not retried; QGADESLICEDOWN says so until the next GUI
         // agent start.
