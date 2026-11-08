@@ -3350,6 +3350,42 @@ static BOOL WgcLaunch(void)
         L" x" HELPER_TASK_RESTART_COUNT, sid);
     return TRUE;
 }
+// THE LAUNCH RUNS OFF THE MAIN LOOP (Jev which_change_is_the_fix = move_registration_off_the_loop
+// 0.86, confidence 0.82, 2026-11-08; blocking_loop_is_a_defect 0.85/0.77).
+// WHY, and it is not the de-slice deadline - that was fixed in a93cf137 by stamping the anchor AFTER
+// WgcLaunch() returns. WgcLaunch registers the task with schtasks, a SUBPROCESS. WgcRunSchtasks bounds
+// ONE call with WaitForSingleObject(..., 15000) and HelperTaskRegister retries once after Sleep(500),
+// so the call can hold its caller for about 30.5 s - and its caller is BrokerSupervise, which the main
+// loop invokes at the call site whose own comment reads "every wake, waits for nothing". MEASURED
+// registrations: 0.374, 1.040, 1.676 and 7.524 s; the metering branch broke the 672 ms case down as
+// xml=32 ms, schtasks1=640 ms, retry=0, so the subprocess IS the cost. Two things were paid for it:
+// g_MainLoopTick, the liveness counter the loop bumps unconditionally on every wake, stopped for the
+// whole window; and the broker's own R5 deadline on an agent wake is WGCBRK_AGENT_DEADLINE_MS = 5000,
+// so the 7.524 s case charged us an AgentStalls tick (CheckAgentDeadline counts and disarms - it does
+// NOT end the broker, which is why this cost menus and toasts nothing and is graded below P1).
+// EVERY SHARED-STATE WRITE STAYS ON THE LOOP THREAD. This thread does the blocking work and publishes
+// two scalars; BrokerSupervise reads them on a later pass and then performs exactly the state
+// transitions the synchronous path performed, in the same order. The interlocked state write is a full
+// barrier, so a loop that reads a finished state also sees the tick written before it. Nothing here
+// touches g_WgcLaunched, g_BrokerNextWarn, g_WgcSession or the slot clocks.
+// THE REPORT IS HELD WHILE THE LAUNCH IS IN FLIGHT, by the mechanism that already existed and not by a
+// second one: g_WgcLaunched stays FALSE until the loop reaps the result, so the pre-launch hold below
+// keeps QGADESLICEDOWN quiet exactly as it does before a launch is issued - bounded, as it always was,
+// by DESLICE_LAUNCH_PENDING_MS anchored at the shell, which is three times the longest flight possible.
+// g_WgcLaunchState: 0 idle, 1 in flight, 2 finished and the broker was started, 3 finished and it failed.
+static volatile LONG g_WgcLaunchState = 0;
+static volatile ULONGLONG g_WgcLaunchDoneTick = 0;   // when the launch FINISHED - the de-slice anchor
+// The one-shot launch thread, kept only so the exit path can wait for a registration still in
+// flight (BrokerShutdown) - closed and cleared as soon as the loop reaps the result.
+static HANDLE g_WgcLaunchThread = NULL;
+static DWORD WINAPI WgcLaunchThreadProc(IN void* param)
+{
+    UNREFERENCED_PARAMETER(param);
+    const BOOL ok = WgcLaunch();
+    g_WgcLaunchDoneTick = GetTickCount64();
+    _InterlockedExchange(&g_WgcLaunchState, ok ? 2 : 3);
+    return 0;
+}
 // Open a helper process published by pid for SYNCHRONIZE/TERMINATE - VALIDATED first. The pid
 // is written by a user-session helper into something the interactive user can write (the
 // broker's shared section per the wgcbroker_ipc.h security note; the bridge's ProgramData
@@ -4264,7 +4300,50 @@ static void BrokerSupervise(void)
     // THE ONE LAUNCH PER AGENT LIFE (HELPER LIFECYCLE above): once a console session with a shell exists, and never
     // into a session that is ending. No throttle, no retry - a launch that fails is said at ERROR and QGADESLICEDOWN
     // escalates; Task Scheduler's restart-on-failure is the only relauncher of what did start.
-    if (!g_WgcLaunched && !HelpersDisarmed() && sid != 0xFFFFFFFF && ShellWindowNow())
+    // IT IS ISSUED ON ONE PASS AND REAPED ON ANOTHER (two blocks, in order, both on this thread
+    // only), because the registration blocks - see WgcLaunchThreadProc for the measurement. The
+    // guard that made it one launch per agent life still does: g_WgcLaunchState leaves 0 once and
+    // never returns to it, and g_WgcLaunched latches in the reap.
+    if (!g_WgcLaunched && !HelpersDisarmed() && sid != 0xFFFFFFFF && ShellWindowNow() && g_WgcLaunchState == 0)
+    {
+        // ISSUE. Everything the launch must see set is set HERE, on this thread, before the thread
+        // that performs it exists. g_WgcLaunched is deliberately NOT set yet: it is the latch that
+        // keeps the pre-launch hold above in force, and that hold is what keeps QGADESLICEDOWN quiet
+        // while the registration is in flight - bounded, as it already was, by the shell-anchored
+        // DESLICE_LAUNCH_PENDING_MS, three times the longest registration this rig has measured.
+        // AND THIS IS THE REARM. A launch is the event the stand-down latch waits for: "no timer, no
+        // supervisor until next rearm" (owner, 2026-10-24). Supervision resumes from here, so a broker
+        // that was deliberately stopped and is now being started again is supervised normally.
+        g_BrokerStoodDown = FALSE;
+        // ZERO THE SHARED PID, so "ready" can only mean the NEW instance published one - the same trap that made a
+        // stale heartbeat certify a corpse as alive (measured 2026-09-08) - and every request clock starts fresh.
+        WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
+        for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
+            if (g_SlotCtlSince[i]) g_SlotCtlSince[i] = now;
+        // THE STATE IS CLAIMED BEFORE THE THREAD EXISTS, or the thread could finish and publish its
+        // result first and this line would overwrite it with "in flight" forever. The thread only
+        // ever writes a FINISHED state; this thread only ever writes 1 here (before there is a
+        // thread) or 0 just below (when there is none), so the two never race for the same value.
+        _InterlockedExchange(&g_WgcLaunchState, 1);
+        g_WgcLaunchThread = CreateThread(NULL, 0, WgcLaunchThreadProc, NULL, 0, NULL);
+        if (!g_WgcLaunchThread)
+        {
+            // AN ANOMALY, SAID AT ERROR, AND THE LAUNCH STILL HAPPENS. A guest that cannot create a
+            // thread has worse problems than a blocked loop, and the user's menus and toasts are
+            // worth more than the loop's liveness counter - so this runs exactly what the loop ran
+            // before this change, ON the loop, and the reap below then fires on this same pass,
+            // which is the old behaviour end to end.
+            _InterlockedExchange(&g_WgcLaunchState, 0);
+            LogError("QGABROKERLAUNCHTHREAD could not start the launch thread (%lu) - registering the broker on the "
+                "main loop instead, which blocks it for as long as schtasks takes", GetLastError());
+            (void)WgcLaunchThreadProc(NULL);
+        }
+    }
+    // REAP: the launch has finished and has not been accounted for yet. These are the transitions the
+    // synchronous path performed after WgcLaunch() returned, in the same order, against the tick it
+    // actually finished at. No guard from the issue above is repeated here - the launch has already
+    // gone out, so a session that has since started ending does not un-launch it.
+    if (g_WgcLaunchState >= 2 && !g_WgcLaunched)
     {
         g_WgcLaunched = TRUE;
         // A FRESH TICK, NOT THE PASS'S `now`. `now` is sampled once at the top of BrokerSupervise,
@@ -4298,13 +4377,11 @@ static void BrokerSupervise(void)
         // distinct launch->ready pairs across 440 distinct gui-agent logs on this rig the spread is
         // min 0.17, median 4.85, p90 13.24, p99 22.83, max 31.33 s, and exactly ONE exceeds 30 s - by
         // 1.33 s, which is inside that jitter. There is no measurement here that convicts the 30 s.
-        // THE STAMPS ARE TAKEN WHERE THE LAUNCH FINISHES, NOT HERE - see below. This position is
-        // BEFORE WgcLaunch(), which is the call that registers the task and starts it, so a tick
-        // taken here is "about to launch", not "launched".
-        // AND THIS IS THE REARM. A launch is the event the stand-down latch waits for: "no timer, no
-        // supervisor until next rearm" (owner, 2026-10-24). Supervision resumes from here, so a broker
-        // that was deliberately stopped and is now being started again is supervised normally.
-        g_BrokerStoodDown = FALSE;
+        // AND THE STAMP IS NOW TAKEN BY THE LAUNCH ITSELF, which is why this is a separate pass: the
+        // tick is read inside WgcLaunchThreadProc the instant WgcLaunch() returns, published before
+        // the state that releases this block, and read back here. Taking GetTickCount64() HERE would
+        // reintroduce the very error the two fixes above chased - it would be the tick the loop got
+        // round to noticing, not the tick the broker was asked to run.
         // A NEW LAUNCH RESTARTS THE GRACE, and only the deadline moves - not the outage's start.
         // MEASURED 2026-10-24, acceptance run 40037710497 win11-reinstall, on a build that already
         // carried the pre-launch hold and the post-healthy anchor:
@@ -4320,7 +4397,7 @@ static void BrokerSupervise(void)
         // and a launch that has just gone out is exactly when that grace is owed.
         // g_BrokerDownSince is deliberately NOT moved: the report's duration must stay true, so a
         // broker that never comes up still says how long it has really been missing.
-        // A FRESH TICK HERE TOO, for the same reason as g_WgcLastLaunch above - and this is the one
+        // THE SAME TICK HERE TOO, for the same reason as g_WgcLastLaunch below - and this is the one
         // that actually decides when the report fires, which the anchor fix alone did not.
         // MEASURED 2026-10-26 on win11r-dsm, a quick-upgrade smoke of the package built WITH the
         // anchor fix (gui-agent ver=4.3.37.1125, package 4.3.37+agent.8d3d657eb6a5):
@@ -4331,15 +4408,14 @@ static void BrokerSupervise(void)
         // sampled before HelperTaskRegister, so the grace this rearm exists to GIVE was 7.5 s short.
         // Fixing g_WgcLastLaunch moved the ANCHOR (the duration the report prints) and left the
         // DEADLINE on the stale value, because they are two assignments in two places and only one
-        // was read. Both are now the same fresh tick.
+        // was read. Both now read the one tick the launch itself stamped.
+        // READ ON THE REAPING PASS, AND THAT IS THE SAME VALUE the synchronous path read: the
+        // pre-launch hold above runs earlier in every pass and, while g_WgcLaunched is still FALSE,
+        // either zeroes this clock or (past the pending window) holds it set - so it says the same
+        // thing on the pass that issued the launch and on the pass that reaps it.
         const BOOL _rearmGrace = (g_BrokerDownSince != 0);
-        // ZERO THE SHARED PID, so "ready" can only mean the NEW instance published one - the same trap that made a
-        // stale heartbeat certify a corpse as alive (measured 2026-09-08) - and every request clock starts fresh.
-        WGCBRK_HDR(g_WgcBase)->BrokerPid = 0;
-        for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
-            if (g_SlotCtlSince[i]) g_SlotCtlSince[i] = now;
         // A failed launch is not retried - no relaunch loop (owner 2026-10-07); QGADESLICEDOWN keeps saying so.
-        const BOOL _launched = WgcLaunch();
+        const BOOL _launched = (g_WgcLaunchState == 2);
         // THE LAUNCH IS ISSUED WHEN WgcLaunch RETURNS, and that is the only tick that can anchor
         // "has not been running for N s". MEASURED 2026-10-26 by the metering branch, which is the
         // only reason this was found - two fixes and a review had already accepted the wrong story:
@@ -4357,7 +4433,7 @@ static void BrokerSupervise(void)
         // 161055.83, and QGADESLICEDOWN fired at 161055.834 while the registration had only
         // finished at 161033.348. Stamping after the call moves the deadline to 161063.35, past the
         // 161059.387 session end that was the real reason the broker never reported ready.
-        g_WgcLastLaunch = GetTickCount64();
+        g_WgcLastLaunch = g_WgcLaunchDoneTick;
         // AND A NEW LAUNCH RESTARTS THE GRACE from the same instant, for the case the pre-launch
         // hold does NOT cover: a broker that died after a healthy run leaves g_BrokerDownSince set,
         // so this branch is live and must use the post-launch tick too. g_BrokerDownSince is
@@ -4368,6 +4444,9 @@ static void BrokerSupervise(void)
         // The de-slice broker's one launch failed and is not retried; QGADESLICEDOWN says so until the next GUI
         // agent start.
         else LogError("QGABROKERLAUNCHFAIL launch failed, no menus or toasts until restart");
+        // The thread has published its result and is on its way out, so the handle's one remaining
+        // job - telling the exit path that a registration is still in flight - is done.
+        if (g_WgcLaunchThread) { CloseHandle(g_WgcLaunchThread); g_WgcLaunchThread = NULL; }
     }
 }
 
@@ -4377,7 +4456,25 @@ static void BrokerShutdown(void)
     // would restart on - then ask the broker to leave (the Shutdown flag, read when it wakes on the ctl event), wait
     // bounded on the validated handle, then delete the task, which ENDS an instance that did not leave (measured,
     // notifhost.cpp). A helper ended here is never relaunched: the next agent start re-creates the task.
-    if (g_WgcLaunched)
+    // A LAUNCH STILL IN FLIGHT IS WAITED FOR FIRST, bounded, because it and this function both drive
+    // schtasks against the SAME task: without this wait a /delete here could overtake the /create
+    // there and leave the task registered with the agent gone - which is a broker Task Scheduler
+    // keeps restarting and nothing supervises. The bound is the registration's own worst case (two
+    // WgcRunSchtasks calls at 15 s each plus the 500 ms retry gap) and a second over; an expiry is an
+    // anomaly, said at ERROR, and the disarm below then runs anyway because the task must not
+    // outlive us. This is the only place the agent waits on the launch, and it is the exit path.
+    if (g_WgcLaunchThread)
+    {
+        const DWORD lw = WaitForSingleObject(g_WgcLaunchThread, 31000);
+        if (lw != WAIT_OBJECT_0)
+            LogError("QGABROKERLAUNCHTHREAD the broker launch had not finished at the agent's exit (wait=0x%lx) - "
+                "disarming the task anyway", lw);
+        CloseHandle(g_WgcLaunchThread);
+        g_WgcLaunchThread = NULL;
+    }
+    // ISSUED COUNTS, NOT REAPED: a launch that went out registered the task even if the loop never
+    // got to account for it, and a failed one can have registered it before failing to start it.
+    if (g_WgcLaunched || g_WgcLaunchState != 0)
         HelperTaskDisarm(WGC_TASK_NAME, L"the agent's exit");
     if (g_WgcBase) WGCBRK_HDR(g_WgcBase)->Shutdown = 1;   // broker self-exits on this flag...
     if (g_WgcCtl) SetEvent(g_WgcCtl);                      // ...read when it wakes: it has no timer any more
@@ -15501,6 +15598,17 @@ static ULONG WINAPI WatchForEvents(void)
             if (waitTimeout == INFINITE || toStall < (DWORD)waitTimeout)
                 waitTimeout = toStall;
         }
+
+        // A LAUNCH IN FLIGHT NEEDS ONE BOUNDED WAKE. The loop's default wait is INFINITE (rest-zero
+        // S4: "no idle wakeup for the helpers"), and the thread that performs the broker launch
+        // publishes its result without touching any watched event - so on a quiet desktop the loop
+        // would not account for the launch until something unrelated woke it. What that costs is not
+        // the de-slice deadline (the shell-anchored pre-launch hold still covers the flight) but the
+        // REPORT: a launch that FAILED would go unsaid until that window expired and then name the
+        // wrong reason. Armed only while a launch is in flight - at most the registration's own
+        // duration, measured 0.37 to 7.5 s on this rig - and absent at rest.
+        if (g_WgcLaunchState == 1 && (waitTimeout == INFINITE || waitTimeout > 250))
+            waitTimeout = 250;
 
         // SLICE-MAP-HOLD WAKE GUARANTEE (see MapDeferWakeSweep): release any expired
         // map-hold NOW (queues the window for the tracking pass that maps it), then cap
