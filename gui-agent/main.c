@@ -358,6 +358,15 @@ static UINT64 g_WgcNonce = 0;
 // other process can pre-create it.
 static HANDLE g_WgcAlive = NULL;
 static HANDLE g_WgcFrame = NULL;   // broker -> agent: a frame was published (auto-reset)
+// broker -> agent: THIS broker is up (auto-reset, one-shot). Readiness used to be POLLED - g_BrokerReadyAt was
+// stamped on whichever main-loop pass first observed the broker alive - so the launch->ready figure carried up to
+// a whole pass of latency that had nothing to do with the broker. Over the 229 launch->ready pairs recorded above
+// BrokerSupervise: median 4.85 s, max 31.33 s, against a DESLICE_FIRST_WARN_MS of 30 s - so one run in 229 told
+// the user the broker had not come up when it had. Jev readiness_publication = dedicated_ready_event 0.77 (conf
+// 0.71): the frame event cannot carry this - signalling it with no frame published scored semantics_rot 0.78,
+// because the line above it would stop being true - and the notification bridge already pays for exactly this
+// object with g_NotifReadyEvt. The broker derives the name from --shm, as it already does for _alive.
+static HANDLE g_WgcReadyEvt = NULL;
 // RESERVED, NOT COMMITTED (rest-zero S2, design c4; Jev 0.98): the section is SEC_RESERVE and each allocation is committed on
 // the agent's view when it is made (WgcArenaAlloc), so the commit charge is what windows actually use (its high-water mark -
 // committed section pages are never decommitted, and a reused region is already committed). Measured 2026-10-01: the old
@@ -2882,7 +2891,7 @@ static BOOL WgcCreateSection(void)
     LARGE_INTEGER pc; QueryPerformanceCounter(&pc);
     g_WgcNonce = ((UINT64)GetTickCount64() << 20) ^ (UINT64)pc.QuadPart
                ^ ((UINT64)GetCurrentProcessId() << 3);
-    WCHAR nmShm[128], nmCtl[128], nmFrm[128];
+    WCHAR nmShm[128], nmCtl[128], nmFrm[128], nmRdy[128];
     StringCchPrintf(nmShm, RTL_NUMBER_OF(nmShm), L"Global\\QubesWgcBrk_%llx_shm", g_WgcNonce);
     StringCchPrintf(nmCtl, RTL_NUMBER_OF(nmCtl), L"Global\\QubesWgcBrk_%llx_ctl", g_WgcNonce);
     // BROKER -> AGENT wake. The ctl event above is agent->broker only; there was NO channel the
@@ -2891,6 +2900,10 @@ static BOOL WgcCreateSection(void)
     // entirely, so a painted window could sit unnoticed on a static desktop. Measured 2026-09-11:
     // ~125 ms of the menu hold, plus that correctness hole.
     StringCchPrintf(nmFrm, RTL_NUMBER_OF(nmFrm), L"Global\\QubesWgcBrk_%llx_frm", g_WgcNonce);
+    // BROKER -> AGENT readiness, derived by the broker from --shm (..._shm -> ..._ready) exactly as _alive is, so
+    // nothing is added to the registered command line - that registration is the measured cost of a launch
+    // (QGAMETERHELPERTASK), not something to lengthen for a name that can be computed.
+    StringCchPrintf(nmRdy, RTL_NUMBER_OF(nmRdy), L"Global\\QubesWgcBrk_%llx_ready", g_WgcNonce);
 
     PSECURITY_DESCRIPTOR sdS = NULL, sdE = NULL;
     // section: SY GENERIC_ALL, IU GENERIC_READ|WRITE; event: SY all, IU SYNCHRONIZE|MODIFY_STATE
@@ -2930,6 +2943,22 @@ static BOOL WgcCreateSection(void)
     }
     g_WgcCtl = CreateEvent(&saE, FALSE, FALSE, nmCtl);
     g_WgcFrame = CreateEvent(&saE, FALSE, FALSE, nmFrm);
+    // Same saE as the two events above (SY all, IU SYNCHRONIZE|MODIFY_STATE): the broker only ever sets this one.
+    g_WgcReadyEvt = CreateEvent(&saE, FALSE, FALSE, nmRdy);
+    const DWORD rdyGle = GetLastError();   // read BEFORE the LocalFrees below can clobber it
+    // ALREADY-EXISTS IS A REFUSAL, as for the section and the alive mutex above (adversary (c)): on a fresh
+    // nonce nobody else can have created this name first, so if someone did, it is not ours to trust. The
+    // bridge's ready event refuses on the same test (NotifIpcEnsure); ctl and frame predate the rule.
+    if (g_WgcReadyEvt && rdyGle == ERROR_ALREADY_EXISTS) { CloseHandle(g_WgcReadyEvt); g_WgcReadyEvt = NULL; }
+    // NOT FATAL, AND NOT SILENT. This event only makes readiness arrive as a WAKE instead of being noticed on
+    // the loop's next pass; without it the agent polls exactly as it did across the 440 logs behind the
+    // measurement in g_WgcReadyEvt's comment, and the wait-array entry is guarded on the handle, so a NULL
+    // degrades by itself. Failing the section here would put the whole broker - every de-sliced window -
+    // behind an optimisation for a warning that fired once in 229 launches, which is the opposite trade from
+    // the one the broker's ctl event refuses (there the channel is load-bearing, so it refuses to run
+    // half-deaf). But a fallback is an ANOMALY here, so it is named rather than absorbed.
+    if (!g_WgcReadyEvt)
+        LogWarning("QGABROKERREADYEVT not created (%lu), broker readiness falls back to the next loop pass", rdyGle);
     LocalFree(sdS); LocalFree(sdE);
     if (!g_WgcBase || !g_WgcCtl || !g_WgcFrame) return FALSE;
     WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
@@ -4426,6 +4455,12 @@ static void BrokerSupervise(void)
         // distinct launch->ready pairs across 440 distinct gui-agent logs on this rig the spread is
         // min 0.17, median 4.85, p90 13.24, p99 22.83, max 31.33 s, and exactly ONE exceeds 30 s - by
         // 1.33 s, which is inside that jitter. There is no measurement here that convicts the 30 s.
+        // THAT INFLATION IS GONE as of the broker's ready event (g_WgcReadyEvt, declared next to
+        // g_WgcFrame): the broker SetEvents it once it has published its pid, so the loop wakes and
+        // validates that pid on THAT wake - a "ready" tick is now the broker's readiness, not the
+        // loop's next pass. The 229 pairs above were measured BEFORE it and are kept as the reason it
+        // exists: do not re-read them as the cost of the current build, and do not derive a deadline
+        // from them.
         // AND THE STAMP IS NOW TAKEN BY THE LAUNCH ITSELF, which is why this is a separate pass: the
         // tick is read inside WgcLaunchThreadProc the instant WgcLaunch() returns, published before
         // the state that releases this block, and read back here. Taking GetTickCount64() HERE would
@@ -15915,6 +15950,11 @@ static ULONG WINAPI WatchForEvents(void)
         if (g_NotifBridgeProc) watchedEvents[eventCount++] = g_NotifBridgeProc;
         // The bridge's ready event (rest-zero S4c): set once it has published its pid, so the supervisor runs then.
         if (g_NotifReadyEvt && !g_NotifBridgeProc) watchedEvents[eventCount++] = g_NotifReadyEvt;
+        // THE BROKER'S READY EVENT, same shape as the bridge's: set once the broker has published its pid, so
+        // BrokerSupervise adopts it on THIS wake instead of up to a pass later. Dropped from the wait once the
+        // process handle is held - from then on that handle and the frame event carry everything this loop wants
+        // from the broker, and the readiness wake has nothing left to say.
+        if (g_WgcReadyEvt && !g_WgcBrokerProc) watchedEvents[eventCount++] = g_WgcReadyEvt;
         // BROKER FRAME PUBLISHED - appended LAST, EVERY iteration. It used to be placed once, before this loop, at
         // index 7: the broker's section (and with it g_WgcFrame) is created later, by BrokerSupervise, so it was
         // usually absent then - and when present, the two lines above overwrote index 7 with a process handle. The
