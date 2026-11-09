@@ -188,8 +188,12 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
                 LogInfo("VCHANWAIT %s: ring drained after %I64u ms, %I64u bytes sent",
                     what, GetTickCount64() - start, (ULONG64)size);
             }
-            if (consumedWake)
-                SetEvent(vchanEvent);
+            if (vchanEvent)
+            {
+                if (consumedWake)
+                    SetEvent(vchanEvent);
+                CloseHandle(vchanEvent);
+            }
             return TRUE;
         }
 
@@ -199,8 +203,12 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             // Safe to return even mid-message: the stream is gone, there is nothing left
             // to keep in sync.
             *result = VCHAN_SEND_DEAD;
-            if (consumedWake)
-                SetEvent(vchanEvent);
+            if (vchanEvent)
+            {
+                if (consumedWake)
+                    SetEvent(vchanEvent);
+                CloseHandle(vchanEvent);
+            }
             return FALSE;
         }
 
@@ -209,7 +217,21 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             blocked = TRUE;
             start = GetTickCount64();
             firstBlock = start;
-            vchanEvent = libvchan_fd_for_select(vchan);
+            // OWN THE HANDLE WE WAIT ON. libvchan_fd_for_select hands back the vchan's OWN event
+            // handle, and libvchan_close closes it - which, now that the wait below runs with the
+            // lock OFF, can happen while this thread is blocked on it (main.c's exit closes the
+            // vchan under this same lock, and a parked sender no longer holds it). Waiting on a
+            // handle another thread closes is undefined: the value can be recycled by the next
+            // CreateEvent and the wait would then take a wake belonging to an unrelated object. A
+            // duplicate keeps the kernel object alive for exactly as long as this call needs it, and
+            // SetEvent on the duplicate signals the SAME object, so the hand-back still reaches the
+            // main loop waiting on the original. A failed duplicate degrades to the plain sleep.
+            {
+                HANDLE raw = libvchan_fd_for_select(vchan);
+                if (!raw || !DuplicateHandle(GetCurrentProcess(), raw, GetCurrentProcess(),
+                                             &vchanEvent, 0, FALSE, DUPLICATE_SAME_ACCESS))
+                    vchanEvent = NULL;
+            }
             LogWarning("VCHANWAIT %s: ring full (need %I64u, free %d) - waiting up to %u ms "
                 "for gui-daemon to drain", what, (ULONG64)size, space, VCHAN_SEND_DEADLINE_MS);
         }
@@ -218,8 +240,12 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             if (mayAbort)
             {
                 *result = VCHAN_SEND_UNRESPONSIVE;
-                if (consumedWake)
-                    SetEvent(vchanEvent);
+                if (vchanEvent)
+                {
+                    if (consumedWake)
+                        SetEvent(vchanEvent);
+                    CloseHandle(vchanEvent);
+                }
                 return FALSE;
             }
 
@@ -238,8 +264,12 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
                 LogError("VCHANWAIT %s: no room after %u ms with a message already partly written; "
                     "connection abandoned, the agent exits", what, VCHAN_SEND_COMMITTED_DEADLINE_MS);
                 *result = VCHAN_SEND_DEAD;
-                if (consumedWake)
-                    SetEvent(vchanEvent);
+                if (vchanEvent)
+                {
+                    if (consumedWake)
+                        SetEvent(vchanEvent);
+                    CloseHandle(vchanEvent);
+                }
                 return FALSE;
             }
 
@@ -290,7 +320,11 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
                     LogWarning("VCHANWAIT %s: the connection was declared gone while %I64u bytes "
                         "waited for room - not sent", what, (ULONG64)size);
                     *result = VCHAN_SEND_DEAD;
-                    // No wake handed back: the ring this event belongs to is being torn down.
+                    // No wake handed back: the ring this event belongs to is being torn down, so
+                    // signalling it would reach loops that are gone with it. The duplicate is still
+                    // ours to close, and closing it is what releases the kernel object.
+                    if (vchanEvent)
+                        CloseHandle(vchanEvent);
                     return FALSE;
                 }
             }
