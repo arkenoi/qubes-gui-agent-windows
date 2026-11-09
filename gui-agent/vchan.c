@@ -50,7 +50,9 @@ struct libvchan *g_Vchan = NULL;
 // re-check, and a wake that fails to arrive costs one slice, not a whole 10 s deadline.
 #define VCHAN_RESERVE_WAIT_SLICE_MS 100
 
-// All four are written only under g_VchanCriticalSection, which every sender holds.
+// All four are written only under g_VchanCriticalSection. Every sender holds it - EXCEPT across the
+// wait for ring room in VchanReserveLocked, which releases it while no byte of its message is in the
+// ring yet and re-reads g_VchanClientConnected on the way back in (QRSENDLOCK, below).
 static BOOL              g_VchanSendWedged = FALSE;
 static VCHAN_SEND_RESULT g_VchanWedgeResult = VCHAN_SEND_OK;
 static ULONG64           g_VchanSendGiveUps = 0;
@@ -122,9 +124,18 @@ static void VchanGiveUpLocked(IN struct libvchan *vchan, IN VCHAN_SEND_RESULT re
 
 // Wait until the write ring can take `size` bytes, then return TRUE with that space
 // RESERVED: the caller holds g_VchanCriticalSection and is therefore the only writer, and
-// the daemon can only ever consume, so from here until we write the free space is
-// monotonically non-decreasing. The reservation cannot be stolen and the writes it covers
-// cannot block.
+// the daemon can only ever consume, so from the OBSERVATION THAT SUCCEEDS until we write the
+// free space is monotonically non-decreasing. The reservation cannot be stolen and the writes
+// it covers cannot block.
+//
+// THE WAIT ITSELF RELEASES g_VchanCriticalSection (QRSENDLOCK), and only while mayAbort is TRUE
+// - i.e. while nothing of this message is in the ring, so a sender admitted meanwhile writes a
+// COMPLETE message and the daemon's stream stays in sync. The reservation is therefore
+// established by the LAST observation, under an unbroken hold; a pass that saw no room has
+// released and re-acquired, and re-checks everything on the way back in. Holding the lock across
+// the wait is what let one daemon that stopped draining stop EVERY sender in this agent at once -
+// the capture thread, the resolution thread and the main loop - instead of only the message that
+// found the ring full.
 //
 // mayAbort == FALSE means the deadline may not end the wait: the caller has already put
 // bytes of this message into the ring, and abandoning it there would leave the daemon
@@ -140,6 +151,12 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
     ULONGLONG start = 0;
     ULONGLONG firstBlock = 0;
     BOOL blocked = FALSE;
+
+    // LATCHED AT ENTRY, so the re-check after the wait's re-acquisition tests the TRANSITION and not
+    // the flag. The flag is also FALSE before the first client connects, and a sender that was never
+    // connected must behave exactly as it did before this change; what must end the wait is another
+    // thread declaring the peer gone WHILE we waited.
+    const BOOL connectedAtEntry = g_VchanClientConnected;
 
     // The wait below used to be Sleep(1): under back-pressure (daemon slow to drain a heavy
     // damage burst, or a human on its modal dialog) the sending thread ran a 1 kHz
@@ -243,11 +260,40 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             if (elapsed < (ULONGLONG)VCHAN_SEND_DEADLINE_MS &&
                 (ULONGLONG)VCHAN_SEND_DEADLINE_MS - elapsed < (ULONGLONG)wait)
                 wait = (DWORD)((ULONGLONG)VCHAN_SEND_DEADLINE_MS - elapsed);
+            // QRSENDLOCK: THE LOCK COMES OFF FOR THE WAIT. g_VchanCriticalSection orders writes so
+            // two senders' bytes cannot interleave in the ring; waiting does not need it, and holding
+            // it here is what turned one daemon that stopped draining into a stop for every sender in
+            // this agent rather than for the one message that found the ring full.
+            // mayAbort IS EXACTLY THE RIGHT CONDITION, and it is already the one deciding whether the
+            // deadline may end this wait: mayAbort means nothing of this message has been written, so
+            // a sender admitted meanwhile writes a COMPLETE message and the stream stays in sync.
+            // Once committed (mayAbort FALSE - the oversize path past its first piece) the lock must
+            // NOT come off: another sender's bytes would land INSIDE this message and desync the
+            // daemon permanently, which is the one outcome the committed path exists to prevent.
+            if (mayAbort)
+                LeaveCriticalSection(&g_VchanCriticalSection);
             DWORD w = (vchanEvent == NULL) ? WAIT_FAILED : WaitForSingleObject(vchanEvent, wait);
             if (w == WAIT_OBJECT_0)
                 consumedWake = TRUE;
             else if (w != WAIT_TIMEOUT)
                 Sleep(wait);    // a failed wait returns at once; without this the loop would spin
+            if (mayAbort)
+            {
+                EnterCriticalSection(&g_VchanCriticalSection);
+                // RE-VALIDATED BECAUSE THE LOCK WAS OFF: another sender can have run VchanGiveUpLocked
+                // and declared the peer gone, which clears this flag under this lock and is the one
+                // thing that makes `vchan` unsafe to touch here. Every send is already gated on the
+                // flag, so honouring it is that same rule one iteration later - and it is tested as a
+                // transition from connectedAtEntry, never as a bare FALSE.
+                if (connectedAtEntry && !g_VchanClientConnected)
+                {
+                    LogWarning("VCHANWAIT %s: the connection was declared gone while %I64u bytes "
+                        "waited for room - not sent", what, (ULONG64)size);
+                    *result = VCHAN_SEND_DEAD;
+                    // No wake handed back: the ring this event belongs to is being torn down.
+                    return FALSE;
+                }
+            }
         }
     }
 }
