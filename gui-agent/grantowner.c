@@ -23,6 +23,11 @@ struct _GRANT_OWNER
     HANDLE Request;        // caller -> worker
     HANDLE Done;           // worker -> caller
     CRITICAL_SECTION Lock; // serialises callers; the worker never takes it
+    // Set under Lock by GoClose BEFORE it posts GO_OP_CLOSE, because the worker RETURNS on that op.
+    // A post after it would set Request with nobody left to answer: the caller would wait on Done
+    // forever holding Lock, and every other caller would then block on Lock forever. Checked by the
+    // two public entry points under the same lock, so a refusal is a failed call, never a park.
+    volatile LONG Closing;
     PXENCONTROL_CONTEXT Xc;
     const WCHAR* Name;
 
@@ -98,10 +103,32 @@ static DWORD WINAPI GoWorker(LPVOID param)
 // between would let a second caller overwrite the request this one is about to post.
 static DWORD GoCallLocked(IN GRANT_OWNER* o, IN GO_OP op)
 {
+    HANDLE waits[2];
+    DWORD w;
+
     o->Op = op;
     ResetEvent(o->Done);
     SetEvent(o->Request);
-    WaitForSingleObject(o->Done, INFINITE);
+    // THE WORKER'S DEATH IS AN EXIT, AND IT IS NOT A BOUND. The header's deferral of a TIMEOUT to
+    // the owner stands untouched; nothing here times anything out. What it restores is the
+    // invariant the direct ioctl had and this rendezvous silently dropped: the wait ended when the
+    // WORK ended. Posting to another thread couples it to that thread still being alive to answer,
+    // and nothing checked that - so if the worker exits without setting Done (it has already
+    // RETURNED after GO_OP_CLOSE, or it died), Done is never set, this parks FOREVER with Lock
+    // HELD, and every later caller then blocks on Lock forever. One stuck grant becomes the whole
+    // agent, which is why "it moves WHICH THREAD issues the ioctl and nothing else" was not the
+    // whole story.
+    // Thread is signalled when the worker exits, so a wait on both cannot park. GO_OP_CLOSE signals
+    // both; with bWaitAll FALSE the LOWEST index wins, so Done still reports the real status there.
+    waits[0] = o->Done;
+    waits[1] = o->Thread;
+    w = WaitForMultipleObjects(2, waits, FALSE, INFINITE);
+    if (w != WAIT_OBJECT_0)
+    {
+        LogError("GRANTOWNER '%s' worker is gone without answering op %d (wait %lu) - failing the "
+                 "call instead of waiting for an answer that cannot come", o->Name, (int)op, w);
+        return ERROR_NO_SUCH_DEVICE;
+    }
     return o->Status;
 }
 
@@ -167,6 +194,13 @@ DWORD GoPermitForeignAccess(IN GRANT_OWNER* owner, IN USHORT remoteDomain, IN PV
     if (!owner)
         return ERROR_INVALID_HANDLE;
     EnterCriticalSection(&owner->Lock);
+    if (owner->Closing)
+    {
+        // Read UNDER the lock, which is what makes it sound: GoClose sets it holding this lock, so a
+        // caller that got in first is already past here and finishes before the close posts.
+        LeaveCriticalSection(&owner->Lock);
+        return ERROR_NO_SUCH_DEVICE;
+    }
     owner->RemoteDomain = remoteDomain;
     owner->Address = address;
     owner->NumberPages = numberPages;
@@ -187,6 +221,11 @@ DWORD GoRevokeForeignAccess(IN GRANT_OWNER* owner, IN PVOID sharedAddress)
     if (!owner)
         return ERROR_INVALID_HANDLE;
     EnterCriticalSection(&owner->Lock);
+    if (owner->Closing)
+    {
+        LeaveCriticalSection(&owner->Lock);
+        return ERROR_NO_SUCH_DEVICE;
+    }
     owner->Revoke = sharedAddress;
     status = GoCallLocked(owner, GO_OP_REVOKE);
     LeaveCriticalSection(&owner->Lock);
@@ -202,6 +241,9 @@ void GoClose(IN OUT GRANT_OWNER** owner)
     *owner = NULL;
 
     EnterCriticalSection(&o->Lock);
+    // Before the post, because the worker returns on GO_OP_CLOSE: from here on the rendezvous can
+    // no longer answer anybody, so a later grant or revoke must be REFUSED rather than posted.
+    o->Closing = 1;
     (void)GoCallLocked(o, GO_OP_CLOSE);
     LeaveCriticalSection(&o->Lock);
 
