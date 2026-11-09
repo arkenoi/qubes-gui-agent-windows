@@ -168,9 +168,28 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
     // (SetEvent) on every exit, or a message would sit unread in the ring until the next
     // unrelated wake. A data-less wake is already routine for the main loop (the daemon's
     // read-notify produces them), so the re-signal is harmless there.
+    // "NO LOST WAKE" ABOVE IS ABOUT THE ARMING ORDER ONLY, and saying it without this
+    // qualification was wrong. request_notify does precede the space read, so the daemon's next
+    // consume always FIRES the event - but firing it is not the same as this thread receiving it.
+    // The event is AUTO-RESET and shared, so it releases exactly ONE waiter, and the hand-back is
+    // ONE-DIRECTIONAL: a sender parked here re-signals for the main loop, while the main loop
+    // (main.c:16341 case 4) consumes a wake and relays nothing back. A wake the reader takes is a
+    // wake this sender never sees, and it then rides out a full VCHAN_RESERVE_WAIT_SLICE_MS.
+    // THE SAME DEFECT WAS MEASURED IN QREXEC on 2026-11-09 - 67-72% of 187 stalls across two
+    // builds ended on a slice timeout rather than a wake - and fixed there with a dedicated
+    // auto-reset room event that only the reader waits on the vchan's event and relays from.
+    // THE RATE HERE IS UNMEASURED, which is what the two counters below exist to establish, and
+    // why they land BEFORE any fix: a build without them cannot serve as the BEFORE side of the
+    // A/B, exactly as core-agent 1249 could not. They are reported on the drained line, which is
+    // the one place that already knows a wait happened and how long it took.
     // Fetched on the first miss, like the clock: the hot path stays one ring query.
     HANDLE vchanEvent = NULL;
     BOOL consumedWake = FALSE;
+    // How the waits below ENDED, not how many there were: `wakes` counts the event arriving,
+    // `slices` the slice expiring with no wake. Their sum is the number of waits, and `slices`
+    // alone is the cost this sender paid for a wake that went elsewhere.
+    ULONG wakes = 0;
+    ULONG slices = 0;
 
     for (;;)
     {
@@ -185,8 +204,11 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
         {
             if (blocked)
             {
-                LogInfo("VCHANWAIT %s: ring drained after %I64u ms, %I64u bytes sent",
-                    what, GetTickCount64() - start, (ULONG64)size);
+                // The counts are APPENDED, never inserted: everything up to "bytes sent" is
+                // byte-identical to what this line printed before, so a pattern anchored on the
+                // prefix still matches and no parser goes blind on the addition.
+                LogInfo("VCHANWAIT %s: ring drained after %I64u ms, %I64u bytes sent, %lu wake(s) and %lu slice timeout(s)",
+                    what, GetTickCount64() - start, (ULONG64)size, wakes, slices);
             }
             if (vchanEvent)
             {
@@ -304,9 +326,24 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
                 LeaveCriticalSection(&g_VchanCriticalSection);
             DWORD w = (vchanEvent == NULL) ? WAIT_FAILED : WaitForSingleObject(vchanEvent, wait);
             if (w == WAIT_OBJECT_0)
+            {
                 consumedWake = TRUE;
-            else if (w != WAIT_TIMEOUT)
+                wakes++;
+            }
+            else if (w == WAIT_TIMEOUT)
+            {
+                slices++;
+            }
+            else
+            {
+                // NEITHER COUNTER MOVES HERE, and that is what makes the instrument readable: a
+                // NULL or bad handle lands in this arm, so a degraded build reports a real
+                // duration with 0 wake(s) and 0 slice timeout(s) - distinguishable from a genuine
+                // all-timeouts stall, which reports 0 wakes and a slice count matching the
+                // duration. A run whose counters sum to zero is measuring nothing and must not be
+                // read as a result.
                 Sleep(wait);    // a failed wait returns at once; without this the loop would spin
+            }
             if (mayAbort)
             {
                 EnterCriticalSection(&g_VchanCriticalSection);
