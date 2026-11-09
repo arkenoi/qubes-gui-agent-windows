@@ -83,6 +83,15 @@ typedef struct _VCHAN_IOV
 BOOL VchanInit(IN int domain, IN int port);
 BOOL VchanSendMessage(IN const struct msg_hdr* header, IN int headerSize, IN const void* data, IN int dataSize, IN const WCHAR* what);
 
+// THE MAIN LOOP MUST CALL THIS FOR EVERY WAKE OF THE VCHAN EVENT (watchedEvents[4]), before and
+// regardless of whether it finds a message to read. The main loop is the only thread that waits on
+// the vchan's own event, which is AUTO-RESET and so releases exactly one waiter; a sender blocked
+// on a full ring waits on a separate room event instead, and this is what tells it the daemon
+// consumed. A data-less wake IS the room notification (libvchan arms VCHAN_NOTIFY_READ on every
+// buffer-space query), so relaying only when data arrived would drop precisely the wakes senders
+// are waiting for. Cheap, idempotent, and safe to call before VchanInit.
+void VchanRelayWake(void);
+
 // Send all pieces as ONE protocol message: the space for the whole thing is reserved
 // before the first byte is written, so the send can only ever fail BETWEEN messages and
 // the daemon's single in-order stream can never be left half-fed. Callers with a message

@@ -16339,6 +16339,16 @@ static ULONG WINAPI WatchForEvents(void)
             break;
 
         case 4: // vchan receive
+            // FIRST, AND WITHOUT A CONDITION. This loop is the only thread that waits on the
+            // vchan's own event, which is AUTO-RESET: whoever it releases is the only one released.
+            // A sender blocked on a full ring therefore waits on a separate room event, and this is
+            // the relay that tells it the daemon consumed. It is deliberately NOT inside any of the
+            // branches below - a wake carrying no message at all IS the room notification a sender
+            // armed (libvchan arms VCHAN_NOTIFY_READ on every buffer-space query), so relaying only
+            // when there is data to read, or only while connected, would drop exactly the wakes the
+            // senders are waiting for. Every `break` and every error path below is downstream of
+            // this line for that reason.
+            VchanRelayWake();
             if (!g_VchanClientConnected)
             {
                 // KEEP-FATAL: this flag is also cleared by the bounded send (vchan.c) when

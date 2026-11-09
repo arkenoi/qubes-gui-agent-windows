@@ -38,16 +38,51 @@ CRITICAL_SECTION g_VchanCriticalSection;
 
 struct libvchan *g_Vchan = NULL;
 
+// WHERE A BLOCKED SENDER WAITS NOW, AND WHY IT IS NOT THE VCHAN'S OWN EVENT.
+// libvchan_fd_for_select hands back the vchan's OWN event, which is AUTO-RESET: it releases exactly
+// ONE waiter ("returns after releasing a single waiting thread, even if multiple threads are
+// waiting" - PulseEvent docs on auto-reset semantics). The main loop waits on that same event for
+// INCOMING data (main.c watchedEvents[4]), so a sender parked on it was in a race it could only
+// lose: when the daemon's consume fired the channel, EITHER the reader took the wake OR the sender
+// did. The hand-back was ONE-DIRECTIONAL - the sender re-signalled for the reader (consumedWake),
+// while the reader relayed nothing back - so the loss ran toward the sender, which then rode out a
+// full VCHAN_RESERVE_WAIT_SLICE_MS although the room it wanted was already there.
+// MEASURED IN QREXEC, not theorised: the identical idiom there lost 67-72% of wakes across 187
+// stalls on two clones of one golden, and a dedicated room event took it to 0 of 149 (core-agent
+// 6061882 -> c5b5ade, 2026-11-09). THIS agent's rate is being measured by the wake/slice counters
+// in VchanReserveLocked; the fix lands alongside them so the counters' own build is the BEFORE side.
+// ONLY THE READER WAITS ON THE CHANNEL. The main loop relays every wake here through
+// VchanRelayWake, unconditionally - see the note there on why "unconditionally" is the whole point.
+// AUTO-RESET IS MANDATORY, AND NOT AN OVERSIGHT. Manual-reset would stay signalled, so a sender
+// would wake, find no room, loop, and return instantly from the next wait: a full-speed spin under
+// a lock, which is exactly the Sleep(1) behaviour this layer was built to remove. A condition
+// variable is also wrong here: WakeAllConditionVariable would fix the residual below, but a CV
+// stores NO state, so a wake landing between a sender's ring check and its wait is lost outright
+// unless the reader signals under g_VchanCriticalSection - which restores the reader-blocks-on-the-
+// send-lock shape that releasing the lock for the wait exists to avoid.
+// WHAT THIS DOES NOT COVER, AND IT IS NOT CLAIMED TO: an auto-reset event releases ONE waiter, so
+// if two senders are blocked at once, one relay frees one of them and the other runs to its slice.
+// On the default configuration that case does not arise - perwindow.c decides CaptureWorkers ONCE
+// and it defaults to 1, so there is a single capture-worker sender against a single reader, which
+// is exactly the population an auto-reset event serves completely. Raise CaptureWorkers, or send
+// from another thread, and the residual returns, bounded by the slice. Never closed, like
+// main.c's g_ShutdownEvent: senders can be parked on it at exit, and closing a handle another
+// thread is waiting on is the undefined behaviour this whole change is about.
+static HANDLE g_VchanRoomEvent = NULL;
+
 // Piece size used for the messages that cannot fit in the ring at all (see
 // VchanSendOversizeLocked). Small enough that the reservation is satisfiable with a wide
 // margin even if the ring turns out smaller than VCHAN_WRITE_RING_SIZE, and small enough
 // that the daemon gets to drain between pieces.
 #define VCHAN_SEND_CHUNK_SIZE 16384
 
-// Longest single wait for ring space in VchanReserveLocked. The wait is on the vchan's
-// event (fired when the daemon consumes, see below), the slice is only a backstop: a peer
-// that dies without firing the channel is still noticed by the per-slice libvchan_is_open
-// re-check, and a wake that fails to arrive costs one slice, not a whole 10 s deadline.
+// Longest single wait for ring space in VchanReserveLocked. The wait is on g_VchanRoomEvent, which
+// the main loop signals for every channel wake (above); the slice is only a backstop: a peer that
+// dies without firing the channel is still noticed by the per-slice libvchan_is_open re-check.
+// "A WAKE THAT FAILS TO ARRIVE COSTS ONE SLICE" used to be the whole story told here, and it named
+// only one cause - a peer that died without firing. The common cause was the reader taking the wake
+// off a shared auto-reset event, which this file no longer does. What is left is the residual named
+// above: a second sender blocked at the same moment.
 #define VCHAN_RESERVE_WAIT_SLICE_MS 100
 
 // All four are written only under g_VchanCriticalSection. Every sender holds it - EXCEPT across the
@@ -161,33 +196,18 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
     // The wait below used to be Sleep(1): under back-pressure (daemon slow to drain a heavy
     // damage burst, or a human on its modal dialog) the sending thread ran a 1 kHz
     // timer-resolution spin for up to 10-30 s. libvchan already has the trigger: every
-    // VchanGetWriteBufferSize call arms VCHAN_NOTIFY_READ, so the daemon's next consume
-    // fires this event (armed BEFORE the space is read, so no lost wake). It is the same
-    // auto-reset event the main loop watches for INCOMING data (main.c watchedEvents[4]),
-    // so a wake taken here may have been "data arrived" - `consumedWake` hands it back
-    // (SetEvent) on every exit, or a message would sit unread in the ring until the next
-    // unrelated wake. A data-less wake is already routine for the main loop (the daemon's
-    // read-notify produces them), so the re-signal is harmless there.
-    // "NO LOST WAKE" ABOVE IS ABOUT THE ARMING ORDER ONLY, and saying it without this
-    // qualification was wrong. request_notify does precede the space read, so the daemon's next
-    // consume always FIRES the event - but firing it is not the same as this thread receiving it.
-    // The event is AUTO-RESET and shared, so it releases exactly ONE waiter, and the hand-back is
-    // ONE-DIRECTIONAL: a sender parked here re-signals for the main loop, while the main loop
-    // (main.c:16341 case 4) consumes a wake and relays nothing back. A wake the reader takes is a
-    // wake this sender never sees, and it then rides out a full VCHAN_RESERVE_WAIT_SLICE_MS.
-    // THE SAME DEFECT WAS MEASURED IN QREXEC on 2026-11-09 - 67-72% of 187 stalls across two
-    // builds ended on a slice timeout rather than a wake - and fixed there with a dedicated
-    // auto-reset room event that only the reader waits on the vchan's event and relays from.
-    // THE RATE HERE IS UNMEASURED, which is what the two counters below exist to establish, and
-    // why they land BEFORE any fix: a build without them cannot serve as the BEFORE side of the
-    // A/B, exactly as core-agent 1249 could not. They are reported on the drained line, which is
-    // the one place that already knows a wait happened and how long it took.
-    // Fetched on the first miss, like the clock: the hot path stays one ring query.
-    HANDLE vchanEvent = NULL;
-    BOOL consumedWake = FALSE;
-    // How the waits below ENDED, not how many there were: `wakes` counts the event arriving,
+    // VchanGetWriteBufferSize call arms VCHAN_NOTIFY_READ, so the daemon's next consume fires the
+    // channel (armed BEFORE the space is read, so the notification is never missed on that side).
+    // IT WAITS ON g_VchanRoomEvent, NOT ON THE CHANNEL - see that global's note for why, and for
+    // the one case it still does not cover. Nothing in this function fetches, duplicates, hands
+    // back or closes the vchan's event any more: the main loop owns it and relays through
+    // VchanRelayWake. That removes the DuplicateHandle this function needed only because it was
+    // waiting on a handle libvchan_close owns, and with it the consumedWake book-keeping on all
+    // five exit paths.
+    // How the waits ENDED, not how many there were: `wakes` counts the room event arriving,
     // `slices` the slice expiring with no wake. Their sum is the number of waits, and `slices`
-    // alone is the cost this sender paid for a wake that went elsewhere.
+    // alone is the cost this sender paid for a wake that went elsewhere. They stay after the fix -
+    // the residual the global describes is real, and an unmeasured fix is not a fix.
     ULONG wakes = 0;
     ULONG slices = 0;
 
@@ -210,12 +230,6 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
                 LogInfo("VCHANWAIT %s: ring drained after %I64u ms, %I64u bytes sent, %lu wake(s) and %lu slice timeout(s)",
                     what, GetTickCount64() - start, (ULONG64)size, wakes, slices);
             }
-            if (vchanEvent)
-            {
-                if (consumedWake)
-                    SetEvent(vchanEvent);
-                CloseHandle(vchanEvent);
-            }
             return TRUE;
         }
 
@@ -225,12 +239,6 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             // Safe to return even mid-message: the stream is gone, there is nothing left
             // to keep in sync.
             *result = VCHAN_SEND_DEAD;
-            if (vchanEvent)
-            {
-                if (consumedWake)
-                    SetEvent(vchanEvent);
-                CloseHandle(vchanEvent);
-            }
             return FALSE;
         }
 
@@ -239,21 +247,14 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             blocked = TRUE;
             start = GetTickCount64();
             firstBlock = start;
-            // OWN THE HANDLE WE WAIT ON. libvchan_fd_for_select hands back the vchan's OWN event
-            // handle, and libvchan_close closes it - which, now that the wait below runs with the
-            // lock OFF, can happen while this thread is blocked on it (main.c's exit closes the
-            // vchan under this same lock, and a parked sender no longer holds it). Waiting on a
-            // handle another thread closes is undefined: the value can be recycled by the next
-            // CreateEvent and the wait would then take a wake belonging to an unrelated object. A
-            // duplicate keeps the kernel object alive for exactly as long as this call needs it, and
-            // SetEvent on the duplicate signals the SAME object, so the hand-back still reaches the
-            // main loop waiting on the original. A failed duplicate degrades to the plain sleep.
-            {
-                HANDLE raw = libvchan_fd_for_select(vchan);
-                if (!raw || !DuplicateHandle(GetCurrentProcess(), raw, GetCurrentProcess(),
-                                             &vchanEvent, 0, FALSE, DUPLICATE_SAME_ACCESS))
-                    vchanEvent = NULL;
-            }
+            // NOTHING TO ACQUIRE HERE ANY MORE, and that is the shape of the change. This used to
+            // DuplicateHandle the vchan's own event, for one reason only: the wait runs with the
+            // lock OFF, so libvchan_close could close the handle while this thread was blocked on
+            // it (main.c's exit closes the vchan under this same lock, and a parked sender no
+            // longer holds it), and waiting on a handle another thread closes is undefined. A
+            // process-wide event this module creates and never closes has no such lifetime
+            // question, so the duplicate, its failure branch, and the hand-back it existed to
+            // deliver are all gone.
             LogWarning("VCHANWAIT %s: ring full (need %I64u, free %d) - waiting up to %u ms "
                 "for gui-daemon to drain", what, (ULONG64)size, space, VCHAN_SEND_DEADLINE_MS);
         }
@@ -262,12 +263,6 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             if (mayAbort)
             {
                 *result = VCHAN_SEND_UNRESPONSIVE;
-                if (vchanEvent)
-                {
-                    if (consumedWake)
-                        SetEvent(vchanEvent);
-                    CloseHandle(vchanEvent);
-                }
                 return FALSE;
             }
 
@@ -286,12 +281,6 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
                 LogError("VCHANWAIT %s: no room after %u ms with a message already partly written; "
                     "connection abandoned, the agent exits", what, VCHAN_SEND_COMMITTED_DEADLINE_MS);
                 *result = VCHAN_SEND_DEAD;
-                if (vchanEvent)
-                {
-                    if (consumedWake)
-                        SetEvent(vchanEvent);
-                    CloseHandle(vchanEvent);
-                }
                 return FALSE;
             }
 
@@ -324,10 +313,19 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             // daemon permanently, which is the one outcome the committed path exists to prevent.
             if (mayAbort)
                 LeaveCriticalSection(&g_VchanCriticalSection);
-            DWORD w = (vchanEvent == NULL) ? WAIT_FAILED : WaitForSingleObject(vchanEvent, wait);
+            // THE CHECK-TO-WAIT WINDOW IS COVERED BY THE EVENT'S STATE, which is why this is an
+            // event and not a condition variable. The ring was read above with the lock held and
+            // the lock has just come off, so the daemon can consume - and the main loop relay - in
+            // the gap before this wait begins. An auto-reset event signalled in that gap stays
+            // signalled, so the wait returns at once. A CV's WakeAll in the same gap would be lost.
+            // NO NULL GUARD, matching qrexec-agent.c:462 and qrexec-wrapper.c, which is where this
+            // idiom is proven. The event is created in VchanInit BEFORE the vchan, and every send
+            // is gated on g_VchanClientConnected, which is only set once the handshake completes -
+            // so no sender can reach this line with the handle unset. The guard the replaced code
+            // had was for the vchan's event, whose fetch could genuinely fail.
+            DWORD w = WaitForSingleObject(g_VchanRoomEvent, wait);
             if (w == WAIT_OBJECT_0)
             {
-                consumedWake = TRUE;
                 wakes++;
             }
             else if (w == WAIT_TIMEOUT)
@@ -337,11 +335,10 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
             else
             {
                 // NEITHER COUNTER MOVES HERE, and that is what makes the instrument readable: a
-                // NULL or bad handle lands in this arm, so a degraded build reports a real
-                // duration with 0 wake(s) and 0 slice timeout(s) - distinguishable from a genuine
-                // all-timeouts stall, which reports 0 wakes and a slice count matching the
-                // duration. A run whose counters sum to zero is measuring nothing and must not be
-                // read as a result.
+                // failed wait lands in this arm, so a run reports a real duration with 0 wake(s)
+                // and 0 slice timeout(s) - distinguishable from a genuine all-timeouts stall,
+                // which reports 0 wakes and a slice count matching the duration. A run whose
+                // counters sum to zero is measuring nothing and must not be read as a result.
                 Sleep(wait);    // a failed wait returns at once; without this the loop would spin
             }
             if (mayAbort)
@@ -357,11 +354,11 @@ static BOOL VchanReserveLocked(IN struct libvchan *vchan, IN size_t size, IN con
                     LogWarning("VCHANWAIT %s: the connection was declared gone while %I64u bytes "
                         "waited for room - not sent", what, (ULONG64)size);
                     *result = VCHAN_SEND_DEAD;
-                    // No wake handed back: the ring this event belongs to is being torn down, so
-                    // signalling it would reach loops that are gone with it. The duplicate is still
-                    // ours to close, and closing it is what releases the kernel object.
-                    if (vchanEvent)
-                        CloseHandle(vchanEvent);
+                    // NOTHING TO HAND BACK OR CLOSE: the room event is this module's, process-wide
+                    // and outlives every vchan, so a teardown of the ring says nothing about it.
+                    // The old code closed a duplicate here and deliberately withheld the hand-back
+                    // because signalling the vchan's event would have reached loops going away with
+                    // it; neither concern exists once the event is not the channel's.
                     return FALSE;
                 }
             }
@@ -638,6 +635,19 @@ BOOL VchanInit(IN int domain, IN int port)
     // because a MSG_WINDOW_DUMP at the protocol's maximum geometry is 384 KiB of grant
     // refs - six times this ring - and could never be reserved whole.
 
+    // BEFORE THE VCHAN, NOT AFTER IT. The handshake that follows a successful server init is itself
+    // a sender, so the event has to exist before anything can block on a full ring. Auto-reset,
+    // initially unsignalled, unnamed: it is private to this process and never shared with the
+    // daemon. win_perror is how the other failures in this module report, and this is a NEW log
+    // signature even so - the macro expands to _win_perror(__FUNCTION__, L"..."), so VchanInit is
+    // part of the key. Declared in mgmt/harness/log-sweep-baseline.json.
+    g_VchanRoomEvent = CreateEvent(NULL, FALSE, FALSE, NULL);
+    if (!g_VchanRoomEvent)
+    {
+        win_perror("CreateEvent(send-room)");
+        return FALSE;
+    }
+
     g_Vchan = VchanInitServer(domain, port, VCHAN_WRITE_RING_SIZE, 5 * 60 * 1000);
     if (!g_Vchan)
     {
@@ -646,4 +656,22 @@ BOOL VchanInit(IN int domain, IN int port)
     }
 
     return TRUE;
+}
+
+// CALLED BY THE MAIN LOOP FOR EVERY CHANNEL WAKE, and the word "every" is the fix.
+// The main loop is the only thread that waits on the vchan's own event now, so it is the only
+// thread that can tell a blocked sender the daemon consumed something. It must relay
+// UNCONDITIONALLY - not only when it found data to read - because a wake carrying NO data is
+// precisely the room notification a sender armed: VchanGetWriteBufferSize is libvchan_buffer_space,
+// which calls request_notify(VCHAN_NOTIFY_READ) BEFORE it reads the space, so the daemon's next
+// consume fires the channel whether or not it also sent us anything. Relaying only on "I had data"
+// would drop exactly the wakes the senders are waiting for.
+// A SPURIOUS RELAY IS FREE. If no sender is blocked the event simply stays signalled and the next
+// sender to block consumes it and re-checks the ring, which is a correct no-op - and it is what
+// closes the check-to-wait window, because the event holds its state while a CV would not.
+// Safe before VchanInit and after a failed one: a NULL handle means no sender can be parked yet.
+void VchanRelayWake(void)
+{
+    if (g_VchanRoomEvent)
+        SetEvent(g_VchanRoomEvent);
 }
