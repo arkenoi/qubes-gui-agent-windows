@@ -56,32 +56,30 @@
  * failures being reproduced are all failures of a CONNECTED, running agent; a fault that
  * lands during the daemon handshake only reproduces "the agent never came up".
  *
- * FLAGS (registry DWORD under the gui-agent module key; environment variable wins;
- * every one defaults to 0 = off, and every one is logged at startup and on each trigger):
+ * FLAGS. Every fault is a registry DWORD under the gui-agent module key, the environment
+ * variable wins, every one defaults to 0 = off, and every one is logged at startup and on
+ * each trigger.
  *
- *   FaultArmDelaySec   QUBES_GUI_FAULT_DELAY          seconds; global arming delay (default 60)
- *   FaultNegCreate     QUBES_GUI_FAULT_NEG_CREATE     N one-shots: invert the rect of the
- *                                                     next N MSG_CREATEs  [FI_NEG_CREATE]
- *   FaultNegCreateHwnd QUBES_GUI_FAULT_NEG_CREATE_HWND if non-zero, only the CREATE for
- *                                                     this hwnd (as the protocol carries
- *                                                     it: low 32 bits) is inverted
- *   FaultRawCreate     QUBES_GUI_FAULT_RAW_CREATE     mode (not a shot): skip the agent-side
- *                                                     geometry sanitizer for MSG_CREATE, so an
- *                                                     injected bad rect really reaches dom0
- *                                                     and the daemon's dialog can be seen to
- *                                                     fire                  [FI_RAW_CREATE]
- *   FaultRingStallSec  QUBES_GUI_FAULT_RING_STALL     seconds: the send wrapper sees the
- *                                                     ring as permanently full [FI_RING_STALL]
- *   FaultPumpStallSec  QUBES_GUI_FAULT_PUMP_STALL     seconds, ONE-SHOT: one WatchForEvents
- *                                                     iteration sleeps  [FI_PUMP_STALL]
- *   FaultCaptureExit   QUBES_GUI_FAULT_CAPTURE_EXIT   N one-shots (use 1): the capture
- *                                                     thread exits WITHOUT signalling its
- *                                                     error event      [FI_CAPTURE_EXIT]
- *   FaultDupCreate     QUBES_GUI_FAULT_DUP_CREATE     N one-shots: re-emit MSG_CREATE for
- *                                                     an already-created hwnd [FI_DUP_CREATE]
- *   FaultLegacySend    QUBES_GUI_FAULT_LEGACY_SEND    N one-shots: route the send through
- *                                                     the unbounded vendored path, for the
- *                                                     A/B against rank 2  [FI_LEGACY_SEND]
+ * THERE IS NO LIST OF THEM HERE, DELIBERATELY. Until 2026-11-10 this block enumerated the
+ * flags, and the enumeration had rotted to NINE of the FIFTEEN that faultinject.c defines -
+ * FaultPrintWindowFail, FaultSlabDoubleBind, FaultGateOff, FaultDamageDelayMs,
+ * FaultPumpStallLose and FaultMonStale were all absent, four of them added after this block
+ * was last touched. It read as authoritative because it was the only list in the header, so
+ * an audit of "all fault-injection sites" censused from it and came up six short; two of
+ * those six turned out to be the named instrument for an open user-visible P2 (PWCOLLISION)
+ * and for the live M5 typing-latency measurement, and were very nearly deleted as dead code
+ * on the strength of this block's silence. A second, hand-maintained copy of a list the
+ * compiler already holds is the defect; refreshing it would only reset the clock on the
+ * same drift.
+ *
+ * THE TWO AUTHORITATIVE SOURCES, both machine-checkable, neither duplicated:
+ *   - the registry value name and env var of every fault: the REG_CONFIG_FAULT*_VALUE and
+ *     FAULT_*_ENV_VALUE defines in faultinject.c, read in one place by FiInit();
+ *   - what each fault DOES, and which check it exists to make fail: the [FI_*] comment
+ *     above that fault's accessor, below in this header.
+ * Every fault accessor below carries one; FiInit is the initialiser, not a fault, and has
+ * none. An audit of this surface enumerates the defines, not any prose - including this
+ * paragraph.
  *
  * "One-shot" means the counter is consumed atomically, so N=1 fires exactly once across
  * all threads. A time-window flag (RING_STALL) is active for its whole window and logs
