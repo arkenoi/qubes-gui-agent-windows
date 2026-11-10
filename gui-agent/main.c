@@ -4914,6 +4914,35 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL 
         resident ? L"resident, restart-on-failure is the scheduler's" : L"one-shot", exeArgs);
     return TRUE;
 }
+
+// THE AGENT RETIRES A STALE STOP REQUEST AT ITS OWN START, because the bridge cannot be relied on to.
+// The bridge deletes a leftover stop file at its start (notifhost.cpp: "a stale stop request must not kill a fresh
+// start") - as the interactive user. This process writes that file as SYSTEM (NotifBridgeRequestStop, at every agent
+// exit), into a directory the INSTALLER creates elevated (guest/provision-etwproxy-account.ps1 step 9). The file's
+// ACEs are then SYSTEM, Administrators and read-only Users, so a user whose token does not carry an enabled
+// Administrators group - a standard user, and every administrator while UAC is on - can read it and cannot delete it
+// (measured on a rig Windows 11 guest: read OK, delete refused, file still there). Left in place it stops every
+// bridge seconds after its start, in every boot after the first: the bridge logs "stop requested" and exits 0, this
+// agent records an intended departure, and the guest has no notification bridge - silently. The rig's guests are
+// built with UAC off, where the "least privilege" helper holds a full administrator token, so it does not happen there.
+// SYSTEM can always delete its own file, so the request is retired by its writer: once, at Init of a run that will
+// launch a bridge, before the launch the leftover would otherwise kill. An install already in the field repairs
+// itself at its first agent start.
+static void NotifBridgeClearStaleStop(void)
+{
+    WCHAR f[MAX_PATH];
+    if (!ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge\\stop", f, RTL_NUMBER_OF(f)))
+        return;
+    if (DeleteFile(f))
+    {
+        LogInfo("NOTIFBRIDGE stale stop file removed at start");
+        return;
+    }
+    const DWORD err = GetLastError();
+    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+        LogWarning("NOTIFBRIDGE stale stop file not removed (%lu): the bridge will stop on it", err);
+}
+
 static BOOL NotifBridgeLaunch(void)
 {
     WCHAR args[768];
@@ -4975,10 +5004,10 @@ static DWORD WINAPI NotifLaunchThreadProc(IN void* param)
 // and the bridge's --agent-pid self-exit handle is denied to its limited user token against
 // this SYSTEM process (it falls back to a PID snapshot poll, which PID reuse can defeat) - so
 // this file is the one channel that deterministically stops a live bridge.
-// Written only when the state dir already exists: it is created by the bridge/notifhost as
-// the user, and creating it from SYSTEM would give the user-mode bridge a directory it cannot
-// delete files in (inherited ProgramData ACLs); a dir that was never created means no bridge
-// ever ran here, so there is nothing to stop.
+// Written only when the state dir already exists: a dir that was never created means no bridge
+// ever ran here, so there is nothing to stop. The installer creates the directory elevated, so
+// the bridge can read what this SYSTEM process writes there and cannot be relied on to delete it:
+// the file written here is retired by its writer (NotifBridgeClearStaleStop), not by its reader.
 static void NotifBridgeRequestStop(void)
 {
     WCHAR dir[MAX_PATH], f[MAX_PATH];
@@ -17270,7 +17299,13 @@ static ULONG Init(void)
         // objects the bridge will write its records into are created now (this is the main-loop thread, which must
         // own the liveness mutex NotifIpcEnsure creates), and the hold resolves its knob and its worker once.
         if (g_NotifBridge)
+        {
             (void)NotifIpcEnsure();
+            // HERE AND NOT ON THE LAUNCH THREAD: Init is single-threaded and precedes the launch and every stop
+            // request this process makes (it makes one only at its exit), so what is removed was left by an
+            // earlier agent - never a request of this run.
+            NotifBridgeClearStaleStop();
+        }
         ToastHoldInit(g_NotifBridge);
         if (!g_NotifBridge)
         {
