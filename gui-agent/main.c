@@ -3246,7 +3246,17 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
         L"    <RunOnlyIfIdle>false</RunOnlyIfIdle>\r\n"
         L"    <WakeToRun>false</WakeToRun>\r\n"
         L"    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\r\n"
-        L"    <Priority>7</Priority>\r\n"
+        // 4, NOT THE SCHEMA'S DEFAULT OF 7. Task Scheduler turns <Priority> into the process's priority class AND
+        // its I/O and memory priority (Microsoft, "Priority (settingsType) Element": "Priority levels 7 and 8 are
+        // used for background tasks, and priority levels 4, 5, and 6 are used for interactive tasks."). 7 is
+        // BELOW_NORMAL_PRIORITY_CLASS with low I/O and low memory priority; 4 is NORMAL_PRIORITY_CLASS with normal
+        // I/O and memory priority - what a process started any other way has. These helpers ARE the interactive
+        // path: the broker supplies every window's pixels on Windows 11 and must answer the agent's control
+        // requests inside 2 s, the bridge carries the user's notifications.
+        // NOT MEASURED: how much of a slow helper start on a loaded 2-vCPU guest the priority explains (field: 17-70 s
+        // from launch to ready, rig median 2.5 s), or whether it explains a QGABROKERHUNG verdict there. This value
+        // stands on the documentation alone.
+        L"    <Priority>4</Priority>\r\n"
         L"%s"
         L"  </Settings>\r\n"
         L"  <Actions Context=\"Author\"><Exec><Command>%s</Command><Arguments>%s</Arguments></Exec></Actions>\r\n"
