@@ -4977,32 +4977,49 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL 
     return TRUE;
 }
 
-// THE AGENT RETIRES A STALE STOP REQUEST AT ITS OWN START, because the bridge cannot be relied on to.
-// The bridge deletes a leftover stop file at its start (notifhost.cpp: "a stale stop request must not kill a fresh
-// start") - as the interactive user. This process writes that file as SYSTEM (NotifBridgeRequestStop, at every agent
-// exit), into a directory the INSTALLER creates elevated (guest/provision-etwproxy-account.ps1 step 9). The file's
-// ACEs are then SYSTEM, Administrators and read-only Users, so a user whose token does not carry an enabled
-// Administrators group - a standard user, and every administrator while UAC is on - can read it and cannot delete it
-// (measured on a rig Windows 11 guest: read OK, delete refused, file still there). Left in place it stops every
-// bridge seconds after its start, in every boot after the first: the bridge logs "stop requested" and exits 0, this
-// agent records an intended departure, and the guest has no notification bridge - silently. The rig's guests are
-// built with UAC off, where the "least privilege" helper holds a full administrator token, so it does not happen there.
-// SYSTEM can always delete its own file, so the request is retired by its writer: once, at Init of a run that will
-// launch a bridge, before the launch the leftover would otherwise kill. An install already in the field repairs
-// itself at its first agent start.
-static void NotifBridgeClearStaleStop(void)
+// THE AGENT RETIRES, AT ITS OWN START, WHAT AN EARLIER RUN LEFT IN THE BRIDGE'S STATE DIRECTORY, because the bridge
+// cannot be relied on to. Three small files live there: "stop", which this process writes as SYSTEM at every agent
+// exit (NotifBridgeRequestStop), and "heartbeat" and "exit-reason", which the bridge writes as the interactive user
+// (notifhost.cpp). The bridge deletes or replaces all three at its start - with the token it holds at THAT start.
+// The INSTALLER creates the directory elevated (guest/provision-etwproxy-account.ps1 step 9), so a file in it carries
+// SYSTEM, Administrators, read-only Users and full control for its owner - and a file created by an elevated token
+// is owned by the Administrators group. A user whose token does not carry an enabled Administrators group - a
+// standard user, and every administrator while UAC is on - can therefore read, and cannot delete or replace, a file
+// that SYSTEM wrote or that a bridge wrote while UAC was off. The rig's guests are built with UAC off, where the
+// "least privilege" helper holds a full administrator token, so none of this happens there.
+// What each leftover does when it stays:
+//   stop        - stops every bridge seconds after its start: the bridge logs "stop requested" and exits 0, this
+//                 agent records an intended departure, and the guest has no notification bridge;
+//   heartbeat   - the new bridge cannot publish its pid, so this agent reads the earlier run's, never reports a
+//                 bridge ready and holds no toast window back while that bridge forwards the same toasts to dom0;
+//   exit-reason - the bridge cannot record why it leaves, so a departure it was asked for is reported as a death.
+// SYSTEM can always delete them, so they are retired here: once, at Init of a run that will launch a bridge, before
+// the launch a leftover would defeat. Nothing this run reads is lost: its launch re-creates the bridge's task, which
+// ends any instance an earlier agent left, a pid is accepted only from a file written after that launch, and a
+// reason only from the pid that just exited. An install already in the field repairs itself at its first agent start.
+static void NotifBridgeRetireLeftovers(void)
 {
-    WCHAR f[MAX_PATH];
-    if (!ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge\\stop", f, RTL_NUMBER_OF(f)))
+    static const struct { const WCHAR* name; const WCHAR* ifKept; } left[] = {
+        { L"stop",        L"the bridge will stop on it" },
+        { L"heartbeat",   L"a bridge that cannot replace it is never reported ready" },
+        { L"exit-reason", L"a bridge that cannot replace it has an exit it was asked for reported as a death" },
+    };
+    WCHAR dir[MAX_PATH], f[MAX_PATH];
+    if (!ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge", dir, RTL_NUMBER_OF(dir)))
         return;
-    if (DeleteFile(f))
+    for (size_t i = 0; i < RTL_NUMBER_OF(left); i++)
     {
-        LogInfo("NOTIFBRIDGE stale stop file removed at start");
-        return;
+        if (FAILED(StringCchPrintf(f, RTL_NUMBER_OF(f), L"%s\\%s", dir, left[i].name)))
+            continue;
+        if (DeleteFile(f))
+        {
+            LogInfo("NOTIFBRIDGE stale state file removed at start: %s", left[i].name);
+            continue;
+        }
+        const DWORD err = GetLastError();
+        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+            LogWarning("NOTIFBRIDGE stale state file not removed (%lu): %s; %s", err, left[i].name, left[i].ifKept);
     }
-    const DWORD err = GetLastError();
-    if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
-        LogWarning("NOTIFBRIDGE stale stop file not removed (%lu): the bridge will stop on it", err);
 }
 
 static BOOL NotifBridgeLaunch(void)
@@ -5069,7 +5086,7 @@ static DWORD WINAPI NotifLaunchThreadProc(IN void* param)
 // Written only when the state dir already exists: a dir that was never created means no bridge
 // ever ran here, so there is nothing to stop. The installer creates the directory elevated, so
 // the bridge can read what this SYSTEM process writes there and cannot be relied on to delete it:
-// the file written here is retired by its writer (NotifBridgeClearStaleStop), not by its reader.
+// the file written here is retired by its writer (NotifBridgeRetireLeftovers), not by its reader.
 static void NotifBridgeRequestStop(void)
 {
     WCHAR dir[MAX_PATH], f[MAX_PATH];
@@ -17365,8 +17382,8 @@ static ULONG Init(void)
             (void)NotifIpcEnsure();
             // HERE AND NOT ON THE LAUNCH THREAD: Init is single-threaded and precedes the launch and every stop
             // request this process makes (it makes one only at its exit), so what is removed was left by an
-            // earlier agent - never a request of this run.
-            NotifBridgeClearStaleStop();
+            // earlier run - never a request of this one, and never a file the bridge it launches wrote.
+            NotifBridgeRetireLeftovers();
         }
         ToastHoldInit(g_NotifBridge);
         if (!g_NotifBridge)
