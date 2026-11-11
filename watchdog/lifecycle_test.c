@@ -332,6 +332,14 @@ int main(void)
           QgaDesliceWarnDue(1000, 31000, 31000) == TRUE);
     check("deslice: armed and past the deadline is due",
           QgaDesliceWarnDue(1000, 31000, 120000) == TRUE);
+    check("deslice start hold: launched, never ready, its process running - held, it is starting",
+          QgaDesliceStartHold(1, 0, 0, 0, 1) == TRUE);
+    check("deslice start hold: no process running is the fault the report names - not held",
+          QgaDesliceStartHold(1, 0, 0, 0, 0) == FALSE);
+    check("deslice start hold: held once - the next deadline reports even while the process runs",
+          QgaDesliceStartHold(1, 0, 0, 1, 1) == FALSE);
+    check("deslice start hold: a helper that has been ready before is down, not starting",
+          QgaDesliceStartHold(1, 114000, 0, 0, 1) == FALSE);
 
     /* THE ANCHOR. Measured 2026-10-23: a broker ready at 20:57:39 and killed at 21:00:52 was
        reported as "not running for 210 s" and the complaint fired 29 ms after the detection,

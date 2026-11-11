@@ -870,6 +870,16 @@ static __inline BOOL QgaDesliceWarnDue(IN unsigned long long downSince, IN unsig
 #endif
     return (BOOL)(now >= nextWarn);
 }
+/* STARTING IS NOT ABSENT. The report says the helper "is not running". At the first deadline after its launch a
+   helper whose process is running and that has never been ready is starting, and becomes ready by itself: the
+   report would name a fault that is not there. It is held ONCE - the next deadline reports whatever the process
+   is doing, so a start that never finishes is still said. A helper that has been ready before, or whose death is
+   being reported, is down, not starting, and is never held. */
+static __inline BOOL QgaDesliceStartHold(IN int launched, IN unsigned long long readyAt, IN unsigned long long diedAt,
+                                         IN int heldBefore, IN int processAlive)
+{
+    return (BOOL)(launched && readyAt == 0 && diedAt == 0 && !heldBefore && processAlive);
+}
 /* ---------------------------------------------------------------------------------------------
  * IS THIS RUNNING IMAGE THE SESSION'S SHELL?
  *

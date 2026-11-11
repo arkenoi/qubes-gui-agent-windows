@@ -3861,6 +3861,38 @@ static BOOL ProcessRunningByName(IN const WCHAR* imageName)
     return ProcessPidByName(imageName) != 0;
 }
 
+// IS A CAPTURE HELPER PROCESS RUNNING? The helper creates its singleton mutex as its first act and holds that handle
+// for its whole life, so the named object exists exactly while a helper process does: the system's own record of the
+// helper, read by opening it. Nothing is acquired - a wait would take the mutex for an instant, and a helper starting
+// in that instant would see another instance and leave - and no process is looked for by image name, which a
+// supervisor may not do (docs/ADR-supervision.md 8). A denied open is still an object that exists.
+static BOOL BrokerProcessAlive(void)
+{
+    HANDLE h = OpenMutexW(SYNCHRONIZE, FALSE, WGCBRK_SINGLETON_NAME);
+    if (h) { CloseHandle(h); return TRUE; }
+    return GetLastError() == ERROR_ACCESS_DENIED;
+}
+
+// STARTING IS NOT ABSENT (QgaDesliceStartHold). Called when a not-running report is due. A helper whose process is
+// running and that has never been ready is starting - on a guest that is slow or busy at logon - and becomes ready
+// by itself, so "is not running" would tell the user about a fault that is not there. That one deadline is passed
+// over, with the facts in the log, and the next one reports unconditionally: a start that never finishes is still
+// said, one re-warn interval later. With no helper process running nothing is held - that IS the fault the report
+// names. TRUE = held, and the deadline has been moved.
+static BOOL g_BrokerStartHeld = FALSE;
+static BOOL BrokerStartHold(IN ULONGLONG now, IN ULONGLONG rewarnMs)
+{
+    if (!QgaDesliceStartHold(g_WgcLaunched ? 1 : 0, g_BrokerReadyAt, g_BrokerDiedAt, g_BrokerStartHeld ? 1 : 0,
+                             BrokerProcessAlive() ? 1 : 0))
+        return FALSE;
+    g_BrokerStartHeld = TRUE;
+    g_BrokerNextWarn = now + rewarnMs;
+    LogWarning("QGABROKERSTARTSLOW the de-slice broker's process is running and has not published ready %I64u s after "
+        L"its launch: it is starting, not absent, so this deadline is not reported - reported in %I64u s if it is "
+        L"still not ready", (now - g_BrokerDownSince) / 1000, rewarnMs / 1000);
+    return TRUE;
+}
+
 static void BrokerSupervise(void)
 {
     if (!g_WgcBroker || g_OsBuild < 26100 || !PwEnabled()) return;
@@ -3963,7 +3995,22 @@ static void BrokerSupervise(void)
             }
             else
             {
-                LogInfo("WGCBROKER ready (pid %ld validated)", (long)g_WgcBrokerPidValidated);
+                // How long the start took and where it went: the process's age against the time since the launch
+                // tells a helper that Task Scheduler started late from one that was slow to start, and its CPU time
+                // tells a start that computed from one that waited.
+                FILETIME ftCreated, ftExited, ftKernel, ftUser, ftNow;
+                LONGLONG ageMs = -1, cpuMs = -1;
+                if (GetProcessTimes(g_WgcBrokerProc, &ftCreated, &ftExited, &ftKernel, &ftUser))
+                {
+                    GetSystemTimeAsFileTime(&ftNow);
+                    ageMs = (LONGLONG)(((((ULONGLONG)ftNow.dwHighDateTime) << 32) | ftNow.dwLowDateTime) -
+                                       ((((ULONGLONG)ftCreated.dwHighDateTime) << 32) | ftCreated.dwLowDateTime)) / 10000;
+                    cpuMs = (LONGLONG)(((((ULONGLONG)ftKernel.dwHighDateTime) << 32) | ftKernel.dwLowDateTime) +
+                                       ((((ULONGLONG)ftUser.dwHighDateTime) << 32) | ftUser.dwLowDateTime)) / 10000;
+                }
+                LogInfo("WGCBROKER ready (pid %ld validated) %I64u ms after the launch, its process is %I64d ms old "
+                    L"and has used %I64d ms of CPU", (long)g_WgcBrokerPidValidated,
+                    g_WgcLastLaunch ? now - g_WgcLastLaunch : 0, ageMs, cpuMs);
             }
         }
         // Recovered (or first-ever ready): clear the hard-fail state + its machine-readable flag.
@@ -4333,6 +4380,11 @@ static void BrokerSupervise(void)
         LogDebug("QGADESLICEDOWN not reported while the session is ending / helpers are disarmed "
             L"(down %I64u s so far) - a helper gone during a teardown is expected",
             (now - g_BrokerDownSince) / 1000);
+    }
+    else if (QgaDesliceWarnDue(g_BrokerDownSince, g_BrokerNextWarn, now) && BrokerStartHold(now, DESLICE_REWARN_MS))
+    {
+        // Held once: the helper's process is running and has not published ready yet. BrokerStartHold has said so
+        // and moved the deadline; neither the flag, the ERROR line nor the dom0 row below is written for it.
     }
     else if (QgaDesliceWarnDue(g_BrokerDownSince, g_BrokerNextWarn, now))
     {

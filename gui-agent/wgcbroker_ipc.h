@@ -107,6 +107,9 @@
 #define WGCBRK_ACK_DEADLINE_MS 2000
 /* ABI 19 (D, R5): how long a published frame may wait for the agent to wake on it (AgentFrameWakes unchanged). */
 #define WGCBRK_AGENT_DEADLINE_MS 5000
+/* The broker's singleton mutex: created as its first act and held until it exits, so the object exists exactly while
+ * a broker process does. The agent reads that by opening it and never waits on it (BrokerProcessAlive). */
+#define WGCBRK_SINGLETON_NAME L"Global\\QubesWgcBrokerSingleton"
 /* After a quiet re-route turns out to have been wrong - the window was merely static - do not
  * re-test it for this long. Without the hysteresis a static window is re-tested every quiet
  * period for ever, which is a churn loop costing a render every couple of seconds. */
