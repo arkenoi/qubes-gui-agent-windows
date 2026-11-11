@@ -1349,7 +1349,12 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
         }
         else
         {
-            LogWarning("window 0x%x not tracked", window);
+            // dom0 and the guest are not synchronised, so a configure can name a window this guest has just
+            // destroyed. A handle that is no longer a window is that; one that still exists is a fault.
+            if (!IsWindow(window))
+                LogInfo("QGADOM0WINDOWGONE dom0's configure names window 0x%x, which is not a window any more - nothing to apply", window);
+            else
+                LogWarning("QGADOM0WINDOWUNTRACKED dom0's configure names window 0x%x, which exists and is not tracked - nothing applied", window);
         }
 
         if (replyToMessages && data != NULL)
@@ -1488,7 +1493,12 @@ static DWORD HandleFocus(IN HWND window)
         WINDOW_DATA* data = FindWindowByHandle(window);
         if (!data)
         {
-            LogWarning("window 0x%x not tracked", window);
+            // The same two cases as in HandleConfigure: a window destroyed while dom0's focus was on its way is
+            // not a tracking fault, a window that still exists and is not tracked is one.
+            if (!IsWindow(window))
+                LogInfo("QGADOM0WINDOWGONE dom0's focus names window 0x%x, which is not a window any more - nothing to apply", window);
+            else
+                LogWarning("QGADOM0WINDOWUNTRACKED dom0's focus names window 0x%x, which exists and is not tracked - nothing applied", window);
         }
         // THE TEST IS THE SURFACE'S KIND, NOT "does it have a crop". It was the latter, and the
         // difference only became reachable on 2026-10-18 when ShellManaged's default went from NONE
