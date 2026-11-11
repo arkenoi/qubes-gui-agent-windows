@@ -402,14 +402,23 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // Pre-emption, evaluated on EVERY pass (identity known or not) while the bridge is UP: a bridge-bound or
     // still-pending toast listed AFTER this banner's own toast is queued behind it and may paint into this
     // window in place. A dead bridge's records are nobody's queue (its unconfirmed ones read as window).
+    // `successorQueued`: ANY toast newer than this banner's own that is still a match candidate (the core's
+    // own rule - unconsumed, younger than TH_RECORD_TTL_MS), whatever its verdict. Windows paints it into
+    // this window in place when the current display ends, and nothing reliably reports that repaint: no
+    // event may come, or its read lands before the new content. So a DECIDED banner re-reads on the
+    // recheck tick while one is queued (below), and a reading that names it takes the content-changed path.
+    BOOL successorQueued = FALSE;
     if (!e->NotBanner && in.BridgeUp)
     {
         const LONG baseline = in.MatchFound ? in.MatchSeq : e->Core.RecordSeq;
+        TI_CANDIDATE queued[TH_IPC_RECORDS];
+        ThCoreCandidates(recs, nrec, &g_ThCons, 0, now, queued);
         for (int i = 0; i < nrec; i++)
         {
             ULONGLONG due = 0;
             TH_IPC_RECORD eff = recs[i];
             if (ThConsumedHas(&g_ThCons, recs[i].Seq)) continue;   // some banner's own record: shown or suppressed already
+            if (queued[i].Eligible && recs[i].Seq > baseline) successorQueued = TRUE;
             eff.Verdict = ThCoreDeadVerdict(recs[i].Seq, recs[i].Verdict, deadSeq);
             if (ThCorePreemptBy(&eff, baseline, now, &due))
             {
@@ -463,6 +472,8 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             ThRequestReadLocked(e, now);
         else if (secondLookDue || failedRetryDue)
             ThRequestReadLocked(e, now);
+        else if (successorQueued && e->Core.Phase == ThPhaseDecided && since >= recheck)
+            ThRequestReadLocked(e, now);   // a newer toast is queued: is it painted in this window yet?
         // Whatever happened above, arm the moment the next attempt becomes due - anchored at the attempt
         // just made (or the refused one), so a refused request waits its back-off instead of spinning.
         if (!e->ReadInFlight && !e->NotBanner)
@@ -546,6 +557,11 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // rest. S3ii and S3iii were the SAME mixed pairs ~5.1 s apart - after the hold had resolved and the
     // window event for the next banner arrived - which is why they were never lost and this was.
     if (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecSuppress)
+        e->Due = ThMinTick(e->Due, now + TH_HOLD_RECHECK_MS);
+    // ...and ANY decided banner, shown or suppressed, while a newer toast is queued behind it: the tick
+    // is what brings the re-read above. It ends when that toast's record is consumed (some banner was
+    // decided for it) or ages past TH_RECORD_TTL_MS, and the entry is dropped with its window.
+    if (successorQueued && e->Core.Phase == ThPhaseDecided)
         e->Due = ThMinTick(e->Due, now + TH_HOLD_RECHECK_MS);
     if (armRetry)
         e->Due = ThMinTick(e->Due, retryAt);
