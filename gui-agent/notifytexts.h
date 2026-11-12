@@ -23,39 +23,24 @@
  * Human names (the header never says "gui-agent" or "wgcbroker.exe"): the GUI agent, the de-slice
  * broker, the notification bridge, the ETW signal proxy - the same names guest/qwt-report-death.ps1
  * uses for the deaths of these components, so a reader meets one vocabulary.
- *
- * DEFECT KNOBS (render test only; never build them otherwise):
- *   NOTIFYTEXT_DEFECT_HEADER       a header in the old style: product prefix, file name, code, count
- *   NOTIFYTEXT_DEFECT_SECRETWORD   a line carries a credential keyword the route refuses
- *   NOTIFYTEXT_DEFECT_WRONGSOURCE  a process exit code phrased by the Win32 (SCM) table
  */
 #ifndef QWT_NOTIFYTEXTS_H
 #define QWT_NOTIFYTEXTS_H
 
 #include "notifyerr.h"
 
-#ifdef NOTIFYTEXT_DEFECT_HEADER
-#define QERR_TXT_BROKER_MISSING_HEADER \
-    "Qubes Windows Tools, gui-agent: wgcbroker.exe is missing (0xC0000135); death 1 this boot"
-#else
 #define QERR_TXT_BROKER_MISSING_HEADER "The notification and menu capture helper is missing"
-#endif
-
-#ifdef NOTIFYTEXT_DEFECT_SECRETWORD
-#define QERR_TXT_DESKTOP_STUCK_NEXT \
-    "Seamless mode shows nothing while this lasts: arm autologon (the token is in the registry)."
-#else
 #define QERR_TXT_DESKTOP_STUCK_NEXT \
     "Seamless mode shows nothing while this lasts: arm autologon, or switch this qube to the windowed desktop."
-#endif
 
-#ifdef NOTIFYTEXT_DEFECT_WRONGSOURCE
-#define QERR_TXT_LISTENER_DENIED_CODE  "Windows error 2"
-#define QERR_TXT_LISTENER_DENIED_CAUSE "Cause: Windows error 2 (the system cannot find the file specified)."
-#else
+/* The bridge's refusal (notifhost.cpp, ListenerDenialReason): ONE notice per boot, the row chosen by what denies
+ * access, read at the refusal in the order that decides - a policy (group policy or device management, the same
+ * setting) overrides both consent toggles, the device toggle overrides the user's. Each row names its fix; the
+ * last is the refusal no setting explains, which is a bug to report, not a choice to accept. The FATAL access
+ * line in bridge.log carries every value read. The Settings path is Windows 10's ("Privacy & security" on 11). */
 #define QERR_TXT_LISTENER_DENIED_CODE  "exit code 2"
-#define QERR_TXT_LISTENER_DENIED_CAUSE "Cause: Windows refused toast-listener access for this user."
-#endif
+#define QERR_TXT_LISTENER_DENIED_COUNT "reported once per boot, every boot until fixed"
+#define QERR_TXT_LISTENER_DENIED_EVIDENCE QERR_BRIDGE_LOG ", line FATAL access"
 
 #define QERR_GUI_AGENT_LOG "gui-agent log in Qubes Logs"
 /* bridge.log is in the COMMON log directory, not the bridge's state directory. It moved there in
@@ -170,11 +155,29 @@ static const QerrText QerrTexts[] = {
      * Both recur for the life of the guest: Task Scheduler restarts the bridge on failure, at most three times
      * a minute apart, and it dies the same way each time; the GUI agent relaunches nothing. Denied access is
      * Windows' notification-access setting for this user (Settings > Privacy > Notifications). */
-    { "listener-denied", "notifhost", "listener-denied", QERR_SEV_ACTION, "notifhost.exe", QERR_TXT_LISTENER_DENIED_CODE,
-      "The notification bridge may not read toasts",
-      "Bridged apps show as plain windows: allow notification access for this user, or turn service.notify-bridge off.",
-      QERR_TXT_LISTENER_DENIED_CAUSE,
-      QERR_BRIDGE_LOG, NULL },
+    { "listener-denied-policy", "notifhost", "listener-denied", QERR_SEV_ACTION, "notifhost.exe", QERR_TXT_LISTENER_DENIED_CODE,
+      "A Windows policy blocks notification access",
+      "Notifications show as plain windows. Set that policy to \"User is in control\", then restart this qube.",
+      "Cause: group policy \"Let Windows apps access notifications\" is set to Force Deny.",
+      QERR_TXT_LISTENER_DENIED_EVIDENCE, QERR_TXT_LISTENER_DENIED_COUNT },
+
+    { "listener-denied-device", "notifhost", "listener-denied", QERR_SEV_ACTION, "notifhost.exe", QERR_TXT_LISTENER_DENIED_CODE,
+      "Notification access is off for this Windows device",
+      "Notifications show as plain windows. Allow device access in Settings > Privacy > Notifications, then restart this qube.",
+      "Cause: notification access is turned off for the whole device (an administrator setting).",
+      QERR_TXT_LISTENER_DENIED_EVIDENCE, QERR_TXT_LISTENER_DENIED_COUNT },
+
+    { "listener-denied-user", "notifhost", "listener-denied", QERR_SEV_ACTION, "notifhost.exe", QERR_TXT_LISTENER_DENIED_CODE,
+      "Notification access is off for this Windows user",
+      "Notifications show as plain windows. Allow app access in Settings > Privacy > Notifications, then restart this qube.",
+      "Cause: notification access for apps is turned off for this user.",
+      QERR_TXT_LISTENER_DENIED_EVIDENCE, QERR_TXT_LISTENER_DENIED_COUNT },
+
+    { "listener-denied-unknown", "notifhost", "listener-denied", QERR_SEV_ACTION, "notifhost.exe", QERR_TXT_LISTENER_DENIED_CODE,
+      "Windows refused notification access to the bridge",
+      "Notifications show as plain windows. No setting explains this, so it is a bug: please report it.",
+      "Cause: Windows refused although no policy or consent setting denies access.",
+      QERR_TXT_LISTENER_DENIED_EVIDENCE, QERR_TXT_LISTENER_DENIED_COUNT },
 
     { "listener-init", "notifhost", "listener-init", QERR_SEV_ACTION, "notifhost.exe", "exit code 3",
       "The notification bridge could not start",
