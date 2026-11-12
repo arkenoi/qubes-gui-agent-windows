@@ -3564,6 +3564,41 @@ static BOOL BrokerAckOverdue(IN ULONGLONG now, OUT int* slotOut, OUT ULONGLONG* 
     return FALSE;
 }
 
+// THE PREDICATE ABOVE IS A SUSPICION; THIS IS THE VERDICT (2026-11-12, findings/issues.md WGCBROKERHANGSANDISNOTRELAUNCHED).
+// The 2 s deadline dates from when an ended broker was back in ~0.6 s (docs/ADR-capture.md decision 10). Since
+// docs/ADR-supervision.md section 5 nothing relaunches it, so a verdict costs every menu, toast and broker-served window
+// until the next agent start. The field tester's 4.3.37/4.3.38 logs hold three verdicts in six broker starts (the rig:
+// none in 1349 agent logs), two of them at stage=loop - the top of the broker's own main loop, in none of its calls -
+// which is also what a broker the system is not scheduling looks like. So the first time the predicate holds the broker
+// is only SUSPECTED: one warning, nothing ended. It is ended only if the predicate still holds BROKER_HANG_GRACE_MS
+// later; any ack, progress or stage change makes the predicate false and closes the episode with a line saying when the
+// broker was seen moving again. Jev: fix_shape warn-then-end 0.86, still ends a real hang 0.84; root cause
+// insufficient-evidence 0.83 - the warning's second line is the measurement that was missing.
+#define BROKER_HANG_GRACE_MS 6000u
+static ULONGLONG g_BrokerSlowSince = 0;   // when the predicate first held in this episode; 0 = nothing suspected
+static BOOL BrokerHangConfirm(IN BOOL overdue, IN ULONGLONG now, IN int slot, IN ULONGLONG ageMs)
+{
+    if (!overdue)
+    {
+        if (g_BrokerSlowSince)
+        {
+            LogWarning("QGABROKERSLOW de-slice broker seen moving again %I64u ms after the warning - slow, not hung, "
+                L"and kept", now - g_BrokerSlowSince);
+            g_BrokerSlowSince = 0;
+        }
+        return FALSE;
+    }
+    if (!g_BrokerSlowSince)
+    {
+        g_BrokerSlowSince = now;
+        LogWarning("QGABROKERSLOW de-slice broker has not answered slot %d for %I64u ms and made no progress, stage=%u "
+            L"slot=%d - suspected, not ended: it is ended if nothing moves for %u ms more", slot, ageMs,
+            WGCBRK_STAGE_CODE(g_BrokerStageSeen), WGCBRK_STAGE_SLOT(g_BrokerStageSeen), BROKER_HANG_GRACE_MS);
+        return FALSE;
+    }
+    return now - g_BrokerSlowSince >= BROKER_HANG_GRACE_MS;
+}
+
 // The earliest moment the broker's supervision needs the main loop awake; 0 = nothing armed, which is the rest state.
 // While the broker is up: an outstanding request's ack deadline (R1/R4). While it is DOWN or STARTING - a failure state,
 // which keeps its bounded timers (design C, "Cost") - the relaunch throttle and the next QGADESLICEDOWN. Never a past
@@ -3576,6 +3611,10 @@ static ULONGLONG BrokerNextDue(void)
     ULONGLONG due = 0;
     if (g_BrokerReady)
     {
+        // A SUSPECTED broker (BrokerHangConfirm): the predicate already holds, so every deadline below is in the past
+        // and returning one would spin this loop. What is due next is the end of the grace; an earlier wake that finds
+        // the broker moving closes the episode.
+        if (g_BrokerSlowSince) return g_BrokerSlowSince + BROKER_HANG_GRACE_MS;
         // The LATEST of the three things BrokerAckOverdue requires: the request's deadline, the broker's last
         // progress + the deadline, and the declared stage's own budget. Waking before all three are due would only
         // find the check false - and at rest a wake that does nothing is exactly what the idle-load work removed.
@@ -3950,12 +3989,16 @@ static void BrokerSupervise(void)
             }
         }
     }
-    // HUNG = a request this READY instance has not acknowledged within WGCBRK_ACK_DEADLINE_MS. Checked only once ready:
-    // requests outstanding across a restart get a fresh clock at the ready transition below.
+    // HUNG = a request this READY instance has not acknowledged within WGCBRK_ACK_DEADLINE_MS (suspected), and nothing
+    // moved for BROKER_HANG_GRACE_MS after that (BrokerHangConfirm). Checked only once ready: requests outstanding
+    // across a restart get a fresh clock at the ready transition below.
     int hungSlot = -1; ULONGLONG hungMs = 0;
-    const BOOL hung = (!g_WgcBrokerHung && g_WgcBrokerProc && g_BrokerReady) ?
-                      BrokerAckOverdue(now, &hungSlot, &hungMs) : FALSE;
-    if (hung) g_WgcBrokerHung = TRUE;
+    BOOL hung = FALSE;
+    if (!g_WgcBrokerHung && g_WgcBrokerProc && g_BrokerReady)
+        hung = BrokerHangConfirm(BrokerAckOverdue(now, &hungSlot, &hungMs), now, hungSlot, hungMs);
+    else
+        g_BrokerSlowSince = 0;   // no READY instance is judged: an exit, a reap or a start ends any episode silently
+    if (hung) { g_WgcBrokerHung = TRUE; g_BrokerSlowSince = 0; }
     const BOOL alive = !brokerExited && g_WgcBrokerProc && (g_WgcSession == sid) && !g_WgcBrokerHung;
     if (alive)
     {
