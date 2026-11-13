@@ -6687,6 +6687,13 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
         // The broker picks WHICH of the slot's two buffers is current; WHERE they are and how big is the agent's own record.
         boff = (LONGLONG)g_WgcSlotBufs[e->PwBrokerSlot].Off[b];
         if (!boff) BFF_NO(L"no-buffer-offset");
+        // NOTHING PUBLISHED INTO THIS REGISTRATION YET. BrokerRegister zeroes Seq and FrameId but leaves the frame's size,
+        // so a reused slot shows its previous occupant's FrameWidth/Height until the broker's first publish for this
+        // window - the pair the broker itself reads as "not this registration's frame" (FrameId > 0 is what its
+        // FlushPendingSignatures signs). That is the first-frame-pending case the 0x0 test below names, not a size
+        // disagreement, so it must not start the stuck clock: a first frame slower than BROKER_DIMS_STUCK_MS would be
+        // re-registered, and the re-registration restarts the very wait it was waiting out.
+        if (s0 == 0 || fid == 0) BFF_NO(L"first-frame-pending");
         // dims must EXACTLY match the slab (so the dest-bounds check covers the source too).
         // A mismatch is transient while a resize is in flight (the slot's request and the slab
         // are updated a pass apart) and PERMANENT if the two ever disagree at rest - and a
