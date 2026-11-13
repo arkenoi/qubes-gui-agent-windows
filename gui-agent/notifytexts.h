@@ -84,7 +84,7 @@ static const QerrText QerrTexts[] = {
      * Log line QGABROKERDIED. */
     { "broker-died", "gui-agent", "broker-died", QERR_SEV_DEGRADED, "gui-agent.exe", NULL,
       "The notification and menu capture helper stopped serving",
-      "Restart this qube to start it again; nothing it captures reaches dom0 until then.",
+      "Restart this qube to start it again; until it runs, nothing it captures reaches dom0.",
       "Cause: it exited or stopped answering after it was ready.",
       QERR_GUI_AGENT_LOG ", line QGABROKERDIED", NULL },
 
@@ -97,14 +97,15 @@ static const QerrText QerrTexts[] = {
      * it up to three times", on docs/ADR-supervision.md 4's word, which nobody had measured. Measured
      * 2026-11-13 (25H2, the live task definition copied verbatim): RestartOnFailure fires only when the task
      * cannot be launched; an instance that ran and exited 2 or 0xC0000005 was not restarted. The line now
-     * promises no restart and names the step that always works.
+     * promises no restart, names the step that always works, and ties the outage to the helper running
+     * again rather than to the restart: a retried launch or a new GUI agent can bring it back first.
      *
      * WHEN THIS CAN STILL FIRE, after the stand-down latch (QgaDesliceSupervisionHeld): the broker was
      * launched and never became ready. A deliberate stand-down no longer reaches here at all, and a death
      * is reported by the death reporter instead (QgaDesliceOwnedByDeath). */
     { "deslice-down-present", "gui-agent", "deslice-down", QERR_SEV_ACTION, "gui-agent.exe", NULL,
       "The notification and menu capture helper is not running",
-      "Restart this qube to start it again; nothing it captures reaches dom0 until then.",
+      "Restart this qube to start it; until it runs, nothing it captures reaches dom0.",
       "Cause: wgcbroker.exe is installed, but its launch produced no broker.",
       QERR_GUI_AGENT_LOG ", line QGADESLICEDOWN", NULL },
 
