@@ -38,6 +38,16 @@ void HelpersDisarm(IN const WCHAR *why);
 void HelpersRearm(void);
 // Defined in main.c too: TRUE once the relaunch of this session's helpers has been disarmed.
 BOOL HelpersDisarmed(void);
+// Defined in main.c too: TRUE while the guest is in seamless mode and the session is going down
+// (LifecycleSessionEnding: WM_QUERYENDSESSION, not cancelled). In seamless mode the one-shot launches of
+// docs/ADR-supervision.md item 2b refuse then - the caption helper, the shadows helper, the two QGA notices and
+// the error route's notice; in non-seamless mode the notices keep launching. Not this agent's own exit: an
+// agent that leaves for another reason keeps its notices, because the session goes on.
+BOOL SeamlessGoingDown(void);
+// Defined in main.c too: copies LifecycleSessionEnding() into the toast-hold section's header, where the
+// notification bridge reads it (it cannot open the SYSTEM-only going-down latch). Called by the end-session
+// handler when the end starts and when it is cancelled; a no-op while the section does not exist.
+void NotifHoldPublishGoingDown(void);
 
 // THE GOING-DOWN QUESTION, answered once for the whole process. Every emitter that is about to
 // complain that something is absent, lost or could not be recreated asks THIS - never its own flag.

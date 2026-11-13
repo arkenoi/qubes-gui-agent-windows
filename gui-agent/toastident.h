@@ -411,7 +411,11 @@ typedef struct _TH_IPC_HEADER
                                   FORWARDS NOTHING (every toast takes the window path), or every forwarded toast would
                                   double (docs/ADR-toasts.md 10). Updated by the agent on every mode switch. */
     UINT64 BridgeStartTick;
-    UINT64 Reserved[4];
+    volatile LONG GoingDown;   /* agent: 1 while the session is going down (WM_QUERYENDSESSION until a cancel). With
+                                  Seamless set, the bridge's own launches refuse (docs/ADR-supervision.md item 2b, by
+                                  mode). The bridge cannot open the SYSTEM-only going-down latch; this is its copy. */
+    LONG Reserved0;
+    UINT64 Reserved[3];
 } TH_IPC_HEADER;              /* 64 bytes */
 
 #define TH_IPC_BYTES (sizeof(TH_IPC_HEADER) + (size_t)TH_IPC_RECORDS * sizeof(TH_IPC_RECORD))

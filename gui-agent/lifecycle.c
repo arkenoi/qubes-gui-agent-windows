@@ -101,6 +101,9 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         LogInfo("QGAENDSESSION Windows is ending this session (%s, lParam 0x%Ix) - helper launches disarmed first, "
             L"then the service is told", logoff ? L"logoff" : L"shutdown", (ULONG_PTR)lp);
         HelpersDisarm(L"the session is ending");
+        // The notification bridge runs as the user and cannot open the latch below, so the same fact goes into the
+        // section it already shares with this agent (docs/ADR-supervision.md item 2b, by mode).
+        NotifHoldPublishGoingDown();
         // THE DURABLE FORM OF THE SAME FACT, published before anything is told and before any wait, so that it
         // holds even if this process is terminated inside the wait below - which is what Windows measurably does
         // (33-826 ms after the shutdown begins, per the header of this file). HelpersDisarm covers launches in
@@ -195,6 +198,7 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         InterlockedExchange(&g_SessionEnding, 0);
         LogWarning("QGAENDSESSION session end CANCELLED, the session continues; helpers re-armed");
         HelpersRearm();
+        NotifHoldPublishGoingDown();
         // WITHDRAW THE DURABLE FACT, because it has stopped being true and this session keeps its id: a latch
         // left behind here would refuse every launch into a live session until it logs off. This process is the
         // one that learns of the veto, straight from Windows, with no service in the path - which is why the

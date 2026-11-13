@@ -46,6 +46,7 @@
 #include <log.h>
 #include "errbox.h"
 #include "modver.h"
+#include "lifecycle.h"   /* SeamlessGoingDown */
 #else
 #include <sys/stat.h>
 #include <errno.h>
@@ -78,6 +79,7 @@ static int       PlatShowErrorBox(const char* header, const char* text, unsigned
 static void      PlatDefaultStateDir(char* out, size_t cap);
 static unsigned long PlatPid(void);                                       /* this process, for the technical line */
 static void      PlatBuild(char* out, size_t cap);                        /* this image's version, "" if unreadable */
+static int       PlatSeamlessGoingDown(void);                             /* 1 = seamless mode, session going down */
 
 #ifndef QERR_AGENT_LAYER
 /* Test hooks (notifyerr_test.c): the spawn outcome, the box and the log sink are the test's. */
@@ -87,6 +89,7 @@ void (*QerrTestLogHook)(const char* line) = NULL;
 long long QerrTestBootStamp = 0;                              /* 0 = wall clock (the suite always pins it) */
 unsigned long QerrTestPid = 4242;                             /* the pid the technical line shows under test */
 const char* QerrTestBuild = "4.3.36.915";                     /* the build the technical line shows; NULL = unreadable */
+int QerrTestSeamlessGoingDown = 0;                            /* 1 = seamless mode and the session is going down */
 #endif
 
 /* --- API ---------------------------------------------------------------------------------- */
@@ -174,6 +177,16 @@ QerrDecision QerrReport(const char* component, const char* id, int sev, const ch
                 "header, line 1 or technical line, or over %u bytes)",
                 component ? component : "-", id ? id : "-", (unsigned)sizeof(text));
         return QERR_REJECT_REDACT;
+    }
+
+    /* SEAMLESS MODE, SESSION GOING DOWN: dropped here, before the route (docs/ADR-supervision.md item 2b, by mode).
+     * Every later step can put an error box into the ending session - no boot token, an unwritable store, the
+     * gated route, a spawn that fails - and the marker and the cap would be spent on a notice that never went
+     * out. So nothing below runs: the log keeps the record. In non-seamless mode the notice goes out as always. */
+    if (PlatSeamlessGoingDown()) {
+        PlatLogInfo("NOTIFYERR %s.%s not sent: %s (seamless mode, the session is going down)",
+                    component ? component : "-", id ? id : "-", QerrDecisionName(QERR_DROPPED_GOINGDOWN));
+        return QERR_DROPPED_GOINGDOWN;
     }
 
 #ifdef NOTIFYERR_DEFECT_BOXSTORM
@@ -468,11 +481,16 @@ static int PlatSpawnNotify(const char* notifyPath, int* exeMissing)
     if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         return 0;
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);   /* fire and forget: no wait, ever */
-    /* LAUNCHED EVEN WHILE THE SESSION IS GOING DOWN - a recorded exception to docs/ADR-supervision.md 2b:
-     * refused, the notice would not reach dom0, and the route reads a spawn that did not happen as a transport
-     * failure, so ShowWindowFallback would put it up as an error box in the ending session instead. The process
-     * is windowless and delivers outside the session (qubes.Notifications through qrexec-client-vm). */
+    /* While the session is going down this is reached in non-seamless mode only, where notices keep launching.
+     * In seamless mode QerrReport drops the notice before the route, never here: a spawn refused here would be
+     * read as a transport failure and put up as an error box in the ending session. */
     return 1;
+}
+
+/* docs/ADR-supervision.md item 2b, by mode: main.c owns both facts (lifecycle.h). */
+static int PlatSeamlessGoingDown(void)
+{
+    return SeamlessGoingDown() ? 1 : 0;
 }
 
 /* The box: a system-drawn message box on the console session (errbox.h). Non-blocking; the box outlives this call. */
@@ -573,6 +591,11 @@ static int PlatSpawnNotify(const char* notifyPath, int* exeMissing)
     *exeMissing = 0;
     if (!QerrTestSpawnHook) { *exeMissing = 1; return 0; }
     return QerrTestSpawnHook(notifyPath);
+}
+
+static int PlatSeamlessGoingDown(void)
+{
+    return QerrTestSeamlessGoingDown;
 }
 
 static int PlatShowErrorBox(const char* header, const char* text, unsigned long* error)

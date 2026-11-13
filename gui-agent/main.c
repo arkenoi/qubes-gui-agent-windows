@@ -3106,6 +3106,13 @@ BOOL HelpersDisarmed(void)
 {
     return InterlockedCompareExchange(&g_HelpersDisarmed, 0, 0) != 0;
 }
+// docs/ADR-supervision.md item 2b, by mode: in seamless mode the one-shot launches refuse while the session is
+// going down. The session, not this agent: HelpersDisarmed() is also set when the agent exits for another reason,
+// and its exit path still removes every window (ResetWatch), which can raise a notice the session should get.
+BOOL SeamlessGoingDown(void)
+{
+    return g_SeamlessMode && LifecycleSessionEnding();
+}
 void HelpersDisarm(IN const WCHAR *why)
 {
     // A helper's exit after this point is the session's teardown or our own stop: graded INFO, never a death (R1 above).
@@ -4792,6 +4799,14 @@ static void DirectSuppressNotifyUser(IN DWORD count)
             count);
         return;
     }
+    // SEAMLESS MODE, SESSION GOING DOWN: not sent (docs/ADR-supervision.md item 2b, by mode), and before the throttle
+    // is stamped, so the next suppression after a cancelled end still notifies, with the count persisted by the caller.
+    if (SeamlessGoingDown())
+    {
+        LogInfo("QGAHELPERREFUSED QGADIRECTSUPPRESS: %lu withheld window(s) not notified, the session is going down "
+            L"(seamless mode; the ERROR above stands)", count);
+        return;
+    }
 
     ULONGLONG now = GetTickCount64();
     if (g_DirectNotifyNext != 0 && now < g_DirectNotifyNext)
@@ -4841,9 +4856,8 @@ static void DirectSuppressNotifyUser(IN DWORD count)
     // qrexec-client-vm), notifhost.exe being packaged, and dom0 policy. This is therefore a good
     // SECONDARY channel - independent of the GUI vchan, so it can report display faults - and NOT
     // a last-resort one: it cannot survive a dead qrexec.
-    // LAUNCHED EVEN WHILE THE SESSION IS GOING DOWN - a recorded exception to docs/ADR-supervision.md
-    // 2b, here and at QGASTARTDISMISS: refused, the notice would never reach dom0 and nothing sends it
-    // again. The process is windowless and delivers outside the session.
+    // While the session is going down this launch is reached in non-seamless mode only, where notices keep launching;
+    // the same holds at QGASTARTDISMISS (docs/ADR-supervision.md item 2b, by mode).
     WCHAR exe[MAX_PATH] = { 0 };
     if (GetModuleFileName(NULL, exe, RTL_NUMBER_OF(exe)))
     {
@@ -4908,6 +4922,15 @@ static void NotifHoldPublishMode(void)
     if (g_NotifHoldBase)
         TI_STORE32(&((TH_IPC_HEADER*)g_NotifHoldBase)->Seamless, g_SeamlessMode ? 1 : 0);
 }
+// THE SESSION GOING DOWN, for the bridge (docs/ADR-supervision.md item 2b, by mode): it runs as the user and cannot
+// open the SYSTEM-only latch, so it reads this copy beside Seamless. Called at the section's creation and by the
+// end-session handler (lifecycle.c) on its own thread; one interlocked store, no wake.
+void NotifHoldPublishGoingDown(void)
+{
+    void* const base = g_NotifHoldBase;
+    if (base)
+        TI_STORE32(&((TH_IPC_HEADER*)base)->GoingDown, LifecycleSessionEnding() ? 1 : 0);
+}
 static BOOL NotifIpcEnsure(void)
 {
     if (g_NotifAlive && g_NotifReadyEvt) return TRUE;
@@ -4969,6 +4992,7 @@ static BOOL NotifIpcEnsure(void)
                 ThIpcInit((TH_IPC_HEADER*)base);   // zeroed, header published Magic-last
                 g_NotifHoldMap = map; g_NotifHoldBase = base; g_NotifVerdictEvt = ev;
                 NotifHoldPublishMode();
+                NotifHoldPublishGoingDown();
                 ToastHoldAttachIpc((TH_IPC_HEADER*)base, ev);
                 LogInfo("QGANOTIFIPC toast-hold records section created (%lu bytes, %u records) + verdict event",
                     (ULONG)TH_IPC_BYTES, (unsigned)TH_IPC_RECORDS);
@@ -5259,6 +5283,40 @@ static BOOL g_NotifLaunched = FALSE;           // the ONE launch this agent perf
 // and removing the exit report without it would be a silencing (0.90).
 static DWORD g_NotifLaunchedSession = 0;
 static BOOL g_NotifNotReadyLogged = FALSE;     // "no instance published its pid" said once per launch/exit
+// The earliest tick at which the awaited bridge could have started: this pass's tick when the launch is issued, and the
+// exit's when one re-arms the wait. A stand-down record must not predate it. g_NotifLastLaunch cannot serve: it is
+// the reap's DONE tick, and a bridge started by the task's registration can stand down before schtasks returns.
+static ULONGLONG g_NotifAwaitedSince = 0;
+// THE BRIDGE'S EXIT-REASON FILE (tools/notifhost/qtb_shared.h): "<pid> <reason> <tick>", written at a deliberate
+// departure; <tick> is the bridge's GetTickCount64 at the write and is absent from older bridges (*tick = 0).
+// path gets the file's path (MAX_PATH) whether or not it reads, so a caller can consume it. TRUE when a pid and a
+// reason word were read.
+static BOOL NotifReadExitReason(OUT WCHAR* path, OUT WCHAR* reason, IN size_t reasonCch, OUT DWORD* pid,
+                                OUT ULONGLONG* tick)
+{
+    path[0] = 0; reason[0] = 0; *pid = 0; *tick = 0;
+    if (!ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge\\exit-reason", path, MAX_PATH))
+        return FALSE;
+    HANDLE rf = CreateFile(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
+                           FILE_ATTRIBUTE_NORMAL, NULL);
+    if (rf == INVALID_HANDLE_VALUE)
+        return FALSE;
+    char buf[160] = { 0 };
+    DWORD rd = 0;
+    if (ReadFile(rf, buf, sizeof(buf) - 1, &rd, NULL) && rd > 0)
+    {
+        char word[64] = { 0 };
+        unsigned long long t = 0;
+        const int n = sscanf_s(buf, "%lu %63s %llu", pid, word, (unsigned)sizeof(word), &t);
+        if (n >= 2)
+        {
+            MultiByteToWideChar(CP_ACP, 0, word, -1, reason, (int)reasonCch);
+            if (n == 3) *tick = (ULONGLONG)t;
+        }
+    }
+    CloseHandle(rf);
+    return reason[0] != 0;
+}
 static void NotifBridgeSupervise(void)
 {
     if (!g_NotifBridge) { NotifBridgeRestoreSweep(); return; }
@@ -5373,24 +5431,8 @@ static void NotifBridgeSupervise(void)
         {
             WCHAR reasonPath[MAX_PATH] = { 0 }, reason[64] = { 0 };
             DWORD reasonPid = 0;
-            if (ExpandEnvironmentStrings(L"%ProgramData%\\qubes-toast-bridge\\exit-reason",
-                                         reasonPath, RTL_NUMBER_OF(reasonPath)))
-            {
-                HANDLE rf = CreateFile(reasonPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                       NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-                if (rf != INVALID_HANDLE_VALUE)
-                {
-                    char buf[128] = { 0 };
-                    DWORD rd = 0;
-                    if (ReadFile(rf, buf, sizeof(buf) - 1, &rd, NULL) && rd > 0)
-                    {
-                        char word[64] = { 0 };
-                        if (sscanf_s(buf, "%lu %63s", &reasonPid, word, (unsigned)sizeof(word)) == 2)
-                            MultiByteToWideChar(CP_ACP, 0, word, -1, reason, RTL_NUMBER_OF(reason));
-                    }
-                    CloseHandle(rf);
-                }
-            }
+            ULONGLONG reasonTick = 0;
+            (void)NotifReadExitReason(reasonPath, reason, RTL_NUMBER_OF(reason), &reasonPid, &reasonTick);
             if (reason[0] && reasonPid == g_NotifBridgePid)
             {
                 // A SESSION CHANGE IS NOT ACCOMMODATED - IT IS REPORTED. Owner, 2026-10-08:
@@ -5464,6 +5506,7 @@ static void NotifBridgeSupervise(void)
         // looks again, accepting only ticks from now on. Nothing is launched by this agent.
         g_NotifLaunchPending = TRUE;
         g_NotifLastLaunch = now;
+        g_NotifAwaitedSince = now;
         g_NotifNotReadyLogged = FALSE;
     }
     // REAP AN OFF-LOOP LAUNCH, ON THE LOOP, before any early return below can strand it and before the
@@ -5609,6 +5652,25 @@ static void NotifBridgeSupervise(void)
         if (now - g_NotifLastLaunch >= 60000 && !g_NotifNotReadyLogged)
         {
             g_NotifNotReadyLogged = TRUE;
+            // A BRIDGE THAT STOOD DOWN BEFORE IT HAD A PID TO PUBLISH (docs/ADR-toasts.md 12): on an explicit Deny of
+            // notification access it sends its own notice, records the stand-down with the tick it wrote it at, and
+            // leaves. A record written since this wait began (g_NotifAwaitedSince) is its word, and it excuses THIS
+            // report only - a death needs the pid (the exit grading above). Nothing is waited for: no clock, no
+            // deadline, no report (docs/ADR-supervision.md 7).
+            {
+                WCHAR sdPath[MAX_PATH], sdReason[64];
+                DWORD sdPid = 0;
+                ULONGLONG sdTick = 0;
+                if (NotifReadExitReason(sdPath, sdReason, RTL_NUMBER_OF(sdReason), &sdPid, &sdTick) &&
+                    sdTick >= g_NotifAwaitedSince && sdTick <= now && 0 == wcsncmp(sdReason, L"listener-denied-", 16))
+                {
+                    LogInfo("NOTIFBRIDGE the bridge (pid %lu) stood down at its start: %s - not armed and not "
+                        L"relaunched, guest toasts take the window path; its own notice names the setting",
+                        sdPid, sdReason);
+                    DeleteFile(sdPath);   // consumed: it may not excuse a later launch
+                    return;
+                }
+            }
             // No relaunch loop (owner 2026-10-07). bridge.log says whether it started; Task Scheduler's history for
             // the task says whether it was restarted.
             LogError("QGANOTIFNOTREADY no notification bridge instance published its pid within %I64u ms of the %s: "
@@ -5622,6 +5684,7 @@ static void NotifBridgeSupervise(void)
     g_NotifLaunched = TRUE;
     g_NotifLaunchedSession = WTSGetActiveConsoleSessionId();   // which session this one serves
     g_NotifBridgeExitedAt = 0;
+    g_NotifAwaitedSince = now;   // before the thread exists, so before any bridge it starts
     // OFF THE LOOP, like the broker's (NOTIFLAUNCHBLOCKSTHELOOP): NotifBridgeLaunch reaches schtasks
     // /delete plus a /create and one retry, which measured 0.374-7.524 s against this agent's 5 s wake
     // deadline, and this function runs on EVERY wake. The state is claimed BEFORE the thread exists, so a
@@ -7027,11 +7090,8 @@ static BOOL CropReadyForMap(IN OUT WINDOW_DATA* entry)
 static BOOL g_SeamlessShadowsDone = FALSE;
 static BOOL ApplyGuestShadows(IN BOOL enable)
 {
-    // LAUNCHED EVEN WHILE THE SESSION IS GOING DOWN, in both directions - a recorded exception to
-    // docs/ADR-supervision.md 2b. The restore direction has no retry, and the seamless direction's only retry is
-    // DaemonSettleSweep, which runs when the main loop's wait TIMES OUT - a wait that is INFINITE on a quiet desktop -
-    // so a refusal here could leave the shadows wrong after a cancelled end until something times the loop out.
-    // What is refused is the sweep's REPEATED retry (DaemonSettleSweep), which loses nothing by skipping a pass.
+    // While the session is going down, ApplySeamlessTweaks does not call this in seamless mode in either direction
+    // (docs/ADR-supervision.md item 2b, by mode), and the settle sweep skips its retry while launches are disarmed.
     if (SpawnHelperInSession(enable ? L"--set-shadows 1" : L"--set-shadows 0"))
     {
         // The same helper also turns client-area animation OFF in both directions (the toast
@@ -7186,10 +7246,17 @@ static void RestyleGuestCaption(IN WINDOW_DATA* entry, IN BOOL hide)
     // lands before or after it. Blocking the frame loop on a process spawn would be far worse
     // than a repaint.
     //
-    // LAUNCHED EVEN WHILE THE SESSION IS GOING DOWN - a recorded exception to docs/ADR-supervision.md 2b. The windows
-    // announced during an end include the prompts that can cancel it ("save changes?"); refused, each would show
-    // the guest's own title bar under dom0's, and keep it after a cancelled end: a caption is stripped when its
-    // window is announced (AddWindow), and a window that stays announced is not stripped again.
+    // SEAMLESS MODE, SESSION GOING DOWN: no strip (docs/ADR-supervision.md item 2b, by mode). The cost is accepted
+    // collateral: a window announced during the end - a "save changes?" prompt among them - shows the guest's own
+    // title bar under dom0's, and keeps it after a cancelled end, because a caption is stripped only when its window
+    // is announced. Nothing is recorded, so nothing is owed back. The restore direction is decided by its caller,
+    // before it consumes the stripped set (ApplySeamlessTweaks).
+    if (hide && SeamlessGoingDown())
+    {
+        LogInfo("QGAHELPERREFUSED 0x%x: caption strip not launched, the session is going down (seamless mode)",
+            entry->Handle);
+        return;
+    }
     DWORD ownerPid = 0;
     GetWindowThreadProcessId(entry->Handle, &ownerPid);
     HANDLE proc = ownerPid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ownerPid) : NULL;
@@ -7298,8 +7365,25 @@ static void CapStripReload(void)
 
 static void ApplySeamlessTweaks(IN BOOL seamless)
 {
+    // SEAMLESS MODE, SESSION GOING DOWN: neither helper is launched (docs/ADR-supervision.md item 2b, by mode). A pass
+    // that enters or leaves seamless mode belongs to it - g_SeamlessMode still holds the mode being left here - so
+    // a non-seamless pass alone keeps launching. Nothing is spent and nothing is consumed. After a cancelled end that
+    // is accepted collateral: the seamless direction stays not-done until the settle sweep retries it, which happens
+    // only when the main loop's wait times out (nothing arms that wait for it, so a quiet desktop keeps the guest's
+    // shadows until then), and the restore direction leaves the shadows off and the stripped set whole until the next
+    // non-seamless pass (a later switch, or the next agent start reading the persisted mode).
+    const BOOL refuse = LifecycleSessionEnding() && (seamless || g_SeamlessMode);
+    if (refuse)
+        LogInfo("QGAHELPERREFUSED shadows and caption helpers not launched for seamless=%d, the session is going down "
+            L"(seamless mode)", seamless ? 1 : 0);
+
     // 1. Guest window shadows: dom0 draws them in seamless.
-    if (seamless)
+    if (refuse)
+    {
+        if (seamless)
+            g_SeamlessShadowsDone = FALSE;                  // the sweep resumes after a cancelled end
+    }
+    else if (seamless)
         g_SeamlessShadowsDone = ApplyGuestShadows(FALSE);   // retried by the sweep until applied
     else
     {
@@ -7329,7 +7413,7 @@ static void ApplySeamlessTweaks(IN BOOL seamless)
     // announce path strips it.
     {
         ULONG touched = 0, dead = 0;
-        if (!seamless && s_csCapStripReady)
+        if (!seamless && s_csCapStripReady && !refuse)
         {
             HWND snapshot[CAPSTRIP_MAX];
             ULONG n = 0;
@@ -7349,8 +7433,12 @@ static void ApplySeamlessTweaks(IN BOOL seamless)
                 touched++;
             }
         }
-        LogInfo("QGATWEAKS seamless=%d applied (shadows, effects; captions restored on %lu "
-            L"window(s), %lu already gone)", seamless ? 1 : 0, touched, dead);
+        if (refuse)
+            LogInfo("QGATWEAKS seamless=%d applied (effects only; shadows and captions left for the next pass)",
+                seamless ? 1 : 0);
+        else
+            LogInfo("QGATWEAKS seamless=%d applied (shadows, effects; captions restored on %lu "
+                L"window(s), %lu already gone)", seamless ? 1 : 0, touched, dead);
     }
 }
 
@@ -9515,7 +9603,11 @@ static void StartOpeningExamine(IN HWND start, IN BOOL surfaceVisible)
             LogErrorUnlessGoingDown(FALSE, "QGASTARTDISMISS 0x%x: activation to 0x%x refused - foreground held by pid %lu; "
                 "the hidden menu may take clicks", (DWORD)(ULONG_PTR)start, (DWORD)(ULONG_PTR)target, fgPid);
 
-        if (!g_StartDismissNotified)
+        // SEAMLESS MODE, SESSION GOING DOWN: not sent (docs/ADR-supervision.md item 2b, by mode), and the once-per-run
+        // latch is left unset, so the next hidden-Start opening after a cancelled end still tells the user.
+        if (!g_StartDismissNotified && SeamlessGoingDown())
+            LogInfo("QGAHELPERREFUSED QGASTARTDISMISS: user notification not sent, the session is going down (seamless mode)");
+        else if (!g_StartDismissNotified)
         {
             g_StartDismissNotified = TRUE;
             StartDismissNotifyUser();

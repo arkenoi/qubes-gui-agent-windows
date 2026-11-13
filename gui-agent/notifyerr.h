@@ -114,7 +114,9 @@ typedef enum QerrDecision {
     QERR_SUPPRESS_DUP,
     QERR_SUPPRESS_CAP,
     QERR_FAIL_TRANSPORT,    /* glue only: policy said send, the store or the spawn failed */
-    QERR_GATED              /* glue only: policy said send, the operator's gate keeps it from dom0 */
+    QERR_GATED,             /* glue only: policy said send, the operator's gate keeps it from dom0 */
+    QERR_DROPPED_GOINGDOWN  /* glue only: seamless mode and the session is going down - dropped before the route
+                               (docs/ADR-supervision.md item 2b, by mode); nothing written, no window */
 } QerrDecision;
 
 static inline const char* QerrDecisionName(QerrDecision d)
@@ -128,6 +130,7 @@ static inline const char* QerrDecisionName(QerrDecision d)
     case QERR_SUPPRESS_CAP:    return "suppressed:cap";
     case QERR_FAIL_TRANSPORT:  return "failed:transport";
     case QERR_GATED:           return "gated";
+    case QERR_DROPPED_GOINGDOWN: return "dropped:going-down";
     }
     return "?";
 }

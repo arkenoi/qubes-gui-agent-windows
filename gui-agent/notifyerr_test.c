@@ -55,6 +55,7 @@ extern void (*QerrTestLogHook)(const char* line);
 extern long long QerrTestBootStamp;
 extern unsigned long QerrTestPid;
 extern const char* QerrTestBuild;
+extern int QerrTestSeamlessGoingDown;
 
 static unsigned g_run = 0, g_fail = 0;
 static char g_base[256];
@@ -350,6 +351,21 @@ int main(void)
         CheckDecision("gate off: the 9th distinct gated error is capped", QerrReport("gui-agent", "gated-9", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_SUPPRESS_CAP);
         Check("gate off: the cap holds for windows too (still eight)", g_boxes == QERR_CAP_PER_BOOT);
     }
+
+    /* ---- 4b. seamless mode, session going down: dropped BEFORE the route (docs/ADR-supervision.md item 2b) ---- */
+    ResetStore();
+    QerrTestSpawnHook = SpawnFail;   /* a notice that reached the spawn would come back as an error window */
+    QerrTestSeamlessGoingDown = 1;
+    QerrInit(1, g_dir);
+    CheckDecision("going down: an ACTION report is dropped before the route",
+        QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_DROPPED_GOINGDOWN);
+    Check("going down: nothing spawned, no window, no per-boot record",
+          g_spawned == 0 && g_boxes == 0 && !FileExists("gui-agent.deslicedown") && !FileExists(".count"));
+    CheckCount("going down: the drop is logged once", "dropped:going-down", LogCount("dropped:going-down"), 1);
+    QerrTestSeamlessGoingDown = 0;
+    QerrTestSpawnHook = SpawnOk;
+    CheckDecision("going down, then cancelled: the same report sends (nothing was spent)",
+        QerrReport("gui-agent", "deslicedown", QERR_SEV_ACTION, "x", "y", NULL, "z"), QERR_SEND);
 
     /* ---- 5. glue end-to-end: sends, dedupe, cap ----------------------------------------- */
     ResetStore();
