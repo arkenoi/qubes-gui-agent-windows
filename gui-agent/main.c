@@ -10680,6 +10680,23 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             (!bs || bs->ReqWidth != (LONG)windowData->PwWidth ||
              bs->ReqHeight != (LONG)windowData->PwHeight ||
              BrokerSlotStale(windowData, bs));
+        // THE CLOCK ARMS THE SAME REPAIR. BrokerFreshFrame flags PwDimsStuck only when a rejected frame arrives more
+        // than BROKER_DIMS_STUCK_MS after the first, and a window that stops painting sends no such frame: a caption
+        // strip grows the slab, the broker's session keeps the old size, its one frame is rejected, and the window
+        // keeps its pre-strip picture until it paints again. This pass runs every WINDOW_RESYNC_INTERVAL_MS with or
+        // without frames, and the slab equals the live geometry here, so a mismatch this old is a desync, not a
+        // resize in flight.
+        if (windowData->PwBrokerSourced && !windowData->PwDimsStuck && windowData->PwDimsSince != 0)
+        {
+            const ULONGLONG dimsAge = GetTickCount64() - windowData->PwDimsSince;
+            if (dimsAge > BROKER_DIMS_STUCK_MS)
+            {
+                windowData->PwDimsStuck = TRUE;
+                LogInfo("BROKERDIMS hwnd 0x%x stuck by the clock: %I64u ms since the first rejected frame, none past "
+                    L"%d ms (slab %ux%u) - re-registering", (DWORD)(ULONG_PTR)windowData->Handle, dimsAge,
+                    BROKER_DIMS_STUCK_MS, windowData->PwWidth, windowData->PwHeight);
+            }
+        }
         // NEVER REGISTERED. A slice-fed window added while the broker could not take it - it was not ready yet, or it had
         // died and was being relaunched, or the arena or the slots were full - has PwBrokerSourced FALSE, which the repair
         // below never looks at, so nothing ever registered it and a direct-required window with no slot is WITHHELD from
