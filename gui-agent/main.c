@@ -17916,8 +17916,9 @@ static ULONG Init(void)
 // invisible-border crop math - the 7 px black band measured 2026-08-16.
 //
 // This is a per-USER preference (HKCU), so the agent cannot write it as SYSTEM; it runs in the same
-// owner-context helper as the caption restyle. The previous UserPreferencesMask is saved so the
-// fullscreen direction restores what the user actually had, rather than assuming a default.
+// owner-context helper as the caption restyle. Enabling always sets the bit: the user's earlier value
+// is kept nowhere, so the non-seamless direction turns shadows on whatever the user had. `saved`
+// only skips a write that would change nothing.
 static int SetShadowsMain(LPSTR cmdLine)
 {
     int enable = 1;
