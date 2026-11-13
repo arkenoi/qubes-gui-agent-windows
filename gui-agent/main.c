@@ -6549,6 +6549,39 @@ static DWORD g_RaiseSent = 0, g_RaiseSkipped = 0, g_RaiseDebounced = 0;
 // to repair rather than a resize in flight. A resize settles within a pass or two (~100 ms).
 #define BROKER_DIMS_STUCK_MS 750
 
+// THE STUCK CLOCK NEEDS A WAKE. A mismatch is flagged stuck by BrokerFreshFrame when another rejected frame arrives past
+// BROKER_DIMS_STUCK_MS, or by UpdateWindowData's clock check when a tracking pass examines the window - and on a quiet
+// desktop neither happens: a window that stopped painting sends no frame, and the main loop waits INFINITE (rest-zero S4),
+// so no pass runs. The window keeps the stale frame's picture until something unrelated wakes the loop. So the first
+// rejected frame of a run arms ONE deadline at the end of the grace, the main loop caps its wait by it, and this sweep
+// queues every window whose mismatch is still outstanding then for the pass that repairs it. One wake per mismatch run and
+// none at rest (0 = nothing armed). Main-loop thread only, like g_MapDeferWake: BrokerFreshFrame and the sweep run there.
+static ULONGLONG g_BrokerDimsWake = 0;   // earliest outstanding dims deadline (tick), 0 = none armed
+
+static void BrokerDimsWakeSweep(void)
+{
+    if (g_BrokerDimsWake == 0)
+        return;
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_BrokerDimsWake)
+        return;
+    ULONGLONG next = 0;
+    EnterCriticalSection(&g_csWatchedWindows);
+    for (LIST_ENTRY* le = g_WatchedWindowsList.Flink; le != &g_WatchedWindowsList; le = le->Flink)
+    {
+        WINDOW_DATA* entry = CONTAINING_RECORD(le, WINDOW_DATA, ListEntry);
+        if (entry->DeletePending || !entry->PwBrokerSourced || entry->PwDimsStuck || entry->PwDimsSince == 0)
+            continue;
+        const ULONGLONG due = entry->PwDimsSince + BROKER_DIMS_STUCK_MS + 10;
+        if (now >= due)
+            QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);   // not re-armed: one wake per run
+        else if (next == 0 || due < next)
+            next = due;
+    }
+    LeaveCriticalSection(&g_csWatchedWindows);
+    g_BrokerDimsWake = next;
+}
+
 // Read a fresh, fully-BOUNDS-CHECKED broker frame for this window. Every broker-written field
 // is validated before use (a user-IL process shares the section R/W); the frame is accepted
 // ONLY if its dims exactly match the slab and its arena region is fully in-bounds, so the
@@ -6667,7 +6700,13 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
             {
                 ULONGLONG nowTick = GetTickCount64();
                 if (e->PwDimsSince == 0)
+                {
                     e->PwDimsSince = nowTick;
+                    // The run's one deadline (BrokerDimsWakeSweep): the stuck clock must not wait for another frame.
+                    const ULONGLONG due = nowTick + BROKER_DIMS_STUCK_MS + 10;
+                    if (g_BrokerDimsWake == 0 || due < g_BrokerDimsWake)
+                        g_BrokerDimsWake = due;
+                }
                 if (!e->PwDimsLogged)
                 {
                     e->PwDimsLogged = TRUE;
@@ -10682,10 +10721,10 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
              BrokerSlotStale(windowData, bs));
         // THE CLOCK ARMS THE SAME REPAIR. BrokerFreshFrame flags PwDimsStuck only when a rejected frame arrives more
         // than BROKER_DIMS_STUCK_MS after the first, and a window that stops painting sends no such frame: a caption
-        // strip grows the slab, the broker's session keeps the old size, its one frame is rejected, and the window
-        // keeps its pre-strip picture until it paints again. This pass runs every WINDOW_RESYNC_INTERVAL_MS with or
-        // without frames, and the slab equals the live geometry here, so a mismatch this old is a desync, not a
-        // resize in flight.
+        // strip resizes the slab, the last frame the broker published was cut for the old request, and the window
+        // keeps its pre-strip picture until it paints again. No frame is needed to get here: the first rejected frame
+        // armed BrokerDimsWakeSweep, which queues this window when the grace ends. The slab equals the live geometry
+        // here, so a mismatch this old is a desync, not a resize in flight.
         if (windowData->PwBrokerSourced && !windowData->PwDimsStuck && windowData->PwDimsSince != 0)
         {
             const ULONGLONG dimsAge = GetTickCount64() - windowData->PwDimsSince;
@@ -16145,6 +16184,17 @@ static ULONG WINAPI WatchForEvents(void)
             DWORD toDefer = (g_MapDeferWake > now64) ? (DWORD)(g_MapDeferWake - now64) : 0;
             if (waitTimeout == INFINITE || toDefer < (DWORD)waitTimeout)
                 waitTimeout = toDefer;
+        }
+
+        // STUCK-DIMS WAKE (BrokerDimsWakeSweep): queue each window whose size-rejected broker frame outlived the grace, then
+        // cap the wait by the earliest deadline still outstanding. Inert (0) unless a mismatch is outstanding.
+        BrokerDimsWakeSweep();
+        if (g_BrokerDimsWake != 0)
+        {
+            const ULONGLONG now64 = GetTickCount64();
+            const DWORD toDims = (g_BrokerDimsWake > now64) ? (DWORD)(g_BrokerDimsWake - now64) : 0;
+            if (waitTimeout == INFINITE || toDims < (DWORD)waitTimeout)
+                waitTimeout = toDims;
         }
 
         // TOAST-HOLD DEADLINE (toasthold.c): the fail-open bound of a banner held for its verdict - a
