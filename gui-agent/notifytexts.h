@@ -76,36 +76,35 @@ static const QerrText QerrTexts[] = {
       "Cause: Windows delivers no new pictures of the window, even to a re-created capture.",
       QERR_GUI_AGENT_LOG ", line QGAWGCDEAF", NULL },
 
-    /* DEGRADED on purpose: below the route's ACTION threshold, so it stays in the log (Task Scheduler's
-     * restart-on-failure may bring it back; deslice-down escalates 30 s later if not). Wired so the threshold
-     * is exercised by a real site and a promotion is a one-word change. Task Scheduler restarts it on failure
-     * at most three times, a minute apart; the GUI agent relaunches nothing (docs/ADR-supervision.md 4-5).
+    /* DEGRADED on purpose: below the route's ACTION threshold, so it stays in the log; the dom0 row for a broker
+     * death is the death reporter's, and deslice-down's is suppressed for that outage (QgaDesliceOwnedByDeath).
+     * Wired so the threshold is exercised by a real site and a promotion is a one-word change.
+     * Nothing brings the broker back before the next GUI agent start: Task Scheduler's restart-on-failure fires
+     * only when the task cannot be launched, and the GUI agent relaunches nothing (docs/ADR-supervision.md 4-5).
      * Log line QGABROKERDIED. */
     { "broker-died", "gui-agent", "broker-died", QERR_SEV_DEGRADED, "gui-agent.exe", NULL,
       "The notification and menu capture helper stopped serving",
-      "Task Scheduler restarts it up to three times; nothing it captures reaches dom0 until then.",
+      "Restart this qube to start it again; nothing it captures reaches dom0 until then.",
       "Cause: it exited or stopped answering after it was ready.",
       QERR_GUI_AGENT_LOG ", line QGABROKERDIED", NULL },
 
     /* wgcbroker.exe is installed but has not been running for over 30 s on a system that needs it (log line
      * QGADESLICEDOWN): the de-slice path is down. The gui-agent and wgcbroker logs have the sequence.
      *
-     * THE NEXT-STEP LINE WAS FALSE, and the owner received it. It said "Nothing of ours restarts it; it
-     * comes back when the GUI agent next starts", which contradicts docs/ADR-supervision.md 4 - a
-     * task-launched helper comes back through Task Scheduler's restart settings - AND main.c's own comment
-     * at the recovery path, "Task Scheduler restarted it (this agent relaunches nothing)". The sibling row
-     * deslice-down-died has said the true thing all along; this one is now the same sentence. "Nothing of
-     * ours relaunches it" is true of the AGENT (ADR-supervision 5) and was wrongly written as true of the
-     * product. Measured cost: the row reached the owner on a guest where a launch had already succeeded
-     * 4 s later, so both the condition AND the advice were wrong (findings/issues.md
-     * DESLICEDOWNFIRESWHILETHELAUNCHISINFLIGHT).
+     * THE NEXT-STEP LINE HAS BEEN WRONG TWICE. It first said "Nothing of ours restarts it; it comes back when
+     * the GUI agent next starts" and reached the owner on a guest where the launch succeeded 4 s later
+     * (findings/issues.md DESLICEDOWNFIRESWHILETHELAUNCHISINFLIGHT). It was then made "Task Scheduler restarts
+     * it up to three times", on docs/ADR-supervision.md 4's word, which nobody had measured. Measured
+     * 2026-11-13 (25H2, the live task definition copied verbatim): RestartOnFailure fires only when the task
+     * cannot be launched; an instance that ran and exited 2 or 0xC0000005 was not restarted. The line now
+     * promises no restart and names the step that always works.
      *
      * WHEN THIS CAN STILL FIRE, after the stand-down latch (QgaDesliceSupervisionHeld): the broker was
      * launched and never became ready. A deliberate stand-down no longer reaches here at all, and a death
      * is reported by the death reporter instead (QgaDesliceOwnedByDeath). */
     { "deslice-down-present", "gui-agent", "deslice-down", QERR_SEV_ACTION, "gui-agent.exe", NULL,
       "The notification and menu capture helper is not running",
-      "Task Scheduler restarts it up to three times; nothing it captures reaches dom0 until then.",
+      "Restart this qube to start it again; nothing it captures reaches dom0 until then.",
       "Cause: wgcbroker.exe is installed, but its launch produced no broker.",
       QERR_GUI_AGENT_LOG ", line QGADESLICEDOWN", NULL },
 
@@ -152,9 +151,9 @@ static const QerrText QerrTexts[] = {
 
     /* --- the notification bridge's own faults (notifhost.cpp ReportErrorSelf) --------------- */
     /* its exit codes are its own (BridgeMain): 2 = listener access denied, 3 = listener init threw.
-     * Both recur for the life of the guest: Task Scheduler restarts the bridge on failure, at most three times
-     * a minute apart, and it dies the same way each time; the GUI agent relaunches nothing. Denied access is
-     * Windows' notification-access setting for this user (Settings > Privacy > Notifications). */
+     * Neither is restarted: Task Scheduler's restart-on-failure fires only when the task cannot be launched,
+     * and the GUI agent relaunches nothing, so the bridge starts again with the next GUI agent start. Which
+     * setting denies access is read at the refusal; one row per answer. */
     { "listener-denied-policy", "notifhost", "listener-denied", QERR_SEV_ACTION, "notifhost.exe", QERR_TXT_LISTENER_DENIED_CODE,
       "A Windows policy blocks notification access",
       "Notifications show as plain windows. Set that policy to \"User is in control\", then restart this qube.",
@@ -181,7 +180,7 @@ static const QerrText QerrTexts[] = {
 
     { "listener-init", "notifhost", "listener-init", QERR_SEV_ACTION, "notifhost.exe", "exit code 3",
       "The notification bridge could not start",
-      "Bridged apps show as plain windows; Task Scheduler restarts the bridge (up to three times).",
+      "Bridged apps show as plain windows. Restart this qube to start the bridge again.",
       "Cause: the toast listener threw while starting.",
       QERR_BRIDGE_LOG, NULL },
 };

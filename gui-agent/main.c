@@ -324,7 +324,7 @@ static ULONGLONG g_BrokerNextWarn = 0;     // next QGADESLICEDOWN warning is due
 // TOLD TO GO DOWN, SO IT STAYS DOWN (QgaDesliceSupervisionHeld). Set when the broker's absence is
 // ASKED FOR rather than a fault - a deliberate stand-down, or helper launches being disarmed for a
 // session end / this agent's exit; cleared ONLY by an event - the broker being seen alive again
-// (Task Scheduler's recovery can bring it back without us asking, ADR-supervision 4), a new launch
+// (Task Scheduler retries a launch that failed, ADR-supervision 4), a new launch
 // being issued, or the disarm itself being undone in HelpersRearm. Never by time: a latch that
 // expires is the defect it replaces. DECLARED HERE, beside the clock it suppresses, because
 // HelpersRearm is defined far above the supervisor and must be able to clear it.
@@ -3070,6 +3070,12 @@ static BOOL WgcRunSchtasks(const WCHAR* argtail, OUT DWORD *exitCode, OUT WCHAR 
 // (it publishes its pid; the supervisors validate it). Both helpers exit 0 when the agent is gone (wgcbroker.cpp,
 // notifhost.cpp BridgeMain), so an agent death does not make Task Scheduler restart helpers into an agent-less session.
 //
+// MEASURED 2026-11-13 (25H2; throwaway tasks carrying the live \Qubes-NotifBridge definition verbatim, counted by
+// Operational-log event ID): RestartOnFailure fires only when the task CANNOT BE LAUNCHED - a missing program was
+// tried 1 + 3 times, a minute apart. An instance that ran and exited 2 or 0xC0000005 was not restarted, and neither
+// was the real bridge refused by a notification policy (exit 2, no restart attempt in its task history). So in
+// practice "or not at all" is the case: a helper that started and then died stays down until the next agent start.
+//
 // R1 - "if you terminate something that relaunches, make sure it STOPS relaunching beforehand": before this agent
 // ends a helper on purpose (its own exit, a session end, the hung-broker reap) it DISARMS the task first (schtasks
 // /change /disable - a disabled task is not restarted by RestartOnFailure), then ends the helper, then deletes the
@@ -3403,7 +3409,7 @@ static BOOL WgcLaunch(void)
     WgcRunSchtasks(L"/delete /tn " WGC_TASK_NAME L" /f", NULL, NULL, 0);
     if (!HelperTaskRegister(WGC_TASK_NAME, longExe, args, userId, TRUE,
             L"QWT: the GUI agent's de-slice capture broker (re-created by the GUI agent at each of its starts; "
-            L"restarted on failure by Task Scheduler, never by the agent)"))
+            L"Task Scheduler retries only a launch that failed; never relaunched by the agent)"))
     {
         // Task Scheduler not running, or the task XML refused: the schtasks error is logged above (HelperTaskRegister).
         // The de-slice broker task was not registered or started, so the broker is not running and every
@@ -3813,8 +3819,8 @@ static BOOL g_WgcBrokerHung = FALSE;
 // The broker supervisor - EVENT-DRIVEN since rest-zero S4: it runs on every main-loop wake, waits for nothing, and arms
 // no timer while the broker is up and its requests are answered. Creates the section on the first eligible pass;
 // launches the broker ONCE per agent life when a session with a shell exists (HELPER LIFECYCLE above - since 2026-10-07
-// nothing here relaunches it: Task Scheduler's restart-on-failure does, and an instance it brings back is adopted like
-// the first); marks it ready when the pid it publishes validates. EXIT is the broker's process handle (in the main
+// nothing here relaunches it, and Task Scheduler's restart-on-failure retries only a launch that failed; an instance
+// started that way is adopted like the first); marks it ready when the pid it publishes validates. EXIT is the broker's process handle (in the main
 // loop's wait array); READY is the pid the broker publishes and then signals the frame event for; a HANG is a request
 // it has not acknowledged within WGCBRK_ACK_DEADLINE_MS (R1/R4). No heartbeat is read or written.
 static ULONGLONG g_BrokerReadyAt = 0;   // tick the current instance became ready: its run time in a death record
@@ -4024,13 +4030,14 @@ static void BrokerSupervise(void)
             // a fresh clock rather than being charged to this one.
             for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
                 if (g_SlotCtlSince[i]) g_SlotCtlSince[i] = now;
-            // RECOVERY FROM A DEATH IS ITSELF REPORTABLE. A broker that died and came back (Task Scheduler's
-            // restart-on-failure) is not a non-event just because the pixels resumed: something killed it, and the
-            // only record that it happened is this line plus BrokerDeaths and the 4002 already written.
+            // RECOVERY FROM A DEATH IS ITSELF REPORTABLE. Nothing of ours restarts a broker that ran, and neither
+            // does Task Scheduler (its restart-on-failure retries only a launch that failed, measured 2026-11-13);
+            // one that died and came back anyway is not a non-event just because the pixels resumed: something
+            // killed it, and the only record that it happened is this line plus BrokerDeaths and the 4002 already written.
             if (g_BrokerDiedAt)
             {
-                // Task Scheduler restarted it (this agent relaunches nothing); a death is a real failure, and the
-                // crash itself is in the wgcbroker log - collect it.
+                // Something other than this agent started it (it relaunches nothing); a death is a real failure,
+                // and the crash itself is in the wgcbroker log - collect it.
                 LogWarning("QGABROKERBACK de-slice broker is BACK after %I64u ms down (deaths=%lu): windows withheld "
                     L"during the outage were never shown",
                     GetTickCount64() - g_BrokerDiedAt, g_BrokerDeaths);
@@ -4069,8 +4076,9 @@ static void BrokerSupervise(void)
     }
     // THE DEATH TRANSITION IS THE LOUD MOMENT, not the 30 s mark. Excluding logoff and fast-user-switch (these guests
     // enforce autologon with one user, so neither occurs), a CRASH is essentially the only way a ready broker dies,
-    // which makes this the realistic case - and since 2026-10-07 nothing here relaunches it: Task Scheduler does
-    // (restart-on-failure), or nothing does, and the record below is what says it happened.
+    // which makes this the realistic case - and since 2026-10-07 nothing here relaunches it, and Task Scheduler
+    // restarts nothing that ran (measured 2026-11-13), so it stays down until the next agent start; the record below
+    // is what says it happened.
     // A GRACEFUL STAND-DOWN IS ULTIMATE: no clock, no deadline, no re-warn, no dom0 row, until
     // something starts it. Placed after the alive branch (which clears the latch) and before every
     // arming branch below, because the defect was that the stand-down held only for the pass that
@@ -4152,17 +4160,17 @@ static void BrokerSupervise(void)
         // A MAJOR FAILURE, not a hiccup: an eligible guest has no composite fallback while the broker is gone. This
         // agent relaunches nothing (owner, 2026-10-07); BrokerDeaths is the counter under the Qubes Tools config key.
         // After being ready, the broker stopped serving: toasts, menus and WinUI surfaces are withheld (no composite
-        // fallback). A hung instance is ended with its task disarmed first and nothing brings it back before the
-        // next agent start; a clean exit 0 is not restarted by Task Scheduler.
+        // fallback). A hung instance is ended with its task disarmed first; no instance that ran is brought back
+        // before the next agent start (Task Scheduler retries only a launch that failed, measured 2026-11-13).
         LogError("QGABROKERDIED de-slice broker STOPPED SERVING, no menus or toasts (death #%lu, pid was %ld), %s, BrokerDeaths=%lu",
             g_BrokerDeaths, (long)pidBefore,
             hung ? L"hung instance ended, not restarted"
-                 : L"Task Scheduler restarts it on failure (" HELPER_TASK_RESTART_INTERVAL L" x"
-                   HELPER_TASK_RESTART_COUNT L")",
+                 : L"exited, not restarted before the next agent start",
             g_BrokerDeaths);
         // Secondary route, DEGRADED - deliberately BELOW the route's ACTION threshold, so this is
-        // rejected and stays in the log; if the scheduler's restart does not take, QGADESLICEDOWN below
-        // escalates to ACTION 30 s later. Wired so the threshold is exercised by a real site.
+        // rejected and stays in the log; the dom0 row for this outage is the death report's, and
+        // QGADESLICEDOWN below keeps saying it in the log (QgaDesliceOwnedByDeath suppresses its row).
+        // Wired so the threshold is exercised by a real site.
         QerrReportText(QerrTextFind("broker-died"), NULL, NULL);
         // THE HUNG-BROKER REAP (R1: disarm first, then end). A hung broker holds the singleton mutex, its WGC sessions
         // and the shared section; it is ended by the validated handle - only our own wgcbroker.exe in the console
@@ -4200,8 +4208,8 @@ static void BrokerSupervise(void)
             hung ? L"It was running but stopped answering (a hang): the agent ended it, its task disarmed first, and "
                    L"nothing relaunches it before the next GUI agent start. gui-agent log lines QGABROKERHUNG and "
                    L"QGABROKERDIED name the stage it hung in."
-                 : L"Task Scheduler restarts it on failure (its task is armed: at most 3 times, a minute apart; a "
-                   L"clean exit is not restarted); the GUI agent itself relaunches nothing. gui-agent log lines "
+                 : L"Nothing relaunches it before the next GUI agent start: Task Scheduler restarts its task only "
+                   L"when the task cannot be launched, and the GUI agent relaunches nothing. gui-agent log lines "
                    L"QGABROKEREXIT and QGABROKERDIED; a crash also leaves a Windows Error Reporting record "
                    L"(AppCrash_wgcbroker.exe_*).");
     }
@@ -4392,7 +4400,9 @@ static void BrokerSupervise(void)
         // after a healthy run re-armed at a launch tick minutes old and complained instantly).
         const ULONGLONG anchor = QgaDesliceAnchor(g_WgcLaunched ? 1 : 0, g_WgcLastLaunch, g_BrokerReadyAt, now);
         g_BrokerDownSince = anchor;
-        // An exit-code death is one Task Scheduler restarts, so its first deadline is the restart budget.
+        // An exit-code death was taken to be one Task Scheduler restarts (measured 2026-11-13: it is not, HELPER
+        // LIFECYCLE), so its first deadline is the restart budget. That delays only this line and the flag: the
+        // dom0 row for a death is the death report's (QgaDesliceOwnedByDeath).
         g_BrokerNextWarn = anchor + QgaDesliceDeathGraceMs((brokerExited && brokerExitCode != 0) ? 1 : 0,
                                g_BrokerDeaths, HELPER_TASK_RESTART_COUNT_N,
                                HELPER_TASK_RESTART_BUDGET_MS, DESLICE_FIRST_WARN_MS);
@@ -4482,7 +4492,8 @@ static void BrokerSupervise(void)
 
     // THE ONE LAUNCH PER AGENT LIFE (HELPER LIFECYCLE above): once a console session with a shell exists, and never
     // into a session that is ending. No throttle, no retry - a launch that fails is said at ERROR and QGADESLICEDOWN
-    // escalates; Task Scheduler's restart-on-failure is the only relauncher of what did start.
+    // escalates; Task Scheduler's restart-on-failure retries only a launch that failed, and nothing relaunches what
+    // did start.
     // IT IS ISSUED ON ONE PASS AND REAPED ON ANOTHER (two blocks, in order, both on this thread
     // only), because the registration blocks - see WgcLaunchThreadProc for the measurement. The
     // guard that made it one launch per agent life still does: g_WgcLaunchState leaves 0 once and
@@ -4973,8 +4984,8 @@ static BOOL g_NotifRestorePending = FALSE;
 // Run notifhost.exe with the given arguments inside the interactive user session via a Task Scheduler task
 // registered from XML (HelperTaskRegister) - the same interactive-user launch as WgcLaunch, proven to put a
 // helper into the interactive session with a full user context (the run-as-user pattern the bridge's listener
-// was demonstrated under). resident: the bridge (Task Scheduler's restart-on-failure armed - its ONLY relauncher
-// since 2026-10-07); FALSE for a one-shot (a notify, the banner restore), which the scheduler must never retry.
+// was demonstrated under). resident: the bridge (Task Scheduler's restart-on-failure armed, which retries only a
+// launch that failed); FALSE for a one-shot (a notify, the banner restore), which the scheduler must never retry.
 // There is no child handle AT LAUNCH; callers watch their own signals (the bridge: its heartbeat file, then the
 // validated process handle taken from the pid it publishes there; the restore one-shot: its marker deletion).
 static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL resident)
@@ -5009,7 +5020,7 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL 
     WgcRunSchtasks(args, NULL, NULL, 0);
     if (!HelperTaskRegister(taskName, longExe, exeArgs, userId, resident,
             resident ? L"QWT: the GUI agent's notification bridge (re-created by the GUI agent at each of its starts; "
-                       L"restarted on failure by Task Scheduler, never by the agent)"
+                       L"Task Scheduler retries only a launch that failed; never relaunched by the agent)"
                      : L"QWT: a one-shot notification helper run by the GUI agent (not restarted)"))
     {
         LogWarning("NOTIFBRIDGE schtasks /create /xml failed (%s)", taskName);
@@ -5194,9 +5205,10 @@ static void NotifBridgeRestoreSweep(void)
 // sides and a change to one without the other is what this constant exists to make visible.
 #define QGA_NOTIFHOST_EXIT_ALREADY_RUNNING 4u
 
-// once (QGANOTIFBRIDGEEXIT + 4003) and left to Task Scheduler's restart-on-failure; READY = the pid an instance
-// publishes ONCE in its state file, read on the wake its ready event gives and accepted only from a file written
-// after the launch - or after the exit it replaces, which is how a scheduler-restarted instance is adopted. The
+// once (QGANOTIFBRIDGEEXIT + 4003) and not relaunched (Task Scheduler restarts nothing that ran, measured
+// 2026-11-13); READY = the pid an instance publishes ONCE in its state file, read on the wake its ready event gives
+// and accepted only from a file written after the launch - or after the exit it replaces, which would adopt an
+// instance started some other way. The
 // agent launches the bridge ONCE per its life. The bridge fails OPEN by construction (it restores ShowBanner on
 // every exit path and only suppresses while its dom0 connection is up), so a supervision gap costs dom0-native
 // prettiness, never a lost notification. Gate OFF: the only supervision left is the crash-leftover banner restore sweep.
@@ -5334,7 +5346,9 @@ static void NotifBridgeSupervise(void)
         // alone, so their own codes would relaunch a bridge that was deliberately stopped, or push
         // one into a session that is gone - and since 2026-10-07 nothing else relaunches it. Jev:
         // noise 0.90, relaunch hazard real 0.90, keep-zero-and-record-the-reason 0.92 against
-        // distinct-codes 0.00. So the bridge RECORDS why it left and this reads it.
+        // distinct-codes 0.00. So the bridge RECORDS why it left and this reads it. (The premise
+        // was measured false on 2026-11-13: an instance that ran is not restarted whatever its
+        // code - HELPER LIFECYCLE. Exit 0 and the recorded reason stay; they cost nothing.)
         //
         // THE PID IS THE POINT. The reason is accepted only from the instance that just exited, so
         // a file left by an earlier bridge can never excuse a later real death; an unreadable,
@@ -5420,21 +5434,21 @@ static void NotifBridgeSupervise(void)
         // toasts, not lost ones - which does not make it benign.
         // Detected by process wait. This agent relaunches nothing (owner, 2026-10-07); the reason is in bridge.log.
         LogError("QGANOTIFBRIDGEEXIT notification bridge pid %lu EXITED (exit code %lu): guest toasts take the "
-            L"window path until Task Scheduler restarts it (restart-on-failure " HELPER_TASK_RESTART_INTERVAL L" x"
-            HELPER_TASK_RESTART_COUNT L", a clean exit 0 is not restarted)",
+            L"window path until the next agent start (nothing relaunches it)",
             g_NotifBridgePid, exitCode);
         // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo): a crash
         // is in Windows Error Reporting already, a clean unasked exit is visible only here. ONE Event Log
         // entry under our source; the dom0 notification is the event-triggered reporter's job (ADR 3).
         DeathEventReport(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", g_NotifBridgePid, exitCode,
             g_NotifLastLaunch != 0 ? now - g_NotifLastLaunch : DEATHEVENT_RAN_UNKNOWN,
-            L"Task Scheduler restarts it on failure (its task is armed: at most 3 times, a minute apart; a clean exit "
-            L"is not restarted); the GUI agent itself relaunches nothing. bridge.log in Qubes Logs "
+            L"Nothing relaunches it before the next GUI agent start: Task Scheduler restarts its task only when the "
+            L"task cannot be launched, and the GUI agent relaunches nothing. bridge.log in Qubes Logs "
             L"names the reason; gui-agent log line QGANOTIFBRIDGEEXIT; a crash also leaves a Windows Error "
             L"Reporting record (AppCrash_notifhost.exe_*).");
         g_NotifBridgePid = 0;
-        // ADOPT WHAT THE SCHEDULER BRINGS BACK: a restarted instance publishes a heartbeat written AFTER this exit, so
-        // the READY path below looks again, accepting only ticks from now on. Nothing is launched by this agent.
+        // ADOPT ANYTHING THAT COMES BACK: Task Scheduler restarts nothing that ran (measured 2026-11-13), but an
+        // instance started some other way publishes a heartbeat written AFTER this exit, so the READY path below
+        // looks again, accepting only ticks from now on. Nothing is launched by this agent.
         g_NotifLaunchPending = TRUE;
         g_NotifLastLaunch = now;
         g_NotifNotReadyLogged = FALSE;
