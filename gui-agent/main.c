@@ -1631,8 +1631,41 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
             }
             else
             {
-                LogWarning("0x%x: inverted DWM bounds (%d,%d)-(%d,%d) and no usable GetWindowRect - rejecting",
-                    window, dwmRect.left, dwmRect.top, dwmRect.right, dwmRect.bottom);
+                // ONE WARNING PER WINDOW AND RECT. Every polling pass asks again for every window, so
+                // a window whose bounds stay inverted would warn once per pass for as long as it
+                // lives. The table remembers the last 16 (window, rect) pairs rejected here: the
+                // first rejection of a pair warns (the text the error ledger and the sweep baseline
+                // key on), its repeats are counted at DEBUG. A new rect for the same window is a new
+                // condition and warns again.
+                static SRWLOCK s_InvertedLock = SRWLOCK_INIT;
+                static struct { HWND Window; RECT Rect; ULONG Repeats; } s_Inverted[16];
+                static ULONG s_InvertedNext = 0;
+                ULONG repeats = 0;
+                BOOL seen = FALSE;
+                AcquireSRWLockExclusive(&s_InvertedLock);
+                for (ULONG i = 0; i < ARRAYSIZE(s_Inverted); i++)
+                {
+                    if (s_Inverted[i].Window == window && EqualRect(&s_Inverted[i].Rect, &dwmRect))
+                    {
+                        seen = TRUE;
+                        repeats = ++s_Inverted[i].Repeats;
+                        break;
+                    }
+                }
+                if (!seen)
+                {
+                    s_Inverted[s_InvertedNext].Window = window;
+                    s_Inverted[s_InvertedNext].Rect = dwmRect;
+                    s_Inverted[s_InvertedNext].Repeats = 0;
+                    s_InvertedNext = (s_InvertedNext + 1) % ARRAYSIZE(s_Inverted);
+                }
+                ReleaseSRWLockExclusive(&s_InvertedLock);
+                if (!seen)
+                    LogWarning("0x%x: inverted DWM bounds (%d,%d)-(%d,%d) and no usable GetWindowRect - rejecting",
+                        window, dwmRect.left, dwmRect.top, dwmRect.right, dwmRect.bottom);
+                else
+                    LogDebug("0x%x: inverted DWM bounds (%d,%d)-(%d,%d) - rejecting again, repeat %lu",
+                        window, dwmRect.left, dwmRect.top, dwmRect.right, dwmRect.bottom, repeats);
             }
             return ERROR_INVALID_DATA;
         }
