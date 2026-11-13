@@ -2744,6 +2744,16 @@ static void SynthDeactivate(IN OUT WINDOW_DATA* entry)
 // per-user hive are process-scoped.
 static BOOL SpawnHelperAsUser(IN HWND tokenSource, IN const WCHAR* args)
 {
+    // NEVER INTO A SESSION THAT IS GOING DOWN (docs/ADR-supervision.md 2b). HelpersDisarmed() is this process's own
+    // record of it - set at WM_QUERYENDSESSION and at this agent's exit, cleared by a cancelled end - and this
+    // process both writes and reads it, so the local flag is the whole mechanism. Nothing calls this today; a
+    // caller reads FALSE as "not done".
+    if (HelpersDisarmed())
+    {
+        LogInfo("QGAHELPERREFUSED helper '%s' not launched: helper launches are disarmed (the session is going down "
+            L"or this agent is exiting)", args);
+        return FALSE;
+    }
     DWORD pid = 0;
     GetWindowThreadProcessId(tokenSource, &pid);
     HANDLE proc = pid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid) : NULL;
@@ -4831,6 +4841,9 @@ static void DirectSuppressNotifyUser(IN DWORD count)
     // qrexec-client-vm), notifhost.exe being packaged, and dom0 policy. This is therefore a good
     // SECONDARY channel - independent of the GUI vchan, so it can report display faults - and NOT
     // a last-resort one: it cannot survive a dead qrexec.
+    // LAUNCHED EVEN WHILE THE SESSION IS GOING DOWN - a recorded exception to docs/ADR-supervision.md
+    // 2b, here and at QGASTARTDISMISS: refused, the notice would never reach dom0 and nothing sends it
+    // again. The process is windowless and delivers outside the session.
     WCHAR exe[MAX_PATH] = { 0 };
     if (GetModuleFileName(NULL, exe, RTL_NUMBER_OF(exe)))
     {
@@ -7014,6 +7027,11 @@ static BOOL CropReadyForMap(IN OUT WINDOW_DATA* entry)
 static BOOL g_SeamlessShadowsDone = FALSE;
 static BOOL ApplyGuestShadows(IN BOOL enable)
 {
+    // LAUNCHED EVEN WHILE THE SESSION IS GOING DOWN, in both directions - a recorded exception to
+    // docs/ADR-supervision.md 2b. The restore direction has no retry, and the seamless direction's only retry is
+    // DaemonSettleSweep, which runs when the main loop's wait TIMES OUT - a wait that is INFINITE on a quiet desktop -
+    // so a refusal here could leave the shadows wrong after a cancelled end until something times the loop out.
+    // What is refused is the sweep's REPEATED retry (DaemonSettleSweep), which loses nothing by skipping a pass.
     if (SpawnHelperInSession(enable ? L"--set-shadows 1" : L"--set-shadows 0"))
     {
         // The same helper also turns client-area animation OFF in both directions (the toast
@@ -7167,6 +7185,11 @@ static void RestyleGuestCaption(IN WINDOW_DATA* entry, IN BOOL hide)
     // the outer rect), so the geometry being announced below stays correct whether the helper
     // lands before or after it. Blocking the frame loop on a process spawn would be far worse
     // than a repaint.
+    //
+    // LAUNCHED EVEN WHILE THE SESSION IS GOING DOWN - a recorded exception to docs/ADR-supervision.md 2b. The windows
+    // announced during an end include the prompts that can cancel it ("save changes?"); refused, each would show
+    // the guest's own title bar under dom0's, and keep it after a cancelled end: a caption is stripped when its
+    // window is announced (AddWindow), and a window that stays announced is not stripped again.
     DWORD ownerPid = 0;
     GetWindowThreadProcessId(entry->Handle, &ownerPid);
     HANDLE proc = ownerPid ? OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, ownerPid) : NULL;
@@ -7992,7 +8015,11 @@ void DaemonSettleSweep(void)
     // turned into a permanent process-spawn treadmill: one CreateProcessAsUser and one WARN every
     // second, for the life of the session, while the log said only "will retry". Retrying for ever
     // is not a defined outcome - it is the same limbo as a wait with no terminal state.
-    if (g_SeamlessMode && !g_SeamlessShadowsDone && g_ShadowAttempts < SHADOW_APPLY_MAX_ATTEMPTS)
+    // NOT WHILE HELPER LAUNCHES ARE DISARMED (the session going down, or this agent exiting - docs/ADR-supervision.md
+    // 2b): the pass is skipped, so no helper is launched into the ending session, no attempt is spent and no 3 s
+    // helper wait lands on this thread during the end; a cancelled end resumes the retry where it stood.
+    if (g_SeamlessMode && !g_SeamlessShadowsDone && g_ShadowAttempts < SHADOW_APPLY_MAX_ATTEMPTS &&
+        !HelpersDisarmed())
     {
         g_SeamlessShadowsDone = ApplyGuestShadows(FALSE);
         if (g_SeamlessShadowsDone)

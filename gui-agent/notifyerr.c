@@ -468,6 +468,10 @@ static int PlatSpawnNotify(const char* notifyPath, int* exeMissing)
     if (!CreateProcessW(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
         return 0;
     CloseHandle(pi.hThread); CloseHandle(pi.hProcess);   /* fire and forget: no wait, ever */
+    /* LAUNCHED EVEN WHILE THE SESSION IS GOING DOWN - a recorded exception to docs/ADR-supervision.md 2b:
+     * refused, the notice would not reach dom0, and the route reads a spawn that did not happen as a transport
+     * failure, so ShowWindowFallback would put it up as an error box in the ending session instead. The process
+     * is windowless and delivers outside the session (qubes.Notifications through qrexec-client-vm). */
     return 1;
 }
 
