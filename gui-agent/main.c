@@ -4809,7 +4809,7 @@ static void BrokerShutdown(void)
 #define DIRECT_NOTIFY_REPEAT_MS (5u * 60u * 1000u)
 static ULONGLONG g_DirectNotifyNext = 0;
 static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL resident);   // defined below
-static void DirectSuppressNotifyUser(IN DWORD count)
+static void DirectSuppressNotifyUser(IN DWORD count, IN const WCHAR* fault)
 {
     // NOT AT BOOT. The broker's one launch waits for a shell, so EVERY cold boot has a window -
     // measured 10.8-11.6 s on an AppVM, 1.4-4.3 s on a StandaloneVM - in which a window is
@@ -4830,6 +4830,16 @@ static void DirectSuppressNotifyUser(IN DWORD count)
         LogInfo("QGADIRECTSUPPRESS: %lu withheld window(s) during startup - the display path is not "
             L"up yet, which is the designed path, so the user is NOT notified (the ERROR above stands)",
             count);
+        return;
+    }
+    // DEFINITIVE FAULTS ONLY. A withheld window whose first painted frame is merely late is an application still
+    // painting - a slow guest, a busy app - and it maps the instant that frame lands, so telling the user it "could
+    // not be shown" would be false. The user hears only of a state that waiting cannot resolve, as DirectSuppressFault
+    // names it; a capture session that goes silent has its own notice (QGAWGCDEAF). The ERROR at the call site stands.
+    if (!fault)
+    {
+        LogInfo("QGADIRECTSUPPRESS: not notified - no definitive fault (the broker is up and has not refused the "
+            L"window), a late first paint maps when it lands (the ERROR above stands; DirectSuppressed=%lu)", count);
         return;
     }
     // SEAMLESS MODE, SESSION GOING DOWN: not sent (docs/ADR-supervision.md item 2b, by mode), and before the throttle
@@ -4911,7 +4921,7 @@ static void DirectSuppressNotifyUser(IN DWORD count)
     else if (CreateProcess(NULL, cmd, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
     {
         CloseHandle(pi.hThread); CloseHandle(pi.hProcess);
-        LogInfo("QGADIRECTSUPPRESS: user notification sent (%lu suppressed window(s))", count);
+        LogInfo("QGADIRECTSUPPRESS: user notification sent (%lu suppressed window(s), fault %s)", count, fault);
     }
     else
     {
@@ -5898,6 +5908,26 @@ static BROKER_STATE BrokerState(void)
     ULONGLONG anchor = g_BrokerDownSince ? g_BrokerDownSince : g_AgentStartTick;
     ULONGLONG since = (now > anchor) ? (now - anchor) : 0;
     return (since < BROKER_LAUNCH_GRACE_MS) ? BRK_STARTING : BRK_DOWN;
+}
+
+// THE DEFINITIVE FAULT BEHIND A WITHHELD WINDOW, or NULL when there is none: a window whose broker is up and holds its
+// slot is only waiting for its first painted frame, maps the instant it lands, and is logged but never reported to the
+// user (DirectSuppressNotifyUser). Each non-NULL answer is a state that waiting does not resolve. A slot held FAILED with
+// WGCBRK_E_DEAF is left out: a deaf capture session has its own notice (QGAWGCDEAF), and counting it here too would tell
+// the user twice about one window. The slot an entry names is its own (the agent alone writes a slot's Hwnd and clears
+// PwBrokerSlot when it frees one), so it is read without matching the Hwnd.
+static const WCHAR* DirectSuppressFault(IN const WINDOW_DATA* entry)
+{
+    if (BrokerState() == BRK_DOWN)
+        return L"broker-down";
+    if (entry->PwBrokerSlot < 0)
+        return entry->PwRegFailLogged ? L"no-slot-or-arena" : NULL;   // QGABROKERREGFAIL said which
+    if (!g_WgcBase || entry->PwBrokerSlot >= WGCBRK_MAX_SLOTS)
+        return NULL;
+    const WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
+    if (s->AckState == WGCBRK_FAILED && s->FailHr != WGCBRK_E_DEAF)
+        return L"slot-refused";
+    return NULL;
 }
 
 void QgaNameThread(IN const WCHAR* name)
@@ -8246,6 +8276,9 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
     // window that lived and was never attributed anywhere is exactly what stage 1 exists
     // to surface, so the line goes out even when every counter but `seen` is zero.
     PwLedgerEmit(entry, L"destroy");
+    // Read before PwDetachWindow frees the broker slot: a slot the broker refused is a fact of that slot, gone once it is
+    // unregistered. Only a window we withheld can be reported as closed-while-withheld below.
+    const WCHAR* suppressFault = (entry && entry->PwDirectWaitLogged) ? DirectSuppressFault(entry) : NULL;
     // Stop per-window capture and queue its grant for revocation before any protocol
     // messages: the daemon releases its mapping on UNMAP/DESTROY below, after which
     // the queued revoke succeeds on a tick.
@@ -8363,7 +8396,7 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
             L"painted frame, never shown (brokerState=%d sliceFed=1 brokerSourced=%d frames=%lu DirectSuppressed=%lu)",
             (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height,
             (int)BrokerState(), entry->PwBrokerSourced, entry->PwBrokerFrames, g_DirectSuppressed);
-        DirectSuppressNotifyUser(g_DirectSuppressed);
+        DirectSuppressNotifyUser(g_DirectSuppressed, suppressFault);
     }
 
     free(entry);
@@ -11011,7 +11044,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                     windowData->Width, windowData->Height,
                     windowData->PwBrokerSourced, windowData->PwBrokerSlot,
                     WgcBrokerActive(), g_DirectSuppressed);
-                DirectSuppressNotifyUser(g_DirectSuppressed);
+                DirectSuppressNotifyUser(g_DirectSuppressed, DirectSuppressFault(windowData));
                 // The line above says "never received a frame" but tests "no PAINTED frame"; this one says which.
                 ToastFeedReport(windowData, L"suppressed");
             }
