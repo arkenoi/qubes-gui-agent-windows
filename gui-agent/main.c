@@ -11354,6 +11354,8 @@ static ULONG TrackWindows(OUT TRACK_STATS* stats)
     return status;
 }
 
+static void StartReplacementRefresh(void);   // defined with g_StartReplacement below; called beside WorkAreaEnsureApplied
+
 // Apply pending window events outside of frame processing. This is what makes
 // window moves reach the gui daemon at input rate instead of at capture rate.
 static void ProcessWindowEvents(void)
@@ -11404,6 +11406,9 @@ static void ProcessWindowEvents(void)
     // matching call). Self-rate-limited inside, and must run outside
     // g_csWatchedWindows: a re-assert does cross-process window calls.
     WorkAreaEnsureApplied();
+    // The menu key's replacement verdict, on the same two call sites for the same reason:
+    // self-rate-limited inside, and outside g_csWatchedWindows because it takes a process snapshot.
+    StartReplacementRefresh();
 
     if (status != ERROR_SUCCESS)
         win_perror2(status, "TrackWindows");
@@ -13565,10 +13570,24 @@ static void ShellImageConfigured(OUT WCHAR *image, IN size_t cch)
 // suppressed surface holding focus, which at least gets reported (Jev 0.74).
 static volatile LONG g_StartReplacement = 0;   // 0 = unknown, 1 = present, -1 = absent (enumerated)
 
+// Minimum spacing of the snapshots, so a replacement installed mid-session is seen within it.
+#define START_REPL_LOOK_MS 5000
+
 static void StartReplacementRefresh(void)
 {
     if (InterlockedCompareExchange(&g_StartReplacement, 0, 0) == 1)
         return;                                 // latched present: nothing can un-install it under us
+    // Looked for only while the answer can change the key's fate: the policy itself, asked as if no
+    // replacement ran, says whether it would drop the key. With the key blocked (the default), Start
+    // presented, or outside seamless, it would not, and no snapshot is taken.
+    if (QgaMenuKeyPolicy(g_SeamlessMode, g_BlockMenuKey, g_SeamlessStart, TRUE, FALSE)
+            != QGA_MENUKEY_DROP_UNCLOSABLE)
+        return;
+    static DWORD lastCheck;                     // main-loop thread only (both call sites)
+    const DWORD now = GetTickCount();
+    if (lastCheck != 0 && now - lastCheck < START_REPL_LOOK_MS)
+        return;
+    lastCheck = now;
     const DWORD csid = WTSGetActiveConsoleSessionId();
     if (csid == 0xFFFFFFFF)
         return;                                 // no console session: stays unknown, key forwarded
@@ -16691,6 +16710,7 @@ static ULONG WINAPI WatchForEvents(void)
                 // death, when only frames arrive.
                 InterlockedIncrement64(&g_C8WorkAreaApplied);   // LEDGER C8
                 WorkAreaEnsureApplied();
+                StartReplacementRefresh();   // the menu key's replacement verdict; see ProcessWindowEvents
             }
 
             if (capture)
