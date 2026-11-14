@@ -269,7 +269,7 @@ typedef struct _WGCBRK_SLOT {
      * instead of being argued about. Diagnostic only: the broker never decides on them. */
     volatile LONG     FramesArrived;     /* FrameArrived callbacks entered for this channel */
     volatile LONG     FramesPublished;   /* frames that reached the publish path */
-    volatile LONG     FramesDropSize;    /* dropped: ContentSize != pool size */
+    volatile LONG     FramesDropSize;    /* dropped: ContentSize != pool size, or a surface smaller than its content */
     volatile LONG     RecreateOk;        /* pool.Recreate() succeeded */
     volatile LONG     RecreateFail;      /* pool.Recreate() threw - the stale-pool trap */
     volatile LONG     LastContentW;      /* ContentSize of the most recent arrival */
