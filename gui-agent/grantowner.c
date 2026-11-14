@@ -52,6 +52,28 @@ struct _GRANT_OWNER
     XENCONTROL_LOG_LEVEL Level;
 };
 
+// XcGnttabPermitForeignAccess2 gives the driver an OVERLAPPED on its own stack and returns with the
+// IRP pending; the kernel writes the final status into that dead slot when the grant is revoked or
+// the handle closes. Issued from the revoke's frame, the slot is where the revoke's call into
+// DeviceIoControl keeps its return address, so a revoke zeroed the low half of it and the worker
+// executed 0x00007ffc00000000. The pad puts the slot below anything this thread calls later.
+// noinline is load-bearing - inlined, the pad joins GoWorker's frame and the two calls share it
+// again - and touching the pad after the call keeps the call from becoming a tail call.
+#define GO_PERMIT_PAD (64 * 1024)
+
+static __declspec(noinline) DWORD GoPermitBelowPad(GRANT_OWNER* o)
+{
+    volatile BYTE pad[GO_PERMIT_PAD];
+    DWORD status;
+
+    pad[0] = 0;
+    status = XcGnttabPermitForeignAccess2(o->Xc, o->RemoteDomain, o->Address, o->NumberPages,
+                                          o->NotifyOffset, o->NotifyPort, o->Flags,
+                                          o->SharedAddress, o->References);
+    pad[GO_PERMIT_PAD - 1] = 0;
+    return status;
+}
+
 static DWORD WINAPI GoWorker(LPVOID param)
 {
     GRANT_OWNER* o = (GRANT_OWNER*)param;
@@ -73,10 +95,7 @@ static DWORD WINAPI GoWorker(LPVOID param)
         switch (o->Op)
         {
         case GO_OP_GRANT:
-            o->Status = XcGnttabPermitForeignAccess2(o->Xc, o->RemoteDomain, o->Address,
-                                                     o->NumberPages, o->NotifyOffset,
-                                                     o->NotifyPort, o->Flags,
-                                                     o->SharedAddress, o->References);
+            o->Status = GoPermitBelowPad(o);
             break;
         case GO_OP_REVOKE:
             o->Status = XcGnttabRevokeForeignAccess(o->Xc, o->Revoke);
