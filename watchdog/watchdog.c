@@ -453,7 +453,7 @@ static void StopOwnAgent(IN HANDLE agentProcess, IN DWORD agentPid, IN const WCH
 // What this service does about an agent exit, decided by include/qga-lifecycle.h's table and said in the log and,
 // for a death, in the Event Log. Returns the verdict for the caller's state changes.
 static QGA_EXIT_VERDICT JudgeAgentExit(IN const WCHAR *exeName, IN DWORD agentPid, IN DWORD agentSession,
-    IN DWORD exitCode, IN BOOL noticeAcked, IN BOOL orderlyDone, IN ULONGLONG startedAt)
+    IN DWORD exitCode, IN BOOL exitKnown, IN BOOL noticeAcked, IN BOOL orderlyDone, IN ULONGLONG startedAt)
 {
     const QGA_EXIT_VERDICT v = QgaDecideAgentExit(exitCode, noticeAcked, orderlyDone);
     const ULONGLONG ranMs = startedAt != 0 ? GetTickCount64() - startedAt : DEATHEVENT_RAN_UNKNOWN;
@@ -555,7 +555,8 @@ static QGA_EXIT_VERDICT JudgeAgentExit(IN const WCHAR *exeName, IN DWORD agentPi
         // unasked exit is visible only here. ONE Event Log entry under our source, with the exit
         // code and how long it ran; the dom0 notification is the event-triggered reporter's job
         // (ADR 3), not this service's - nothing here waits on qrexec or on a session.
-        DeathEventReport(DEATHEVENT_ID_GUI_AGENT, exeName, agentPid, exitCode, ranMs,
+        DeathEventReport(DEATHEVENT_ID_GUI_AGENT, exeName, agentPid,
+            exitKnown ? (ULONGLONG)exitCode : DEATHEVENT_EXIT_UNKNOWN, ranMs,
             v.FailService
                 ? L"The QubesGuiWatchdog service ends itself so that Windows' service recovery restarts it (after 5 s, "
                   L"15 s, then 60 s) and the restarted service starts a new GUI agent. Its log and the agent's are in "
@@ -857,12 +858,14 @@ DWORD WINAPI WatchdogThread(void *param)
         {
             DWORD exitCode = 0;
             QGA_EXIT_VERDICT v;
-            if (!GetExitCodeProcess(agentProcess, &exitCode))
+            const BOOL exitKnown = GetExitCodeProcess(agentProcess, &exitCode);
+            if (!exitKnown)
                 exitCode = 0xFFFFFFFF;
             // Did the agent get to the END of its orderly exit before the system reaped it? Its own signal
             // answers that; the observed process code cannot (both cases arrive as 0x40010004).
             orderlyDone = (channel.Done != NULL && WaitForSingleObject(channel.Done, 0) == WAIT_OBJECT_0);
-            v = JudgeAgentExit(exeName, agentPid, agentSession, exitCode, noticeAcked, orderlyDone, startedAt);
+            v = JudgeAgentExit(exeName, agentPid, agentSession, exitCode, exitKnown, noticeAcked, orderlyDone,
+                startedAt);
             if (v.NoLaunchIntoSession)
                 endedSession = agentSession;
             if (v.Decision == QGA_DECIDE_NOGUI_LATCH)

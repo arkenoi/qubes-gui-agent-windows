@@ -952,7 +952,7 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
     }
 
     DWORD rc = (DWORD)-1;
-    GetExitCodeProcess(g_Proc, &rc);
+    const BOOL rcKnown = GetExitCodeProcess(g_Proc, &rc);
     DWORD pid = GetProcessId(g_Proc);
     ULONGLONG uptimeMs = GetTickCount64() - g_LaunchTick;
 
@@ -994,7 +994,8 @@ static VOID CALLBACK EtwProxyExitCb(PVOID context, BOOLEAN timedOut)
     // left EPS_RUNNING and returned above), so each is ONE Event Log entry under our source, with the
     // exit code and the run time, whatever this function then decides - park, or dead for this agent's
     // life. The dom0 notification is the event-triggered reporter's job (ADR 3); nothing here waits on anything.
-    DeathEventReport(DEATHEVENT_ID_ETWPROXY, L"etwproxy.exe", pid, rc, uptimeMs,
+    DeathEventReport(DEATHEVENT_ID_ETWPROXY, L"etwproxy.exe", pid,
+        rcKnown ? (ULONGLONG)rc : DEATHEVENT_EXIT_UNKNOWN, uptimeMs,
         (rc == ETWPROXY_EXIT_DENIED || rc == ETWPROXY_EXIT_BADTOKEN) ?
             L"A rights problem a relaunch cannot fix: the agent parks the ETW toast tier for this boot. "
             L"gui-agent log line ETWPROXYSUP; etw-proxy.log in the Qubes Tools log directory." :

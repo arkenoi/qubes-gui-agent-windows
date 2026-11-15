@@ -43,8 +43,7 @@
 //
 // HEADER-ONLY ON PURPOSE. The watchdog and the agent are separate binaries (vs2022/watchdog compiles
 // watchdog.c alone) and include/ is on both projects' include path (common.h comes from there). The
-// composer is pure - no I/O - so the offline suite (gui-agent/deathevent_test.c, gcc on the dev qube)
-// pins the contract; the writer is three Win32 calls, which that suite stubs.
+// composer is pure - no I/O; the writer is three Win32 calls.
 //
 // The exit code is written RAW. Its meaning (0xC0000409 = fast-fail, ...) is decoded in ONE place,
 // the reporter, so the text a human reads in dom0 and the text in our own deaths log cannot drift.
@@ -86,13 +85,14 @@
 
 // "I do not know": a supervisor that found a child gone without observing its exit has no exit
 // code; one that found it gone without a launch stamp has no run time. Both are written as the
-// word "unknown", never as 0.
-#define DEATHEVENT_EXIT_UNKNOWN     0xFFFFFFFFUL
+// word "unknown", never as 0. The exit sentinels lie above 32 bits: every DWORD is an exit code a
+// process can really carry (TerminateProcess(h, (UINT)-1), which Stop-Process uses, exits 0xFFFFFFFF).
+#define DEATHEVENT_EXIT_UNKNOWN     0x100000000ULL
 #define DEATHEVENT_RAN_UNKNOWN      ((ULONGLONG)-1)
 // A HANG IS NOT AN EXIT: a child that was still running but stopped answering, and that the
 // supervisor then ended itself, has no exit code of its own - the word "hung" is written in the
 // exit-code field, so the reporter renders a hang as a hang and never as "exited, code unknown".
-#define DEATHEVENT_EXIT_HUNG        0xFFFFFFFEUL
+#define DEATHEVENT_EXIT_HUNG        0x100000001ULL
 
 // The human name of each supervised child (the dom0 notification and the deaths log use the same
 // names - guest/qwt-report-death.ps1's table), and who supervises it.
@@ -143,35 +143,19 @@ static WORD DeathEventCompose(
     IN DWORD eventId,
     IN const WCHAR *exeName,
     IN DWORD pid,
-    IN DWORD exitCode,
+    IN ULONGLONG exitCode,
     IN ULONGLONG ranMs,
     IN const WCHAR *detail OPTIONAL)
 {
     WCHAR ran[64];
 
     ZeroMemory(ev, sizeof(*ev));
-#ifdef DEATHEVENT_DEFECT_SHAREDID
-    UNREFERENCED_PARAMETER(eventId);
-    ev->EventId = DEATHEVENT_ID_GUI_AGENT;       // DEFECT: every death looks like an agent death
-#else
     ev->EventId = eventId;
-#endif
-#ifdef DEATHEVENT_DEFECT_WARNING
-    ev->Type = EVENTLOG_WARNING_TYPE;            // DEFECT: "it is not fucking warning! it is a major error!"
-#else
     // A death is an ERROR (owner 2026-10-03: not a warning, a major error). A teardown is not a death
     // and must not paint the Application log red on every ordinary shutdown: INFORMATION.
     ev->Type = DEATHEVENT_ID_IS_TEARDOWN(ev->EventId) ? EVENTLOG_INFORMATION_TYPE : EVENTLOG_ERROR_TYPE;
-#endif
     StringCchCopyW(ev->Exe, RTL_NUMBER_OF(ev->Exe), (exeName && *exeName) ? exeName : L"?");
     StringCchPrintfW(ev->Pid, RTL_NUMBER_OF(ev->Pid), L"%lu", (unsigned long)pid);
-#ifdef DEATHEVENT_DEFECT_NOCODE
-    exitCode = DEATHEVENT_EXIT_UNKNOWN;          // DEFECT: the one fact a crash leaves behind is dropped
-#endif
-#ifdef DEATHEVENT_DEFECT_HANGASEXIT
-    if (exitCode == DEATHEVENT_EXIT_HUNG)
-        exitCode = DEATHEVENT_EXIT_UNKNOWN;      // DEFECT: a hang is written as an exit with no code (rz39 defect 2)
-#endif
     if (exitCode == DEATHEVENT_EXIT_UNKNOWN)
         StringCchCopyW(ev->ExitCode, RTL_NUMBER_OF(ev->ExitCode), L"unknown");
     else if (exitCode == DEATHEVENT_EXIT_HUNG)
@@ -225,13 +209,13 @@ static WORD DeathEventCompose(
 // A TEARDOWN, NOT A DEATH: the same record under the 4011-4014 id, INFORMATION, which the dom0 reporter
 // does not read. Call it where a supervisor can PROVE the system ended its child (the exit code
 // QGA_EXIT_SYSTEM_TERMINATED) rather than the child failing. Everything is recorded; only faults escalate.
-static BOOL DeathEventReport(IN DWORD eventId, IN const WCHAR *exeName, IN DWORD pid, IN DWORD exitCode,
+static BOOL DeathEventReport(IN DWORD eventId, IN const WCHAR *exeName, IN DWORD pid, IN ULONGLONG exitCode,
                              IN ULONGLONG ranMs, IN const WCHAR *detail OPTIONAL);
 static BOOL DeathEventReportTeardown(
     IN DWORD baseEventId,
     IN const WCHAR *exeName,
     IN DWORD pid,
-    IN DWORD exitCode,
+    IN ULONGLONG exitCode,
     IN ULONGLONG ranMs,
     IN const WCHAR *detail OPTIONAL)
 {
@@ -242,7 +226,7 @@ static BOOL DeathEventReport(
     IN DWORD eventId,
     IN const WCHAR *exeName,
     IN DWORD pid,
-    IN DWORD exitCode,
+    IN ULONGLONG exitCode,
     IN ULONGLONG ranMs,
     IN const WCHAR *detail OPTIONAL)
 {

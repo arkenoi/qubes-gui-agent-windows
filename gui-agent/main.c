@@ -3999,11 +3999,11 @@ static void BrokerSupervise(void)
     const LONG pidBefore = g_WgcBrokerPidValidated;   // for the death report: an exit clears it below
     // PROCESS EXIT IS THE DEATH SIGNAL. The validated handle (opened below on ready) sits in the main loop's wait array,
     // so an exit wakes the loop and lands here at once.
-    BOOL brokerExited = FALSE; DWORD brokerExitCode = 0;
+    BOOL brokerExited = FALSE; DWORD brokerExitCode = 0; BOOL brokerExitKnown = FALSE;
     if (g_WgcBrokerProc && WaitForSingleObject(g_WgcBrokerProc, 0) == WAIT_OBJECT_0)
     {
         brokerExited = TRUE;
-        GetExitCodeProcess(g_WgcBrokerProc, &brokerExitCode);
+        brokerExitKnown = GetExitCodeProcess(g_WgcBrokerProc, &brokerExitCode);
         CloseHandle(g_WgcBrokerProc); g_WgcBrokerProc = NULL;
         g_WgcBrokerHung = FALSE;
         _InterlockedExchange(&g_WgcBrokerPidValidated, 0);   // a dead broker must not keep suppressing windows
@@ -4253,7 +4253,8 @@ static void BrokerSupervise(void)
         // is kept for a death that is neither an observed exit nor an observed hang (the session
         // changed under it, the handle is gone).
         DeathEventReport(DEATHEVENT_ID_WGCBROKER, L"wgcbroker.exe", (DWORD)pidBefore,
-            brokerExited ? brokerExitCode : (hung ? DEATHEVENT_EXIT_HUNG : DEATHEVENT_EXIT_UNKNOWN),
+            (brokerExited && brokerExitKnown) ? (ULONGLONG)brokerExitCode
+                : (hung ? DEATHEVENT_EXIT_HUNG : DEATHEVENT_EXIT_UNKNOWN),
             g_BrokerReadyAt != 0 ? now - g_BrokerReadyAt : DEATHEVENT_RAN_UNKNOWN,
             hung ? L"It was running but stopped answering (a hang): the agent ended it, its task disarmed first, and "
                    L"nothing relaunches it before the next GUI agent start. gui-agent log lines QGABROKERHUNG and "
@@ -5401,7 +5402,8 @@ static void NotifBridgeSupervise(void)
     if (g_NotifBridgeProc && WaitForSingleObject(g_NotifBridgeProc, 0) == WAIT_OBJECT_0)
     {
         DWORD exitCode = 0;
-        if (!GetExitCodeProcess(g_NotifBridgeProc, &exitCode)) exitCode = 0xFFFFFFFF;
+        const BOOL exitKnown = GetExitCodeProcess(g_NotifBridgeProc, &exitCode);
+        if (!exitKnown) exitCode = 0xFFFFFFFF;
         CloseHandle(g_NotifBridgeProc); g_NotifBridgeProc = NULL;
         bridgeExited = TRUE;
         g_NotifBridgeExitedAt = now;
@@ -5537,7 +5539,8 @@ static void NotifBridgeSupervise(void)
         // THE ONE RECORD THE SYSTEM CANNOT WRITE ITSELF (docs/ADR-supervision.md 2, main repo): a crash
         // is in Windows Error Reporting already, a clean unasked exit is visible only here. ONE Event Log
         // entry under our source; the dom0 notification is the event-triggered reporter's job (ADR 3).
-        DeathEventReport(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", g_NotifBridgePid, exitCode,
+        DeathEventReport(DEATHEVENT_ID_NOTIFBRIDGE, L"notifhost.exe", g_NotifBridgePid,
+            exitKnown ? (ULONGLONG)exitCode : DEATHEVENT_EXIT_UNKNOWN,
             g_NotifLastLaunch != 0 ? now - g_NotifLastLaunch : DEATHEVENT_RAN_UNKNOWN,
             L"Nothing relaunches it before the next GUI agent start: Task Scheduler restarts its task only when the "
             L"task cannot be launched, and the GUI agent relaunches nothing. bridge.log in Qubes Logs "
