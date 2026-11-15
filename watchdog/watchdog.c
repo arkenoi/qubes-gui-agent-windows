@@ -151,6 +151,22 @@ BOOL IsProcessRunning(IN const WCHAR *exeName, OUT DWORD *processId OPTIONAL, OU
     {
         if (0 == _wcsnicmp(exeName, processInfo[i].pProcessName, wcslen(exeName))) // match
         {
+            // A process that has already exited stays in this list while anyone holds a handle to it -
+            // Windows Error Reporting does, while it writes up a crash of our own agent. Waiting on it
+            // returns at once, the launch path asks again, finds it again, and spins until the handle
+            // is let go. A match that cannot be opened is still counted, as before.
+            HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, processInfo[i].ProcessId);
+            if (h)
+            {
+                const BOOL exited = (WaitForSingleObject(h, 0) == WAIT_OBJECT_0);
+                CloseHandle(h);
+                if (exited)
+                {
+                    LogVerbose("%s: PID %d has exited and is only still listed - not a running process",
+                        processInfo[i].pProcessName, processInfo[i].ProcessId);
+                    continue;
+                }
+            }
             if (processId)
                 *processId = processInfo[i].ProcessId;
             if (sessionId)
