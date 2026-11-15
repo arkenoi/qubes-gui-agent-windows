@@ -100,6 +100,12 @@ typedef struct _TH_ENTRY
     // refused read holds to the bound - which is the safe direction - while a read that lands saying the
     // content did not change (a move, not a swap) opens the gate at once.
     BOOL      SwapGateReadPending;
+    // A DECIDED banner with a newer toast queued behind it, kept so its end can say whether Windows ever
+    // painted that toast into it: the queued toast's notification id as of the last tracking pass (0 =
+    // none), and the completed re-reads that still named this banner's own content while it was queued.
+    UINT32    QueuedNotif;
+    UINT      QueuedSameReads;
+    ULONGLONG QueuedLastSameRead;
     ULONGLONG LastUse;
 } TH_ENTRY;
 
@@ -408,6 +414,7 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // event may come, or its read lands before the new content. So a DECIDED banner re-reads on the
     // recheck tick while one is queued (below), and a reading that names it takes the content-changed path.
     BOOL successorQueued = FALSE;
+    UINT32 successorNotif = 0;
     if (!e->NotBanner && in.BridgeUp)
     {
         const LONG baseline = in.MatchFound ? in.MatchSeq : e->Core.RecordSeq;
@@ -418,7 +425,11 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             ULONGLONG due = 0;
             TH_IPC_RECORD eff = recs[i];
             if (ThConsumedHas(&g_ThCons, recs[i].Seq)) continue;   // some banner's own record: shown or suppressed already
-            if (queued[i].Eligible && recs[i].Seq > baseline) successorQueued = TRUE;
+            if (queued[i].Eligible && recs[i].Seq > baseline)
+            {
+                successorQueued = TRUE;
+                successorNotif = recs[i].NotifId;
+            }
             eff.Verdict = ThCoreDeadVerdict(recs[i].Seq, recs[i].Verdict, deadSeq);
             if (ThCorePreemptBy(&eff, baseline, now, &due))
             {
@@ -429,7 +440,23 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         }
     }
 
+    // A banner already on screen whose reading now names a different toast was swapped in place. When no
+    // window event closed the swap gate first, nothing is held, so nothing is released and no repaint is
+    // owed - and a slice-fed banner at rest gets no capture frame to carry the new content (main.c, the
+    // repaint debt). The show below then owes one itself.
+    const BOOL shownBefore = (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecShow);
+    const UINT64 identBefore = e->Core.Ident;
+
     ThCoreDecide(&e->Core, &in, now, &out);
+
+    const BOOL swappedInPlace = shownBefore && out.Decision == ThDecShow && e->Core.Ident != identBefore;
+    const UINT32 queuedNow = (successorQueued && e->Core.Phase == ThPhaseDecided) ? successorNotif : 0;
+    if (queuedNow != e->QueuedNotif)
+    {
+        e->QueuedNotif = queuedNow;
+        e->QueuedSameReads = 0;
+        e->QueuedLastSameRead = 0;
+    }
 
     if (out.ReleaseSeq)
         ThConsumedRemove(&g_ThCons, out.ReleaseSeq);
@@ -606,9 +633,11 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         }
     }
     ULONG framesHeld = 0;
+    BOOL ungated = FALSE;
     if (!out.GateFrames && !swapGateHold && out.Decision == ThDecShow &&
         SendWindowFrameUngate(entry->Handle, &framesHeld))
     {
+        ungated = TRUE;
         // Held frames left dom0 with the last one it received, and nothing else re-sends the current
         // content, so the ungate OWES this window a repaint. It is RECORDED here and sent by main.c's
         // region-aware release, which repaints rgnVisible - this window minus whatever is stacked above
@@ -654,6 +683,17 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
                 LogInfo("QGATOASTGATE hwnd=0x%x frames resumed after %lu held: the window carries a window-path "
                     L"toast again and has been repainted in full", hw, (ULONG)framesHeld);
         }
+    }
+    // The in-place swap no gate saw: the same debt, paid by the same region-aware release.
+    if (!ungated && swappedInPlace && !out.GateFrames && !swapGateHold && out.Decision == ThDecShow)
+    {
+        EnterCriticalSection(&g_ThLock);
+        TH_ENTRY* owed = ThFindLocked(entry->Handle);
+        if (owed)
+            owed->RepaintOwed = TRUE;
+        LeaveCriticalSection(&g_ThLock);
+        LogInfo("QGATOASTSWAP hwnd=0x%x id=%lu painted into the shown banner in place with no window event: a "
+            L"repaint is owed so dom0 is sent this toast's pixels", hw, (ULONG)notifForLog);
     }
     // A HELD OR SUPPRESSED WINDOW KEEPS ITS GATE, deliberately. Only a decision to SHOW opens it. An
     // unmapped window has no frames worth forwarding, and releasing the gate on the same pass that unmaps
@@ -871,17 +911,31 @@ void ToastHoldEvict(IN HWND window)
     if (!g_ThLockInit || !window) return;
     EnterCriticalSection(&g_ThLock);
     TH_ENTRY* e = ThFindLocked(window);
+    UINT32 queuedNotif = 0, ownNotif = 0;
+    UINT queuedSameReads = 0;
+    ULONGLONG sinceSameRead = 0;
     if (e)
     {
         // A record reserved for a hold that never resolved belongs to nobody now; a decided record
         // stays consumed (its banner was shown or suppressed).
         if (e->Core.Phase == ThPhaseHolding && e->Core.RecordSeq)
             ThConsumedRemove(&g_ThCons, e->Core.RecordSeq);
+        queuedNotif = e->QueuedNotif;
+        ownNotif = e->Core.NotifId;
+        queuedSameReads = e->QueuedSameReads;
+        sinceSameRead = e->QueuedLastSameRead ? GetTickCount64() - e->QueuedLastSameRead : 0;
         ZeroMemory(e, sizeof(*e));
         InterlockedDecrement(&g_ThEntryCount);
     }
     ThRecomputeDueLocked();
     LeaveCriticalSection(&g_ThLock);
+    // Whether Windows ever painted the queued toast here is otherwise unrecorded: a re-read that finds the
+    // same content logs nothing. One line per banner that ends with a newer toast still queued behind it.
+    if (queuedNotif)
+        LogInfo("QGATOASTQUEUED hwnd=0x%x destroyed with id=%lu still queued behind id=%lu: %u re-read(s) named "
+            L"id=%lu's content while it was queued, the last %llu ms before the destroy",
+            (DWORD)(ULONG_PTR)window, (ULONG)queuedNotif, (ULONG)ownNotif, queuedSameReads, (ULONG)ownNotif,
+            (unsigned long long)sinceSameRead);
     // A window destroyed while its frames were held must not leave its handle in a gate slot: the slot
     // would be spent for the life of the process, and a recycled HWND would be born gated. No repaint
     // here - the window is gone, and there is nothing left to repaint.
@@ -1019,6 +1073,11 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
         before = e->IdentValid ? e->Ident.Combined : 0;
         after = ident.Combined;
         changed = (before != after);
+        if (!changed && e->QueuedNotif)
+        {
+            e->QueuedSameReads++;
+            e->QueuedLastSameRead = now;
+        }
         e->Ident = ident;
         e->IdentValid = TRUE;
         e->MsgLen = msgLen;
