@@ -131,58 +131,6 @@ int wmain(int argc, WCHAR *argv[])
     return ERROR_SUCCESS;
 }
 
-// DETECTION ONLY. Finds a process by exe name so the watchdog can tell that an agent it did not
-// start is alive (and say so, QGAWDFOREIGN). The pid it returns is never adopted as our agent and
-// never terminated: the owner's rule (2026-10-03) is that a component touches only processes it
-// started, by handle - a process found by name is ANY process with that name.
-BOOL IsProcessRunning(IN const WCHAR *exeName, OUT DWORD *processId OPTIONAL, OUT DWORD *sessionId OPTIONAL)
-{
-    WTS_PROCESS_INFO *processInfo = NULL;
-    DWORD count = 0, i;
-    BOOL found = FALSE;
-
-    if (!WTSEnumerateProcesses(WTS_CURRENT_SERVER, 0, 1, &processInfo, &count))
-    {
-        win_perror("WTSEnumerateProcesses");
-        goto cleanup;
-    }
-
-    for (i = 0; i < count; i++)
-    {
-        if (0 == _wcsnicmp(exeName, processInfo[i].pProcessName, wcslen(exeName))) // match
-        {
-            // A process that has already exited stays in this list while anyone holds a handle to it -
-            // Windows Error Reporting does, while it writes up a crash of our own agent. Waiting on it
-            // returns at once, the launch path asks again, finds it again, and spins until the handle
-            // is let go. A match that cannot be opened is still counted, as before.
-            HANDLE h = OpenProcess(SYNCHRONIZE, FALSE, processInfo[i].ProcessId);
-            if (h)
-            {
-                const BOOL exited = (WaitForSingleObject(h, 0) == WAIT_OBJECT_0);
-                CloseHandle(h);
-                if (exited)
-                {
-                    LogVerbose("%s: PID %d has exited and is only still listed - not a running process",
-                        processInfo[i].pProcessName, processInfo[i].ProcessId);
-                    continue;
-                }
-            }
-            if (processId)
-                *processId = processInfo[i].ProcessId;
-            if (sessionId)
-                *sessionId = processInfo[i].SessionId;
-            LogVerbose("%s: PID %d, session %d", processInfo[i].pProcessName, processInfo[i].ProcessId, processInfo[i].SessionId);
-            found = TRUE;
-            break;
-        }
-    }
-
-cleanup:
-    if (processInfo)
-        WTSFreeMemory(processInfo);
-    return found;
-}
-
 // ---- the lifecycle channel (include/qga-lifecycle.h) --------------------------------------------------
 typedef struct _LIFECYCLE_CHANNEL
 {
@@ -612,12 +560,11 @@ DWORD WINAPI WatchdogThread(void *param)
     // no foreign agent). TRUE at service start - "service start with a console session present" is a trigger.
     BOOL launchWanted = TRUE;
     BOOL waitingForSession = FALSE;
-    // A same-named process this service did NOT start. Never adopted (owner's rule 2026-10-03:
-    // nothing is killed or adopted by NAME), never stopped; only WAITED ON, through this handle, so that
-    // no second agent is started while it lives (two agents fight for the vchan and the loser dies -
-    // main.c, the single-instance mutex), and reported once per episode (QGAWDFOREIGN).
-    HANDLE foreignProcess = NULL;
-    DWORD foreignPid = 0;
+    // An agent this service did NOT start, seen only through its liveness record (QGA_AGENT_ALIVE_NAME): the
+    // service holds a handle to the record and never to the process - not adopted, not stopped, only waited
+    // out, so that no second agent is started while it lives (two agents fight for the vchan), and reported
+    // once per episode (QGAWDFOREIGN). No process is looked for by image name (docs/ADR-supervision.md 8).
+    HANDLE foreignAlive = NULL;
     // The agent reported NO GUI DOMAIN this boot (include/qga-exitcodes.h): nothing is relaunched before the next boot.
     BOOL noGuiDomain = FALSE;
     // When the latch above was set, and whether its expiry has already been reported (see
@@ -634,10 +581,9 @@ DWORD WINAPI WatchdogThread(void *param)
         DWORD wait;
 
         // ---- a launch, if one is wanted and possible --------------------------------------------------------
-        if (launchWanted && !agentProcess && !foreignProcess && !noGuiDomain)   // QGA_NOGUI_NORELAUNCH
+        if (launchWanted && !agentProcess && !foreignAlive && !noGuiDomain)   // QGA_NOGUI_NORELAUNCH
         {
             DWORD consoleSession = WTSGetActiveConsoleSessionId();
-            DWORD pid = 0, sid = 0;
             if (consoleSession == NO_SESSION)
             {
                 // No console session yet (early boot, or changing): nothing can be started. The arrival event wakes us.
@@ -673,27 +619,23 @@ DWORD WINAPI WatchdogThread(void *param)
                 endedSessionAt = GetTickCount64();
                 continue;
             }
-            else if (IsProcessRunning(exeName, &pid, &sid))
+            else if ((foreignAlive = OpenMutexW(SYNCHRONIZE, FALSE, QGA_AGENT_ALIVE_NAME)) != NULL ||
+                     GetLastError() != ERROR_FILE_NOT_FOUND)
             {
-                // Is the gui agent running already? Our handle is authoritative; without one, a same-named process
-                // may exist. It is NOT ours: never adopted, never stopped - reported once per episode as an anomaly,
-                // with pid and session, and waited out through a separate handle so that no second agent is started
-                // while it lives. The launch stays wanted and happens when it exits.
-                foreignProcess = OpenProcess(SYNCHRONIZE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-                if (foreignProcess)
-                    foreignPid = pid;
-                else
-                    win_perror("OpenProcess(foreign agent, SYNCHRONIZE)");
-                LogError("QGAWDFOREIGN '%s' (PID %u, session %u) is running but was NOT started by this service - "
-                    L"not adopted, not stopped, and no second agent is started while it lives (%s)",
-                    exeName, pid, sid,
-                    foreignProcess ? L"waiting on its handle" : L"it cannot be opened - the service ends with a failure "
-                                                                   L"code so the SCM's recovery looks again");
-                if (!foreignProcess)
+                // An agent is alive and it is not the one this service holds (it holds none here): its liveness
+                // record exists. Reported once per episode and waited out on the record; the launch stays wanted
+                // and happens when that agent ends. A record that exists but cannot be opened cannot be waited on:
+                // the service ends with a failure code so the SCM's recovery looks again.
+                if (!foreignAlive)
                 {
+                    win_perror("OpenMutex(" QGA_AGENT_ALIVE_NAME L")");
+                    LogError("QGAWDFOREIGN '%s' not launched: the agent liveness record cannot be opened - the service "
+                        L"ends with a failure code so the SCM's recovery looks again", exeName);
                     InterlockedExchange(&g_ServiceFailCode, (LONG)QGA_SVC_EXIT_LAUNCH_FAILED);
                     break;
                 }
+                LogError("QGAWDFOREIGN an agent this service did not start holds " QGA_AGENT_ALIVE_NAME L" - not adopted, "
+                    L"not stopped, and no second '%s' is started until it ends", exeName);
                 waitingForSession = FALSE;
             }
             else
@@ -742,9 +684,9 @@ DWORD WINAPI WatchdogThread(void *param)
             idxNotice = waitCount; waitHandles[waitCount++] = channel.Notice;
             idxContinue = waitCount; waitHandles[waitCount++] = channel.Continue;
         }
-        else if (foreignProcess)
+        else if (foreignAlive)
         {
-            idxProcess = waitCount; waitHandles[waitCount++] = foreignProcess;   // waited on, never acted on
+            idxProcess = waitCount; waitHandles[waitCount++] = foreignAlive;   // the record, never the process
         }
 
         // The wait has a deadline ONLY while a latched session has no agent left in it: that is the one state that
@@ -805,9 +747,10 @@ DWORD WINAPI WatchdogThread(void *param)
             // A SESSION ARRIVED (logon / console connect): a launch trigger when no agent of ours runs, for any
             // session but one that announced its end.
             DWORD sid = (DWORD)InterlockedCompareExchange(&g_ArriveSession, -1, -1);
-            if (agentProcess || foreignProcess)
-                LogInfo("QGAWDTRIGGER session %u arrived while an agent runs (PID %u) - nothing to launch", sid,
-                    agentProcess ? agentPid : foreignPid);
+            if (agentProcess)
+                LogInfo("QGAWDTRIGGER session %u arrived while an agent runs (PID %u) - nothing to launch", sid, agentPid);
+            else if (foreignAlive)
+                LogInfo("QGAWDTRIGGER session %u arrived while an agent this service did not start runs - nothing to launch", sid);
             else if (sid == endedSession)
                 LogInfo("QGAWDTRIGGER session %u arrived but it announced its end and has not ended - not a launch trigger", sid);
             else
@@ -904,17 +847,15 @@ DWORD WINAPI WatchdogThread(void *param)
             }
             continue;
         }
-        if (foreignProcess && wait == WAIT_OBJECT_0 + idxProcess)
+        if (foreignAlive && (wait == WAIT_OBJECT_0 + idxProcess || wait == WAIT_ABANDONED_0 + idxProcess))
         {
-            // A stranger we were waiting out has exited: say so; the deferred launch happens at the top of the loop.
-            DWORD exitCode = 0;
-            if (!GetExitCodeProcess(foreignProcess, &exitCode))
-                exitCode = 0xFFFFFFFF;
-            LogInfo("QGAWDFOREIGN the '%s' this service did not start (PID %u) has exited with code 0x%x - "
-                L"the deferred launch proceeds", exeName, foreignPid, exitCode);
-            CloseHandle(foreignProcess);
-            foreignProcess = NULL;
-            foreignPid = 0;
+            // The agent we were waiting out has ended: its record was abandoned and this wait now owns it. Released
+            // and closed at once, so the record no longer exists for the launch that follows at the top of the loop.
+            LogInfo("QGAWDFOREIGN the '%s' this service did not start has ended (%s) - the deferred launch proceeds",
+                exeName, wait == WAIT_ABANDONED_0 + idxProcess ? L"record abandoned" : L"record released");
+            ReleaseMutex(foreignAlive);
+            CloseHandle(foreignAlive);
+            foreignAlive = NULL;
             launchWanted = TRUE;
             continue;
         }
@@ -927,11 +868,11 @@ DWORD WINAPI WatchdogThread(void *param)
     // agent to stop; the service ends and the SCM restarts it.
     if (agentProcess)
         StopOwnAgent(agentProcess, agentPid, exeName, &channel);
-    if (foreignProcess)
+    if (foreignAlive)
     {
-        LogError("QGAWDFOREIGN service stopping while '%s' (PID %u), which this service did not start, is running - "
-            L"left running, not ours", exeName, foreignPid);
-        CloseHandle(foreignProcess);
+        LogError("QGAWDFOREIGN service stopping while a '%s' this service did not start is running - left running, "
+            L"not ours", exeName);
+        CloseHandle(foreignAlive);
     }
     return ERROR_SUCCESS;
 }

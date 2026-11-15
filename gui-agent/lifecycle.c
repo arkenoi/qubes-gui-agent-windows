@@ -31,6 +31,7 @@ static HANDLE g_Ack = NULL;
 static HANDLE g_Continue = NULL;
 static HANDLE g_Done = NULL;                  // agent -> service: the orderly exit COMPLETED (qga-lifecycle.h)
 static HANDLE g_WindowReady = NULL;           // manual-reset: the window thread has its window (or gave up)
+static HANDLE g_AgentAlive = NULL;            // QGA_AGENT_ALIVE_NAME, owned by the main thread for the process's life
 static HWND g_Window = NULL;
 // The session THIS agent published as going down (QgaGoingDownSet), or QGA_NO_SESSION when nothing was
 // published - a failed publish must not be followed by releasing a latch this agent does not own.
@@ -270,6 +271,29 @@ void LifecycleStart(void)
     WCHAR name[96];
     const DWORD pid = GetCurrentProcessId();
     HANDLE thread;
+
+    // Called from WinMain, so the main thread owns the liveness record and it is abandoned only when the process ends.
+    {
+        PSECURITY_DESCRIPTOR sd = NULL;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptor(QGA_LIFECYCLE_SDDL, SDDL_REVISION_1, &sd, NULL) && sd)
+        {
+            SECURITY_ATTRIBUTES sa = { sizeof(sa), sd, FALSE };
+            g_AgentAlive = CreateMutex(&sa, TRUE, QGA_AGENT_ALIVE_NAME);
+            const DWORD gle = GetLastError();
+            LocalFree(sd);
+            if (g_AgentAlive && gle == ERROR_ALREADY_EXISTS)
+            {
+                CloseHandle(g_AgentAlive);
+                g_AgentAlive = NULL;
+                LogError("QGALIFECYCLE another agent holds " QGA_AGENT_ALIVE_NAME L" - this instance is not the one the "
+                    L"service sees as alive");
+            }
+            else if (!g_AgentAlive)
+                win_perror("CreateMutex(" QGA_AGENT_ALIVE_NAME L")");
+        }
+        else
+            win_perror("ConvertStringSecurityDescriptorToSecurityDescriptor(agent liveness record)");
+    }
 
     g_ExitDone = CreateEvent(NULL, TRUE, FALSE, NULL);
     g_WindowReady = CreateEvent(NULL, TRUE, FALSE, NULL);

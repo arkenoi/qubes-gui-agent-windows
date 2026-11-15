@@ -71,6 +71,13 @@
 // else may signal "my session is ending" for an agent, or acknowledge it.
 #define QGA_LIFECYCLE_SDDL          L"D:P(A;;GA;;;SY)"
 
+// THE AGENT'S LIVENESS RECORD. The agent creates this mutex OWNED, on its main thread, as its first act, and holds
+// it until the process ends, when the kernel abandons it - also for a process that has exited but is still listed
+// because something holds a handle to it. The service reads "an agent is alive" from the object existing, and
+// learns that agent has gone by waiting on it (docs/ADR-supervision.md 8: no process is looked for by image name).
+// An instance that finds it already existing does not own it and closes its handle, so only the owner keeps it.
+#define QGA_AGENT_ALIVE_NAME        L"Global\\QGA_AGENT_ALIVE"
+
 // ---- THE GOING-DOWN LATCH: a durable FACT, where the channel above is a MESSAGE -------------------------
 //
 // WHY A SECOND THING AT ALL. The channel tells the service that this session is ending, and the service
