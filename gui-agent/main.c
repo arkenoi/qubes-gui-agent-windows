@@ -808,6 +808,10 @@ HANDLE g_ShutdownEvent = NULL;
 // Explorer's Win10 ribbon, so this fires without Office installed. See ShouldAcceptWindow().
 #define SCENIC_DROPSHADOW_CLASS L"SCENIC_DROPSHADOW_WINDOW_CLASS"
 
+// The shell's drag image: the thumbnail and drop tip that follow the cursor in a file drag.
+// See ShouldAcceptWindow().
+#define SHELL_DRAGIMAGE_CLASS L"SysDragImage"
+
 // Written by the hook thread, drained by the main loop.
 static CRITICAL_SECTION g_csWindowEvents;
 static HWND g_PendingWindows[PENDING_WINDOWS_MAX];
@@ -9926,6 +9930,30 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
                 (DWORD)(ULONG_PTR)data->Owner, ownerData->Width, ownerData->Height, ownerData->X, ownerData->Y);
             return FALSE;
         }
+    }
+
+    // THE DRAG IMAGE IS SHOWN BY THE WINDOWS BENEATH IT. It is an ownerless WS_POPUP |
+    // WS_EX_TOOLWINDOW | WS_EX_LAYERED window with per-pixel alpha, and most of it is transparent
+    // around the thumbnail and the drop tip: measured on a 390x130 Explorer drag image, 71-78% of
+    // its pixels alpha 0. Captured on its own, that transparency arrives premultiplied as opaque
+    // black, and announced to dom0 (which has no alpha) it is a black box following the cursor.
+    //
+    // The broker sets IncludeSecondaryWindows, under which Windows draws a WS_POPUP or
+    // WS_EX_TOOLWINDOW window into the frames of a captured window it intersects, when only such
+    // windows lie between them in z-order, with its real transparency, clipped to that window; the
+    // documented rule names no owner and no process. Measured: the Explorer window
+    // under the drag carried the thumbnail and the drop tip, blended, at every point sampled. So it
+    // is not announced at all. What is lost is only the part over no captured guest window, which
+    // in seamless mode is another qube or dom0's own desktop.
+    //
+    // Only while the broker is active, as for the owned popup above: the broker is what composites
+    // it. Below the direct floor the window comes from the composited desktop, already blended, and
+    // keeps its own dom0 window. LogVerbose: the image moves at input rate and this runs on every move.
+    if (0 == wcscmp(data->Class, SHELL_DRAGIMAGE_CLASS) && WgcBrokerActive())
+    {
+        LogVerbose("0x%x: drag image (%ux%u at %d,%d) not announced - the captured windows beneath carry it",
+            (DWORD)(ULONG_PTR)data->Handle, data->Width, data->Height, data->X, data->Y);
+        return FALSE;
     }
 
     if (data->DeletePending)
