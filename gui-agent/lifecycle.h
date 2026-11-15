@@ -26,6 +26,8 @@ DWORD LifecycleLatchExit(IN DWORD code);
 DWORD LifecycleExitCode(void);
 // TRUE from WM_QUERYENDSESSION until a WM_ENDSESSION(FALSE) cancels it.
 BOOL LifecycleSessionEnding(void);
+// How many WTS session notifications and end-session messages (or cancellations) the lifecycle window has had.
+LONG LifecycleSessionEventSeq(void);
 // WinMain, right before it returns: the orderly exit has run. The end-session handler waits on this.
 // The ORDERLY CONTRACT is satisfied - call it where the last orderly step finishes, not where the
 // main thread leaves. Idempotent (the event is manual-reset).

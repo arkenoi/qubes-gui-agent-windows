@@ -545,34 +545,34 @@ static __inline QGA_HELPER_STOP_OUTCOME QgaHelperStopOutcome(IN BOOL sessionEndi
 // window alone a guest that really IS locked at that moment would be graded PRE_SHELL and degrade to the 30 s
 // path's 10-minute backstop - the "report it, ONCE" half of the owner's rule traded away for the "never assume"
 // half, which he stated in one sentence. So when the reading says LOCK and no window was seen, the verdict turns
-// on ONE desktop-independent fact: whether a shell PROCESS runs in the console session (main.c reads it from the
-// same Toolhelp pass that finds LogonUI/consent, matched to the console session). Present -> a real lock met by
+// on ONE desktop-independent fact: whether the session's shell is up on its Default desktop (main.c asks from a thread
+// attached to Default: GetShellWindow, or a visible window owned by the configured shell). Present -> a real lock met by
 // a fresh agent, reported; absent -> PRE_SHELL; unreadable -> NO_FACT, said at WARNING - never silently "absent",
 // never a lock. A user-name read would not do: WTSUserName is set at logon success, before any shell exists.
 //   NO_FACT    a fact the verdict needs could not be read: the query failed, a level the union does not document,
-//              a flags value that is neither LOCK nor UNLOCK, or - on the LOCK-without-window path - the process
-//              list. Never a lock. WTS_SESSIONSTATE_LOCK is 0, so a ZEROED buffer reads as a lock unless the level
+//              a flags value that is neither LOCK nor UNLOCK, or - on the LOCK-without-window path - the Default
+//              desktop probe. Never a lock. WTS_SESSIONSTATE_LOCK is 0, so a ZEROED buffer reads as a lock unless the level
 //              is checked - this arm is what stands between that and a dom0 notification.
 //   TEARDOWN   the session is ending: a teardown, whatever the flags say (a console user is present, LogonUI is up).
 //   UNLOCKED   read: WTS_SESSIONSTATE_UNLOCK. A fact, and not a lock (a logon in progress, a UAC prompt).
-//   PRE_SHELL  read: LOCK, no shell window seen by this instance AND no shell process in the session: the session
+//   PRE_SHELL  read: LOCK, no shell window seen by this instance AND no shell on the Default desktop: the session
 //              has not reached a shell. LOGGED with its facts, never reported.
-//   LOCKED     read: LOCK, no teardown, and a shell either SEEN (the window) or FOUND (the process). The one arm
+//   LOCKED     read: LOCK, no teardown, and a shell either SEEN (the window) or FOUND (the Default probe). The one arm
 //              that reports - at once, once per boot (the once is notifyerr.c's persisted marker, not this header's).
 // `shellProcess` is read ONLY on the LOCK-without-window path and is UNREAD everywhere else (the earlier arms
 // return first, so an UNREAD value is never consulted where it was not needed). `infoLevel` is WTSINFOEX.Level as
 // read, 0 when nothing was read; `sessionFlags` likewise, UNKNOWN when nothing was.
 // Two knobs, each the measured or the reviewed defect, each required to make the suite FAIL:
 //   QGA_LIFECYCLE_DEFECT_PRESHELLLOCK     a LOCK reading is asserted with no shell seen or found (the measured one)
-//   QGA_LIFECYCLE_DEFECT_SHELLPROCSILENT  an UNREADABLE process list is read as "no shell" (the silent-skip shape)
+//   QGA_LIFECYCLE_DEFECT_SHELLPROCSILENT  an UNREADABLE Default probe is read as "no shell" (the silent-skip shape)
 #define QGA_WTS_SESSIONSTATE_LOCK     0x00000000UL   // wtsapi32.h's WTS_SESSIONSTATE_LOCK, mirrored so this header
 #define QGA_WTS_SESSIONSTATE_UNLOCK   0x00000001UL   // stays pure and the suite builds without that header;
 #define QGA_WTS_SESSIONSTATE_UNKNOWN  0xFFFFFFFFUL   // main.c C_ASSERTs each against the real one
 typedef enum _QGA_SHELL_PROCESS
 {
-    QGA_SHELLPROC_UNREAD = 0,   // not read: not needed on this path, or the process list could not be snapshotted
-    QGA_SHELLPROC_ABSENT,       // the list was read: no shell process runs in the console session
-    QGA_SHELLPROC_PRESENT       // the list was read: a shell process runs in the console session
+    QGA_SHELLPROC_UNREAD = 0,   // not read: not needed on this path, or the Default desktop could not be probed
+    QGA_SHELLPROC_ABSENT,       // probed: no shell window and no window of the configured shell on Default
+    QGA_SHELLPROC_PRESENT       // probed: the shell window, or a window of the configured shell, is on Default
 } QGA_SHELL_PROCESS;
 typedef enum _QGA_LOCK_VERDICT
 {
