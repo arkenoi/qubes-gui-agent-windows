@@ -11,6 +11,7 @@
  */
 #include <windows.h>
 #include <strsafe.h>
+#include <wtsapi32.h>   // WTSRegisterSessionNotification: the lock verdict re-reads on the session's own events
 
 #include <log.h>
 
@@ -31,6 +32,7 @@ static HANDLE g_Ack = NULL;
 static HANDLE g_Continue = NULL;
 static HANDLE g_Done = NULL;                  // agent -> service: the orderly exit COMPLETED (qga-lifecycle.h)
 static HANDLE g_WindowReady = NULL;           // manual-reset: the window thread has its window (or gave up)
+static HANDLE g_AgentAlive = NULL;            // QGA_AGENT_ALIVE_NAME, owned by the main thread for the process's life
 static HWND g_Window = NULL;
 // The session THIS agent published as going down (QgaGoingDownSet), or QGA_NO_SESSION when nothing was
 // published - a failed publish must not be followed by releasing a latch this agent does not own.
@@ -52,6 +54,29 @@ DWORD LifecycleExitCode(void)
 BOOL LifecycleSessionEnding(void)
 {
     return InterlockedCompareExchange(&g_SessionEnding, 0, 0) != 0;
+}
+
+// Every WTS session notification (lock, unlock, logon, logoff, ...) and every end-session message or cancellation
+// this window received: what the lock verdict compares to decide whether its facts can have changed.
+static volatile LONG g_SessionEventSeq = 0;
+
+LONG LifecycleSessionEventSeq(void)
+{
+    return InterlockedCompareExchange(&g_SessionEventSeq, 0, 0);
+}
+
+static const WCHAR *SessionEventName(IN WPARAM code)
+{
+    switch (code)
+    {
+    case WTS_SESSION_LOCK:   return L"lock";
+    case WTS_SESSION_UNLOCK: return L"unlock";
+    case WTS_SESSION_LOGON:  return L"logon";
+    case WTS_SESSION_LOGOFF: return L"logoff";
+    case WTS_CONSOLE_CONNECT:    return L"console-connect";
+    case WTS_CONSOLE_DISCONNECT: return L"console-disconnect";
+    default:                 return L"other";
+    }
 }
 
 // THE ORDERLY CONTRACT IS SATISFIED. Separate from LifecycleExitDone because the two meanings were
@@ -98,6 +123,7 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         // vetoed here - a shutdown is not ours to refuse.
         const BOOL logoff = (lp & ENDSESSION_LOGOFF) != 0;
         InterlockedExchange(&g_SessionEnding, 1);
+        InterlockedIncrement(&g_SessionEventSeq);
         LogInfo("QGAENDSESSION Windows is ending this session (%s, lParam 0x%Ix) - helper launches disarmed first, "
             L"then the service is told", logoff ? L"logoff" : L"shutdown", (ULONG_PTR)lp);
         HelpersDisarm(L"the session is ending");
@@ -196,6 +222,7 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         // The end was cancelled by another application's veto: the session continues, with everything re-armed
         // (the helper launches), telling the service so through the continue event.
         InterlockedExchange(&g_SessionEnding, 0);
+        InterlockedIncrement(&g_SessionEventSeq);
         LogWarning("QGAENDSESSION session end CANCELLED, the session continues; helpers re-armed");
         HelpersRearm();
         NotifHoldPublishGoingDown();
@@ -223,6 +250,12 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
         }
         if (g_Continue && !SetEvent(g_Continue))
             win_perror("SetEvent(lifecycle continue)");
+        return 0;
+    case WM_WTSSESSION_CHANGE:
+        // The session's own word that something changed: counted, so the lock verdict re-reads its facts on the
+        // next frame instead of on a clock, and said once per event.
+        InterlockedIncrement(&g_SessionEventSeq);
+        LogInfo("QGASESSIONEVT %s (code %Iu, session %Id)", SessionEventName(wp), (ULONG_PTR)wp, (LONG_PTR)lp);
         return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);
@@ -252,6 +285,12 @@ static DWORD WINAPI LifecycleWindowThread(void *param)
                               0, 0, 0, 0, NULL, NULL, wc.hInstance, NULL);
     if (!g_Window)
         win_perror("CreateWindowEx(lifecycle window)");
+    // This session's lock, unlock, logon and logoff come to this window as WM_WTSSESSION_CHANGE. Without them the
+    // lock verdict still reads at the start of every secure-desktop episode, but a lock that follows within one
+    // episode is not re-read: said at ERROR.
+    if (g_Window && !WTSRegisterSessionNotification(g_Window, NOTIFY_FOR_THIS_SESSION))
+        LogError("QGASESSIONEVT session notifications unavailable (error 0x%x): the lock verdict reads only at the "
+            L"start of each secure-desktop episode", GetLastError());
     SetEvent(g_WindowReady);
     if (!g_Window)
         return ERROR_SUCCESS;
@@ -270,6 +309,29 @@ void LifecycleStart(void)
     WCHAR name[96];
     const DWORD pid = GetCurrentProcessId();
     HANDLE thread;
+
+    // Called from WinMain, so the main thread owns the liveness record and it is abandoned only when the process ends.
+    {
+        PSECURITY_DESCRIPTOR sd = NULL;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptor(QGA_LIFECYCLE_SDDL, SDDL_REVISION_1, &sd, NULL) && sd)
+        {
+            SECURITY_ATTRIBUTES sa = { sizeof(sa), sd, FALSE };
+            g_AgentAlive = CreateMutex(&sa, TRUE, QGA_AGENT_ALIVE_NAME);
+            const DWORD gle = GetLastError();
+            LocalFree(sd);
+            if (g_AgentAlive && gle == ERROR_ALREADY_EXISTS)
+            {
+                CloseHandle(g_AgentAlive);
+                g_AgentAlive = NULL;
+                LogError("QGALIFECYCLE another agent holds " QGA_AGENT_ALIVE_NAME L" - this instance is not the one the "
+                    L"service sees as alive");
+            }
+            else if (!g_AgentAlive)
+                win_perror("CreateMutex(" QGA_AGENT_ALIVE_NAME L")");
+        }
+        else
+            win_perror("ConvertStringSecurityDescriptorToSecurityDescriptor(agent liveness record)");
+    }
 
     g_ExitDone = CreateEvent(NULL, TRUE, FALSE, NULL);
     g_WindowReady = CreateEvent(NULL, TRUE, FALSE, NULL);
