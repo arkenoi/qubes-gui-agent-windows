@@ -293,15 +293,14 @@ QerrDecision QerrReportText(const QerrText* t, const char* idOverride, const cha
         return QERR_REJECT_NAME;
     }
     if (!QerrFormatHeader(header, sizeof(header), t->header, headerArg) ||
-        !QerrFormatTechLine(tech, sizeof(tech), t->subject, PlatPid(), t->code, NULL,
-                            t->count ? t->count : "reported once per boot", t->evidence, g_QerrBuild))
+        !QerrFormatTechLine(tech, sizeof(tech), t->subject, PlatPid(), t->code, NULL, t->count, t->evidence,
+                            g_QerrBuild))
     {
         PlatLog("NOTIFYERR %s.%s not sent: the header or the technical line did not render",
                 t->component, idOverride ? idOverride : t->id);
         return QERR_REJECT_REDACT;
     }
-    return QerrReport(t->component, idOverride ? idOverride : t->id, t->sev, header, t->next,
-                      t->cause, tech);
+    return QerrReport(t->component, idOverride ? idOverride : t->id, t->sev, header, t->next, NULL, tech);
 }
 
 /* ========================================================================================= */
