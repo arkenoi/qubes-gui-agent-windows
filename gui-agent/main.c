@@ -302,7 +302,7 @@ static LONG g_WgcBrokerPidSeen = 0;        // last published broker pid accounte
 // broker's CtlAck catches up (0 = nothing outstanding). Unanswered for WGCBRK_ACK_DEADLINE_MS = a hung broker.
 static LONG      g_SlotCtlWant[WGCBRK_MAX_SLOTS];
 static ULONGLONG g_SlotCtlSince[WGCBRK_MAX_SLOTS];
-// QGAWGCDEAF is said once per request: the ControlSeq it was said for, per slot (0 = not said).
+// QGAWGCDEAF is said once per hold: the ControlSeq it was said for, per slot (0 = not said, or revived since).
 static LONG      g_SlotDeafSaid[WGCBRK_MAX_SLOTS];
 // QGAWGCRECREATE: the broker's QuietReroutes per slot as last reported (a recreate is reported when it moves).
 static LONG      g_SlotQuietSeen[WGCBRK_MAX_SLOTS];
@@ -3703,9 +3703,10 @@ static ULONGLONG BrokerNextDue(void)
     return due;
 }
 
-// QGAWGCDEAF (rest-zero E): the broker declared a slot's WGC session deaf - silent through a first frame or an own-change
-// poke, recreated once, silent again - and holds it FAILED with WGCBRK_E_DEAF until it is asked again. Said once per
-// request, published as WgcDeaf for the harness. The window keeps its last content (or stays withheld): there is no
+// QGAWGCDEAF (rest-zero E): the broker declared a slot's WGC session deaf - a key or click unanswered, recreated once,
+// and the fresh session still silent when the next one went unanswered - and holds it FAILED with WGCBRK_E_DEAF until that
+// session delivers after all (QGAWGCREVIVED) or the slot is asked again. Said once per hold, published as WgcDeaf for
+// the harness. The window keeps its last content (or stays withheld): there is no
 // PrintWindow route under it any more (c2: 0.05).
 // The user-facing half of QGAWGCDEAF (ADR-capture 32). The id carries the app's image name reduced to [a-z0-9-] (the route's
 // name rule), so each deaf app is reported once per boot; the text is the "capture-deaf" row of notifytexts.h, its header
@@ -3851,22 +3852,34 @@ static void BrokerReportDeaf(void)
                     (ULONGLONG)s->Hwnd, i, ic, s->ChanOpens);
             g_SlotClosedSeen[i] = ic;
         }
+        const LONG seq = s->ControlSeq;
+        // QGAWGCREVIVED: a slot reported deaf for this request is ACTIVE again - the broker keeps a deaf session open, and
+        // a first frame that was only late lands. Said, because the QGAWGCDEAF before it would otherwise be the last word
+        // on a window that is live. The dom0 notice already sent stays sent; a later hold under the same request is said
+        // again.
+        if (g_SlotDeafSaid[i] == seq && s->ReqState == WGCBRK_REQUESTED && s->AckState == WGCBRK_ACTIVE)
+        {
+            g_SlotDeafSaid[i] = 0;
+            LogWarning("QGAWGCREVIVED hwnd 0x%llx slot %d: the capture session held deaf delivered after all, the "
+                L"window is live again (deaf holds %ld, sessions opened %ld)",
+                (ULONGLONG)s->Hwnd, i, s->DeafHolds, s->ChanOpens);
+            continue;
+        }
         if (s->ReqState != WGCBRK_REQUESTED || s->AckState != WGCBRK_FAILED || s->FailHr != WGCBRK_E_DEAF)
             continue;
-        const LONG seq = s->ControlSeq;
         if (g_SlotDeafSaid[i] == seq)
             continue;
         g_SlotDeafSaid[i] = seq;
         (void)CfgWriteDword(NULL, REG_CONFIG_WGC_DEAF_VALUE, ++g_WgcDeafCount, NULL);
         // There is no PrintWindow fallback for a deaf slot; WgcDeaf is the counter under the Qubes Tools config key.
-        LogError("QGAWGCDEAF hwnd 0x%llx slot %d: WGC delivered no first frame or own-change poke within %u ms, "
-            L"recreated once, silent again: held FAILED by the broker, the window keeps its last content until "
-            L"re-registered (deaf holds %ld, WgcDeaf=%lu)",
+        LogError("QGAWGCDEAF hwnd 0x%llx slot %d: held FAILED by the broker - its recreated capture session delivered "
+            L"nothing and a key or click went unanswered for %u ms - the window keeps its last content until that "
+            L"session delivers (QGAWGCREVIVED) or the window is registered again (deaf holds %ld, WgcDeaf=%lu)",
             (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, s->DeafHolds, g_WgcDeafCount);
         // NO SILENT REGRESSIONS (owner 2026-10-02: "fail loudly (including user facing message) if capture really goes
-        // deaf someday"). A deaf hold is the product not delivering a window, and nothing here recovers it: the user is told
-        // in dom0 through the agent's error route (notifyerr: ACTION, one notification per app per boot, at most
-        // QERR_CAP_PER_BOOT per boot), naming the app by its image name - never a window title.
+        // deaf someday"). A deaf hold is the product not delivering a window: the user is told in dom0 through the agent's
+        // error route (notifyerr: ACTION, one notification per app per boot, at most QERR_CAP_PER_BOOT per boot), naming
+        // the app by its image name - never a window title.
         DeafNotifyUser((HWND)(ULONG_PTR)s->Hwnd);
     }
 }
