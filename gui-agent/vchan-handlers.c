@@ -428,19 +428,6 @@ static DWORD HandleKeypress(IN HWND window)
         }
     }
 
-    // A KEY PRESS THIS AGENT FORWARDS is a promise that the window may change: the broker's PrintWindow
-    // route renders only when told, and a WGC session that leaves it unanswered is recreated, then held DEAF
-    // (ADR-capture 32 point 2: liveness is checked when a key is DELIVERED). So the poke comes only after the
-    // menu-key drop above, and only for a press. It used to be the first statement: a Super press the policy
-    // drops still poked, and its release - which always passes, and changes nothing - poked again. Measured
-    // 2026-11-19 on GWeck's environment (German 25H2, 4.3.45, enableWinKey 1, no Open-Shell): a dom0 key that
-    // changed nothing in Explorer made the broker recreate its session 4 of 4 times (QGAWGCRECREATE), and on a
-    // loaded guest a recreate ends in "Window stopped updating: explorer" (forum 42717 #225, GWECK-STATUS 44).
-    // A release no longer pokes: WGC delivers the window's own changes as arrivals, so this costs a liveness
-    // question, never a frame (Jev presses_after_drop 0.88).
-    if (keyMsg.type == KeyPress)
-        BrokerPokeWindow(window);
-
     inputEvent.type = INPUT_KEYBOARD;
     inputEvent.ki.time = 0;
     inputEvent.ki.wScan = 0;
@@ -474,10 +461,6 @@ static DWORD HandleKeypress(IN HWND window)
 static DWORD HandleButton(IN HWND window)
 {
     _InterlockedIncrement(&g_InButton);
-    // Input for this window: its pixels are about to change, and the broker's PrintWindow
-    // path renders only when told. Desktop-duplication damage does not cover this class of
-    // window (measured), so input is the signal that keeps interaction responsive.
-    BrokerPokeWindow(window);
     struct msg_button buttonMsg;
 
     LogVerbose("0x%x", window);
@@ -794,10 +777,6 @@ static DWORD HandleCrossing(IN HWND window)
 static DWORD HandleMotion(IN HWND window)
 {
     _InterlockedIncrement(&g_InMotion);
-    // Pointer motion pokes only a slot the broker renders on request (the PrintWindow route): a menu's highlight follows
-    // the pointer and that render is how it is captured. A WGC slot is NOT poked on motion - motion promises no change,
-    // and an unanswered poke made the broker recreate healthy sessions (BrokerPokeWindowMotion, measured 2026-10-01).
-    BrokerPokeWindowMotion(window);
     struct msg_motion motionMsg;
 
     LogVerbose("0x%x", window);

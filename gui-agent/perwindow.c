@@ -524,11 +524,11 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
 
     // Windows PrintWindow cannot capture still get their own buffer, fed from the
     // composited screen framebuffer by the frame loop (see PwSliceFed in main.h).
-    // docs/ADR-capture.md section 18: on a direct-capable guest (26100+, broker eligible - DirectRequired, decided at
+    // docs/ADR-capture.md section 18: on a direct-capable guest (25H2+, broker eligible - DirectRequired, decided at
     // start) EVERY window is fed from its own WGC capture through the broker, an ordinary window too. PrintWindow asks
     // the application to paint - a Windows 11 Notepad repaints for it, and the repaint is the next change (the idle
     // burn, 2026-09-30) - and the composited desktop is slicing, which the owner is removing entirely; WGC is neither,
-    // and it delivers a frame only when that window's own content changed. Below 26100 there is no broker, and an
+    // and it delivers a frame only when that window's own content changed. Below 25H2 there is no broker, and an
     // ordinary window keeps the PrintWindow engine as before.
     const BOOL sliceFed = !PwWindowEligible(entry) || DirectRequired();
 
@@ -713,7 +713,7 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     // and the one-shot QGASLICEBLACK diagnostic (PwNoteSliceContent: copied-but-black hold).
     entry->PwHoldLogged = FALSE;
     entry->PwSliceBlackLogged = FALSE;
-    // WGC broker (24H2+): source this sliceFed window's pixels from the user-session broker's
+    // WGC broker (25H2+): source this sliceFed window's pixels from the user-session broker's
     // per-HWND WGC capture. Every sliceFed window is attempted; no-op (returns FALSE) unless
     // the broker is active. Toasts are not sliceFed and never reach here.
     if (entry->PwBrokerKeep)

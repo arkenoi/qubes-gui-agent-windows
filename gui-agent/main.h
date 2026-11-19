@@ -177,15 +177,6 @@ typedef struct _WINDOW_DATA
     // release_mapped_mfns), so the re-map must re-announce the buffer first, as ToggleMap does, or the banner comes back with
     // no image. Set at that unmap, cleared when the buffer is re-announced.
     BOOL ToastHoldUnmapped;
-    // Rest-zero E: the signature of this window's VISIBLE region (its rect + the opaque rects above it) on the last frame
-    // that carried damage. A damage poke needs it unchanged: damage while it changes is reveal/occlusion, not W's own.
-    UINT64 PwVisSig;
-    BOOL PwVisSigValid;
-    // Rest-zero, the held-menu echo: the desktop pixels inside this PrintWindow slot's rect at its last damage poke. A
-    // render makes Windows present the window again with the same pixels; damage whose pixels did not change pokes nothing.
-    UINT64 PwPixSig;
-    BOOL PwPixSigValid;
-    ULONG PwEchoSkips;      // damage pokes withheld because the pixels had not changed (QGAPWECHO)
     // QGACOMPOSITECOPY said for this window (M4: a composite copy on a DirectRequired guest is an error, said once).
     BOOL PwCompositeLogged;
 
@@ -369,7 +360,7 @@ typedef struct _WINDOW_DATA
     BOOL PwSliceFed;
     BOOL PwSliceNeedsFull; // one full-window copy pending (fresh attach/remap)
 
-    // WGC broker (24H2+): this sliceFed window's pixels come from the user-session broker's
+    // WGC broker (25H2+): this sliceFed window's pixels come from the user-session broker's
     // per-HWND WGC capture instead of the composited-desktop slice. See BrokerRegister/
     // BrokerFreshFrame in main.c. IT DOES NOT FALL BACK TO THE SLICE WHERE DirectRequired():
     // this said "falls back to the slice whenever no fresh broker frame" until 2026-10-31, which
@@ -377,7 +368,7 @@ typedef struct _WINDOW_DATA
     // `else if (DirectRequired())` arm ABOVE both composite-copy arms and HOLDS the window's last
     // content instead (owner 2026-09-06: "no fallback on a system that supports the direct path"),
     // and PwNoteCompositeCopy makes a composite copy there a per-window ERROR. The fallback is
-    // real only where the direct path is not eligible: win10, below the 26100 floor, WgcBroker=0.
+    // real only where the direct path is not eligible: win10, below the broker floor (25H2), WgcBroker=0.
     // Set for the duration of a RESIZE rebuild when the broker slot can be kept and merely
     // retargeted instead of released and re-acquired. A Win11 menu resizes repeatedly while it
     // opens, and every resize used to release the slot: the broker's Reconcile then CLOSED the
@@ -639,8 +630,8 @@ typedef struct _WINDOW_DATA
     // named this invariant as the thing the plan was missing (0.78).
     PW_WINDOW_CLASS PwLedgerClass;       // as the ROUTER decided it, never recomputed here
     ULONG64 PwLedgerFramesSeen;          // passes over this window while mapped
-    ULONG64 PwLedgerBrokerWgc;           // broker frame consumed, slot not routed to PrintWindow
-    ULONG64 PwLedgerBrokerPw;            // broker frame consumed, slot routed to PrintWindow
+    ULONG64 PwLedgerBrokerWgc;           // broker frame consumed
+    ULONG64 PwLedgerBrokerPw;            // always 0: the broker has no PrintWindow route (ADR-capture 36); QGALEDGER keeps the column
     ULONG64 PwLedgerDdaSlice;            // C1: PwSliceCopyAndDamage out of the framebuffer
     ULONG64 PwLedgerDdaOwned;            // C4: the DDA-owned foreground channel
     ULONG64 PwLedgerDragSlice;           // C3: PwDragSliceRefresh during an input drag
@@ -717,10 +708,6 @@ void QgaNameThread(IN const WCHAR* name);
 // is broker-fed: the capture thread then copies nothing out of the desktop (rest-zero S2). Read racily by that thread.
 BOOL DesktopImageWanted(void);
 BOOL BrokerRegister(IN OUT WINDOW_DATA* entry);
-// Tell the broker a window's pixels are likely to have changed. Called from the input path:
-// desktop-duplication damage is measured not to cover cross-process-content windows.
-void BrokerPokeWindow(IN HWND window);
-void BrokerPokeWindowMotion(IN HWND window);
 // TRUE when a resize can keep this window's existing broker slot: it is registered, the slot is
 // still ours, and the new size still fits the arena buffers the slot already owns.
 BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG newHeight);

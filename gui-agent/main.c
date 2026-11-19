@@ -191,12 +191,13 @@ BOOL g_NoScreenGrant = TRUE;
 
 // WGC capture broker (DESIGN-wgc-broker.md): user-session helper that captures OCCLUDED
 // app/NRB windows via Windows.Graphics.Capture (which the SYSTEM agent itself cannot
-// activate) and streams frames through a cross-session shared section. Win11 24H2+ (26100)
+// activate) and streams frames through a cross-session shared section. Win11 25H2+ (26200)
 // only; feature-gated (registry "WgcBroker" / qubesdb /qubes-service/wgc-broker), default
 // OFF (experimental). Stage 2a here is section+spawn+supervise ONLY (no consumer): it can
 // never affect rendering. Toasts/o-r menus are NOT routed here (topmost, slice-correct; the
 // toast interceptor handles toasts). See wgcbroker_ipc.h for the contract.
 #define REG_CONFIG_WGC_BROKER_VALUE L"WgcBroker"
+#define WGC_BROKER_BUILD_FLOOR 26200u   // 25H2: the broker, slice retirement and de-slice run here and later (ADR-capture 36)
 // FlattenCorners: Win11 rounds window corners at DWM composition and the broker's capture grabs
 // that composited result, so the rounded-out corner triangles arrive TRANSPARENT and dom0 renders
 // them as BLACK. Owner, watching menus 2026-09-11: "corners are black". Rather than plumb a
@@ -237,15 +238,15 @@ BOOL          g_NotifBridge = TRUE;
 // whether the agent's own faults reach dom0.
 #define REG_CONFIG_NOTIF_ERRORS_VALUE L"NotifyErrors"
 BOOL          g_NotifyErrors = TRUE;
-// Slice retirement (broker-only sliceFed handling) is the SHIPPED behaviour on 24H2+ and tracks
+// Slice retirement (broker-only sliceFed handling) is the SHIPPED behaviour on 25H2+ and tracks
 // the broker build floor unconditionally; the SliceRetire diagnostic knob is retired. Field
 // kill-switch: WgcBroker=0 / /qubes-service/wgc-broker=0 - broker inactive routes every sliceFed
 // window to the retained agent DDA slice. (An earlier comment here claimed toasts are "covered
 // by the notifhost interceptor" - that component was never launched by anything; toasts render
 // on the same o-r shell-surface path as menus, cropped by toastcrop.)
 BOOL          g_WgcBroker   = FALSE;
-BOOL          g_SliceRetire = FALSE;   // broker-era sliceFed handling; set once at init: TRUE iff build >= 26100 (knob retired)
-BOOL          g_DeSlice = FALSE;       // DERIVED at init (g_SliceRetire && build >= 26100), not a
+BOOL          g_SliceRetire = FALSE;   // broker-era sliceFed handling; set once at init: TRUE iff build >= WGC_BROKER_BUILD_FLOOR (knob retired)
+BOOL          g_DeSlice = FALSE;       // DERIVED at init (g_SliceRetire && build >= WGC_BROKER_BUILD_FLOOR), not a
                                        // knob: every surface is per-window (synth + materialized
                                        // deferred until ready). The whole-desktop monitor composite
                                        // (MONSLICE/CreateForMonitor) it used to gate was proven
@@ -304,9 +305,7 @@ static LONG      g_SlotCtlWant[WGCBRK_MAX_SLOTS];
 static ULONGLONG g_SlotCtlSince[WGCBRK_MAX_SLOTS];
 // QGAWGCDEAF is said once per request: the ControlSeq it was said for, per slot (0 = not said).
 static LONG      g_SlotDeafSaid[WGCBRK_MAX_SLOTS];
-// QGAWGCRECREATE: the broker's QuietReroutes per slot as last reported (a recreate is reported when it moves).
-static LONG      g_SlotQuietSeen[WGCBRK_MAX_SLOTS];
-// QGAWGCITEMCLOSED: the broker's ItemClosed per slot as last reported (baseline at each registration, like the above).
+// QGAWGCITEMCLOSED: the broker's ItemClosed per slot as last reported (baseline at each registration).
 static LONG      g_SlotClosedSeen[WGCBRK_MAX_SLOTS];
 // Count of WGC sessions the broker declared DEAF (FAILED + WGCBRK_E_DEAF), published like DirectSuppressed: acceptance
 // asserts 0 (M7).
@@ -3621,7 +3620,7 @@ static BOOL BrokerAckOverdue(IN ULONGLONG now, OUT int* slotOut, OUT ULONGLONG* 
         if (!g_SlotCtlSince[i]) continue;
         if ((LONG)((ULONG)slots[i].CtlAck - (ULONG)g_SlotCtlWant[i]) >= 0) { g_SlotCtlSince[i] = 0; continue; }
         if (now - g_SlotCtlSince[i] >= WGCBRK_ACK_DEADLINE_MS && now - g_BrokerProgressAt >= WGCBRK_ACK_DEADLINE_MS &&
-            now - g_BrokerStageAt >= WgcbrkStageBudgetMs(WGCBRK_STAGE_CODE(g_BrokerStageSeen)))   // GUARD:stagebudget
+            now - g_BrokerStageAt >= WgcbrkStageBudgetMs(WGCBRK_STAGE_CODE(g_BrokerStageSeen)))
         {
             *slotOut = i; *ageOut = now - g_SlotCtlSince[i];
             return TRUE;
@@ -3672,7 +3671,7 @@ static BOOL BrokerHangConfirm(IN BOOL overdue, IN ULONGLONG now, IN int slot, IN
 // that brings the shell, not for a spin.
 static ULONGLONG BrokerNextDue(void)
 {
-    if (!g_WgcBroker || g_OsBuild < 26100 || !PwEnabled() || !g_WgcBase) return 0;
+    if (!g_WgcBroker || g_OsBuild < WGC_BROKER_BUILD_FLOOR || !PwEnabled() || !g_WgcBase) return 0;
     const ULONGLONG now = GetTickCount64();
     ULONGLONG due = 0;
     if (g_BrokerReady)
@@ -3703,10 +3702,10 @@ static ULONGLONG BrokerNextDue(void)
     return due;
 }
 
-// QGAWGCDEAF (rest-zero E): the broker declared a slot's WGC session deaf - silent through a first frame or an own-change
-// poke, recreated once, silent again - and holds it FAILED with WGCBRK_E_DEAF until it is asked again. Said once per
-// request, published as WgcDeaf for the harness. The window keeps its last content (or stays withheld): there is no
-// PrintWindow route under it any more (c2: 0.05).
+// QGAWGCDEAF (rest-zero E): the broker declared a slot's WGC session deaf - Windows closed its capture item, the broker
+// reopened it once, and the reopened item was closed again before it delivered a frame - and holds it FAILED with
+// WGCBRK_E_DEAF until it is asked again. Said once per request, published as WgcDeaf for the harness. The window keeps
+// its last content (or stays withheld): nothing else captures it.
 // The user-facing half of QGAWGCDEAF (ADR-capture 32). The id carries the app's image name reduced to [a-z0-9-] (the route's
 // name rule), so each deaf app is reported once per boot; the text is the "capture-deaf" row of notifytexts.h, its header
 // naming the app (the image name without ".exe" - a human name, not a file name); the generic row when there is no name.
@@ -3800,44 +3799,6 @@ static void BrokerReportDeaf(void)
     for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
     {
         const WGCBRK_SLOT* s = &slots[i];
-        // A RECREATE IS A FALLBACK FIRING, SO IT IS SAID (fallbacks-are-anomalies): the broker closed a session that
-        // left a poke unanswered for WGCBRK_WGC_QUIET_MS and opened a fresh one. Since ADR-capture 32 the poke comes from
-        // a key or click into the window (BrokerPokeWindow): either that key's change was one WGC did not deliver, or the
-        // session had stopped delivering. The broker counts cumulatively per slot; the baseline is taken at each
-        // registration (BrokerRegister), so a reused slot's earlier count is not reported against the new window.
-        const LONG qr = s->QuietReroutes;
-        if (qr != g_SlotQuietSeen[i])
-        {
-            if (s->Hwnd != 0 && qr > g_SlotQuietSeen[i])
-            {
-                // SAY WHAT THIS CODE READ, NOT WHAT IT GUESSED. The old line claimed "a key or click got no frame",
-                // and the agent reads ONLY this counter out of shared memory: it cannot know a key or click was
-                // involved. It is not even the right attribution - PokeSeq is bumped when the window's pixels
-                // ACTUALLY CHANGED (see its comment in wgcbroker_ipc.h), so what went unanswered is a CONTENT CHANGE.
-                // MEASURED 2026-10-19, release 4.3.37 acceptance, win11-appvm cell, agent pid 4472:
-                //   004653.661  I QGARAISE skipped hwnd 0x30068 - own pixels (sliceFed=1 directRequired=1)
-                //   004657.363  W QGAWGCRECREATE hwnd 0x30068 slot 0: ... a key or click got no frame for 2000 ms
-                //   004704.352  I PwDetachWindow: 0x30068: per-window buffer 3828x1017 detached (slice-fed)
-                // The cell sends NO keys and NO clicks - it maps a Notepad window and photographs it - and the
-                // capture SUCCEEDED at 3828x1017. Jev: claim_supported 0.21, report_what_it_reads 0.86.
-                //
-                // AND THE LEVEL NOW COMES FROM WHETHER A SESSION THAT WAS WORKING STOPPED. A slot that has NEVER
-                // published is the case the recreate was BUILT for - Windows closes a UWP app's first capture item as
-                // it launches (26100.1742: Calculator stayed on its splash until poked) - so the repair working is
-                // not an anomaly. A slot that HAD been publishing and then went quiet is the anomalous one, and it
-                // keeps the warning (fallbacks-are-anomalies applies to the fallback that covers a REGRESSION).
-                const LONG published = s->FramesPublished;
-                if (published > 0)
-                    LogWarning("QGAWGCRECREATE hwnd 0x%llx slot %d: capture session recreated after a content change "
-                        L"went unrendered for %u ms, having published %ld frame(s) (quiet reroutes %ld, sessions opened %ld)",
-                        (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, published, qr, s->ChanOpens);
-                else
-                    LogInfo("QGAWGCRECREATE hwnd 0x%llx slot %d: first capture session published nothing in %u ms and "
-                        L"was recreated (quiet reroutes %ld, sessions opened %ld)",
-                        (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, qr, s->ChanOpens);
-            }
-            g_SlotQuietSeen[i] = qr;
-        }
         // WINDOWS CLOSED THE WINDOW'S CAPTURE ITEM - said, because the broker now repairs it on its own initiative: it
         // reopens the session at once (a UWP app's first item is closed as it launches on 26100.1742 - Calculator stayed on
         // its splash in dom0 until poked, 2026-10-01). A second closure before the reopened item delivered goes DEAF.
@@ -3858,11 +3819,11 @@ static void BrokerReportDeaf(void)
             continue;
         g_SlotDeafSaid[i] = seq;
         (void)CfgWriteDword(NULL, REG_CONFIG_WGC_DEAF_VALUE, ++g_WgcDeafCount, NULL);
-        // There is no PrintWindow fallback for a deaf slot; WgcDeaf is the counter under the Qubes Tools config key.
-        LogError("QGAWGCDEAF hwnd 0x%llx slot %d: WGC delivered no first frame or own-change poke within %u ms, "
-            L"recreated once, silent again: held FAILED by the broker, the window keeps its last content until "
+        // Nothing else captures a deaf slot; WgcDeaf is the counter under the Qubes Tools config key.
+        LogError("QGAWGCDEAF hwnd 0x%llx slot %d: Windows closed the capture item again before the reopened session "
+            L"delivered a frame: held FAILED by the broker, the window keeps its last content until "
             L"re-registered (deaf holds %ld, WgcDeaf=%lu)",
-            (ULONGLONG)s->Hwnd, i, (unsigned)WGCBRK_WGC_QUIET_MS, s->DeafHolds, g_WgcDeafCount);
+            (ULONGLONG)s->Hwnd, i, s->DeafHolds, g_WgcDeafCount);
         // NO SILENT REGRESSIONS (owner 2026-10-02: "fail loudly (including user facing message) if capture really goes
         // deaf someday"). A deaf hold is the product not delivering a window, and nothing here recovers it: the user is told
         // in dom0 through the agent's error route (notifyerr: ACTION, one notification per app per boot, at most
@@ -3990,7 +3951,7 @@ static BOOL BrokerStartHold(IN ULONGLONG now, IN ULONGLONG rewarnMs)
 
 static void BrokerSupervise(void)
 {
-    if (!g_WgcBroker || g_OsBuild < 26100 || !PwEnabled()) return;
+    if (!g_WgcBroker || g_OsBuild < WGC_BROKER_BUILD_FLOOR || !PwEnabled()) return;
     if (!g_WgcBase && !WgcCreateSection()) return;
     // R5 (rest-zero D): this loop is alive - the broker's deadline on a published frame is answered by any wake of it
     // (its frame event is one). Replaced the agent heartbeat the broker used to exit on.
@@ -4196,7 +4157,7 @@ static void BrokerSupervise(void)
             // hang names its call instead of leaving it to be guessed - "most likely PrintWindow" was a
             // guess, and a fix built on another guess (the WGC teardown lock, 2026-09-27) changed nothing.
             static const wchar_t* const stgName[] = { L"loop", L"reconcile", L"open-channel",
-                L"close-channel", L"relay-dwm", L"probe", L"source-printwindow", L"polled-printwindow",
+                L"close-channel", L"unused", L"unused", L"unused", L"unused",   /* 4-7 retired (ADR-capture 36) */
                 L"republish", L"sign", L"close-lock", L"close-reap" };
             const LONG stg = WGCBRK_HDR(g_WgcBase)->BrokerStage;
             const LONG code = stg >= 0 ? (stg >> 8) : -1;
@@ -4267,7 +4228,7 @@ static void BrokerSupervise(void)
 
     // HARD-FAIL, LOUDLY, ON AN ELIGIBLE SYSTEM (owner 2026-09-04: "I want deslicer to hard fail
     // on eligible system", "silent fallbacks with no diag" is the exact worry). We are here only
-    // when the WgcBroker gate is ON and the build is >= 26100 - i.e. de-slice is EXPECTED. The
+    // when the WgcBroker gate is ON and the build is >= WGC_BROKER_BUILD_FLOOR - i.e. de-slice is EXPECTED. The
     // renderer still falls back to the retained DDA slice so the desktop is never black, but that
     // fallback must never be SILENT: the moment the broker is expected-but-absent, say so at ERROR
     // level - matching the QERR_SEV_ACTION row it sends to dom0, because one condition cannot be
@@ -5843,7 +5804,7 @@ static void NotifBridgeShutdown(void)
 // ---- WGC broker stage 2b: register occluded NRB app windows, consume their frames --------
 BOOL WgcBrokerActive(void)
 {
-    return g_WgcBroker && g_OsBuild >= 26100 && PwEnabled() && g_BrokerReady && g_WgcBase;
+    return g_WgcBroker && g_OsBuild >= WGC_BROKER_BUILD_FLOOR && PwEnabled() && g_BrokerReady && g_WgcBase;
 }
 
 // DIRECT PATH REQUIRED (owner, 2026-09-06: "no fallback on a system that supports the direct
@@ -5917,10 +5878,16 @@ static BROKER_STATE BrokerState(void)
 // slot is only waiting for its first painted frame, maps the instant it lands, and is logged but never reported to the
 // user (DirectSuppressNotifyUser). Each non-NULL answer is a state that waiting does not resolve. A slot held FAILED with
 // WGCBRK_E_DEAF is left out: a deaf capture session has its own notice (QGAWGCDEAF), and counting it here too would tell
-// the user twice about one window. The slot an entry names is its own (the agent alone writes a slot's Hwnd and clears
-// PwBrokerSlot when it frees one), so it is read without matching the Hwnd.
-static const WCHAR* DirectSuppressFault(IN const WINDOW_DATA* entry)
+// the user twice about one window. So is one held with E_HANDLE: the window was gone when the broker opened it, which is
+// a window closing, not a capture refused. failHr, when given, receives a FAILED slot's code whatever the answer (0
+// otherwise), so the line that declares the fault can say which code it was (ADR-capture 36). The slot an entry names is
+// its own (the agent alone writes a slot's Hwnd and clears PwBrokerSlot when it frees one), so it is read without
+// matching the Hwnd. A FAILED slot stays FAILED until this agent asks again (a new ControlSeq), so its code cannot change
+// under this read.
+static const WCHAR* DirectSuppressFault(IN const WINDOW_DATA* entry, OUT OPTIONAL ULONG* failHr)
 {
+    if (failHr)
+        *failHr = 0;
     if (BrokerState() == BRK_DOWN)
         return L"broker-down";
     if (entry->PwBrokerSlot < 0)
@@ -5928,9 +5895,14 @@ static const WCHAR* DirectSuppressFault(IN const WINDOW_DATA* entry)
     if (!g_WgcBase || entry->PwBrokerSlot >= WGCBRK_MAX_SLOTS)
         return NULL;
     const WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
-    if (s->AckState == WGCBRK_FAILED && s->FailHr != WGCBRK_E_DEAF)
-        return L"slot-refused";
-    return NULL;
+    if (s->AckState != WGCBRK_FAILED)
+        return NULL;
+    const LONG hr = s->FailHr;
+    if (failHr)
+        *failHr = (ULONG)hr;
+    if (hr == WGCBRK_E_DEAF || hr == (LONG)E_HANDLE)
+        return NULL;
+    return L"slot-refused";
 }
 
 void QgaNameThread(IN const WCHAR* name)
@@ -5949,7 +5921,7 @@ void QgaNameThread(IN const WCHAR* name)
 
 BOOL DirectRequired(void)
 {
-    return g_WgcBroker && g_OsBuild >= 26100 && PwEnabled();
+    return g_WgcBroker && g_OsBuild >= WGC_BROKER_BUILD_FLOOR && PwEnabled();
 }
 
 // rest-zero S2 (docs/DESIGN-rest-zero-capture.md): on a direct-required guest in seamless mode no window takes pixels
@@ -6228,7 +6200,7 @@ static BOOL BrokerSlotStale(IN const WINDOW_DATA* e, IN const WGCBRK_SLOT* bs)
 // root for a card it finds one for - while BrokerFreshFrame refuses any slot whose Hwnd is not the window's own
 // (slot-holds-another-hwnd). Guarding the read on Hwnd==window would print ack=-1 for exactly that case and hide it; the
 // agent alone writes a slot's Hwnd and clears PwBrokerSlot when it frees one, so the slot an entry names is its own. The
-// tick block (TickPw, FirstArrivedTick) is the broker's per-OPEN record and is trusted only when TickHwnd names the
+// tick block (FirstArrivedTick) is the broker's per-OPEN record and is trusted only when TickHwnd names the
 // slot's hwnd: slots are recycled (see the BROKERCHAIN comment in BrokerConsumePass).
 static void ToastFeedReport(IN OUT WINDOW_DATA* e, IN const WCHAR* end)
 {
@@ -6242,7 +6214,7 @@ static void ToastFeedReport(IN OUT WINDOW_DATA* e, IN const WCHAR* end)
     const UINT64 sh = s ? (UINT64)s->Hwnd : 0;
     const BOOL ticks = (BOOL)(s && sh != 0 && (UINT64)s->TickHwnd == sh);
     LogInfo("QGATOASTFEED hwnd=0x%x end=%s reg_ms=%llu consumed=%lu held_frames=%lu first_ms=%lld painted_ms=%lld why=%s "
-        L"slot=%d src=0x%llx ack=%ld fail=0x%08lx fid=%llu pw=%ld route=%ld arrived=%d deaf=%ld",
+        L"slot=%d src=0x%llx ack=%ld fail=0x%08lx fid=%llu arrived=%d deaf=%ld",
         (DWORD)(ULONG_PTR)e->Handle, end,
         (ULONGLONG)(now - e->ToastFeedRegTick),
         (unsigned long)e->PwBrokerFrames, (unsigned long)e->ToastFeedHeldFrames,
@@ -6252,7 +6224,6 @@ static void ToastFeedReport(IN OUT WINDOW_DATA* e, IN const WCHAR* end)
         slot, (unsigned long long)sh,
         s ? (long)s->AckState : -1L, s ? (unsigned long)s->FailHr : 0UL,
         s ? (unsigned long long)s->FrameId : 0ULL,
-        ticks ? (long)s->TickPw : -1L, s ? (long)s->Route : -1L,
         (ticks && s->FirstArrivedTick) ? 1 : 0,
         s ? (long)s->DeafHolds : -1L);
 }
@@ -6277,7 +6248,6 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     entry->ToastFeedHeldFrames = 0;
     entry->ToastFeedWhy = NULL;
     entry->ToastFeedRegTick = GetTickCount64();
-    entry->PwPixSigValid = FALSE;   // a new slot renders its first frame on its own; the next damage pokes
     if (!WgcBrokerActive() || !entry->PwSliceFed) return FALSE;
     if (entry->Width == 0 || entry->Height == 0) return FALSE;
 
@@ -6349,22 +6319,6 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     // window's rect at capture time. This was missing here entirely - only the retarget wrote it -
     // so a slot's FIRST registration always shipped the racy inset alone.
     BrokerWriteCardPos(entry, s);
-    // ASK FOR THE ROUTE THIS WINDOW CLASS NEEDS (ABI 23). A shell CoreWindow - toast host, Start,
-    // Search - is not served by a WGC session on itself: it delivers frames that are entirely
-    // BLACK, which the broker's quiet ladder cannot see, so the window stayed on route 0 for ever
-    // and was mapped dark or never shown at all. The same classifier that decides this window's
-    // crop decides its route, so the two cannot drift. See wgcbroker_ipc.h ReqRoute.
-    // START AND SEARCH ONLY - NOT THE TOAST, and that is a measurement, not caution. Every black
-    // surface in the 2026-10-17 captures is one of those two: Start 0x10174 (642x726) and the
-    // 'Suche' SearchHost surfaces 0x10180/82/86/88/8a/a0 (800x750, 800x798). No toast appears in
-    // the evidence at all. And the toast has its own recorded measurement pointing the other way:
-    // "warm, the toast is served on plain WGC and matches (MAD 2.2); on every cold boot it ended
-    // on the relay, whose thumbnail renders it with 15 colours against the guest's 28 (MAD 17.7)"
-    // (Jev relay-renders-the-toast-unfaithfully 0.83). Routing toasts here would trade a defect
-    // they do not have for a fidelity loss they do.
-    const SHELL_SURFACE_KIND routeKind = ShellSurfaceKind(entry);
-    s->ReqRoute = (routeKind == ShellSurfaceStart || routeKind == ShellSurfaceSearch)
-                  ? (LONG)WGCBRK_ROUTE_RELAY : (LONG)WGCBRK_ROUTE_WGC;
     s->OpaqueL = s->OpaqueT = s->OpaqueR = s->OpaqueB = -1;  // "not measured yet" until the broker reports
     s->AckState = WGCBRK_FREE; s->FrameId = 0; s->Seq = 0; s->ActiveBuffer = 0;
     MemoryBarrier();
@@ -6374,16 +6328,14 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     _InterlockedIncrement(&h->ControlGen);
     entry->PwBrokerSlot = slot; entry->PwBrokerSourced = TRUE; entry->PwBrokerArenaOff = off0;
     entry->PwBrokerEverSourced = TRUE;   // sticky for this window's life (QgaLateRegIsStartup)
-    g_SlotQuietSeen[slot] = s->QuietReroutes;   // QGAWGCRECREATE baseline for this window
     g_SlotClosedSeen[slot] = s->ItemClosed;     // QGAWGCITEMCLOSED baseline for this window
     BrokerRequestSent(slot);
     if (g_WgcCtl) SetEvent(g_WgcCtl);
     // At Info, with a tick: the gap from here to QGASLICECONTENT is the broker's first-frame
     // latency, which is what menu latency reduces to once nothing maps unpainted (2026-09-11).
-    LogDebug("QGABROKERREG hwnd=0x%x slot=%d %ux%u buf=%llu t=%llu reqroute=%s",
+    LogDebug("QGABROKERREG hwnd=0x%x slot=%d %ux%u buf=%llu t=%llu",
             (DWORD)(ULONG_PTR)entry->Handle, slot,
-            entry->Width, entry->Height, one, (ULONGLONG)GetTickCount64(),
-            s->ReqRoute == (LONG)WGCBRK_ROUTE_RELAY ? L"relay" : L"wgc");
+            entry->Width, entry->Height, one, (ULONGLONG)GetTickCount64());
     return TRUE;
 }
 
@@ -6407,97 +6359,6 @@ BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG 
     if (g_WgcSlotBufs[entry->PwBrokerSlot].Bytes < need) return FALSE;
     if (!g_WgcSlotBufs[entry->PwBrokerSlot].Off[0] || !g_WgcSlotBufs[entry->PwBrokerSlot].Off[1]) return FALSE;
     return TRUE;
-}
-
-// Tell the broker this window's pixels changed.
-//
-// The broker's PrintWindow path renders the full window synchronously on the CAPTURED
-// APPLICATION's UI thread - p50 31.7 ms on a 1216x941 window, measured 2026-09-25 - so polling it
-// on a fixed tick spends about 43% of a core per window whether or not anything moved. The agent
-// is already the one place that knows what changed: this damage pass intersects the desktop's
-// dirty rects with each window rect. So say so, and let the broker render only then.
-//
-// Cheap by construction: an interlocked increment and a SetEvent on an auto-reset event the
-// broker is already waiting on. Bumping more than once for a frame is harmless - the broker
-// compares against the value it last serviced, it does not count pokes.
-void BrokerPokeDamage(IN const WINDOW_DATA* entry)
-{
-    if (!g_WgcBase || !entry->PwBrokerSourced ||
-        entry->PwBrokerSlot < 0 || entry->PwBrokerSlot >= WGCBRK_MAX_SLOTS)
-        return;
-    WGCBRK_SLOT* s = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
-    _InterlockedIncrement(&s->PokeSeq);
-    if (g_WgcCtl) SetEvent(g_WgcCtl);
-}
-
-// Poke by HWND, for the input path. dom0's keyboard/mouse/focus messages name the window they
-// are for, and input is the moment a user notices latency.
-//
-// WHY INPUT AND NOT DAMAGE. The damage poke this sits beside is driven by the desktop's DDA dirty
-// rects, and those are measured NOT to cover this class of window: with Settings being actively
-// driven - 12 keystrokes, content visibly changing - the per-frame diagnostics reported a
-// TWO-PIXEL dirty area and no window damage for the whole drive, while dom0 only updated via the
-// 1 s staleness bound. The content lives in a separate composition target, which is the same
-// shape as the original defect. Jev on that measurement: dda-unusable 0.67, best remaining source
-// input-and-focus 0.60 (winevent object events 0.38 - the next lever if this leaves gaps),
-// combine-with-the-staleness-bound 0.87.
-//
-// Takes the watched-window lock itself; CRITICAL_SECTION is recursive, so a caller already
-// holding it is fine.
-void BrokerPokeWindow(IN HWND window)
-{
-    if (!g_WgcBase || !window)
-        return;
-    // TRY, never wait. This runs on the VCHAN HANDLER thread, in front of injecting a keystroke
-    // or a mouse event. The capture thread holds this same lock for its whole per-window damage
-    // pass, and sends to the vchan inside it - so a blocking acquire here would put dom0's input
-    // behind a frame, and behind a full vchan ring. Input latency is the thing this change exists
-    // to improve; paying for it with input latency would be self-defeating.
-    //
-    // It also makes the lock-order question moot rather than argued: this path can now hold at
-    // most one lock and never waits for one, so it cannot take part in a cycle. Jev rated that
-    // risk blocking at 0.86 with worst_risk=lock-order 1.00 before this was written.
-    //
-    // A skipped poke is not a lost frame: the broker's 1 s staleness bound still repaints the
-    // window, and the next input event pokes again.
-    if (!TryEnterCriticalSection(&g_csWatchedWindows))
-    {
-        // Counted, not swallowed: if this climbs alongside SafetyPolls the contention is real and
-        // the poke needs a different signal. A silent skip here would look exactly like a working
-        // design that simply had nothing to report.
-        _InterlockedIncrement(&WGCBRK_HDR(g_WgcBase)->PokeLockMiss);
-        return;
-    }
-    const WINDOW_DATA* entry = FindWindowByHandle(window);
-    if (entry)
-        BrokerPokeDamage(entry);
-    LeaveCriticalSection(&g_csWatchedWindows);
-}
-
-// Poke for POINTER MOTION - only a slot the broker RENDERS on request. On the PrintWindow route (WGCBRK_ROUTE_PW: menus
-// and the other classes WGC cannot capture) the poke is the render trigger - motion over a menu moves its highlight and
-// that render is the only way the change is captured - so it stays. A WGC or relay slot delivers its own changes as
-// arrivals; there the poke only asks a LIVENESS question ("a change is coming - did the session see it?"), and pointer
-// motion makes no such promise: over a window with no hover effect nothing changes, the poke goes unanswered, and the
-// broker's quiet test recreates a healthy session. Measured 2026-10-01 on w11r-ds: the owner hovered over a focused
-// Notepad - its slot took +2555 pokes and 3 QGAWGCRECREATE in ~75 s while the damage path's pixel compare (since removed,
-// ADR-capture 32) refused all 2304 pointer damages; Paint, whose status bar follows the pointer, answered every poke and was
-// not recreated (Jev: chain established 0.64). Since ADR-capture 32 no desktop damage pokes a WGC or relay slot either;
-// keys and buttons still poke every slot (BrokerPokeWindow).
-void BrokerPokeWindowMotion(IN HWND window)
-{
-    if (!g_WgcBase || !window)
-        return;
-    if (!TryEnterCriticalSection(&g_csWatchedWindows))   // never wait on the vchan thread - see BrokerPokeWindow
-    {
-        _InterlockedIncrement(&WGCBRK_HDR(g_WgcBase)->PokeLockMiss);
-        return;
-    }
-    const WINDOW_DATA* entry = FindWindowByHandle(window);
-    if (entry && entry->PwBrokerSourced && entry->PwBrokerSlot >= 0 && entry->PwBrokerSlot < WGCBRK_MAX_SLOTS &&
-        WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot].Route == (LONG)WGCBRK_ROUTE_PW)
-        BrokerPokeDamage(entry);
-    LeaveCriticalSection(&g_csWatchedWindows);
 }
 
 BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
@@ -6841,7 +6702,7 @@ static BOOL BrokerOpaqueInsets(IN HWND window, OUT RECT* insets)
 #define CROP_BEFORE_SHOW_TIMEOUT_MS (TOAST_CROP_UIA_TIMEOUT_MS + 200)
 
 // SLICE-CONTENT MAP-HOLD readiness (g_SliceMapHold). The non-de-sliced slice-fed path has the
-// same black-first-frame defect the de-slice arm below already fixes for 24H2+: AddWindow maps
+// same black-first-frame defect the de-slice arm below already fixes for 25H2+: AddWindow maps
 // the window and sends a full-rect initial damage while its per-window slab is still the zeroed
 // memory PwSlabAcquire handed out (perwindow.c documents "BLACK until the window painted"), and
 // the first composite copy (PwSliceCopyAndDamage) only lands later, on a captured frame whose
@@ -6916,7 +6777,7 @@ static ULONGLONG g_MapDeferWake = 0;   // earliest MapDeferred deadline (tick), 
 
 // The first deadline of a newly held window. On a DirectRequired guest it is the crop CEILING itself (rest-zero S4): the
 // window is released before it by its own events - its first painted broker frame (PwConsumeBrokerFrame queues it), its
-// crop result, its show - so the 32 ms re-check tick below 26100 has no work to do there.
+// crop result, its show - so the 32 ms re-check tick below the broker floor has no work to do there.
 static ULONGLONG MapDeferFirstDue(IN const WINDOW_DATA* entry)
 {
     return DirectRequired() ? entry->MapDeferSince + CROP_BEFORE_SHOW_TIMEOUT_MS + 10
@@ -8281,7 +8142,8 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
     PwLedgerEmit(entry, L"destroy");
     // Read before PwDetachWindow frees the broker slot: a slot the broker refused is a fact of that slot, gone once it is
     // unregistered. Only a window we withheld can be reported as closed-while-withheld below.
-    const WCHAR* suppressFault = (entry && entry->PwDirectWaitLogged) ? DirectSuppressFault(entry) : NULL;
+    ULONG suppressHr = 0;
+    const WCHAR* suppressFault = (entry && entry->PwDirectWaitLogged) ? DirectSuppressFault(entry, &suppressHr) : NULL;
     // Stop per-window capture and queue its grant for revocation before any protocol
     // messages: the daemon releases its mapping on UNMAP/DESTROY below, after which
     // the queued revoke succeeds on a tick.
@@ -8396,9 +8258,11 @@ ULONG RemoveWindow(IN OUT WINDOW_DATA *entry)
         // vanish unreported. For the broker see QGADESLICEDOWN/DesliceBrokerDown; for a capture desync
         // BROKERDIMS/BROKERREREG.
         LogError("QGADIRECTSUPPRESS hwnd 0x%x (class %s, %ux%u) CLOSED WHILE WITHHELD: destroyed before its first "
-            L"painted frame, never shown (brokerState=%d sliceFed=1 brokerSourced=%d frames=%lu DirectSuppressed=%lu)",
+            L"painted frame, never shown (brokerState=%d sliceFed=1 brokerSourced=%d frames=%lu DirectSuppressed=%lu "
+            L"fault=%s failHr=0x%08lx)",
             (DWORD)(ULONG_PTR)entry->Handle, entry->Class, entry->Width, entry->Height,
-            (int)BrokerState(), entry->PwBrokerSourced, entry->PwBrokerFrames, g_DirectSuppressed);
+            (int)BrokerState(), entry->PwBrokerSourced, entry->PwBrokerFrames, g_DirectSuppressed,
+            suppressFault ? suppressFault : L"none", suppressHr);
         DirectSuppressNotifyUser(g_DirectSuppressed, suppressFault);
     }
 
@@ -9970,15 +9834,10 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     if (!(g_DiagWindowFilterOff & 1) && data->Handle == ShellWindowNow())
         return FALSE;
 
-    // THE BROKER'S OWN WINDOWS ARE INFRASTRUCTURE, NEVER USER CONTENT. The user-session broker needs
-    // real top-level windows to receive DWM thumbnails of the classes that have no per-window pixel
-    // source - measured: a thumbnail reaches a destination placed off-screen or held at
-    // WS_EX_LAYERED alpha 0, but NOT one that is SW_HIDE, so the destination cannot simply be
-    // hidden. Without this test those destinations are ordinary windows to us: measured
-    // 2026-09-26, a probe's destinations at -9000,-9000 were accepted, classified slice-fed, given
-    // broker slot 3 and MAPPED to dom0 ("class=QubesThumbProbeDest ... QGAHELDMAP"). Any relay
-    // implementation would have manufactured dom0 windows the same way (Jev: this was a design
-    // error rather than a probe artefact, 0.75).
+    // THE BROKER'S OWN WINDOWS ARE INFRASTRUCTURE, NEVER USER CONTENT. Without this test a window the
+    // broker creates is an ordinary window to us: measured 2026-09-26, a probe's off-screen windows at
+    // -9000,-9000 were accepted, classified slice-fed, given broker slot 3 and MAPPED to dom0
+    // ("class=QubesThumbProbeDest ... QGAHELDMAP") (Jev: a design error rather than a probe artefact, 0.75).
     //
     // Keyed on the VALIDATED broker pid, not on a class name and not on the shared section's
     // BrokerPid field. That field is user-writable, so keying on it would let any guest process
@@ -11001,15 +10860,14 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // it, and the QGADIRECTDARK map below is unreachable - deleted rather than left to look
         // like a live path.
         //
-        // THE PREMISE OF THIS ESCAPE WAS REFUTED 2026-10-17, and it is scheduled to go. It read
+        // THE PREMISE OF THIS ESCAPE WAS REFUTED 2026-10-17. It read
         // "the feed is demonstrably working and the blackness belongs to the surface, not to us".
         // Arriving frames do not demonstrate a working feed: a shell CoreWindow served by a WGC
         // session on itself delivers frames on time that are ALL empty (26 of 26 on this rig), so
         // this escape mapped a capture defect onto the user's screen as a dark window with a
-        // shadow strip. Jev: remove-it-fix-the-route 1.00. The route fix (ABI 23 ReqRoute) lands
-        // first and must be MEASURED to paint this class; removing the escape before that would
-        // turn a dark menu into no menu at all, which is not an improvement for anyone looking at
-        // the screen. Ordering, not hesitation.
+        // shadow strip. Jev: remove-it-fix-the-route 1.00. Nothing else paints this class - the
+        // relay is retired (ADR-capture 36) - so removing the escape would turn a dark menu into
+        // no menu at all, which is not an improvement for anyone looking at the screen.
         if (toastHeld)
         {
             // Held or suppressed by the bridge verdict: stays unmapped (see above).
@@ -11070,14 +10928,16 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // No composite fallback: mapping it would show a BLACK window. A BUG TO FIX, not a degraded mode -
                 // QGADESLICEDOWN/DesliceBrokerDown for the broker, BROKERDIMS/BROKERREREG for a capture desync;
                 // DirectSuppressed is the counter under the Qubes Tools config key.
+                ULONG failHr = 0;
+                const WCHAR* fault = DirectSuppressFault(windowData, &failHr);
                 LogError("QGADIRECTSUPPRESS hwnd 0x%x (class %s, %ux%u) NOT SHOWN: never received a frame on the "
                     L"required direct per-window path, suppressed instead of mapped black (sliceFed=1 "
-                    L"brokerSourced=%d slot=%d brokerActive=%d DirectSuppressed=%lu)",
+                    L"brokerSourced=%d slot=%d brokerActive=%d DirectSuppressed=%lu fault=%s failHr=0x%08lx)",
                     (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class,
                     windowData->Width, windowData->Height,
                     windowData->PwBrokerSourced, windowData->PwBrokerSlot,
-                    WgcBrokerActive(), g_DirectSuppressed);
-                DirectSuppressNotifyUser(g_DirectSuppressed, DirectSuppressFault(windowData));
+                    WgcBrokerActive(), g_DirectSuppressed, fault ? fault : L"none", failHr);
+                DirectSuppressNotifyUser(g_DirectSuppressed, fault);
                 // The line above says "never received a frame" but tests "no PAINTED frame"; this one says which.
                 ToastFeedReport(windowData, L"suppressed");
             }
@@ -11782,7 +11642,7 @@ static BOOL PwBrokerCopyDiff(IN OUT WINDOW_DATA* entry, IN const BYTE* srcBase, 
     if (!srcBase || srcPitch <= 0 || !entry->PwBuffer)
         return PwLedgerRefuse(entry);
     // The SCREEN, not the published desktop image (g_FbWidth/g_FbHeight): this source is the window's own frame, and on
-    // 26100+ in seamless no desktop image is published at all (rest-zero S2), so those read 0 and clipped every copy to
+    // 25H2+ in seamless no desktop image is published at all (rest-zero S2), so those read 0 and clipped every copy to
     // nothing - every window held black, then declared (QGADIRECTSUPPRESS 8 of 8, rz3 on w11-ds, 2026-10-01). While a
     // desktop image was published it was screen-sized, so this is the same clip.
     RECT screenR = { 0, 0, (LONG)g_ScreenWidth, (LONG)g_ScreenHeight };
@@ -11980,7 +11840,7 @@ static void PwPatchSynthChildClipped(IN WINDOW_DATA* owner, IN const WINDOW_DATA
         return;
     }
     // Pixel source. PREFER the child's OWN per-window broker frame (window-relative, already
-    // cropped pixel-exact) - the de-sliced path, shipped default on 24H2+. srcOrigin is the
+    // cropped pixel-exact) - the de-sliced path, shipped default on 25H2+. srcOrigin is the
     // SCREEN coord mapping to source (0,0): (c->X,c->Y) for the window-relative child frame,
     // (0,0) for the screen-relative DDA framebuffer. Fallback: the DDA composited desktop
     // (g_FbBits) on non-de-sliced configs (win10 / broker floor). De-sliced with no per-window
@@ -12187,36 +12047,6 @@ static int PwCollectOccluders(IN const WINDOW_DATA* self, IN const RECT* rect,
     return n;
 }
 
-// PwCollectOccluders restricted to windows that are LIKELY OPAQUE: not WS_EX_LAYERED (a layered window may be translucent)
-// and not override-redirect (menus, tooltips and popups carry translucent shadows and acrylic). Used by the broker damage
-// poke, where excluding damage under a translucent window would hide a visible change of the window beneath it.
-static int PwCollectOccludersEx(IN const WINDOW_DATA* self, IN const RECT* rect,
-                                OUT RECT* out, IN int maxOut)
-{
-    int n = 0;
-    RECT hit;
-    WINDOW_DATA* e = (WINDOW_DATA*)g_WatchedWindowsList.Flink;
-    while (e != (WINDOW_DATA*)&g_WatchedWindowsList)
-    {
-        e = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
-        const BOOL popup = (e->ExStyle & WS_EX_LAYERED) || e->IsOverrideRedirect;
-        if (e != self && e->IsVisible && !e->IsIconic && !e->DeletePending &&
-            e->Width > 0 && e->Height > 0 && e->ZOrder < self->ZOrder &&
-            !popup)
-        {
-            RECT other = { e->X, e->Y, e->X + (int)e->Width, e->Y + (int)e->Height };
-            if (IntersectRect(&hit, &other, rect))
-            {
-                if (n >= maxOut)
-                    return -1;
-                out[n++] = hit;
-            }
-        }
-        e = (WINDOW_DATA*)e->ListEntry.Flink;
-    }
-    return n;
-}
-
 // WHY NOT PwCollectOccluders / g_ZOrderCaptureValid. Both the ZOrder fields and that flag are
 // written only by CollectZOrder, which runs ONLY inside ProcessNewFrame (main.c). At rest - the
 // exact condition this payment exists for - the last frame may predate the banner entirely, so the
@@ -12305,7 +12135,7 @@ static BOOL CALLBACK ToastOccWalkProc(HWND window, LPARAM lParam)
 // changes no observed behaviour - it removes machinery that only a retired path justified.)
 //
 // WHERE THE COMPOSITE IS STILL THE SOURCE THE SUBTRACTION STAYS (src=composite). win10, below the
-// 26100 floor and the explicit WgcBroker=0 opt-out all reach PwSliceCopyAndDamage, the pixels under
+// broker floor and the explicit WgcBroker=0 opt-out all reach PwSliceCopyAndDamage, the pixels under
 // a higher window really do belong to that window, and a full-window send is what "corrupts a
 // menu's host window on hover" (review finding). The occluders are then SUBTRACTED exactly as the
 // frame path does with rgnCovered, and where the order cannot be read, self is not in it, or there
@@ -12429,39 +12259,6 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     entry->ToastRepaintFrameSeen = FALSE;
     entry->ToastRepaintOverdueLogged = FALSE;
     return TRUE;
-}
-
-// Does any part of r lie outside every rect of occ[0..n)? Rectangle subtraction, bounded: past the budget it answers TRUE
-// (for a PrintWindow slot the poke is the render trigger, so the conservative answer is "visible").
-static BOOL PwRectVisibleBeyond(IN const RECT* r, IN const RECT* occ, IN int n, IN OUT int* budget)
-{
-    RECT o, parts[4];
-    int k = 0;
-    if (IsRectEmpty(r)) return FALSE;
-    if (n <= 0) return TRUE;
-    if (--(*budget) < 0) return TRUE;
-    if (!IntersectRect(&o, r, &occ[0])) return PwRectVisibleBeyond(r, occ + 1, n - 1, budget);
-    if (o.top > r->top)       SetRect(&parts[k++], r->left, r->top, r->right, o.top);
-    if (o.bottom < r->bottom) SetRect(&parts[k++], r->left, o.bottom, r->right, r->bottom);
-    if (o.left > r->left)     SetRect(&parts[k++], r->left, o.top, o.left, o.bottom);
-    if (o.right < r->right)   SetRect(&parts[k++], o.right, o.top, r->right, o.bottom);
-    for (int i = 0; i < k; i++)
-        if (PwRectVisibleBeyond(&parts[i], occ + 1, n - 1, budget)) return TRUE;
-    return FALSE;
-}
-
-// What decides a window's visible region on this pass: its rect and the opaque rects above it, in list order.
-static UINT64 PwVisibleSig(IN const RECT* w, IN const RECT* occ, IN int n)
-{
-    UINT64 h = 1469598103934665603ull;
-#define PWVS_MIX(v) do { h ^= (UINT64)(UINT32)(v); h *= 1099511628211ull; } while (0)
-    PWVS_MIX(w->left); PWVS_MIX(w->top); PWVS_MIX(w->right); PWVS_MIX(w->bottom); PWVS_MIX(n);
-    for (int i = 0; i < n; i++)
-    {
-        PWVS_MIX(occ[i].left); PWVS_MIX(occ[i].top); PWVS_MIX(occ[i].right); PWVS_MIX(occ[i].bottom);
-    }
-#undef PWVS_MIX
-    return h;
 }
 
 // ABI 5 reads the broker's first-frame stage ticks as QPC counts; this is the matching agent-side
@@ -13138,18 +12935,12 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
         // buffer and closes the map/first-content pair (releasing a
         // SliceMapHold defer) only once it is actually painted.
         PwNoteSliceContent(entry);
-        // LEDGER: a broker frame actually landed in the granted buffer. Split by
-        // the slot's own route flag so "WGC delivered" and "the broker fell back
-        // to PrintWindow" never collapse into one number - that collapse is what
-        // made a starved slot and a re-routed slot look alike all evening.
+        // LEDGER: a broker frame actually landed in the granted buffer - every broker frame is a WGC frame
+        // (ADR-capture 36).
         {
-            const WGCBRK_SLOT* ls = (g_WgcBase && entry->PwBrokerSlot >= 0 &&
-                                     entry->PwBrokerSlot < WGCBRK_MAX_SLOTS)
-                ? &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot] : NULL;
             // A refusal is already counted by PwLedgerRefuse inside the primitive; counting it
             // here as well would claim a frame that never reached the granted buffer.
             if (!brokerCopied)         { /* refused: counted as a refusal, not as a frame */ }
-            else if (ls && ls->TickPw) entry->PwLedgerBrokerPw++;
             else                       entry->PwLedgerBrokerWgc++;
         }
         if (firstBrokerFrame)
@@ -13198,15 +12989,8 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
                     bs->TickOpenOk && o;
                 if (!ticksMine)
                 {
-                    // The reason must not name a cause it has not established.
-                    // It used to say "slot-reopened-for-another-window" whenever
-                    // TickHwnd differed - which was FALSE for every menu of 2026-09:
-                    // WGC rejected them on that build and polled PrintWindow served
-                    // them, a path that wrote no ticks at all under ABI 3, so the
-                    // block simply still held an older window's record (on
-                    // 26300.9457 WGC captures them: all 13 popups measured
-                    // 2026-11-01 read path=wgc below). Both remain possible now, and
-                    // this probe cannot tell them apart, so it says exactly that.
+                    // The reason must not name a cause it has not established: it says only what the
+                    // block shows.
                     LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,"
                         "valid=0,reason=%s,consumed_ms=%lld",
                         (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
@@ -13214,32 +12998,6 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
                             ? L"ticks-describe-another-window"
                             : (!bs->TickOpenOk ? L"open-not-completed"
                                                : L"no-open-recorded"),
-                        BC_NOW_MS());
-                }
-                else if (bs->TickPw)
-                {
-                    // Polled PrintWindow - the path a window WGC refused takes
-                    // (every menu in 2026-09; none of 13 popups on 26300.9457,
-                    // measured 2026-11-01 with this line: all path=wgc).
-                    // fallback_ms: the WGC attempt failed and we fell back.
-                    // firstpoll_ms: first poll ENTERED. Reconcile opens and polls
-                    //   in the SAME loop iteration, so this contains no waiting.
-                    // pwret_ms - firstpoll_ms: the synchronous PrintWindow call on
-                    //   the window's own UI thread.
-                    // polls: polls entered for this open UP TO THIS READ - it is
-                    //   NOT "renders that came back black": publish_ms == pwret_ms
-                    //   here, i.e. the FIRST render published, and the extra polls
-                    //   are ordinary refreshes that happened before the agent
-                    //   consumed the frame. Do not read it as app-not-painted.
-                    LogInfo("QGAPROTO,msg=BROKERCHAIN,hwnd=0x%x,slot=%d,valid=1,"
-                        "path=printwindow,fallback_ms=%lld,firstpoll_ms=%lld,"
-                        "pwret_ms=%lld,publish_ms=%lld,polls=%d,consumed_ms=%lld",
-                        (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
-                        BC_MS(bs->ItemTick),
-                        BC_MS(bs->StartTick),
-                        BC_MS(bs->FirstArrivedTick),
-                        BC_MS(bs->FirstPublishTick),
-                        (int)bs->PollCount,
                         BC_NOW_MS());
                 }
                 else
@@ -14504,145 +14262,14 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             RECT pwRect = { entry->X, entry->Y,
                             entry->X + (int)entry->Width, entry->Y + (int)entry->Height };
             RECT pwHit;
-            // ---- DAMAGE FOR A PRINTWINDOW-ROUTED BROKER SLOT ---------------------------------
-            // WHY THIS HAS TO BE HERE. A WGC slot is driven by FrameArrived: something arrives and
-            // the broker publishes. A slot the broker has RE-ROUTED to PrintWindow has no such
-            // event - PrintWindow is a pull API, nothing arrives - so a tick has to be synthesised,
-            // and the broker was built to take that tick from the agent ("renders only when the
-            // agent says the window changed", 5a7b33f). It never received one. Measured on the rig
-            // 2026-09-26: PokeSeq=0 with PollsServiced == SafetyPolls == Polls, i.e. every render
-            // that slot ever had came from the 1 s backstop and none from damage.
-            //
-            // Two reasons, both structural rather than a typo. BrokerPokeDamage sits in the legacy
-            // dirty-rect loop, BELOW the `continue` that closes this very block, so it is
-            // unreachable for any attached window - and every broker-served window is attached by
-            // construction, since BrokerRegister requires PwSliceFed and the attach sets
-            // PwDumpSent and PwSliceFed together. And BrokerPokeWindow fires only from the vchan
-            // INPUT handlers, so with no dom0 input there is no poke at all. On an eligible guest
-            // the slice path below does not run either (it serves win10 / sub-26100 / the explicit
-            // opt-out), so NOTHING computed per-window damage for these windows.
-            //
-            // So compute it, once, where the window rect already is. Only for a slot the broker has
-            // actually routed to PrintWindow: a WGC slot needs no poke and paying for an
-            // intersection per dirty rect on every window would be the cost this is meant to avoid.
-            //
-            // HONEST CAVEAT, measured earlier and not contradicted: DDA dirty rects were seen NOT
-            // to cover cross-process-content windows (dr=2, area=2, sends=0 during an active
-            // drive). If that holds, this poke will still rarely fire for exactly the class that
-            // gets re-routed - which is why input was chosen as the trigger in the first place.
-            // That is now a MEASURABLE outcome rather than an assumption: PokeSeq on a re-routed
-            // slot says whether per-window DDA damage exists for it at all.
-            if (entry->PwBrokerSourced && g_WgcBase && frame->dirty_rects_count > 0 &&
-                entry->PwBrokerSlot >= 0 && entry->PwBrokerSlot < WGCBRK_MAX_SLOTS)
-            {
-                const WGCBRK_SLOT* ps = &WGCBRK_SLOTS(g_WgcBase)[entry->PwBrokerSlot];
-                // EVERY broker-sourced slot, not only the PrintWindow-routed ones. For a polled slot
-                // the poke is the RENDER TRIGGER. For a WGC or relay slot it is a LIVENESS SIGNAL:
-                // the broker's quiet detector cannot otherwise tell an IDLE arrival-driven channel
-                // from a BROKEN one, and it was demoting the healthy ones - measured 2026-09-26, a
-                // relay slot delivered 2934 frames, went idle, and was demoted to polling, which is
-                // backwards on cost (Jev 0.84). Silence plus a poke means damage happened and no
-                // frame followed; silence with no poke just means nothing changed.
-                // Jev picked this discriminator at 0.63 over "has never delivered" at 0.25 - the
-                // latter would never re-route the founding case, which had FramesArrived frozen at 3.
-                // ADR-capture 32 (owner 2026-10-02, "go on"): DESKTOP DAMAGE POKES ONLY THE PRINTWINDOW ROUTE, where the poke is
-                // the render trigger (menus). A WGC or relay slot delivers its own changes as arrivals; there the damage poke only
-                // asked a liveness question by comparing what changed on the composed screen with what changed in the window's
-                // capture - two views that legitimately differ (other windows' pixels over it: key-tip badges, the relay's
-                // invisible window, neighbours' shadows; DWM-drawn parts no capture holds: border, corners, backdrop, title-bar
-                // activation visuals). On the target (retail 26300) it caught no real stop in four acceptance chains and caused
-                // dozens of false recreates (Jev: justified 0.19; input + Windows' events only 0.84). Liveness for those slots now
-                // comes from keys and clicks into the window (BrokerPokeWindow) and from Windows closing the capture item.
-                // The WGC liveness filters of ADR-capture sections 21, 24 and 26-30 were removed with it (2026-10-02).
-                if (ps->Hwnd == (UINT64)(ULONG_PTR)entry->Handle && ps->Route == (LONG)WGCBRK_ROUTE_PW)
-                {
-                    // NOT THE BORDER. A damage rect that only reaches this window's outermost pixels is the
-                    // NEIGHBOUR's damage: Windows 11 draws a translucent one-pixel border, the window beneath
-                    // shows through it, and DWM's dirty region for that window runs one pixel into ours.
-                    // Measured 2026-09-30 on w11-ds: during the Notepad re-render burn, 72 of 168 frames had a
-                    // dirty rect touching Settings - every one of them by exactly one pixel, on its left, right
-                    // or bottom edge - and each poked the broker, which PrintWindow-ed Settings ~7x/s for 586
-                    // renders that published nothing new. A change confined to a window's two outermost pixels
-                    // is only its border; losing it costs nothing, and the staleness bound still covers it.
-                    const RECT pokeRect = { pwRect.left + 2, pwRect.top + 2, pwRect.right - 2, pwRect.bottom - 2 };
-                    // NOT UNDER A WINDOW ABOVE IT. Damage that lies wholly inside one window stacked ABOVE this one is
-                    // that window's, not ours - the screen there shows the other window. Measured 2026-09-30 on w11-ds:
-                    // Calculator sits over part of Microsoft Store; typing into Calculator poked Store's slot, Store's
-                    // WGC session correctly delivered nothing, and the broker's quiet test demoted the healthy session
-                    // twice, onto polled PrintWindow. Uses the same capture-grade z-order as the screen-hash decision,
-                    // counting only windows likely to be OPAQUE (PwCollectOccludersEx: a layered or override-redirect
-                    // window above may be translucent, and a change beneath it would be visible); with no valid ordering,
-                    // or too many occluders to describe (-1), nothing is excluded - the behaviour before this.
-                    // WHICH WINDOWS ABOVE COUNT. For a PrintWindow slot the poke is the RENDER trigger, so only windows
-                    // likely to be OPAQUE hide damage (a change beneath a translucent popup is visible and must render).
-                    RECT occ[PW_MAX_OCCLUDERS];
-                    int nOcc = g_ZOrderCaptureValid
-                        ? PwCollectOccludersEx(entry, &pokeRect, occ, PW_MAX_OCCLUDERS) : 0;
-                    if (nOcc < 0)
-                        nOcc = 0;   // too many to describe: nothing excluded, as before
-                    // ONLY THE WINDOW'S OWN CHANGE POKES IT (docs/DESIGN-rest-zero-capture.md E). Two refinements of the
-                    // occluder rule above, because on 26100+ an unanswered poke now ends in a DEAF hold (FAILED, no
-                    // PrintWindow rung) rather than in a polled render:
-                    //   * the damage must reach a part of the window that NO opaque window above covers - the union of
-                    //     the occluders, not one at a time (damage straddling two windows above it is theirs, not ours);
-                    //   * the window's visible region must be the one it had on the previous damaged frame: damage while
-                    //     it changes - this window or one above it moved, appeared, vanished or resized - is a reveal or
-                    //     an occlusion, not this window's content. Such a pass pokes nothing; a real change of its own
-                    //     shows again on the next frame.
-                    const UINT64 vsig = PwVisibleSig(&pwRect, occ, nOcc);
-                    const BOOL visStable = entry->PwVisSigValid && entry->PwVisSig == vsig;
-                    entry->PwVisSig = vsig;
-                    entry->PwVisSigValid = TRUE;
-                    for (UINT ddi = 0; visStable && ddi < frame->dirty_rects_count; ddi++)
-                    {
-                        if (IntersectRect(&pwHit, &frame->dirty_rects[ddi], &pokeRect))
-                        {
-                            int budget = 256;
-                            if (!PwRectVisibleBeyond(&pwHit, occ, nOcc, &budget))
-                                continue;
-                            // A PRINTWINDOW SLOT'S OWN RENDER IS NOT A CHANGE (owner: "if you repaint the same pixels it is
-                            // not a change"). Rendering a window makes Windows present it again, pixels unchanged - a
-                            // desktop dirty rect, the next poke, the next render: measured 2026-10-01 on w11-ds with a held
-                            // system menu, 463 desktop frames and ~11 renders a second at rest, and with the broker merely
-                            // suspended 0 frames; PrintWindow's WM_PRINT path echoes as well (1 frame per render, probe).
-                            // So the damage pokes only when the window's on-screen pixels differ from those at its last
-                            // poke - DDA stays a damage signal, read for this window's rect, never copied, never sent. The
-                            // input path pokes unconditionally, as before. Pixels unreadable: poke (and it is said, once).
-                            if (ps->Route == WGCBRK_ROUTE_PW)
-                            {
-                                RECT pixRect;
-                                const RECT screenR = { 0, 0, (LONG)fbWidth, (LONG)fbHeight };
-                                UINT64 psig = 0;
-                                if (IntersectRect(&pixRect, &pwRect, &screenR) &&
-                                    CaptureFrameRegionSig(frame, &pixRect, &psig))
-                                {
-                                    if (entry->PwPixSigValid && entry->PwPixSig == psig)
-                                    {
-                                        const ULONG n = ++entry->PwEchoSkips;
-                                        if (n <= 4 || (n % 256) == 0)
-                                            LogInfo("QGAPWECHO hwnd=0x%x slot=%d n=%lu: damage with unchanged pixels - no poke "
-                                                L"(the echo of a render)", (DWORD)(ULONG_PTR)entry->Handle,
-                                                entry->PwBrokerSlot, n);
-                                        break;
-                                    }
-                                    entry->PwPixSig = psig;
-                                    entry->PwPixSigValid = TRUE;
-                                }
-                            }
-                            BrokerPokeDamage(entry);
-                            break;      // one poke per pass; the broker coalesces
-                        }
-                    }
-                }
-            }
             if (entry->PwSliceFed)
             {
-                // WGC BROKER (24H2+): if this window has a fresh, bounds-checked per-HWND
+                // WGC BROKER (25H2+): if this window has a fresh, bounds-checked per-HWND
                 // WGC frame from the user-session broker, copy from THAT (occlusion-independent,
                 // window-relative) instead of the composited-desktop slice. Failure splits by
                 // broker state: broker ACTIVE but no usable frame (first frame pending, secure
                 // desktop, torn read, size mismatch) -> the HOLD arm below keeps last content;
-                // broker INACTIVE (down / not ready / pre-24H2) -> the DDA slice fallback
+                // broker INACTIVE (down / not ready / pre-25H2) -> the DDA slice fallback
                 // further below. Broker frames are window-relative: source origin = (entry->X, entry->Y).
                 const WCHAR* holdWhy = NULL;
                 if (PwConsumeBrokerFrame(entry, &pwRect, &holdWhy))
@@ -14684,7 +14311,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // tiny toast dragged in the whole desktop map. That is the fallback this build
                 // removes. Broker-down is now visible as held content plus QGADESLICEDOWN and
                 // the DesliceBrokerDown flag; the DDA slice below serves only NOT-eligible
-                // configs (win10 / below the 26100 floor / the explicit WgcBroker=0 opt-out).
+                // configs (win10 / below the broker floor / the explicit WgcBroker=0 opt-out).
                 else if (DirectRequired())
                 {
                     // A NORMAL REASON IS NOT LOGGED AT ALL, AND MUST NOT SPEND THE ONE-SHOT.
@@ -15613,9 +15240,6 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         {
             if (IntersectRect(&changedArea, &frame->dirty_rects[i], &windowRect))
             {
-                // This window's pixels changed: wake the broker's PrintWindow path for it. Cheap,
-                // and it is what lets that path stop polling a window nobody is touching.
-                BrokerPokeDamage(entry);
                 LogVerbose("damage for 0x%x: window (%d,%d) %dx%d, damage (%d,%d) %dx%d, intersect (%d,%d) %dx%d",
                     entry->Handle, entry->X, entry->Y, entry->Width, entry->Height,
                     frame->dirty_rects[i].left, frame->dirty_rects[i].top,
@@ -16652,8 +16276,8 @@ static ULONG WINAPI WatchForEvents(void)
 
             // WINDOW EVENTS BEFORE THE FRAME, for the same reason (rest-zero M7). A desktop frame showing a NEW window's first
             // pixels was attributed before that window's queued events (index 6) were applied: it was not yet tracked, so not
-            // an occluder (occ=0), and the windows beneath took its pixels for their own change - a false liveness poke and a
-            // WGC session recreate 2 s later (measured 2026-10-01: Calculator opening over a Notepad, 6 pokes, recreated).
+            // an occluder (occ=0), and the windows beneath took its pixels for their own change (measured 2026-10-01:
+            // Calculator opening over a Notepad).
             // Nothing is added: these events are applied on the next pass anyway, under case 6's own conditions.
             if (g_VchanClientConnected && g_SeamlessMode && !g_LocalScreenDestroyed &&
                 WaitForSingleObject(g_WindowEventSignal, 0) == WAIT_OBJECT_0)
@@ -17669,7 +17293,7 @@ static ULONG Init(void)
         g_DisableCursor = TRUE;
     }
 
-    // WGC broker gate (24H2+ occluded-window capture, experimental). OS build via RtlGetVersion
+    // WGC broker gate (25H2+ occluded-window capture, experimental). OS build via RtlGetVersion
     // (GetVersionEx lies without a manifest); registry "WgcBroker" default 0, dom0 override
     // /qubes-service/wgc-broker wins (mirrors the staging/seamless gates).
     {
@@ -17699,10 +17323,10 @@ static ULONG Init(void)
     BOOL gateReadFailed = FALSE;
     const WCHAR *wgcSrc = L"default";
     {
-        // WGC broker ships DEFAULT-ON for 24H2+ (build >= 26100): it is the capture path for the
+        // WGC broker ships DEFAULT-ON for 25H2+ (WGC_BROKER_BUILD_FLOOR): it is the capture path for the
         // win11 shell surfaces, and the win11 de-slice benchmark shows no penalty vs the composite.
         // Registry "WgcBroker" / qubesdb /qubes-service/wgc-broker override it (0 forces it off).
-        DWORD wgc = (g_OsBuild >= 26100) ? 1u : 0u;
+        DWORD wgc = (g_OsBuild >= WGC_BROKER_BUILD_FLOOR) ? 1u : 0u;
         if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_WGC_BROKER_VALUE, &wgc, NULL))
             wgcSrc = L"registry";
         g_WgcBroker = (wgc != 0);
@@ -17711,27 +17335,27 @@ static ULONG Init(void)
         if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
     }
     {
-        // Slice retirement (broker-only per-window slice) is the shipped behaviour on 24H2+ and
+        // Slice retirement (broker-only per-window slice) is the shipped behaviour on 25H2+ and
         // tracks the broker build floor unconditionally; the SliceRetire registry knob is retired
         // (rollback = the WgcBroker gate, which routes sliceFed windows to the retained DDA slice).
-        g_SliceRetire = (g_OsBuild >= 26100);
+        g_SliceRetire = (g_OsBuild >= WGC_BROKER_BUILD_FLOOR);
         // De-slice is DERIVED, not a knob: the whole-desktop composite (MONSLICE) was proven
         // unneeded and DELETED once the de-slice proof window closed, so a DeSlice=0 would have
         // nothing to switch back to. De-sliced wherever the slice is being retired, hard-gated on
-        // the broker floor (26100): below it WgcBrokerActive() is never true and the classic DDA
+        // the broker floor (WGC_BROKER_BUILD_FLOOR): below it WgcBrokerActive() is never true and the classic DDA
         // path never used a composite - exactly the win10 config the benchmark validated. Field
         // kill-switch for the whole broker path: "WgcBroker" / qubesdb /qubes-service/wgc-broker
         // (0 -> sliceFed windows take the retained agent DDA slice fallback).
-        g_DeSlice = g_SliceRetire && (g_OsBuild >= 26100);
+        g_DeSlice = g_SliceRetire && (g_OsBuild >= WGC_BROKER_BUILD_FLOOR);
     }
     // The source is logged so a dom0 override that did not reach the gate is visible in the log.
-    LogInfo("WGCBROKER gate: enabled=%d source=%s osBuild=%lu sliceRetire=%d deSlice=%d (floor 26100)",
-            g_WgcBroker, wgcSrc, g_OsBuild, g_SliceRetire, g_DeSlice);
+    LogInfo("WGCBROKER gate: enabled=%d source=%s osBuild=%lu sliceRetire=%d deSlice=%d (floor %lu)",
+            g_WgcBroker, wgcSrc, g_OsBuild, g_SliceRetire, g_DeSlice, (ULONG)WGC_BROKER_BUILD_FLOOR);
     // Publish an authoritative de-slice health flag from the start. When the broker is NOT
     // expected (win10, or an explicit WgcBroker=0 opt-out) the answer is a definite "not down" =
     // 0, so acceptance never reads a stale value from a prior config; when it IS expected,
     // BrokerSupervise owns the flag (0 on ready, 1/2 on the hard-fail path).
-    if (!(g_WgcBroker && g_OsBuild >= 26100))
+    if (!(g_WgcBroker && g_OsBuild >= WGC_BROKER_BUILD_FLOOR))
         (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
     // docs/DESIGN-rest-zero-capture.md B/S4: on a direct-capable guest every window is broker-fed, so the PrintWindow
     // engine PwInit started above has nothing to capture - and its workers still woke four times a second for the

@@ -904,68 +904,6 @@ void CaptureDesktopImageWanted(void)
     LogInfo("QGADESKCOPY staging copy stale, every window asked to repaint (RedrawWindow %s)", ok ? L"ok" : L"FAILED");
 }
 
-BOOL CaptureFrameRegionSig(IN const CAPTURE_FRAME* frame, IN const RECT* r, OUT UINT64* sig)
-{
-    CAPTURE_CONTEXT* ctx = CONTAINING_RECORD(frame, CAPTURE_CONTEXT, frame);
-    static volatile LONG s_mapFailLogged = 0;
-    BOOL ok = FALSE;
-    EnterCriticalSection(&ctx->frame.lock);
-    do
-    {
-        if (!ctx->frame.texture || !ctx->duplication)
-            break;                                   // no frame acquired: nothing to read
-        const BYTE* bits = NULL;
-        INT pitch = 0;
-        if (ctx->frame.mapped)
-        {
-            bits = (const BYTE*)ctx->frame.rect.pBits;   // the direct-map path keeps the desktop surface mapped
-            pitch = ctx->frame.rect.Pitch;
-        }
-        else
-        {
-            if (!ctx->frame.peek_mapped)
-            {
-                const HRESULT hr = IDXGIOutputDuplication_MapDesktopSurface(ctx->duplication, &ctx->frame.peek_rect);
-                if (FAILED(hr))
-                {
-                    if (InterlockedExchange(&s_mapFailLogged, 1) == 0)
-                        LogError("QGAPWECHO the desktop surface cannot be mapped for reading (0x%x): damage on PrintWindow "
-                            L"slots is poked without its pixel check - the held-menu echo can return", hr);
-                    break;
-                }
-                ctx->frame.peek_mapped = TRUE;
-            }
-            bits = (const BYTE*)ctx->frame.peek_rect.pBits;
-            pitch = ctx->frame.peek_rect.Pitch;
-        }
-        if (!bits || pitch <= 0)
-            break;
-        RECT full = { 0, 0, (LONG)ctx->width, (LONG)ctx->height };
-        RECT c;
-        if (!IntersectRect(&c, r, &full))
-            break;
-        // FNV-1a over the clipped rect's geometry and its rows - the same construction as the frame signature.
-        UINT64 h = 1469598103934665603ULL;
-        h ^= (UINT64)(UINT)c.left;   h *= 1099511628211ULL;
-        h ^= (UINT64)(UINT)c.top;    h *= 1099511628211ULL;
-        h ^= (UINT64)(UINT)c.right;  h *= 1099511628211ULL;
-        h ^= (UINT64)(UINT)c.bottom; h *= 1099511628211ULL;
-        for (LONG y = c.top; y < c.bottom; y++)
-        {
-            const UINT32* px = (const UINT32*)(bits + (SIZE_T)y * pitch + (SIZE_T)c.left * 4);
-            for (LONG x = c.left; x < c.right; x++, px++)
-            {
-                h ^= (UINT64)*px;
-                h *= 1099511628211ULL;
-            }
-        }
-        *sig = h;
-        ok = TRUE;
-    } while (0);
-    LeaveCriticalSection(&ctx->frame.lock);
-    return ok;
-}
-
 static BOOL StagingEnsure(void)
 {
     if (g_Staging.handle)
@@ -1676,7 +1614,7 @@ static HRESULT GetFrame(IN OUT CAPTURE_CONTEXT* ctx, IN UINT timeout)
             if (!g_StagingStale)
             {
                 g_StagingPresentAsked = FALSE;   // a new stale episode begins
-                LogInfo("QGADESKCOPY off: no desktop-image copy, every window broker-fed (26100+, seamless), "
+                LogInfo("QGADESKCOPY off: no desktop-image copy, every window broker-fed (25H2+, seamless), "
                     L"frames a damage signal only (copied %ld, skipped %ld)",
                     g_DeskCopied, g_DeskSkipped);
             }
@@ -1763,19 +1701,6 @@ static HRESULT ReleaseFrame(IN OUT CAPTURE_CONTEXT* ctx)
         }
         ctx->frame.mapped = FALSE;
     }
-    // CaptureFrameRegionSig's read-only map of this frame (never set together with frame.mapped).
-    if (ctx->frame.peek_mapped)
-    {
-        status = IDXGIOutputDuplication_UnMapDesktopSurface(ctx->duplication);
-        ctx->frame.peek_mapped = FALSE;
-        if (FAILED(status))
-        {
-            if (status != DXGI_ERROR_ACCESS_LOST && status != DXGI_ERROR_ACCESS_DENIED)
-                win_perror2(status, "duplication->UnMapDesktopSurface (region signature)");   // the frame is released anyway
-            else
-                LogDebug("duplication went stale at UnMapDesktopSurface (region signature) (0x%x)", status);
-        }
-    }
 
     status = IDXGIResource_Release(ctx->frame.texture);
     if (FAILED(status))
@@ -1806,7 +1731,7 @@ end:
 // docs/DESIGN-rest-zero-capture.md C/S4: on a direct-capable guest the acquire waits with NO timeout while no grant is
 // parked - a desktop at rest must not wake this thread (it woke once a second, FRAME_TIMEOUT, measured 2026-10-01). The
 // one job the timeout did at rest was retrying parked-grant revokes (A6), and at rest none is parked; while one is (a
-// screen-grant change in progress, not rest) the 1 s retry cadence stays. Below 26100 nothing changes.
+// screen-grant change in progress, not rest) the 1 s retry cadence stays. Below the broker floor nothing changes.
 static DWORD CaptureAcquireTimeout(IN OUT CAPTURE_CONTEXT* ctx)
 {
     if (!DirectRequired())
@@ -1851,7 +1776,7 @@ static DWORD WINAPI CaptureThread(void* param)
         }
 
         // A6 timeout fallback: this loop runs at least once per FRAME_TIMEOUT while a grant is
-        // parked (and, below 26100, always), so parked grants whose ack deadline passed are
+        // parked (and, below the broker floor, always), so parked grants whose ack deadline passed are
         // retried here. One attempt per grant per pass - never a wait.
         StaleGrantSweep(capture, FALSE, L"timeout");
 

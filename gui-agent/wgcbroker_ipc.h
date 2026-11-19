@@ -12,7 +12,11 @@
 #include <windows.h>
 
 #define WGCBRK_MAGIC        0x4257434Bu   /* 'KCWB' */
-#define WGCBRK_ABI_VERSION  28u  /* 28: CropWinValid - the SAME ambiguity as ReqCardValid in the
+#define WGCBRK_ABI_VERSION  29u  /* 29: the PrintWindow route, the relay and the poke are retired
+                                  *     (ADR-capture 36); their fields keep their place, and a failed
+                                  *     open is held FAILED with its code (FailHr) until the agent asks
+                                  *     again;
+                                  * 28: CropWinValid - the SAME ambiguity as ReqCardValid in the
                                   *     other direction: the broker writes CropWinX/Y only when
                                   *     GetWindowRect succeeds, so a failure left them zero and the
                                   *     agent's QGACROPFALLBACK read a healthy window as mis-cropped
@@ -82,26 +86,11 @@
  * GUI protocol carries no per-pixel alpha at all. */
 #define WGCBRK_TILES        32
 #define WGCBRK_TILE_BYTES   (WGCBRK_TILES*WGCBRK_TILES*3)
-/* Longest a PrintWindow-captured window may go unrendered when no damage poke arrives. A bound
- * on staleness, not a polling rate: with a working poke path it should almost never fire. */
-#define WGCBRK_POKE_SAFETY_MS 1000
-/* Minimum gap between two PrintWindow renders of the same window, however many pokes arrive.
- * Input can poke at input rate, and PrintWindow costs p50 31.7 ms on a large window rendered on
- * the application's own UI thread, so without this a mouse moving across a window would restore
- * exactly the fixed-tick cost this design exists to avoid. 100 ms caps it at ~10 renders/s while
- * interacting and 0 when idle. It is a CEILING ON COST, not a refresh rate. */
-#define WGCBRK_POKE_MIN_INTERVAL_MS 100
-/* Ceiling for the adaptive backoff. A window whose renders keep changing nothing is asked less
- * and less often, up to this; any changed render or any input poke snaps it back to the floor. */
-#define WGCBRK_POKE_BACKOFF_MAX_MS 8000
-/* How long a VISIBLE window's WGC feed may stay silent before we conclude WGC is not serving it
- * and re-route to PrintWindow. Keyed on the symptom rather than on window structure. Liberal on
- * purpose: a wrong re-route now costs a single render before the adaptive backoff decays it. */
-#define WGCBRK_WGC_QUIET_MS 2000
-/* ABI 19 (docs/DESIGN-rest-zero-capture.md E): FailHr of a slot whose WGC session was quiet through a poke or a missing
- * first frame, recreated once and quiet again. The broker holds it FAILED until the agent asks again (a new ControlSeq)
- * - never a PrintWindow route and never a timed retry. The agent withholds the window and logs QGAWGCDEAF. A
- * customer-bit HRESULT, so it can never collide with one the system returns. */
+/* ABI 19 (docs/DESIGN-rest-zero-capture.md E): FailHr of a slot whose capture item Windows closed, was reopened once and
+ * closed again before it delivered a frame. The broker holds it FAILED until the agent asks again (a new ControlSeq) -
+ * never a timed retry. The agent withholds the window and logs QGAWGCDEAF. A customer-bit HRESULT, so it can never
+ * collide with one the system returns. Any other FailHr on a FAILED slot is the code of the call that could not open
+ * the capture (ADR-capture 36), or E_HANDLE for a window that was gone. */
 #define WGCBRK_E_DEAF       ((LONG)0xA057DEAFu)
 /* ABI 19 (D, R1/R4): how long a request may go unacknowledged (CtlAck behind ControlSeq) before the broker is HUNG. */
 #define WGCBRK_ACK_DEADLINE_MS 2000
@@ -147,21 +136,11 @@ typedef struct _WGCBRK_HEADER {          /* 128 bytes */
     volatile LONG      AgentPid;         /* the launcher agent's pid; broker exits if it changes */
     volatile LONG      BrokerPid;
     volatile LONG      ControlGen;       /* agent bumps on ANY capture-list change */
-    /* Input pokes dropped because the watched-window lock was busy. The input path acquires that
-     * lock with TryEnterCriticalSection and never waits, so dom0's input is never delayed by a
-     * poke - but a dropped poke means that repaint waits for the staleness bound instead. This
-     * project's rule is that a fallback firing is logged loudly and diagnosed, never silent, so
-     * count it: a PokeLockMiss that climbs alongside SafetyPolls says the contention is real and
-     * the design needs a different signal, not that it is working. Layout-compatible - it takes
-     * the place of a pad, so no ABI bump is needed and no reader is invalidated. */
+    /* RETIRED at ABI 29 (ADR-capture 36): the poke and the relay are gone, and nothing writes or reads these. The fields
+     * keep their place so no offset moves. */
     volatile LONG      PokeLockMiss;
-    /* ABI 8: the relay capability AS LATCHED, published so it is visible from outside. A capability
-     * that fails to latch must be LOUD - a silent off is the forbidden silent downgrade, and this one
-     * WAS silent: the first R1 build used VerifyVersionInfo, which the compatibility-manifest shim
-     * lies to, so the relay never engaged on a 26200 guest and the only symptom was relayOk=0 with
-     * relayFail=0. Taken from the reserved padding so the header size stays 128. */
-    volatile LONG      RelayCapable;   /* 1 = the broker latched the relay ON at startup */
-    volatile LONG      RelayOsBuild;   /* the build it decided from, via RtlGetVersion */
+    volatile LONG      RelayCapable;
+    volatile LONG      RelayOsBuild;
     /* ABI 19, R5 (docs/DESIGN-rest-zero-capture.md D): the agent bumps AgentFrameWakes on every main-loop wake (the
      * broker's frame event is one); a frame the broker published that has not moved it within WGCBRK_AGENT_DEADLINE_MS
      * is a HUNG agent,
@@ -204,9 +183,7 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG   Stride;              /* == FrameWidth*4 (packed) */
     volatile LONG   ActiveBuffer;        /* index in [0,WGCBRK_RING) holding the latest frame */
     volatile LONG   Seq;                 /* SEQLOCK: odd = write in progress, even = stable */
-    volatile LONG   HungSkips;           /* ABI 18 (was _pad0): PrintWindows skipped because the target did
-                                          * not answer a 100 ms WM_NULL probe (a hung window would block the
-                                          * broker's main loop in PrintWindow with no timeout) */
+    volatile LONG   HungSkips;           /* RETIRED at ABI 29 with the PrintWindow route it counted; keeps its place */
     volatile UINT64 FrameId;             /* monotonic; agent skips a slot with unchanged FrameId */
     volatile LONGLONG CaptureTick;       /* GetTickCount64 at publish; freshness vs secure-left */
     /* Pixel-exact crop: the broker PrintWindow-renders the FULL window (transparent margin comes
@@ -236,7 +213,7 @@ typedef struct _WGCBRK_SLOT {
      * only path menus use. Stage meanings differ per path, hence TickPw rather than one schema. */
     volatile UINT64   TickHwnd;          /* Hwnd the ticks below belong to; 0 = never opened */
     volatile LONG     TickOpenOk;        /* 1 once this open is past the point that can fail */
-    volatile LONG     TickPw;            /* 1 = polled PrintWindow path, 0 = WGC */
+    volatile LONG     TickPw;            /* RETIRED at ABI 29 (no PrintWindow path); keeps its place */
     /* ABI 5: these six are QueryPerformanceCounter COUNTS, not milliseconds - the reader divides
      * by QueryPerformanceFrequency. GetTickCount64 advances in ~15.6 ms steps and every component
      * of a menu's first-content latency measured 16-31 ms, i.e. one or two of those steps: across
@@ -250,7 +227,7 @@ typedef struct _WGCBRK_SLOT {
     volatile LONGLONG StartTick;         /* WGC: StartCapture returned.        PW: first poll entered */
     volatile LONGLONG FirstArrivedTick;  /* WGC: first FrameArrived.           PW: first PrintWindow returned */
     volatile LONGLONG FirstPublishTick;  /* first publish completed (both paths) */
-    volatile LONG     PollCount;         /* PW: polls entered for this open; WGC: 0 */
+    volatile LONG     PollCount;         /* RETIRED at ABI 29 (no PrintWindow path); keeps its place */
     /* ABI 19 (was _padTick2), R1/R4: the ControlSeq the broker's main loop last HANDLED for this slot - written at the
      * end of each Reconcile pass over it, after any open or close. The agent arms a deadline when it bumps ControlSeq
      * and disarms it when this catches up: unanswered for WGCBRK_ACK_DEADLINE_MS = a hung broker (QGABROKERHUNG). For
@@ -277,89 +254,39 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG     PoolW;             /* the pool size it was compared against */
     volatile LONG     PoolH;
     volatile LONG     DeafHolds;         /* ABI 19 (was _padAbi6): times this slot went FAILED with WGCBRK_E_DEAF */
-    /* ABI 7. DAMAGE-DRIVEN POLLING for the PrintWindow path.
-     *
-     * WHY. A window whose content is rendered by a CROSS-PROCESS CHILD has an empty surface of its
-     * own, so a WGC session on it delivers nothing - measured 2026-09-25: PrintWindow(flags=0) on
-     * the Settings frame returned ONE distinct colour over 1216x941 while PW_RENDERFULLCONTENT
-     * returned 191 and the whole page. Those windows must therefore be captured with PrintWindow.
-     * But PrintWindow is expensive and SYNCHRONOUS ON THE CAPTURED APPLICATION'S UI THREAD:
-     * measured p50 31.7 ms (p90 38.9, max 53.3, n=40) on that window, and the broker's polled path
-     * runs at ~13.5/s, i.e. about 43% of one core, for ONE window, for ever. Jev on those numbers:
-     * unacceptable-as-is 1.00, damage-driven-polling 0.87.
-     *
-     * So the agent, which already computes per-window damage by intersecting the desktop's dirty
-     * rects with each window rect, bumps PokeSeq when this window's pixels actually changed. The
-     * broker renders only when PokeSeq != PokeAck, then stores the value it serviced. A window
-     * nobody is touching costs nothing.
-     *
-     * SafetyPolls bounds staleness if the damage signal is ever wrong: the broker still polls
-     * after WGCBRK_POKE_SAFETY_MS of silence. That is a BOUND, not a fallback - it is counted, and
-     * a SafetyPolls that climbs while PollsSkipped climbs means the poke path is not working and
-     * must be diagnosed, not tolerated. */
+    /* RETIRED at ABI 29 (ADR-capture 36): the poke and the PrintWindow route they served. Nothing writes or reads
+     * these five; they keep their place so no offset moves. */
     volatile LONG     PokeSeq;           /* agent: bumped when this window's pixels changed */
     volatile LONG     PokeAck;           /* broker: the PokeSeq value it last rendered for */
     volatile LONG     PollsServiced;     /* renders actually performed */
     volatile LONG     PollsSkipped;      /* ticks where nothing had changed, so nothing was done */
     volatile LONG     SafetyPolls;       /* renders forced by the staleness bound, not by a poke */
-    /* Times this slot was re-routed from WGC to PrintWindow because the cross-process content
-     * child appeared AFTER the session opened. The frame exists before the app creates its
-     * content, so the first routing decision is usually taken too early; without a re-check the
-     * window stays on a session that will never deliver. A previous attempt at this fix failed
-     * for exactly that reason, so the recovery is counted rather than silent. */
+    /* Sessions the broker reopened on this slot on its own: a capture item Windows closed, or a frame dropped for size
+     * (Reconcile). Counted, never silent. */
     volatile LONG     Reroutes;
     /* ABI 20 (was BackoffMs, the adaptive poll interval S3 removed): WGC arrivals whose card was byte-identical to the
      * published one and were therefore NOT republished - the agent was not woken for them. The owner's rule: the same
      * pixels repainted are not a change. Only in steady state; an arrival that answers a registration is published. */
     volatile LONG     SameFrames;
-    /* Re-routes triggered by the BEHAVIOURAL test (a visible window whose WGC feed never spoke),
-     * as opposed to the structural fast path. Separated so the two can be told apart on the rig:
-     * if QuietReroutes carries the load, the structural test is not earning its place. */
+    /* RETIRED at ABI 29 (ADR-capture 36): the relay, its quiet ladder and the route counters. Nothing writes or reads
+     * these; they keep their place so no offset moves. */
     volatile LONG     QuietReroutes;
-    /* Quiet re-routes the first PrintWindow render DISPROVED - the card matched what WGC had
-     * already published, so the window was static rather than broken and was handed back. This
-     * is the false-positive rate of the behavioural detector, measured rather than argued. */
     volatile LONG     ProbeBounces;
-    /* ABI 8: WHICH WRITER IS FEEDING THIS SLOT. TickPw already said "polled PrintWindow or not", but
-     * with the relay there are THREE answers and collapsing them loses the one that matters: a slot
-     * fed by a thumbnail relay is ARRIVAL-DRIVEN like a WGC slot, not polled like a PrintWindow one,
-     * and a ledger that cannot tell them apart cannot show the fallback going away. */
-    volatile LONG     Route;        /* WGCBRK_ROUTE_* */
-    volatile LONG     RelayOk;      /* thumbnail registrations that produced a capturable dest */
-    volatile LONG     RelayFail;    /* relay attempts that failed; the slot then falls back */
-    volatile UINT64   RelayDest;    /* the destination HWND we own, for cross-checking the agent's
-                                     * broker-owned-window exclusion from outside */
+    volatile LONG     Route;
+    volatile LONG     RelayOk;
+    volatile LONG     RelayFail;
+    volatile UINT64   RelayDest;
     /* ABI 9: DID THE EVENT FIRE, OR DID WE THROW IT AWAY? FramesArrived is incremented AFTER the
      * arrival handler's re-validation guard, so a guard that starts rejecting looks exactly like a
-     * feed that stopped - and the quiet detector then demotes a healthy channel. That is not
-     * hypothetical: five relay slots delivered 83/25/29/3/2 frames and were all demoted, and Jev put
-     * the guard at 0.70 as the mechanism against every other candidate below 0.19. These two count
-     * the raw invocation and the rejection, so the two cases can never be confused again. */
+     * feed that stopped. These two count the raw invocation and the rejection, so the two cases can
+     * never be confused. */
     volatile LONG     ArrivalRaw;       /* handler entered, before any guard */
     volatile LONG     ArrivalRejected;  /* guard returned early: pool null or a different sender */
-    /* ABI 10: A POKE IS NOT EVIDENCE THE SOURCE CHANGED. The agent derives damage from DESKTOP dirty
-     * rects, so a poke fires whenever anything repaints inside a window's screen rectangle - a
-     * passing cursor, an overlapping window - whether or not that window's own content moved. The
-     * quiet detector demoted on "a poke arrived and no frame followed", which a healthy relay on a
-     * STATIC window satisfies for ever: measured 2026-09-26 on win11de-led2, all four rogue classes
-     * sat on route 2 with relayOk=1, frames delivered (56/28/6/3) and then PokeSeq 11772 against
-     * FramesArrived 56. Jev: root_cause=quiet-rule-demotes-healthy-static-relays 1.00, and the fix
-     * is to require evidence the SOURCE changed (0.76). This counts the times that evidence was
-     * absent and the demotion was therefore declined - if it never advances, the new rule is not
-     * firing and any pass is unproven. */
+    /* RETIRED at ABI 29 with the relay's source test; they keep their place. */
     volatile LONG     RelayStaticHolds;
-    /* ABI 11: WHY did the source test decide what it decided? RelayStaticHolds alone could not say.
-     * Measured 2026-09-26 on win11de-led3: three rogue classes held arrival-driven routes with the
-     * hold counter CLIMBING (37->48), while both ULW-layered slots FROZE at 1 and 4 and fell to the
-     * polled path - so the test had returned SAME a few times and then something else. Two
-     * mechanisms fit that equally (PrintWindow succeeding but returning unstable pixels on a
-     * per-pixel-alpha window, versus PrintWindow failing outright, which the code maps to CHANGED by
-     * design) and Jev rated the evidence `insufficient-evidence` 0.85 to separate them, naming
-     * exactly this instrumentation as the next measurement (0.83). One counter per outcome, so the
-     * two can never again be confused. */
-    volatile LONG     RelaySrcChanged;      /* measured: the source hash differed -> demotion allowed */
-    volatile LONG     RelaySrcUnmeasured;   /* throttled: no test ran, neither demote nor hold */
-    volatile LONG     RelayPwFail;          /* the test could not render the source at all */
+    volatile LONG     RelaySrcChanged;
+    volatile LONG     RelaySrcUnmeasured;
+    volatile LONG     RelayPwFail;
     /* ABI 12: DO THE DELIVERED PIXELS MATCH WHAT THE WINDOW RENDERS? Route counters say where a
      * frame came from, not whether it is right, and the census's in-guest test only shows that
      * content exists outside a window's own surface. Asked to accept on that, Jev answered
@@ -435,44 +362,7 @@ typedef struct _WGCBRK_SLOT {
     volatile LONG     DirtyPublishes;
     volatile LONG     DirtyFullCopies;
     volatile LONGLONG DirtyBytes;
-    /* ABI 23: THE AGENT ASKS FOR A ROUTE. WGCBRK_ROUTE_WGC (0) = no preference, the broker decides as before;
-     * WGCBRK_ROUTE_RELAY (1) = this window is NOT capturable by a session on itself, open it on the relay.
-     *
-     * WHY. A per-HWND WGC session is UNRELIABLE for this class - not incapable, unreliable, and the difference
-     * matters. MEASURED 2026-10-17 on win11de-sm (26200.8037), counted per OPENING (one QGABROKERREG):
-     * ordinary windows reached a painted frame in 3 of 3 openings and produced NO black frame at all; the
-     * Search surfaces reached one in 14 of 28; the Start surface in 0 of 2. The shape of a failing opening is
-     * always the same - one QGASLICEBLACK nonblack=0/9400 published at 45-171 ms, then QGADIRECTWAIT "no
-     * painted frame yet" for 719 ms, then the opening ends. When an opening DOES paint, the painted frame is
-     * published at ~392 ms (nonblack=9125/10000). So the first frame is empty and the SECOND arrival is the
-     * one that matters, and it often never comes: WGC publishes on surface CHANGE, and a surface composed
-     * before the session started has no further change to report. The relay captures a destination WE own
-     * carrying a DWM thumbnail, which DWM recomposes, so arrivals do not depend on the source changing again.
-     * (An earlier version of this comment said 26 of 26 frames black and "zero painted, ever". That came from
-     * counting QGASLICEBLACK without counting QGASLICECONTENT - one emitter, not the population - and it
-     * overstated impossibility where the truth is unreliability. Jev on the corrected numbers: the defect is
-     * real-unreliable-first-frame 1.00, this fix relay-still-right 0.76.)
-     *
-     * AND WHY THE AGENT ASKS, rather than the broker deciding. The broker's ladder keys on a SYMPTOM - "quiet
-     * while the agent says it changed" - which cannot see a feed that delivered one empty frame and stopped.
-     * The live broker read relayOk=0 relayFail=0 on every slot with relayCapable=1 published as available, and
-     * both `g_forcePw[i] = true` sites require the slot to ALREADY be a relay, so nothing could ENTER the
-     * route. Only the agent knows the window's class, and it already classifies it (ShellSurfaceKind) to
-     * decide cropping; this carries that answer to where the route is chosen rather than duplicating the
-     * classifier in the broker, where the two would drift.
-     *
-     * This does NOT re-add the rung ADR-capture 32 removed. That decision took the relay out of the QUIET
-     * LADDER (its invisible destination sat over other windows and got a neighbour falsely recreated, rz27) and
-     * in the same sentence kept it as "a CAPTURE ROUTE for a window OPENED on it (cross-process content)" -
-     * which is exactly this. It also restores, for exactly the class that needs it, the architecture pinned
-     * 2026-09-02: "per-HWND WGC for app/UWP/NRB/o-r-menu windows + ONE monitor capture for shell CoreWindows".
-     * Jev, given the full constraint set including ADR-32: shape-route-shell-surfaces 0.97, adr32_conflict
-     * no-adr32-preserves-it 0.83, and the rz27 neighbour-recreate check MUST be re-measured on this
-     * (must-be-measured-not-assumed 0.64) before it ships.
-     *
-     * APPENDED, NOT INSERTED. guest/wgcbroker-peek.ps1 reads this struct at hardcoded byte offsets
-     * ($b+3424/3428/3432 are the ABI 22 fields above); a field in the middle would silently blind every
-     * offset after it. This one lands at 3440 and nothing moves. */
+    /* RETIRED at ABI 29 (ADR-capture 36) with the relay it asked for; keeps its place (3440). */
     volatile LONG     ReqRoute;
     /* ABI 25: THE CARD'S POSITION IN SCREEN COORDINATES, so the crop stops being a race.
      *
@@ -545,10 +435,7 @@ typedef struct _WGCBRK_SLOT {
 #define WGCBRK_STG_RECONCILE  1u   /* Reconcile, between its calls */
 #define WGCBRK_STG_OPEN       2u   /* OpenChannel: CreateForWindow, frame pool, StartCapture */
 #define WGCBRK_STG_CLOSE      3u   /* CloseChannel teardown: revoke, session.Close, pool.Close */
-#define WGCBRK_STG_RELAY_DWM  4u   /* relay destination window + DwmRegister/UnregisterThumbnail */
-#define WGCBRK_STG_PROBE      5u   /* the WM_NULL responsiveness probe (bounded to 100 ms) */
-#define WGCBRK_STG_SRC_PW     6u   /* RelaySourceChanged: PrintWindow of a quiet window's source */
-#define WGCBRK_STG_POLL_PW    7u   /* PublishPrintWindow: PrintWindow of a polled window */
+/* 4-7 were the relay's and the PrintWindow route's stages, retired at ABI 29 (ADR-capture 36); the numbers are not reused. */
 #define WGCBRK_STG_REPUBLISH  8u   /* RepublishRetained */
 
 /* HOW LONG A DECLARED STAGE MAY LAST BEFORE IT IS A HANG (ABI 19, 2026-10-07; findings/issues.md P1, Jev 0.97).
@@ -559,18 +446,14 @@ typedef struct _WGCBRK_SLOT {
  * only a stage that has not changed for that long is a hang. This is not a timeout standing in for an observable
  * condition - the observable conditions (the ack, the progress counter) are still required; this is the third exit,
  * and its expiry is the loud QGABROKERHUNG that names the stage.
- * WGCBRK_STG_OPEN and _CLOSE call into WGC/DWM, which can block on a window that is itself busy; the rest are ours. */
+ * WGCBRK_STG_OPEN and _CLOSE call into WGC, which can block on a window that is itself busy; the rest are ours. */
 static __inline unsigned WgcbrkStageBudgetMs(unsigned stageCode)
 {
     switch (stageCode)
     {
     case WGCBRK_STG_OPEN:
     case WGCBRK_STG_CLOSE:
-    case WGCBRK_STG_RELAY_DWM:
-        return 8000u;    /* a capture session or a DWM thumbnail on a window that has just appeared */
-    case WGCBRK_STG_SRC_PW:
-    case WGCBRK_STG_POLL_PW:
-        return 6000u;    /* PrintWindow into an application that may be slow to paint (IsHungAppWindow is checked) */
+        return 8000u;    /* a capture session on a window that has just appeared */
     default:
         return WGCBRK_ACK_DEADLINE_MS;   /* our own bookkeeping: the ordinary deadline */
     }
@@ -580,12 +463,6 @@ static __inline unsigned WgcbrkStageBudgetMs(unsigned stageCode)
 #define WGCBRK_STG_SIGN       9u   /* FlushPendingSignatures */
 #define WGCBRK_STG_CLOSE_LOCK 10u  /* CloseChannel: acquiring the slot lock a FrameArrived handler may hold */
 #define WGCBRK_STG_CLOSE_REAP 11u  /* CloseChannel: handing the WGC teardown to its own thread (never waits) */
-
-/* Route values. Deliberately explicit rather than a bool pair: the whole point of the relay is to
- * move slots OFF route 2, and "how many slots are still on 2" must be a single readable number. */
-#define WGCBRK_ROUTE_WGC    0u   /* WGC on the window itself - arrival-driven */
-#define WGCBRK_ROUTE_RELAY  1u   /* WGC on a destination carrying a DWM thumbnail - arrival-driven */
-#define WGCBRK_ROUTE_PW     2u   /* polled PrintWindow - the fallback this relay exists to retire */
 
 #define WGCBRK_HDR(base)       ((WGCBRK_HEADER*)(base))
 #define WGCBRK_SLOTS(base)     ((WGCBRK_SLOT*)((BYTE*)(base)+sizeof(WGCBRK_HEADER)))
