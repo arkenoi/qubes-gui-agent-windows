@@ -112,6 +112,14 @@ static const QerrText QerrTexts[] = {
       QERR_TXT_DESKTOP_STUCK_NEXT,
       QERR_GUI_AGENT_LOG ", line QGADESKSTUCK", NULL },
 
+    /* The window-event hook thread exited while the agent keeps running (log line QGAWINEVTDEAD). It is what tells
+     * the agent that a window opened, closed, moved or changed; in seamless on 25H2+ nothing substitutes for it
+     * (docs/ADR-capture.md section 33), and it is never restarted. ACTION: the qube's restart brings it back. */
+    { "window-tracking-stopped", "gui-agent", "window-tracking-stopped", QERR_SEV_ACTION, "gui-agent.exe", NULL,
+      "Guest windows no longer follow changes",
+      "New, closed or moved windows are not shown. Restart the qube.",
+      QERR_GUI_AGENT_LOG ", line QGAWINEVTDEAD", NULL },
+
     /* docs/ADR-uac.md section 7. Windows parks an elevation prompt it did not raise behind a flashing taskbar
      * button, and the agent maps a taskbar only once the shell exists - so during startup the prompt blocks
      * the program that asked and nothing leads the user to it (log line QGAUACPENDING). ACTION: only a human

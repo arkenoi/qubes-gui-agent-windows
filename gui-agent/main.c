@@ -1059,6 +1059,22 @@ static void CALLBACK WindowEventProc(
 
     if (event == EVENT_SYSTEM_DESKTOPSWITCH)
     {
+        // Once per switch (boot, sign-in, lock): which desktop this hook thread is on when it hears the switch,
+        // and which desktop has the input now. A hook sees only its own desktop's events (SetWinEventHook), and
+        // with no desktop frames in seamless on 25H2+ this event is what wakes the agent at the sign-in
+        // desktop's end (ADR-capture 33), so the pair is the record of whether it does.
+        WCHAR mine[64] = L"?", input[64] = L"?";
+        DWORD needed = 0;
+        HDESK cur = GetThreadDesktop(GetCurrentThreadId());
+        if (cur)
+            GetUserObjectInformation(cur, UOI_NAME, mine, sizeof(mine), &needed);
+        HDESK in = OpenInputDesktop(0, FALSE, DESKTOP_READOBJECTS);
+        if (in)
+        {
+            GetUserObjectInformation(in, UOI_NAME, input, sizeof(input), &needed);
+            CloseDesktop(in);
+        }
+        LogInfo("QGADESKSWITCHEVT the hook thread on '%s' heard a desktop switch, input desktop now '%s'", mine, input);
         QueueWindowEvent(NULL, 0, TRUE);
         return;
     }
@@ -1275,9 +1291,10 @@ static DWORD WINAPI WindowEventThreadProc(IN void* param)
     if (stopRequested)
         LogInfo("window event thread exiting on request - the agent is leaving");   // QGA_WINEVT_EXPECTED
     else
-        // The fallback: with the thread gone while the agent keeps running, window tracking falls back to the
-        // 0.5 Hz resync sweep until the agent restarts.
-        LogError("QGAWINEVTDEAD window event thread died unexpectedly, using fallback");
+        // With the thread gone while the agent keeps running, only desktop frames still drive the resync sweep - and
+        // in seamless on 25H2+ there are none, so nothing substitutes for it (ADR-capture 33). The main loop waits on
+        // this thread's handle and tells dom0 (window-tracking-stopped).
+        LogError("QGAWINEVTDEAD window event thread died unexpectedly: windows follow desktop frames only, where there are any");
     InterlockedExchange(&g_WindowEventThreadDead, 1);
 
     LogDebug("end");
@@ -8533,7 +8550,7 @@ static BOOL CALLBACK AddWindowsProc(IN HWND window, IN LPARAM lParam)
 // Intermittent because it is a race against autologon, and cleared by an agent restart because
 // that re-attaches to whatever is current - which is why every check that restarted the agent
 // in a live session missed it.
-static void EnsureOnInputDesktop(void)
+static void EnsureOnInputDesktop(IN const WCHAR* wake)
 {
     WCHAR mine[128] = L"", input[128] = L"";
     DWORD needed = 0;
@@ -8551,7 +8568,7 @@ static void EnsureOnInputDesktop(void)
     if (mine[0] && input[0] && 0 == wcscmp(mine, input))
         return; // already there
 
-    LogInfo("input desktop changed: '%s' -> '%s', re-attaching", mine, input);
+    LogInfo("input desktop changed: '%s' -> '%s', re-attaching (seen on: %s)", mine, input, wake);
     AttachToInputDesktop();
     // The window hooks only receive events from the desktop the setting thread is attached to,
     // so they have to follow as well or tracking stays dead on the new desktop.
@@ -8735,7 +8752,7 @@ static ULONG AddAllWindows(IN OUT UINT* interrogated)
                         (LONG64)g_HoldOver250, (LONG64)g_HoldOver1s, (LONG64)g_HoldOver3s);
         }
     }
-    EnsureOnInputDesktop();
+    EnsureOnInputDesktop(L"enumeration");
 
     // SECURE-DESKTOP FREEZE, enumeration leg (v3): a respawned agent initializing while a
     // UAC prompt is up (ResetWatch -> here; the exact field respawn-during-consent case)
@@ -13619,6 +13636,397 @@ static BOOL SecureDesktopLockedNow(IN BOOL reported, IN OUT BOOL *readDone, IN O
     return FALSE;
 }
 
+// THE INPUT DESKTOP, OBSERVED, and the secure-desktop episode it starts and ends. Runs on every main-loop
+// wake (WatchForEvents) as well as on every desktop frame (ProcessNewFrame), so that nothing about it rests on a
+// desktop frame: ADR-capture 33 removes them in seamless on 25H2+. `wake` names the wake in the change line.
+// TRUE = seamless and the secure desktop is up: the caller must let nothing flow.
+//
+// SECURE-DESKTOP FREEZE (owner rule: the secure desktop is NEVER granted; field root
+// cause 2026-08-27 - the mapped UAC dimming backdrop WAS GWeck's black window). While
+// the input desktop is not "Default", NOTHING may flow: the framebuffer now holds
+// secure-desktop pixels (consent dialog included), and the enumerable windows ARE the
+// secure surfaces. Returning early freezes everything at once - no publish of the
+// secure framebuffer, no tracking pass (so no accept of consent/backdrop AND no removal
+// of the Default desktop's still-mapped windows - a first attempt that denied in
+// ShouldAcceptWindow instead unmapped every open window, measured shot13), no damage.
+// The window-event and broker paths freeze on g_OnSecureDesktop themselves. The resume path
+// invalidates the frame signature so the first Default-desktop frame after the prompt cannot be
+// skipped as redundant and repaints promptly.
+static BOOL ObserveInputDesktop(IN const WCHAR* wake)
+{
+    // Re-observe the input desktop FIRST, BEFORE the freeze decision.
+    // g_OnSecureDesktop is only written by AttachToInputDesktop; EnsureOnInputDesktop
+    // is the one path that calls it on a change. If the freeze gate came first, that
+    // path would be gated by the very flag it must clear - a deadlock (measured v3:
+    // agent stuck on Winlogon forever, zero windows, after the prompt cleared).
+    // EnsureOnInputDesktop early-returns cheaply while the desktop is unchanged, and
+    // on the Default->... and ...->Default transitions re-attaches + rearms the hooks,
+    // updating g_OnSecureDesktop as a side effect.
+    EnsureOnInputDesktop(wake);
+
+    static BOOL s_WasSecure = FALSE;
+    static BOOL s_ShownNonSeamless = FALSE;
+    // SEAMLESS ONLY (owner decision 2026-08-28, superseding "unconditional" here).
+    //
+    // SEAMLESS: the secure desktop is never granted. Each secure surface would become its
+    // OWN standalone dom0 window - a consent box or a full-screen dimming backdrop
+    // indistinguishable from dom0's own UI (that backdrop WAS GWeck's black window,
+    // root-caused 2026-08-27). Freeze everything: no publish of the secure framebuffer, no
+    // tracking pass, no damage.
+    //
+    // NON-SEAMLESS: show it, secure or not. The guest desktop is ONE bounded window there,
+    // so the sign-in screen appears inside it exactly as any other guest content, and the
+    // safety rule is unchanged and enforced elsewhere - no fullscreen unless DOM0 asked for
+    // the size (the geometry guard + shrink-on-entry in SetSeamlessMode), and no
+    // override-redirect. This is what makes a guest that does not log itself in reachable
+    // at all: measured 2026-08-28, autologon off meant 0 windows mapped and no password box
+    // anywhere (forum posts 98/101; upstream QWT shows the sign-in screen and defaults to
+    // this mode). Entering non-seamless still requires service.gui-fullscreen - a guest
+    // cannot put itself into this mode unasked.
+    //
+    // SAY SO WHEN THE FREEZE IS NOT TRANSIENT (2026-08-28). At boot the agent starts on
+    // Winlogon and stays frozen until autologon completes - 15-17 s on this testbed, entirely
+    // normal. But on a guest WITHOUT autologon the freeze never ends: the guest waits at the
+    // sign-in screen, dom0 is shown nothing at all, and the log went completely silent about
+    // it. Two field reports ("absolutely nothing is visible", forum posts 98/101) cost days
+    // because nothing in any log named this state. The freeze stays - what changes is that it
+    // announces itself.
+    #define SECURE_DESKTOP_FIRST_WARN_MS 30000
+    #define SECURE_DESKTOP_REWARN_MS 120000
+    // THE LAST RESORT, AND NOTHING ROUTINE REACHES IT ANY MORE. Autologon is now checked, armed
+    // and confirmed on the first frame of a secure-desktop episode (AutologonEnsure), and the two
+    // states a human must answer - not provisioned, re-arm failed - are reported there, at once,
+    // on the fact. A lock is reported at once too. So this bound is only reached by a guest that
+    // is armed, confirmed, unlocked, and STILL on the secure desktop: autologon that will never
+    // complete (wrong password, disabled or locked-out account). This agent has no positive
+    // signal for that one state, which is why a clock survives here and nowhere else in this
+    // block - the residual, named rather than dressed up. 30 s was the old gate and was wrong
+    // because autologon takes 15-17 s normally and a clean install's first logon exceeds it.
+    #define SECURE_DESKTOP_NOTIFY_ARMED_MS 600000
+    static ULONGLONG s_SecureSince = 0;
+    static ULONGLONG s_SecureNextWarn = 0;
+    static BOOL s_LockReported = FALSE;   // one lock report per secure-desktop episode
+    static BOOL s_LockReadDone = FALSE;    // SecureDesktopLockedNow read this episode
+    static LONG s_LockSeq = 0;              // ...as of this many session events (LifecycleSessionEventSeq)
+    static DWORD s_LockArmsSaid = 0;        // the non-reporting lock arms already said this episode (a bit per QGA_LOCK_*)
+    static BOOL s_ShellProcAbsent = FALSE;  // the process list read "no shell" this episode: not snapshotted again
+    static AutologonState s_Al = AL_OK;     // this episode's autologon verdict, decided on entry
+    static WCHAR s_AlUser[64] = L"";        // the account it is (or would be) armed for
+    if (g_OnSecureDesktop)
+    {
+        ULONGLONG now = GetTickCount64();
+        SESSION_LOCK_READING lockRead;   // the reading the LOCKED line below carries
+        if (!s_WasSecure)
+        {
+            s_SecureSince = now;
+            s_SecureNextWarn = now + SECURE_DESKTOP_FIRST_WARN_MS;
+            s_ShownNonSeamless = FALSE;
+            s_LockReported = FALSE;   // a new episode may be a different cause
+            s_LockReadDone = FALSE;   // read on the first frame of it immediately
+            s_LockArmsSaid = 0;       // and say each refused arm once more, with this episode's facts
+            s_ShellProcAbsent = FALSE;   // a new episode may have reached a shell since
+            // AUTOLOGON, ON THE FIRST FRAME OF THIS EPISODE, WITH NO WAIT. Nothing below
+            // this line waits to find out whether autologon works: it is read, the cause is
+            // removed where that needs no credential, the result is read back, and the two
+            // states nothing here can repair go to dom0 at once. See AutologonEnsure.
+            s_AlUser[0] = L'\0';
+            {
+                WCHAR did[160] = L"";
+                DWORD alErr = 0;
+                s_Al = AutologonEnsure(s_AlUser, RTL_NUMBER_OF(s_AlUser),
+                                       did, RTL_NUMBER_OF(did), &alErr);
+                switch (s_Al)
+                {
+                case AL_FIXED:
+                    // SILENTLY, AT INFO. Owner, 2026-10-09: "so we do it silently, no need to warn
+                    // user we had to re-enable." This started as a WARNING on the theory that
+                    // autologon turning itself off is weird - but the cause is now known and it is
+                    // ROUTINE: a cumulative update rewrites Winlogon values and brings
+                    // AutoLogonCount back (measured 2026-08-13 on win11-tpl). Routine maintenance
+                    // that this code performs and verifies is not something to tell anyone about,
+                    // and a warning on every post-update boot would be exactly the noise this
+                    // change exists to remove. The line stays at INFO so the history is still
+                    // readable when someone asks how often it happens. The mechanism: AutoLogonCount
+                    // makes Windows consume DefaultPassword and fall back to the sign-in screen, and a
+                    // cumulative update rewriting Winlogon is how it returns. Nothing waits on this and
+                    // nobody is told.
+                    LogInfo("QGAAUTOLOGON autologon restored for '%s': %s, read back", s_AlUser, did);
+                    break;
+                case AL_PASSWORD_GONE:
+                    // NOT REPAIRABLE HERE, so dom0 is told AT ONCE, on the fact. Writing
+                    // AutoAdminLogon=1 with no password behind it would make the registry claim
+                    // autologon is armed while the guest still stops at the sign-in screen -
+                    // guest/ensure-autologon.ps1: "PREVENTION, NOT REPAIR ... we do not know the
+                    // password and will not invent one." This is the consumed-password end state:
+                    // AutoLogonCount was present at some point and Windows ate the password. Only a
+                    // human can put it back - guest/set-autologon.ps1 validates the credentials with
+                    // LogonUser before storing them.
+                    LogError("QGAAUTOLOGON the autologon password for '%s' is GONE from both the registry and "
+                        L"the LSA store: autologon cannot succeed whatever AutoAdminLogon says (%s), only a "
+                        L"human can restore it", s_AlUser, did);
+                    QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
+                    break;
+                case AL_UNPROVISIONED:
+                    // Nothing this agent writes can change it; only a human can - guest/set-autologon.ps1,
+                    // or switch the qube to the windowed desktop and sign in by hand.
+                    // NOT provisioned: DefaultUserName is empty, so there is no account to log in as and dom0 is shown
+                    // nothing until a human acts.
+                    LogError("QGAAUTOLOGON autologon is OFF, seamless mode is inactive until user logs in");
+                    QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
+                    break;
+                case AL_WRITE_FAILED:
+                    LogError("QGAAUTOLOGON autologon needed fixing for '%s' and the fix did NOT take "
+                        L"(err %lu): the write or its read-back failed, so this agent cannot recover "
+                        L"the guest's sign-in by itself.", s_AlUser, alErr);
+                    QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
+                    break;
+                case AL_UNREADABLE:
+                    LogError("QGAAUTOLOGON the Winlogon key could not be opened (err %lu), so whether "
+                        L"autologon can work is unknown - which is itself what a reader needs to be "
+                        L"told.", alErr);
+                    break;
+                case AL_OK:
+                default:
+                    break;   // armed, provisioned, no count, password present: nothing to say
+                }
+            }
+        }
+        s_WasSecure = TRUE;
+
+        if (!g_SeamlessMode)
+        {
+            // Bounded desktop window: show it and carry on with normal processing.
+            if (!s_ShownNonSeamless)
+            {
+                s_ShownNonSeamless = TRUE;
+                // The bounded desktop window is the way in for a guest that does not log itself in.
+                LogInfo("QGADESK secure desktop shown inside the desktop window (non-seamless, %lux%lu)",
+                    g_ScreenWidth, g_ScreenHeight);
+            }
+        }
+        // A LOCK IS CONCLUSIVE THE MOMENT IT IS SEEN AND MUST NOT WAIT FOR A CLOCK. Owner,
+        // 2026-10-09: "no one will wait for 10 minutes at locked machine. if it is locked it
+        // should be detected fast." The previous version of this fix got the classification
+        // right but left it inside the 30 s warn point, so a lock was still reported 30 s late
+        // and, with autologon armed, could fall through to the 10 min backstop. The fact a lock
+        // needs - the session's own LOCK state, read from WTSSessionInfoEx - is available on the
+        // first secure frame, so it is read there and the report goes out immediately, once.
+        // A session that is ENDING is excluded: during shutdown the console user is still
+        // present while LogonUI is up, and that is a teardown, not a lock.
+        // AND A LOCK IS NEVER ASSUMED (owner, 2026-10-10: "if there IS locked guest we need to
+        // report it, ONCE, but NEVER assume there is as based on inaccurate measurements"): the
+        // verdict is QgaLockVerdict's, and it is not LOCKED until this agent instance has seen a
+        // shell window - the two measured false reports were each this agent's FIRST secure frame,
+        // 2 s after its start, with no desktop it had ever seen to compare against. The line
+        // carries the facts it rests on; the once per boot is notifyerr's persisted marker.
+        else if (SecureDesktopLockedNow(s_LockReported, &s_LockReadDone, &s_LockSeq, &s_LockArmsSaid,
+                                        &s_ShellProcAbsent, &lockRead))
+        {
+            SECURE_DESKTOP_FACTS f;
+            s_LockReported = TRUE;
+            SecureDesktopFactsRead(&f);
+            // shell-by says which fact established the shell: "window" (seen on Default by this
+            // instance) or "default-probe" (asked from the Default desktop while this agent sits on
+            // Winlogon - a real lock met by a fresh agent). A reader can tell the two paths apart.
+            // dom0 is shown nothing while the session is locked.
+            LogWarning("QGADESKSTUCK session LOCKED, seamless inactive until unlocked: shell-by=%s secure-for=%I64u s "
+                L"wts-flags=%lu level=%lu input-desktop=%s logonui-window=%d consent-window=%d",
+                lockRead.ShellSeen ? L"window" : L"default-probe", (now - s_SecureSince) / 1000,
+                lockRead.SessionFlags, lockRead.Level, f.InputDesktop, (int)f.LogonUi, (int)f.Consent);
+            QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
+        }
+        else if (now >= s_SecureNextWarn)
+        {
+            s_SecureNextWarn = now + SECURE_DESKTOP_REWARN_MS;
+
+            WCHAR desktopName[64] = L"?";
+            HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
+            if (desktop)
+            {
+                DWORD needed = 0;
+                if (!GetUserObjectInformation(desktop, UOI_NAME, desktopName,
+                    sizeof(desktopName), &needed))
+                    StringCchCopy(desktopName, RTL_NUMBER_OF(desktopName), L"?");
+            }
+
+            // WHICH PATH PUT US HERE. Owner, 2026-10-08: "if it sits on the uac prompt we need
+            // to know what path brought us there and how to handle it properly." The desktop
+            // NAME cannot tell them apart - a sign-in screen, a lock screen and a UAC prompt on
+            // the secure desktop are all "Winlogon" - and they need different answers:
+            // Each is told by WHO OWNS THE WINDOWS ON THE INPUT DESKTOP (SecureDesktopFactsRead) and
+            // by whether anybody is logged on (ConsoleUserPresent: an empty WTS user name):
+            //   consent.exe owns a window there -> A UAC PROMPT IS ON THE SECURE DESKTOP, which this
+            //     agent explicitly prevents (QGAUAC writes PromptOnSecureDesktop=0). If we are here
+            //     with consent's prompt up, that setting was NOT honoured - a policy in the template
+            //     or an admin-approval-mode variant overrode it - and that is OUR defect to
+            //     report, not a sign-in screen to advise about. The current value is read back
+            //     and printed so the next reader does not have to guess which it was.
+            //   LogonUI.exe owns it, nobody logged on -> the SIGN-IN screen (autologon did not run).
+            //   LogonUI.exe owns it before this agent has seen a shell -> THE FOURTH ARM (2026-10-10,
+            //     ADR-uac 5): the secure desktop is current before the main desktop owns the session -
+            //     a display reattach, or a lock that predates this agent. Named as that, never
+            //     asserted as a lock (the measured false "LOCKED" reports were this).
+            //   LogonUI.exe owns it, a user logged on -> the lock screen or the security screen.
+            const WCHAR* path = L"unclassified";
+            SECURE_DESKTOP_FACTS owners;
+            SecureDesktopFactsRead(&owners);
+            const BOOL consent = owners.Consent;
+            const BOOL logonui = owners.LogonUi;
+            const BOOL shellSeen = ShellSeenSinceStart();
+            // WTSQuerySessionInformation is used rather than TaskUserId: it returns an EMPTY user name
+            // when nobody is logged on, where TaskUserId's WTSQueryUserToken failure path calls
+            // win_perror - which would write an error line every time this ran during a sign-in screen.
+            const BOOL consoleUser = ConsoleUserPresent();
+            DWORD promptOnSecure = 0xFFFFFFFF;
+            {
+                HKEY k;
+                if (!RegOpenKeyEx(HKEY_LOCAL_MACHINE,
+                        L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
+                        0, KEY_READ, &k))
+                {
+                    DWORD v = 0, cb = sizeof(v), type = 0;
+                    if (!RegQueryValueEx(k, L"PromptOnSecureDesktop", NULL, &type, (BYTE*)&v, &cb)
+                        && type == REG_DWORD)
+                        promptOnSecure = v;
+                    RegCloseKey(k);
+                }
+            }
+            if (consent)
+                path = L"a UAC consent prompt is on the SECURE desktop, which PromptOnSecureDesktop=0 is supposed to prevent";
+            else if (logonui && !consoleUser)
+                path = L"LogonUI is up and nobody is logged on: the sign-in screen";
+            else if (logonui && !shellSeen)
+                path = L"LogonUI is up before this agent saw a shell";
+            else if (logonui)
+                path = L"LogonUI is up with a user logged on: the lock or security screen";
+            else if (!owners.Enumerated)
+                path = L"unclassified: the input desktop's windows could not be enumerated";
+            // The description for the log line below, from this episode's verdict.
+            WCHAR autoDesc[96];
+            switch (s_Al)
+            {
+            case AL_OK:            StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"armed for '%s'", s_AlUser); break;
+            case AL_FIXED:         StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"FIXED by this agent for '%s'", s_AlUser); break;
+            case AL_PASSWORD_GONE: StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"password GONE for '%s'", s_AlUser); break;
+            case AL_UNPROVISIONED: StringCchCopy(autoDesc, RTL_NUMBER_OF(autoDesc), L"NOT PROVISIONED (no DefaultUserName)"); break;
+            case AL_WRITE_FAILED:  StringCchCopy(autoDesc, RTL_NUMBER_OF(autoDesc), L"broken, and the fix FAILED"); break;
+            default:               StringCchCopy(autoDesc, RTL_NUMBER_OF(autoDesc), L"UNKNOWN (Winlogon unreadable)"); break;
+            }
+            // IS ANYBODY LOGGED ON (consoleUser, read above with the path)? The two answers need
+            // opposite handling: a LOCKED session was locked by a human and only a human clears it, so
+            // dom0 should hear about it at once; a sign-in screen with autologon armed is a logon still
+            // in progress and dom0 should hear nothing.
+            // The arming state was DECIDED AND ACTED ON when this episode began (see
+            // AutologonEnsure above), so it is not re-read here: by now autologon is either on,
+            // or it is one of the states already reported. AL_FIXED counts as armed - this
+            // agent armed it.
+            const BOOL autoArmed = (s_Al == AL_OK || s_Al == AL_FIXED);
+            // A few seconds of this at boot is normal (autologon). Persisting means the guest waits at the
+            // Windows sign-in or lock screen, which SEAMLESS mode never shows: arm autologon in the guest, or
+            // switch the qube to the windowed desktop (qvm-features <vm> service.gui-fullscreen 1, then
+            // qubes.SetGuiMode FULLSCREEN), where the sign-in screen is shown inside the bounded window.
+            // dom0 is shown nothing until the secure desktop goes away.
+            LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s, nothing shown until it goes away, PATH: %s "
+                L"(consent-window=%d logonui-window=%d PromptOnSecureDesktop=%s autologon=%s console-user=%d shell-seen=%d)",
+                desktopName, (now - s_SecureSince) / 1000, path, (int)consent, (int)logonui,
+                promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"), autoDesc,
+                (int)consoleUser, (int)shellSeen);
+            // A UAC PROMPT HERE IS A DEFECT OF OURS AND SAYS SO, SEPARATELY AND LOUDLY. It is
+            // not the sign-in screen the notification below describes, and telling the user to
+            // "arm autologon" would be wrong advice for it. This agent writes PromptOnSecureDesktop=0
+            // at start (QGAUAC says what it wrote) precisely so elevation prompts are ordinary windows
+            // dom0 can show; something is overriding it - a template policy, or admin-approval-mode.
+            if (consent)
+                // A consent prompt on the SECURE desktop is invisible in seamless mode.
+                LogError("QGAUACSECURE PromptOnSecureDesktop=%s, a UAC prompt is on the secure desktop and cannot be answered",
+                    promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"));
+            // Secondary route (ACTION: dom0 sees nothing and only a human can change that).
+            // This is the case the route is best at - a guest with zero windows and a live
+            // qrexec - so the notification is exactly what the log line cannot be: seen.
+            // The desktop name is not included: the fixed text is all a reader needs.
+            //
+            // BUT IT GOES OUT ONLY ON POSITIVE EVIDENCE OF THE FAULT IT NAMES, never on
+            // elapsed time alone. Unarmed autologon at 30 s is conclusive and is the case this
+            // route was built for - the two field reports ("absolutely nothing is visible",
+            // forum posts 98/101) where nothing in any log named the state and only a human
+            // could act. Armed autologon at 30 s is an ordinary boot, so dom0 is not told; if
+            // the desktop is STILL up at SECURE_DESKTOP_NOTIFY_ARMED_MS the guest really is
+            // waiting - armed autologon that never completes is its own fault - and the same
+            // notification goes out late rather than never. The log line above is unconditional
+            // either way: the original sin here was silence, and that does not come back.
+            // THE FACTS DECIDE, IN THIS ORDER, and only the last case is left to a clock:
+            //   autologon NOT armed            -> the guest will sit at the sign-in screen for
+            //                                     ever. Conclusive at 30 s, and it is the case
+            //                                     this route was built for. Notify.
+            //   armed + a console user present -> the session is LOCKED: a human locked it and
+            //                                     only a human clears it. Notify.
+            //   armed + nobody logged on       -> a logon is in progress. Say nothing to dom0.
+            // The bound is a BACKSTOP for the one state this agent has NO positive signal for:
+            // autologon that is armed but will never complete (wrong password, disabled or
+            // locked-out account). That case is still decided by elapsed time, which is the
+            // defect class this change is about - so it is named here rather than dressed up,
+            // and it is the only remaining instance. A positive signal for it would be a logon
+            // failure record, which this frame path is the wrong place to read.
+            // consoleUser stays in this gate as a safety net for a lock the fast path above
+            // did not catch, guarded so an already-reported lock is not reported twice.
+            // A CONSOLE USER WITHOUT A SHELL IS A LOGON IN PROGRESS, NOT A LOCK.
+            // The lock arm above reasons "armed + a console user present -> the session is
+            // LOCKED: a human locked it and only a human clears it". That inference fails during
+            // autologon: the console user exists as soon as the session is created, which is
+            // BEFORE the shell starts, so an ordinary autologon boot satisfies it.
+            // MEASURED win11-reinstall, campaign run 38971675274, agent pid 4184 - and the line
+            // directly above names every fact needed to see it:
+            //   QGADESKSTUCK on the secure desktop 'Winlogon' for 30 s ... PATH: LogonUI is up
+            //   before this agent saw a shell (consent.exe=0 LogonUI.exe=1 autologon=armed for
+            //   'user' console-user=1 shell-seen=0)
+            // autologon ARMED, the 600 s backstop nowhere near, so this arm fired - and 7 s
+            // later the desktop went to Default on its own: Winlogon -> Default at 02:14:52
+            // against a notification sent at 02:14:45. dom0 told the user to go and sign in to a
+            // guest that signed itself in eight seconds later, at QERR_SEV_ACTION severity. That
+            // is the notification-noise class GWeck field-reported (forum 42717 post 175).
+            // THE DISCRIMINATOR IS ALREADY COMPUTED AND ALREADY PRINTED: shellSeen. A human
+            // locking a running desktop necessarily did so with a shell up, so a real lock has
+            // shell-seen=1; a console user with NO shell ever seen is a logon in flight. This
+            // costs nothing in the case the arm exists for and removes it in the case it does
+            // not, and the armed-but-never-completes state is still covered by the 600 s
+            // backstop below - the one case this code says it leaves to a clock.
+            // AND THE FAST PATH ALREADY LEARNED THIS. The lock report above is explicit: "a lock
+            // is never assumed (owner, 2026-10-10: 'if there IS locked guest we need to report
+            // it, ONCE, but NEVER assume there is as based on inaccurate measurements'): ... it
+            // is not LOCKED until this agent instance has seen a shell window - the two measured
+            // false reports were each this agent's FIRST secure frame". Same instruction, same
+            // reasoning, same evidence; this arm simply never got it.
+            if (!autoArmed || (consoleUser && shellSeen && !s_LockReported) ||
+                (now - s_SecureSince) >= SECURE_DESKTOP_NOTIFY_ARMED_MS)
+                QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
+            else
+                // Nobody is logged on yet, so a secure desktop now is a logon in progress, not the fault that
+                // notification names. The later deadline is the backstop for autologon that is armed but never
+                // completes.
+                LogInfo("QGADESKSTUCK dom0 not notified, autologon is %s and a logon is in progress at %I64u s, "
+                    L"notified if still up at %u s",
+                    autoDesc, (now - s_SecureSince) / 1000,
+                    (unsigned)(SECURE_DESKTOP_NOTIFY_ARMED_MS / 1000));
+        }
+
+        // Seamless: nothing may flow while this desktop is up. Non-seamless falls through
+        // and is processed like any other frame.
+        if (g_SeamlessMode)
+            return TRUE;
+    }
+    if (s_WasSecure)
+    {
+        s_WasSecure = FALSE;
+        // Mode 1 keeps denying fullscreen-sized windows for FS_BOOT_SETTLE_MS after this.
+        g_SecureDesktopLeftTick = GetTickCount64();
+        LogInfo("secure desktop left after %I64u s - resuming with a full resync and the frame "
+            L"signature invalidated", (GetTickCount64() - s_SecureSince) / 1000);
+        PwInvalidateFramebuffer(); // FrameSigInvalidate + g_FbBits reset; the next desktop frame republishes it
+        QueueWindowEvent(NULL, 0, TRUE); // full re-enumeration: catch up on everything frozen out
+    }
+    return FALSE;
+}
+
 static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* framebuffer,
     IN UINT fbWidth, IN UINT fbHeight)
 {
@@ -13642,391 +14050,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
         (void)SetSeamlessMode(FALSE, TRUE);
     }
 
-    // SECURE-DESKTOP FREEZE (owner rule: the secure desktop is NEVER granted; field root
-    // cause 2026-08-27 - the mapped UAC dimming backdrop WAS GWeck's black window). While
-    // the input desktop is not "Default", NOTHING may flow: the framebuffer now holds
-    // secure-desktop pixels (consent dialog included), and the enumerable windows ARE the
-    // secure surfaces. Returning early here freezes everything at once - no publish of the
-    // secure framebuffer, no tracking pass (so no accept of consent/backdrop AND no removal
-    // of the Default desktop's still-mapped windows - a first attempt that denied in
-    // ShouldAcceptWindow instead unmapped every open window, measured shot13), no damage.
-    // NOTE the warning below about early returns from this function causing a black guest
-    // window: that argument is about skipping work the DEFAULT desktop needs. Here
-    // suppression is the specification - and the resume path invalidates the frame
-    // signature so the first Default-desktop frame after the prompt cannot be skipped as
-    // redundant and repaints promptly.
-    {
-        // Re-observe the input desktop FIRST, every frame, BEFORE the freeze decision.
-        // g_OnSecureDesktop is only written by AttachToInputDesktop; EnsureOnInputDesktop
-        // is the one path that calls it on a change. If the freeze gate came first, that
-        // path would be gated by the very flag it must clear - a deadlock (measured v3:
-        // agent stuck on Winlogon forever, zero windows, after the prompt cleared).
-        // EnsureOnInputDesktop early-returns cheaply while the desktop is unchanged, and
-        // on the Default->... and ...->Default transitions re-attaches + rearms the hooks,
-        // updating g_OnSecureDesktop as a side effect.
-        EnsureOnInputDesktop();
-
-        static BOOL s_WasSecure = FALSE;
-        static BOOL s_ShownNonSeamless = FALSE;
-        // SEAMLESS ONLY (owner decision 2026-08-28, superseding "unconditional" here).
-        //
-        // SEAMLESS: the secure desktop is never granted. Each secure surface would become its
-        // OWN standalone dom0 window - a consent box or a full-screen dimming backdrop
-        // indistinguishable from dom0's own UI (that backdrop WAS GWeck's black window,
-        // root-caused 2026-08-27). Freeze everything: no publish of the secure framebuffer, no
-        // tracking pass, no damage.
-        //
-        // NON-SEAMLESS: show it, secure or not. The guest desktop is ONE bounded window there,
-        // so the sign-in screen appears inside it exactly as any other guest content, and the
-        // safety rule is unchanged and enforced elsewhere - no fullscreen unless DOM0 asked for
-        // the size (the geometry guard + shrink-on-entry in SetSeamlessMode), and no
-        // override-redirect. This is what makes a guest that does not log itself in reachable
-        // at all: measured 2026-08-28, autologon off meant 0 windows mapped and no password box
-        // anywhere (forum posts 98/101; upstream QWT shows the sign-in screen and defaults to
-        // this mode). Entering non-seamless still requires service.gui-fullscreen - a guest
-        // cannot put itself into this mode unasked.
-        //
-        // SAY SO WHEN THE FREEZE IS NOT TRANSIENT (2026-08-28). At boot the agent starts on
-        // Winlogon and stays frozen until autologon completes - 15-17 s on this testbed, entirely
-        // normal. But on a guest WITHOUT autologon the freeze never ends: the guest waits at the
-        // sign-in screen, dom0 is shown nothing at all, and the log went completely silent about
-        // it. Two field reports ("absolutely nothing is visible", forum posts 98/101) cost days
-        // because nothing in any log named this state. The freeze stays - what changes is that it
-        // announces itself.
-        #define SECURE_DESKTOP_FIRST_WARN_MS 30000
-        #define SECURE_DESKTOP_REWARN_MS 120000
-        // THE LAST RESORT, AND NOTHING ROUTINE REACHES IT ANY MORE. Autologon is now checked, armed
-        // and confirmed on the first frame of a secure-desktop episode (AutologonEnsure), and the two
-        // states a human must answer - not provisioned, re-arm failed - are reported there, at once,
-        // on the fact. A lock is reported at once too. So this bound is only reached by a guest that
-        // is armed, confirmed, unlocked, and STILL on the secure desktop: autologon that will never
-        // complete (wrong password, disabled or locked-out account). This agent has no positive
-        // signal for that one state, which is why a clock survives here and nowhere else in this
-        // block - the residual, named rather than dressed up. 30 s was the old gate and was wrong
-        // because autologon takes 15-17 s normally and a clean install's first logon exceeds it.
-        #define SECURE_DESKTOP_NOTIFY_ARMED_MS 600000
-        static ULONGLONG s_SecureSince = 0;
-        static ULONGLONG s_SecureNextWarn = 0;
-        static BOOL s_LockReported = FALSE;   // one lock report per secure-desktop episode
-        static BOOL s_LockReadDone = FALSE;    // SecureDesktopLockedNow read this episode
-        static LONG s_LockSeq = 0;              // ...as of this many session events (LifecycleSessionEventSeq)
-        static DWORD s_LockArmsSaid = 0;        // the non-reporting lock arms already said this episode (a bit per QGA_LOCK_*)
-        static BOOL s_ShellProcAbsent = FALSE;  // the process list read "no shell" this episode: not snapshotted again
-        static AutologonState s_Al = AL_OK;     // this episode's autologon verdict, decided on entry
-        static WCHAR s_AlUser[64] = L"";        // the account it is (or would be) armed for
-        if (g_OnSecureDesktop)
-        {
-            ULONGLONG now = GetTickCount64();
-            SESSION_LOCK_READING lockRead;   // the reading the LOCKED line below carries
-            if (!s_WasSecure)
-            {
-                s_SecureSince = now;
-                s_SecureNextWarn = now + SECURE_DESKTOP_FIRST_WARN_MS;
-                s_ShownNonSeamless = FALSE;
-                s_LockReported = FALSE;   // a new episode may be a different cause
-                s_LockReadDone = FALSE;   // read on the first frame of it immediately
-                s_LockArmsSaid = 0;       // and say each refused arm once more, with this episode's facts
-                s_ShellProcAbsent = FALSE;   // a new episode may have reached a shell since
-                // AUTOLOGON, ON THE FIRST FRAME OF THIS EPISODE, WITH NO WAIT. Nothing below
-                // this line waits to find out whether autologon works: it is read, the cause is
-                // removed where that needs no credential, the result is read back, and the two
-                // states nothing here can repair go to dom0 at once. See AutologonEnsure.
-                s_AlUser[0] = L'\0';
-                {
-                    WCHAR did[160] = L"";
-                    DWORD alErr = 0;
-                    s_Al = AutologonEnsure(s_AlUser, RTL_NUMBER_OF(s_AlUser),
-                                           did, RTL_NUMBER_OF(did), &alErr);
-                    switch (s_Al)
-                    {
-                    case AL_FIXED:
-                        // SILENTLY, AT INFO. Owner, 2026-10-09: "so we do it silently, no need to warn
-                        // user we had to re-enable." This started as a WARNING on the theory that
-                        // autologon turning itself off is weird - but the cause is now known and it is
-                        // ROUTINE: a cumulative update rewrites Winlogon values and brings
-                        // AutoLogonCount back (measured 2026-08-13 on win11-tpl). Routine maintenance
-                        // that this code performs and verifies is not something to tell anyone about,
-                        // and a warning on every post-update boot would be exactly the noise this
-                        // change exists to remove. The line stays at INFO so the history is still
-                        // readable when someone asks how often it happens. The mechanism: AutoLogonCount
-                        // makes Windows consume DefaultPassword and fall back to the sign-in screen, and a
-                        // cumulative update rewriting Winlogon is how it returns. Nothing waits on this and
-                        // nobody is told.
-                        LogInfo("QGAAUTOLOGON autologon restored for '%s': %s, read back", s_AlUser, did);
-                        break;
-                    case AL_PASSWORD_GONE:
-                        // NOT REPAIRABLE HERE, so dom0 is told AT ONCE, on the fact. Writing
-                        // AutoAdminLogon=1 with no password behind it would make the registry claim
-                        // autologon is armed while the guest still stops at the sign-in screen -
-                        // guest/ensure-autologon.ps1: "PREVENTION, NOT REPAIR ... we do not know the
-                        // password and will not invent one." This is the consumed-password end state:
-                        // AutoLogonCount was present at some point and Windows ate the password. Only a
-                        // human can put it back - guest/set-autologon.ps1 validates the credentials with
-                        // LogonUser before storing them.
-                        LogError("QGAAUTOLOGON the autologon password for '%s' is GONE from both the registry and "
-                            L"the LSA store: autologon cannot succeed whatever AutoAdminLogon says (%s), only a "
-                            L"human can restore it", s_AlUser, did);
-                        QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
-                        break;
-                    case AL_UNPROVISIONED:
-                        // Nothing this agent writes can change it; only a human can - guest/set-autologon.ps1,
-                        // or switch the qube to the windowed desktop and sign in by hand.
-                        // NOT provisioned: DefaultUserName is empty, so there is no account to log in as and dom0 is shown
-                        // nothing until a human acts.
-                        LogError("QGAAUTOLOGON autologon is OFF, seamless mode is inactive until user logs in");
-                        QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
-                        break;
-                    case AL_WRITE_FAILED:
-                        LogError("QGAAUTOLOGON autologon needed fixing for '%s' and the fix did NOT take "
-                            L"(err %lu): the write or its read-back failed, so this agent cannot recover "
-                            L"the guest's sign-in by itself.", s_AlUser, alErr);
-                        QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
-                        break;
-                    case AL_UNREADABLE:
-                        LogError("QGAAUTOLOGON the Winlogon key could not be opened (err %lu), so whether "
-                            L"autologon can work is unknown - which is itself what a reader needs to be "
-                            L"told.", alErr);
-                        break;
-                    case AL_OK:
-                    default:
-                        break;   // armed, provisioned, no count, password present: nothing to say
-                    }
-                }
-            }
-            s_WasSecure = TRUE;
-
-            if (!g_SeamlessMode)
-            {
-                // Bounded desktop window: show it and carry on with normal processing.
-                if (!s_ShownNonSeamless)
-                {
-                    s_ShownNonSeamless = TRUE;
-                    // The bounded desktop window is the way in for a guest that does not log itself in.
-                    LogInfo("QGADESK secure desktop shown inside the desktop window (non-seamless, %lux%lu)",
-                        g_ScreenWidth, g_ScreenHeight);
-                }
-            }
-            // A LOCK IS CONCLUSIVE THE MOMENT IT IS SEEN AND MUST NOT WAIT FOR A CLOCK. Owner,
-            // 2026-10-09: "no one will wait for 10 minutes at locked machine. if it is locked it
-            // should be detected fast." The previous version of this fix got the classification
-            // right but left it inside the 30 s warn point, so a lock was still reported 30 s late
-            // and, with autologon armed, could fall through to the 10 min backstop. The fact a lock
-            // needs - the session's own LOCK state, read from WTSSessionInfoEx - is available on the
-            // first secure frame, so it is read there and the report goes out immediately, once.
-            // A session that is ENDING is excluded: during shutdown the console user is still
-            // present while LogonUI is up, and that is a teardown, not a lock.
-            // AND A LOCK IS NEVER ASSUMED (owner, 2026-10-10: "if there IS locked guest we need to
-            // report it, ONCE, but NEVER assume there is as based on inaccurate measurements"): the
-            // verdict is QgaLockVerdict's, and it is not LOCKED until this agent instance has seen a
-            // shell window - the two measured false reports were each this agent's FIRST secure frame,
-            // 2 s after its start, with no desktop it had ever seen to compare against. The line
-            // carries the facts it rests on; the once per boot is notifyerr's persisted marker.
-            else if (SecureDesktopLockedNow(s_LockReported, &s_LockReadDone, &s_LockSeq, &s_LockArmsSaid,
-                                            &s_ShellProcAbsent, &lockRead))
-            {
-                SECURE_DESKTOP_FACTS f;
-                s_LockReported = TRUE;
-                SecureDesktopFactsRead(&f);
-                // shell-by says which fact established the shell: "window" (seen on Default by this
-                // instance) or "default-probe" (asked from the Default desktop while this agent sits on
-                // Winlogon - a real lock met by a fresh agent). A reader can tell the two paths apart.
-                // dom0 is shown nothing while the session is locked.
-                LogWarning("QGADESKSTUCK session LOCKED, seamless inactive until unlocked: shell-by=%s secure-for=%I64u s "
-                    L"wts-flags=%lu level=%lu input-desktop=%s logonui-window=%d consent-window=%d",
-                    lockRead.ShellSeen ? L"window" : L"default-probe", (now - s_SecureSince) / 1000,
-                    lockRead.SessionFlags, lockRead.Level, f.InputDesktop, (int)f.LogonUi, (int)f.Consent);
-                QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
-            }
-            else if (now >= s_SecureNextWarn)
-            {
-                s_SecureNextWarn = now + SECURE_DESKTOP_REWARN_MS;
-
-                WCHAR desktopName[64] = L"?";
-                HDESK desktop = GetThreadDesktop(GetCurrentThreadId());
-                if (desktop)
-                {
-                    DWORD needed = 0;
-                    if (!GetUserObjectInformation(desktop, UOI_NAME, desktopName,
-                        sizeof(desktopName), &needed))
-                        StringCchCopy(desktopName, RTL_NUMBER_OF(desktopName), L"?");
-                }
-
-                // WHICH PATH PUT US HERE. Owner, 2026-10-08: "if it sits on the uac prompt we need
-                // to know what path brought us there and how to handle it properly." The desktop
-                // NAME cannot tell them apart - a sign-in screen, a lock screen and a UAC prompt on
-                // the secure desktop are all "Winlogon" - and they need different answers:
-                // Each is told by WHO OWNS THE WINDOWS ON THE INPUT DESKTOP (SecureDesktopFactsRead) and
-                // by whether anybody is logged on (ConsoleUserPresent: an empty WTS user name):
-                //   consent.exe owns a window there -> A UAC PROMPT IS ON THE SECURE DESKTOP, which this
-                //     agent explicitly prevents (QGAUAC writes PromptOnSecureDesktop=0). If we are here
-                //     with consent's prompt up, that setting was NOT honoured - a policy in the template
-                //     or an admin-approval-mode variant overrode it - and that is OUR defect to
-                //     report, not a sign-in screen to advise about. The current value is read back
-                //     and printed so the next reader does not have to guess which it was.
-                //   LogonUI.exe owns it, nobody logged on -> the SIGN-IN screen (autologon did not run).
-                //   LogonUI.exe owns it before this agent has seen a shell -> THE FOURTH ARM (2026-10-10,
-                //     ADR-uac 5): the secure desktop is current before the main desktop owns the session -
-                //     a display reattach, or a lock that predates this agent. Named as that, never
-                //     asserted as a lock (the measured false "LOCKED" reports were this).
-                //   LogonUI.exe owns it, a user logged on -> the lock screen or the security screen.
-                const WCHAR* path = L"unclassified";
-                SECURE_DESKTOP_FACTS owners;
-                SecureDesktopFactsRead(&owners);
-                const BOOL consent = owners.Consent;
-                const BOOL logonui = owners.LogonUi;
-                const BOOL shellSeen = ShellSeenSinceStart();
-                // WTSQuerySessionInformation is used rather than TaskUserId: it returns an EMPTY user name
-                // when nobody is logged on, where TaskUserId's WTSQueryUserToken failure path calls
-                // win_perror - which would write an error line every time this ran during a sign-in screen.
-                const BOOL consoleUser = ConsoleUserPresent();
-                DWORD promptOnSecure = 0xFFFFFFFF;
-                {
-                    HKEY k;
-                    if (!RegOpenKeyEx(HKEY_LOCAL_MACHINE,
-                            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-                            0, KEY_READ, &k))
-                    {
-                        DWORD v = 0, cb = sizeof(v), type = 0;
-                        if (!RegQueryValueEx(k, L"PromptOnSecureDesktop", NULL, &type, (BYTE*)&v, &cb)
-                            && type == REG_DWORD)
-                            promptOnSecure = v;
-                        RegCloseKey(k);
-                    }
-                }
-                if (consent)
-                    path = L"a UAC consent prompt is on the SECURE desktop, which PromptOnSecureDesktop=0 is supposed to prevent";
-                else if (logonui && !consoleUser)
-                    path = L"LogonUI is up and nobody is logged on: the sign-in screen";
-                else if (logonui && !shellSeen)
-                    path = L"LogonUI is up before this agent saw a shell";
-                else if (logonui)
-                    path = L"LogonUI is up with a user logged on: the lock or security screen";
-                else if (!owners.Enumerated)
-                    path = L"unclassified: the input desktop's windows could not be enumerated";
-                // The description for the log line below, from this episode's verdict.
-                WCHAR autoDesc[96];
-                switch (s_Al)
-                {
-                case AL_OK:            StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"armed for '%s'", s_AlUser); break;
-                case AL_FIXED:         StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"FIXED by this agent for '%s'", s_AlUser); break;
-                case AL_PASSWORD_GONE: StringCchPrintf(autoDesc, RTL_NUMBER_OF(autoDesc), L"password GONE for '%s'", s_AlUser); break;
-                case AL_UNPROVISIONED: StringCchCopy(autoDesc, RTL_NUMBER_OF(autoDesc), L"NOT PROVISIONED (no DefaultUserName)"); break;
-                case AL_WRITE_FAILED:  StringCchCopy(autoDesc, RTL_NUMBER_OF(autoDesc), L"broken, and the fix FAILED"); break;
-                default:               StringCchCopy(autoDesc, RTL_NUMBER_OF(autoDesc), L"UNKNOWN (Winlogon unreadable)"); break;
-                }
-                // IS ANYBODY LOGGED ON (consoleUser, read above with the path)? The two answers need
-                // opposite handling: a LOCKED session was locked by a human and only a human clears it, so
-                // dom0 should hear about it at once; a sign-in screen with autologon armed is a logon still
-                // in progress and dom0 should hear nothing.
-                // The arming state was DECIDED AND ACTED ON when this episode began (see
-                // AutologonEnsure above), so it is not re-read here: by now autologon is either on,
-                // or it is one of the states already reported. AL_FIXED counts as armed - this
-                // agent armed it.
-                const BOOL autoArmed = (s_Al == AL_OK || s_Al == AL_FIXED);
-                // A few seconds of this at boot is normal (autologon). Persisting means the guest waits at the
-                // Windows sign-in or lock screen, which SEAMLESS mode never shows: arm autologon in the guest, or
-                // switch the qube to the windowed desktop (qvm-features <vm> service.gui-fullscreen 1, then
-                // qubes.SetGuiMode FULLSCREEN), where the sign-in screen is shown inside the bounded window.
-                // dom0 is shown nothing until the secure desktop goes away.
-                LogWarning("QGADESKSTUCK on the secure desktop '%s' for %I64u s, nothing shown until it goes away, PATH: %s "
-                    L"(consent-window=%d logonui-window=%d PromptOnSecureDesktop=%s autologon=%s console-user=%d shell-seen=%d)",
-                    desktopName, (now - s_SecureSince) / 1000, path, (int)consent, (int)logonui,
-                    promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"), autoDesc,
-                    (int)consoleUser, (int)shellSeen);
-                // A UAC PROMPT HERE IS A DEFECT OF OURS AND SAYS SO, SEPARATELY AND LOUDLY. It is
-                // not the sign-in screen the notification below describes, and telling the user to
-                // "arm autologon" would be wrong advice for it. This agent writes PromptOnSecureDesktop=0
-                // at start (QGAUAC says what it wrote) precisely so elevation prompts are ordinary windows
-                // dom0 can show; something is overriding it - a template policy, or admin-approval-mode.
-                if (consent)
-                    // A consent prompt on the SECURE desktop is invisible in seamless mode.
-                    LogError("QGAUACSECURE PromptOnSecureDesktop=%s, a UAC prompt is on the secure desktop and cannot be answered",
-                        promptOnSecure == 0xFFFFFFFF ? L"unset" : (promptOnSecure ? L"1" : L"0"));
-                // Secondary route (ACTION: dom0 sees nothing and only a human can change that).
-                // This is the case the route is best at - a guest with zero windows and a live
-                // qrexec - so the notification is exactly what the log line cannot be: seen.
-                // The desktop name is not included: the fixed text is all a reader needs.
-                //
-                // BUT IT GOES OUT ONLY ON POSITIVE EVIDENCE OF THE FAULT IT NAMES, never on
-                // elapsed time alone. Unarmed autologon at 30 s is conclusive and is the case this
-                // route was built for - the two field reports ("absolutely nothing is visible",
-                // forum posts 98/101) where nothing in any log named the state and only a human
-                // could act. Armed autologon at 30 s is an ordinary boot, so dom0 is not told; if
-                // the desktop is STILL up at SECURE_DESKTOP_NOTIFY_ARMED_MS the guest really is
-                // waiting - armed autologon that never completes is its own fault - and the same
-                // notification goes out late rather than never. The log line above is unconditional
-                // either way: the original sin here was silence, and that does not come back.
-                // THE FACTS DECIDE, IN THIS ORDER, and only the last case is left to a clock:
-                //   autologon NOT armed            -> the guest will sit at the sign-in screen for
-                //                                     ever. Conclusive at 30 s, and it is the case
-                //                                     this route was built for. Notify.
-                //   armed + a console user present -> the session is LOCKED: a human locked it and
-                //                                     only a human clears it. Notify.
-                //   armed + nobody logged on       -> a logon is in progress. Say nothing to dom0.
-                // The bound is a BACKSTOP for the one state this agent has NO positive signal for:
-                // autologon that is armed but will never complete (wrong password, disabled or
-                // locked-out account). That case is still decided by elapsed time, which is the
-                // defect class this change is about - so it is named here rather than dressed up,
-                // and it is the only remaining instance. A positive signal for it would be a logon
-                // failure record, which this frame path is the wrong place to read.
-                // consoleUser stays in this gate as a safety net for a lock the fast path above
-                // did not catch, guarded so an already-reported lock is not reported twice.
-                // A CONSOLE USER WITHOUT A SHELL IS A LOGON IN PROGRESS, NOT A LOCK.
-                // The lock arm above reasons "armed + a console user present -> the session is
-                // LOCKED: a human locked it and only a human clears it". That inference fails during
-                // autologon: the console user exists as soon as the session is created, which is
-                // BEFORE the shell starts, so an ordinary autologon boot satisfies it.
-                // MEASURED win11-reinstall, campaign run 38971675274, agent pid 4184 - and the line
-                // directly above names every fact needed to see it:
-                //   QGADESKSTUCK on the secure desktop 'Winlogon' for 30 s ... PATH: LogonUI is up
-                //   before this agent saw a shell (consent.exe=0 LogonUI.exe=1 autologon=armed for
-                //   'user' console-user=1 shell-seen=0)
-                // autologon ARMED, the 600 s backstop nowhere near, so this arm fired - and 7 s
-                // later the desktop went to Default on its own: Winlogon -> Default at 02:14:52
-                // against a notification sent at 02:14:45. dom0 told the user to go and sign in to a
-                // guest that signed itself in eight seconds later, at QERR_SEV_ACTION severity. That
-                // is the notification-noise class GWeck field-reported (forum 42717 post 175).
-                // THE DISCRIMINATOR IS ALREADY COMPUTED AND ALREADY PRINTED: shellSeen. A human
-                // locking a running desktop necessarily did so with a shell up, so a real lock has
-                // shell-seen=1; a console user with NO shell ever seen is a logon in flight. This
-                // costs nothing in the case the arm exists for and removes it in the case it does
-                // not, and the armed-but-never-completes state is still covered by the 600 s
-                // backstop below - the one case this code says it leaves to a clock.
-                // AND THE FAST PATH ALREADY LEARNED THIS. The lock report above is explicit: "a lock
-                // is never assumed (owner, 2026-10-10: 'if there IS locked guest we need to report
-                // it, ONCE, but NEVER assume there is as based on inaccurate measurements'): ... it
-                // is not LOCKED until this agent instance has seen a shell window - the two measured
-                // false reports were each this agent's FIRST secure frame". Same instruction, same
-                // reasoning, same evidence; this arm simply never got it.
-                if (!autoArmed || (consoleUser && shellSeen && !s_LockReported) ||
-                    (now - s_SecureSince) >= SECURE_DESKTOP_NOTIFY_ARMED_MS)
-                    QerrReportText(QerrTextFind("desktop-stuck"), NULL, NULL);
-                else
-                    // Nobody is logged on yet, so a secure desktop now is a logon in progress, not the fault that
-                    // notification names. The later deadline is the backstop for autologon that is armed but never
-                    // completes.
-                    LogInfo("QGADESKSTUCK dom0 not notified, autologon is %s and a logon is in progress at %I64u s, "
-                        L"notified if still up at %u s",
-                        autoDesc, (now - s_SecureSince) / 1000,
-                        (unsigned)(SECURE_DESKTOP_NOTIFY_ARMED_MS / 1000));
-            }
-
-            // Seamless: nothing may flow while this desktop is up. Non-seamless falls through
-            // and is processed like any other frame.
-            if (g_SeamlessMode)
-                return ERROR_SUCCESS;
-        }
-        if (s_WasSecure)
-        {
-            s_WasSecure = FALSE;
-            // Mode 1 keeps denying fullscreen-sized windows for FS_BOOT_SETTLE_MS after this.
-            g_SecureDesktopLeftTick = GetTickCount64();
-            LogInfo("secure desktop left after %I64u s - resuming with a full resync and the frame "
-                L"signature invalidated", (GetTickCount64() - s_SecureSince) / 1000);
-            PwInvalidateFramebuffer(); // FrameSigInvalidate + g_FbBits reset; republished just below
-            QueueWindowEvent(NULL, 0, TRUE); // full re-enumeration: catch up on everything frozen out
-        }
-    }
+    if (ObserveInputDesktop(L"frame"))
+        return ERROR_SUCCESS;   // seamless and the secure desktop is up: nothing may flow
 
     // Publish the live desktop image for paths outside this loop (synthesis).
     if (framebuffer && frame->rect.Pitch > 0)
@@ -15797,6 +15822,8 @@ static ULONG WINAPI WatchForEvents(void)
     ULONGLONG fsStallLast = 0;      // QGAFSSTALL rate limit
     ULONGLONG capStatLast = 0;      // QGACAPSTAT rate limit
     BOOL capDeadReported = FALSE;   // QGACAPDEAD fires once per departure, not once per pass
+    BOOL hookDeadReported = FALSE;  // window-tracking-stopped is sent once: the thread is never restarted
+    int hookEventIdx = -1;
     ULONGLONG degradedLogLast = 0;
 
     // The helpers' first launch must not wait for an unrelated wake: the loop below no longer caps its wait for them.
@@ -16131,6 +16158,14 @@ static ULONG WINAPI WatchForEvents(void)
         if (capture && capture->thread && !capDeadReported && eventCount < MAXIMUM_WAIT_OBJECTS &&
             WaitForSingleObject(capture->thread, 0) == WAIT_TIMEOUT)
             watchedEvents[eventCount++] = capture->thread;
+        // The window-event thread, the same way: it leaves only when it dies (StopWindowEventThread runs after this loop),
+        // and its death is an error and a dom0 notice, nothing substituting for it (ADR-capture 33).
+        hookEventIdx = -1;
+        if (g_WindowEventThread && !hookDeadReported && eventCount < MAXIMUM_WAIT_OBJECTS)
+        {
+            hookEventIdx = (int)eventCount;
+            watchedEvents[eventCount++] = g_WindowEventThread;
+        }
 
         // Wait for events.
         signaledEvent = WaitForMultipleObjects(eventCount, watchedEvents, FALSE, waitTimeout);
@@ -16196,6 +16231,19 @@ static ULONG WINAPI WatchForEvents(void)
             break;
         }
 
+        // The input desktop on every wake but a desktop frame's, which ProcessNewFrame observes itself
+        // (ObserveInputDesktop, ADR-capture 33). The wake is named in the change line: a desktop switch
+        // reaches this loop as a window event (EVENT_SYSTEM_DESKTOPSWITCH, QGADESKSWITCHEVT) and a session
+        // notification as one too (lifecycle.c).
+        if (g_VchanClientConnected && signaledEvent != 1)
+            (void)ObserveInputDesktop(
+                signaledEvent == WAIT_TIMEOUT                 ? L"deadline" :
+                signaledEvent == 4                            ? L"vchan" :
+                signaledEvent == 6                            ? L"window-event" :
+                (int)signaledEvent == frameEventIdx           ? L"broker-frame" :
+                (signaledEvent == 2 || signaledEvent == 3)    ? L"mode-request" :
+                signaledEvent == 5                            ? L"capture-error" : L"helper");
+
         // No event fired within the bounded wait: run the settle sweep armed above (and
         // fall through - the capture-retry logic after the switch also keys on timeouts).
         if (WAIT_TIMEOUT == signaledEvent && g_VchanClientConnected)
@@ -16205,6 +16253,13 @@ static ULONG WINAPI WatchForEvents(void)
         NotifBridgeSupervise();   // every wake, waits for nothing; no-op unless the NotifyBridge gate is on
         EtwProxyPoke();   // launch-precondition only (console session / user change); proxy
                           // DEATH is detected by its exit-wait, not here (etwproxy.c)
+
+        if (hookEventIdx >= 0 && (int)signaledEvent == hookEventIdx)
+        {
+            hookDeadReported = TRUE;   // QGAWINEVTDEAD, from the thread itself, says what failed
+            QerrReportText(QerrTextFind("window-tracking-stopped"), NULL, NULL);
+            continue;
+        }
 
         if (verdictEventIdx >= 0 && (int)signaledEvent == verdictEventIdx)
         {

@@ -19,6 +19,7 @@
 #include "qga-exitcodes.h"
 #include "qga-lifecycle.h"
 #include "lifecycle.h"
+#include "main.h"          // PokeWindowTracking: a session event wakes the main loop
 
 // main.c: the main loop's stop event (Global\QGA_SHUTDOWN), created in Init. NULL until then - the main thread is
 // in Init at that point and WinMain checks the latch when Init returns, so the loop is never entered.
@@ -252,10 +253,12 @@ static LRESULT CALLBACK LifecycleWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
             win_perror("SetEvent(lifecycle continue)");
         return 0;
     case WM_WTSSESSION_CHANGE:
-        // The session's own word that something changed: counted, so the lock verdict re-reads its facts on the
-        // next frame instead of on a clock, and said once per event.
+        // The session's own word that something changed: counted, so the lock verdict re-reads its facts on it
+        // instead of on a clock, and said once per event. It wakes the main loop, which observes the input desktop
+        // on every wake (ObserveInputDesktop) - in seamless on 25H2+ there is no desktop frame to do it (ADR-capture 33).
         InterlockedIncrement(&g_SessionEventSeq);
         LogInfo("QGASESSIONEVT %s (code %Iu, session %Id)", SessionEventName(wp), (ULONG_PTR)wp, (LONG_PTR)lp);
+        PokeWindowTracking();
         return 0;
     }
     return DefWindowProc(hwnd, msg, wp, lp);
