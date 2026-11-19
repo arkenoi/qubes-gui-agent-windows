@@ -23,9 +23,6 @@
 #pragma warning(disable:4200) // nonstandard extension used: zero-sized array (flexible array member)
 #include <qubes-gui-protocol.h>
 
-#define REG_CONFIG_PERWINDOW_VALUE L"PerWindowCapture"
-#define PERWINDOW_ENV_VALUE L"QGA_PERWINDOW"
-
 extern BOOL g_VchanClientConnected; // main.c
 
 static BOOL g_PwOn = FALSE;                   // config + WGC support + init success
@@ -85,19 +82,7 @@ void PwInit(void)
 {
     InitializeCriticalSection(&g_PwPendingLock);
 
-    DWORD enabled = 1; // default ON: this build exists to exercise the new path
-    CfgReadDword(NULL, REG_CONFIG_PERWINDOW_VALUE, &enabled, NULL);
-
-    WCHAR env[16];
-    if (GetEnvironmentVariableW(PERWINDOW_ENV_VALUE, env, RTL_NUMBER_OF(env)) > 0)
-        enabled = (env[0] != L'0');
-
-    if (!enabled)
-    {
-        LogInfo("per-window capture disabled by config");
-        return;
-    }
-
+    // Always on: there is no switch (ADR-capture 33).
     {
         // ADVISORY ONLY: under the agent's SYSTEM-in-session-1 token, IsSupported()
         // activation fails with 0x8007000E even where real capture may work. The
@@ -175,8 +160,14 @@ void PwSetDaemonVersion(uint32_t version)
 {
     g_PwDaemonVersion = version;
     if (g_PwOn && version < QUBES_GUID_MIN_MSG_WINDOW_DUMP_ACK)
-        LogWarning("per-window capture inactive: daemon protocol 0x%x < 0x%x",
-                   version, QUBES_GUID_MIN_MSG_WINDOW_DUMP_ACK);
+    {
+        if (DirectRequired())   // every window is withheld: nothing else can show it (ADR-capture 33)
+            LogError("per-window capture inactive: daemon protocol 0x%x < 0x%x, no window can be shown",
+                     version, QUBES_GUID_MIN_MSG_WINDOW_DUMP_ACK);
+        else
+            LogWarning("per-window capture inactive: daemon protocol 0x%x < 0x%x",
+                       version, QUBES_GUID_MIN_MSG_WINDOW_DUMP_ACK);
+    }
 }
 
 BOOL PwIsAttached(IN const WINDOW_DATA* entry)

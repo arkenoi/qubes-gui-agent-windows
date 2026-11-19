@@ -9,10 +9,8 @@
  * revocation. The daemon side needs no changes: this is the same path the Linux agent
  * uses for every window (see DESIGN-per-window-capture.md).
  *
- * Enabled by registry DWORD "PerWindowCapture" (default ON) or env QGA_PERWINDOW=0/1,
- * and only when the daemon protocol version is >= 1.7 (WINDOW_DUMP_ACK era) and WGC is
- * available. When disabled or when attach fails, windows stay on the legacy
- * screen-slice path unchanged.
+ * Always on (no switch, ADR-capture 33); a window attaches only when the daemon protocol
+ * version is >= 1.7 (WINDOW_DUMP_ACK era).
  */
 
 #pragma once

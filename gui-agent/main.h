@@ -426,6 +426,11 @@ typedef struct _WINDOW_DATA
     // has been eligible this long without a painted frame - before that it is simply young,
     // which is a defined state, not a defect. 0 = not eligible yet.
     ULONGLONG PwDirectSince;
+    // On a direct-required guest the window's own buffer could not be attached (a gui-daemon too old for
+    // per-window buffers, say): nothing else can show it, so it is withheld and reported like a window with no
+    // frame (ADR-capture 33). Cleared by a successful attach.
+    BOOL      PwAttachRefused;
+    ULONG     PwAttachStatus;
     // Also LOAD-BEARING for a log LEVEL: BROKERLATEREG reads it to tell an active broker's refusal
     // (a fault) from a broker that had not started (normal). Changing when this is set changes that
     // level - the lifecycle selftest's main_latereg_level shape check pins the pair together.

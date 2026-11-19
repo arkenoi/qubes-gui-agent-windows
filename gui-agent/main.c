@@ -189,14 +189,10 @@ BOOL g_StagingGrant = TRUE;
 // the gate in Init for why the feature is the right discriminator.
 BOOL g_NoScreenGrant = TRUE;
 
-// WGC capture broker (DESIGN-wgc-broker.md): user-session helper that captures OCCLUDED
-// app/NRB windows via Windows.Graphics.Capture (which the SYSTEM agent itself cannot
-// activate) and streams frames through a cross-session shared section. Win11 25H2+ (26200)
-// only; feature-gated (registry "WgcBroker" / qubesdb /qubes-service/wgc-broker), default
-// OFF (experimental). Stage 2a here is section+spawn+supervise ONLY (no consumer): it can
-// never affect rendering. Toasts/o-r menus are NOT routed here (topmost, slice-correct; the
-// toast interceptor handles toasts). See wgcbroker_ipc.h for the contract.
-#define REG_CONFIG_WGC_BROKER_VALUE L"WgcBroker"
+// WGC capture broker (DESIGN-wgc-broker.md): user-session helper that captures each window via
+// Windows.Graphics.Capture (which the SYSTEM agent itself cannot activate) and streams frames
+// through a cross-session shared section. It runs on every guest at or above the floor; there is
+// no switch (ADR-capture 33). See wgcbroker_ipc.h for the contract.
 #define WGC_BROKER_BUILD_FLOOR 26200u   // 25H2: the broker, slice retirement and de-slice run here and later (ADR-capture 36)
 // FlattenCorners: Win11 rounds window corners at DWM composition and the broker's capture grabs
 // that composited result, so the rounded-out corner triangles arrive TRANSPARENT and dom0 renders
@@ -239,12 +235,7 @@ BOOL          g_NotifBridge = TRUE;
 #define REG_CONFIG_NOTIF_ERRORS_VALUE L"NotifyErrors"
 BOOL          g_NotifyErrors = TRUE;
 // Slice retirement (broker-only sliceFed handling) is the SHIPPED behaviour on 25H2+ and tracks
-// the broker build floor unconditionally; the SliceRetire diagnostic knob is retired. Field
-// kill-switch: WgcBroker=0 / /qubes-service/wgc-broker=0 - broker inactive routes every sliceFed
-// window to the retained agent DDA slice. (An earlier comment here claimed toasts are "covered
-// by the notifhost interceptor" - that component was never launched by anything; toasts render
-// on the same o-r shell-surface path as menus, cropped by toastcrop.)
-BOOL          g_WgcBroker   = FALSE;
+// the broker build floor unconditionally; the SliceRetire diagnostic knob is retired.
 BOOL          g_SliceRetire = FALSE;   // broker-era sliceFed handling; set once at init: TRUE iff build >= WGC_BROKER_BUILD_FLOOR (knob retired)
 BOOL          g_DeSlice = FALSE;       // DERIVED at init (g_SliceRetire && build >= WGC_BROKER_BUILD_FLOOR), not a
                                        // knob: every surface is per-window (synth + materialized
@@ -3671,7 +3662,7 @@ static BOOL BrokerHangConfirm(IN BOOL overdue, IN ULONGLONG now, IN int slot, IN
 // that brings the shell, not for a spin.
 static ULONGLONG BrokerNextDue(void)
 {
-    if (!g_WgcBroker || g_OsBuild < WGC_BROKER_BUILD_FLOOR || !PwEnabled() || !g_WgcBase) return 0;
+    if (g_OsBuild < WGC_BROKER_BUILD_FLOOR || !PwEnabled() || !g_WgcBase) return 0;
     const ULONGLONG now = GetTickCount64();
     ULONGLONG due = 0;
     if (g_BrokerReady)
@@ -3951,7 +3942,7 @@ static BOOL BrokerStartHold(IN ULONGLONG now, IN ULONGLONG rewarnMs)
 
 static void BrokerSupervise(void)
 {
-    if (!g_WgcBroker || g_OsBuild < WGC_BROKER_BUILD_FLOOR || !PwEnabled()) return;
+    if (g_OsBuild < WGC_BROKER_BUILD_FLOOR || !PwEnabled()) return;
     if (!g_WgcBase && !WgcCreateSection()) return;
     // R5 (rest-zero D): this loop is alive - the broker's deadline on a published frame is answered by any wake of it
     // (its frame event is one). Replaced the agent heartbeat the broker used to exit on.
@@ -4233,9 +4224,7 @@ static void BrokerSupervise(void)
     // fallback must never be SILENT: the moment the broker is expected-but-absent, say so at ERROR
     // level - matching the QERR_SEV_ACTION row it sends to dom0, because one condition cannot be
     // "act now" on screen and "workable" in the log - AND publish a machine-readable flag the
-    // health-check / acceptance harness fails on. A deliberate opt-out (WgcBroker=0)
-    // never reaches here - g_WgcBroker is false and BrokerSupervise returns at the top - so a quiet
-    // fallback stays quiet ONLY when the operator asked for it.
+    // health-check / acceptance harness fails on.
     #define DESLICE_FIRST_WARN_MS 30000
     #define DESLICE_REWARN_MS 120000
     // A start observed inside the window moves the deadline, so a restart that recovers is never reported.
@@ -5804,7 +5793,7 @@ static void NotifBridgeShutdown(void)
 // ---- WGC broker stage 2b: register occluded NRB app windows, consume their frames --------
 BOOL WgcBrokerActive(void)
 {
-    return g_WgcBroker && g_OsBuild >= WGC_BROKER_BUILD_FLOOR && PwEnabled() && g_BrokerReady && g_WgcBase;
+    return g_OsBuild >= WGC_BROKER_BUILD_FLOOR && PwEnabled() && g_BrokerReady && g_WgcBase;
 }
 
 // DIRECT PATH REQUIRED (owner, 2026-09-06: "no fallback on a system that supports the direct
@@ -5818,12 +5807,7 @@ BOOL WgcBrokerActive(void)
 // degraded silently into whole-desktop slicing, which is what the desktop grant exists for
 // and what de-slice removed. On an eligible guest there is no composite rung: a window
 // either gets its own per-window frame or it holds, loudly (QGADESLICEDOWN + the
-// DesliceBrokerDown flag name the cause).
-//
-// The one quiet path is the DELIBERATE opt-out: WgcBroker=0 / qubesdb
-// /qubes-service/wgc-broker=0 makes the guest not-eligible, and the retained DDA slice
-// serves it exactly as win10 (no direct path there) is served. An operator asking for the
-// fallback gets it; nothing else does.
+// DesliceBrokerDown flag name the cause). There is no opt-out (ADR-capture 33).
 // BROKER LIFECYCLE - so that "eligible but not ready yet" is a DEFINED, BOUNDED state instead of
 // an undefined one (owner, 2026-09-08: "our task is to eliminate all race conditions to make sure
 // everything goes the defined path or gracefully fails and never ends in undefined state").
@@ -5888,6 +5872,12 @@ static const WCHAR* DirectSuppressFault(IN const WINDOW_DATA* entry, OUT OPTIONA
 {
     if (failHr)
         *failHr = 0;
+    if (entry->PwAttachRefused)
+    {
+        if (failHr)
+            *failHr = entry->PwAttachStatus;
+        return L"no-window-buffer";
+    }
     if (BrokerState() == BRK_DOWN)
         return L"broker-down";
     if (entry->PwBrokerSlot < 0)
@@ -5921,7 +5911,7 @@ void QgaNameThread(IN const WCHAR* name)
 
 BOOL DirectRequired(void)
 {
-    return g_WgcBroker && g_OsBuild >= WGC_BROKER_BUILD_FLOOR && PwEnabled();
+    return g_OsBuild >= WGC_BROKER_BUILD_FLOOR && PwEnabled();
 }
 
 // rest-zero S2 (docs/DESIGN-rest-zero-capture.md): on a direct-required guest in seamless mode no window takes pixels
@@ -6906,7 +6896,7 @@ static BOOL SliceContentReady(IN const WINDOW_DATA* entry);
 // either. That is the intended trade - "either show it or don't".
 static BOOL DirectWouldShowBlack(IN const WINDOW_DATA* entry)
 {
-    return DirectRequired() && entry->PwSliceFed && !SliceContentReady(entry);
+    return DirectRequired() && (entry->PwAttachRefused || (entry->PwSliceFed && !SliceContentReady(entry)));
 }
 
 // IS THIS TOAST BANNER WITHHELD BY THE BRIDGE VERDICT? (docs/ADR-toasts.md 10; toasthold.c.) TRUE while the
@@ -7014,6 +7004,8 @@ BOOL ToastBannerWithheld(IN const WINDOW_DATA* entry)
 static BOOL CropReadyForMap(IN OUT WINDOW_DATA* entry)
 {
     RECT tmp;
+    if (DirectRequired() && entry->PwAttachRefused)
+        return FALSE;   // never mapped: it has no buffer of its own (DirectSuppressFault "no-window-buffer")
     if (IsMenuPopupWindow(entry))
     {
         // Evaluated into locals so the diagnostic can say WHICH term the hold was waiting on.
@@ -7493,21 +7485,22 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             (void)SendWindowCreateForced(entry);
 
         // Per-window framebuffer: announce the window's own buffer BEFORE mapping so
-        // the daemon never composites this window from the screen slice. On failure the window
-        // stays on the legacy path - which on a direct-required guest means dom0 renders it out
-        // of the whole-desktop grant, the escalation the owner ruled out on 2026-09-06. It is
-        // still better than an invisible window, so the window is mapped; what changes is that
-        // the escalation is now NAMED in the log with its status instead of being discarded by
-        // a (void) cast, so it can be investigated rather than silently tolerated.
+        // the daemon never composites this window from the screen slice. On a direct-required guest
+        // nothing else can show the window, so a failed attach withholds it - never mapped - and the
+        // withheld-window report names it (DirectSuppressFault "no-window-buffer", ADR-capture 33).
         if (PwEnabled() && entry->IsVisible && !entry->IsIconic &&
             entry->Width > 0 && entry->Height > 0)
         {
             ULONG pwStatus = PwAttachWindow(entry);
-            if (pwStatus != ERROR_SUCCESS && DirectRequired())
-                // Per-window attach failed on a direct-required guest, so dom0 composites it from the whole-desktop
-                // grant. Investigate: no window on an eligible guest should need that path.
-                LogWarning("QGADIRECTLEGACY hwnd 0x%x attach failed (0x%x), shown from the desktop image instead",
+            entry->PwAttachRefused = (pwStatus != ERROR_SUCCESS && DirectRequired());
+            if (entry->PwAttachRefused)
+            {
+                entry->PwAttachStatus = pwStatus;
+                if (entry->PwDirectSince == 0)
+                    entry->PwDirectSince = GetTickCount64();   // the fault clock (QgaWindowFaultDue)
+                LogWarning("QGADIRECTLEGACY hwnd 0x%x attach failed (0x%x): no buffer of its own, withheld",
                     (DWORD)(ULONG_PTR)entry->Handle, pwStatus);
+            }
         }
 
         // map (show) the window if it's visible OR minimized -- unless crop-before-show holds it.
@@ -10614,14 +10607,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         }
         else if (DirectRequired())
         {
-            // On an eligible guest the legacy path means dom0 composites this window out of the
-            // WHOLE-DESKTOP grant - the fallback that is not allowed here (owner 2026-09-06).
-            // We cannot un-fail the rebuild from this arm, but it must never be a DEBUG line
-            // nobody reads: name it so a rig log shows the escalation instead of a window that
-            // merely looks slightly wrong.
-            // The per-window rebuild FAILED on a direct-required guest: dom0 now composites it from the
-            // whole-desktop grant, the fallback we do not accept. Investigate the attach failure above.
-            LogWarning("QGADIRECTLEGACY hwnd 0x%x rebuild failed, shown from the desktop image instead",
+            // The per-window rebuild FAILED on a direct-required guest: nothing else holds this window's
+            // pixels, so dom0 keeps what it had. Named so a rig log shows it; investigate the failure above.
+            LogWarning("QGADIRECTLEGACY hwnd 0x%x rebuild failed: no buffer of its own at its new size",
                 (DWORD)(ULONG_PTR)windowData->Handle);
         }
         else
@@ -17177,7 +17165,7 @@ cleanup:
 // One dom0 service-gate read on Init's shared qubesdb handle, telling "key absent" (keep the
 // registry base) apart from a FAILED read. Both came back as NULL before, so a qubesdb transport
 // error under a watchdog respawn was applied as the gate's opposite with no log line at all:
-// wgc-broker=0 dropped -> broker launched and QGADESLICEDOWN; notify-bridge=1 dropped -> the
+// notify-bridge=1 dropped -> the
 // gate-off branch deleted the bridge task and wrote its stop file (audit 2026-09-08). The client
 // sets errno=ENOENT for absent, but errno need not cross the DLL's CRT boundary, so the
 // discriminator is a re-read of "/name" - present in every guest qubesdb - on the same handle:
@@ -17293,9 +17281,7 @@ static ULONG Init(void)
         g_DisableCursor = TRUE;
     }
 
-    // WGC broker gate (25H2+ occluded-window capture, experimental). OS build via RtlGetVersion
-    // (GetVersionEx lies without a manifest); registry "WgcBroker" default 0, dom0 override
-    // /qubes-service/wgc-broker wins (mirrors the staging/seamless gates).
+    // OS build via RtlGetVersion (GetVersionEx lies without a manifest): it alone decides the broker.
     {
         // OSVERSIONINFOW is layout-compatible with RTL_OSVERSIONINFOW for the fields RtlGetVersion
         // fills (avoids pulling <winternl.h>); GetVersionEx would lie without a manifest.
@@ -17310,7 +17296,7 @@ static ULONG Init(void)
     // that can never start would hold every direct-path window for ever and never declare a fault -
     // the same undefined limbo, just quieter. See BrokerState().
     g_AgentStartTick = GetTickCount64();
-    // ONE qubesdb connection for every dom0 service gate below (wgc-broker, notify-bridge,
+    // ONE qubesdb connection for every dom0 service gate below (notify-bridge,
     // legacy-toasts, gui-fullscreen, uac-disable). Five throwaway qdb_open() calls each failed
     // SILENTLY into the registry base, so a qubesdb briefly unreachable during a watchdog respawn
     // applied a dropped dom0 override as its opposite - and the gate-off branch ACTS at once
@@ -17321,41 +17307,23 @@ static ULONG Init(void)
     if (!gateQdb)
         return win_perror("qdb_open (dom0 service gates)");
     BOOL gateReadFailed = FALSE;
-    const WCHAR *wgcSrc = L"default";
-    {
-        // WGC broker ships DEFAULT-ON for 25H2+ (WGC_BROKER_BUILD_FLOOR): it is the capture path for the
-        // win11 shell surfaces, and the win11 de-slice benchmark shows no penalty vs the composite.
-        // Registry "WgcBroker" / qubesdb /qubes-service/wgc-broker override it (0 forces it off).
-        DWORD wgc = (g_OsBuild >= WGC_BROKER_BUILD_FLOOR) ? 1u : 0u;
-        if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_WGC_BROKER_VALUE, &wgc, NULL))
-            wgcSrc = L"registry";
-        g_WgcBroker = (wgc != 0);
-        char* v = ReadServiceGate(gateQdb, "/qubes-service/wgc-broker", &gateReadFailed);
-        if (v) { g_WgcBroker = (v[0] != '0'); free(v); wgcSrc = L"qubesdb"; }
-        if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
-    }
     {
         // Slice retirement (broker-only per-window slice) is the shipped behaviour on 25H2+ and
-        // tracks the broker build floor unconditionally; the SliceRetire registry knob is retired
-        // (rollback = the WgcBroker gate, which routes sliceFed windows to the retained DDA slice).
+        // tracks the broker build floor unconditionally; the SliceRetire registry knob is retired.
         g_SliceRetire = (g_OsBuild >= WGC_BROKER_BUILD_FLOOR);
         // De-slice is DERIVED, not a knob: the whole-desktop composite (MONSLICE) was proven
         // unneeded and DELETED once the de-slice proof window closed, so a DeSlice=0 would have
         // nothing to switch back to. De-sliced wherever the slice is being retired, hard-gated on
         // the broker floor (WGC_BROKER_BUILD_FLOOR): below it WgcBrokerActive() is never true and the classic DDA
-        // path never used a composite - exactly the win10 config the benchmark validated. Field
-        // kill-switch for the whole broker path: "WgcBroker" / qubesdb /qubes-service/wgc-broker
-        // (0 -> sliceFed windows take the retained agent DDA slice fallback).
+        // path never used a composite - exactly the win10 config the benchmark validated.
         g_DeSlice = g_SliceRetire && (g_OsBuild >= WGC_BROKER_BUILD_FLOOR);
     }
-    // The source is logged so a dom0 override that did not reach the gate is visible in the log.
-    LogInfo("WGCBROKER gate: enabled=%d source=%s osBuild=%lu sliceRetire=%d deSlice=%d (floor %lu)",
-            g_WgcBroker, wgcSrc, g_OsBuild, g_SliceRetire, g_DeSlice, (ULONG)WGC_BROKER_BUILD_FLOOR);
-    // Publish an authoritative de-slice health flag from the start. When the broker is NOT
-    // expected (win10, or an explicit WgcBroker=0 opt-out) the answer is a definite "not down" =
-    // 0, so acceptance never reads a stale value from a prior config; when it IS expected,
-    // BrokerSupervise owns the flag (0 on ready, 1/2 on the hard-fail path).
-    if (!(g_WgcBroker && g_OsBuild >= WGC_BROKER_BUILD_FLOOR))
+    LogInfo("WGCBROKER gate: enabled=%d osBuild=%lu sliceRetire=%d deSlice=%d (floor %lu)",
+            g_OsBuild >= WGC_BROKER_BUILD_FLOOR, g_OsBuild, g_SliceRetire, g_DeSlice, (ULONG)WGC_BROKER_BUILD_FLOOR);
+    // Publish an authoritative de-slice health flag from the start. Below the floor the broker is not
+    // expected and the answer is a definite "not down" = 0, so acceptance never reads a stale value from a
+    // prior config; at or above it BrokerSupervise owns the flag (0 on ready, 1/2 on the hard-fail path).
+    if (g_OsBuild < WGC_BROKER_BUILD_FLOOR)
         (void)CfgWriteDword(NULL, REG_CONFIG_DESLICE_DOWN_VALUE, 0, NULL);
     // docs/DESIGN-rest-zero-capture.md B/S4: on a direct-capable guest every window is broker-fed, so the PrintWindow
     // engine PwInit started above has nothing to capture - and its workers still woke four times a second for the
