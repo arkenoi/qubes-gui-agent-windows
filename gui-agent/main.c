@@ -16045,7 +16045,8 @@ static ULONG WINAPI WatchForEvents(void)
         if (g_NonSeamlessPending)
         {
             const ULONGLONG now64 = GetTickCount64();
-            const ULONGLONG at = fsStallLast + 3000;
+            const ULONGLONG since = (fsStallLast > g_NonSeamlessPendingSince) ? fsStallLast : g_NonSeamlessPendingSince;
+            const ULONGLONG at = since + 3000;
             const DWORD toStall = (at > now64) ? (DWORD)(at - now64) : 0;
             if (waitTimeout == INFINITE || toStall < (DWORD)waitTimeout)
                 waitTimeout = toStall;
@@ -16986,7 +16987,9 @@ static ULONG WINAPI WatchForEvents(void)
                     g_HostScreenWidth, g_HostScreenHeight, g_FrameCount);
                 (void)SetSeamlessMode(FALSE, TRUE);
             }
-            else if (nowTick - fsStallLast >= 3000)
+            // Stuck means 3 s without completing, counted from when the switch began pending: a switch the same pass
+            // just deferred has not stalled, and the shrink it waits for is normally live within a second.
+            else if (nowTick - ((fsStallLast > g_NonSeamlessPendingSince) ? fsStallLast : g_NonSeamlessPendingSince) >= 3000)
             {
                 fsStallLast = nowTick;
                 LogWarning("QGAFSSTALL,age_ms=%I64u,screen=%ux%u,host=%ux%u,grant=%d,"

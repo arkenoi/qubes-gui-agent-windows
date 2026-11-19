@@ -725,8 +725,15 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                 // margin is stated here rather than tuned until it passes.
                 // The geometry-changed branch above is untouched and stays an ERROR per occurrence:
                 // it is the trigger of an open P2 and one of them matters.
-                g_DupRecreateCount++;
-                if (g_DupRecreateCount == 1)
+                // A recreate during the agent's own exact mode set is that mode set landing (each non-seamless entry and
+                // return makes some), not the input-desktop flip the rate below watches for: logged, never counted.
+                const BOOL ownModeSet = ResolutionExactObtainInFlight();
+                if (!ownModeSet)
+                    g_DupRecreateCount++;
+                if (ownModeSet)
+                    LogDebug("QGADDARECREATE duplication recreated in place after %u attempt(s) during the agent's own "
+                        L"mode set - windows kept, not counted (n=%u in this process)", attempt + 1, g_DupRecreateCount);
+                else if (g_DupRecreateCount == 1)
                     // What the parenthetical used to spell out: ACCESS_LOST with the geometry unchanged is the
                     // documented stale-duplication signal, measured here only at an input-desktop switch, and
                     // recovering in place is the designed response. The line keeps the code and the geometry fact;
@@ -737,7 +744,7 @@ static BOOL RecreateDuplication(IN OUT CAPTURE_CONTEXT* ctx)
                 else
                     LogDebug("QGADDARECREATE duplication recreated in place after %u attempt(s) - windows kept "
                         L"(n=%u in this process)", attempt + 1, g_DupRecreateCount);
-                if (g_DupRecreateCount == QGA_DUP_RECREATE_WARN_AT + 1)
+                if (!ownModeSet && g_DupRecreateCount == QGA_DUP_RECREATE_WARN_AT + 1)
                     // An input-desktop switch recovers in place and is ordinary; this rate is not: something is
                     // flipping the input desktop, or the duplication is being lost for another reason. Each
                     // recovery is in the DEBUG log.
