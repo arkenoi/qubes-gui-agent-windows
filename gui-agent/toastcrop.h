@@ -33,17 +33,17 @@
  *                     XAML class names are field-fragile).
  *   ToastCropL/T/R/B  DWORD px  - force these insets instead of measuring. Still subject
  *                     to the plausibility and floor guards.
- *   ToastCropToastUnion DWORD 0/1 - DEFECT RE-INTRODUCTION: measure toasts with the MENU
- *                     rule (control view + union of the qualifiers) instead of the toast rule
- *                     (raw view + largest qualifier). That is the 2026-09-03 finder that
- *                     cropped a 396x200 reminder toast to ~214x157 and cut its action buttons
- *                     (measured 2026-09-06). Logged at WARNING on start. Menus are unaffected.
  *
  * Card rules (toastcrop-pick.h, unit-tested offline by toastcrop_pick_test.c): a toast's
  * card is ONE element nesting all content, so it is the LARGEST descendant strictly inside
  * the window; a WinUI menu body has no such element (its presenter spans the full window
- * height), so its card is the UNION of the rows. The rule is chosen per surface at enqueue
- * time from the same classification the crop gate made (IsMenuPopupWindow).
+ * height), so its card is the UNION of the rows. The Start card is the union in the RAW view:
+ * on 26H2 (26300, measured 2026-11-19) no element spans it - the largest is an inner pane
+ * whose rect changes per opening (insets t=77 b=77, then t=72 b=13) and cuts off the search
+ * box and the account bar - while the raw union is 13/29/13/13 against a card whose pixels
+ * start at 13 on every side. The union contains the largest element, so where the largest
+ * IS the card (25H2, measured 2026-08-11) the union cannot crop more than it did. The rule is
+ * chosen per surface at enqueue time from the same classification the crop gate made.
  *
  * THE SLIDE-IN RACE (root-caused 2026-09-06 from the agent's own log). A toast slides in
  * from the right as a XAML translate of the card INSIDE a window that does not move, so a
@@ -147,12 +147,18 @@ BOOL ToastCropLookup(
 // One UIA measurement of `window`'s card against its raw rect, no caching. Always writes
 // *insets; zeroes them on any failure. Returns ERROR_SUCCESS when a nonzero crop was
 // measured, otherwise a status that the caller is expected to IGNORE (the zeroed insets
-// are the whole contract). `menu` selects the card rule: TRUE for a WinUI menu popup
-// (control view + union), FALSE for a shell toast (raw view + largest) - see the .c.
+// are the whole contract). `rule` selects the card rule - see the .c.
+typedef enum _TC_RULE
+{
+    TcRuleToast = 0,    // a shell toast: raw view, largest qualifying element
+    TcRuleMenu,         // a WinUI menu popup: control view first, union of the rows
+    TcRuleStart         // the Start card: raw view, union of every qualifying element
+} TC_RULE;
+
 ULONG ToastCropQuery(
     IN HWND window,
     IN RECT raw,
-    IN BOOL menu,
+    IN TC_RULE rule,
     OUT RECT* insets
     );
 

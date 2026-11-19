@@ -45,13 +45,6 @@
 #define REG_CONFIG_TOASTCROP_TOP_VALUE     L"ToastCropT"
 #define REG_CONFIG_TOASTCROP_RIGHT_VALUE   L"ToastCropR"
 #define REG_CONFIG_TOASTCROP_BOTTOM_VALUE  L"ToastCropB"
-// DEFECT RE-INTRODUCTION (CLAUDE.md: a check counts only once it has been seen to FAIL).
-// DWORD 0/1: force TOASTS through the MENU rule - control view first + union of every
-// qualifying element - which is the 2026-09-03 finder that overcropped a 396x200 reminder
-// toast to ~214x157 and cut both action buttons (measured 2026-09-06). Present in release
-// like ToastCropDisable, because fault injection (faultinject.h) is compiled out of the
-// release package the rig validates. Menus are unaffected (that IS their rule).
-#define REG_CONFIG_TOASTCROP_TOAST_UNION_VALUE L"ToastCropToastUnion"
 
 // Absolute floor for a cropped window, used with the SM_CXMIN/SM_CYMIN floor below. The
 // XAML card of a real toast is hundreds of px wide; anything this small is a mismeasure.
@@ -154,7 +147,6 @@ static CRITICAL_SECTION g_TcLock;
 static BOOL g_TcDisabled = FALSE;
 static BOOL g_TcForced = FALSE;         // registry insets replace the UIA measurement
 static RECT g_TcForcedInsets;
-static BOOL g_TcToastUnionDefect = FALSE; // ToastCropToastUnion: toasts use the menu rule (defect)
 
 // LRU clock, shared by the slot cache and the last-good table below.
 static ULONGLONG g_TcClock = 0;
@@ -240,7 +232,7 @@ typedef struct _TC_QUERY_REQ
     RECT  Raw;
     DWORD RawWidth;
     DWORD RawHeight;
-    BOOL  Menu;      // IsMenuPopupWindow at enqueue time: selects the card rule (TcQueryCore)
+    TC_RULE Rule;    // decided at enqueue time from the crop gate's classification (TcQueryCore)
     // An IDENTITY read for the toast hold (toasthold.c), not a crop measurement: the worker hands the
     // read to TcReadCardTexts and the texts to ToastHoldApplyIdentity; touches no crop slot. Raw/Menu unused.
     BOOL  Identity;
@@ -331,8 +323,6 @@ static BOOL WINAPI TcInitOnceCallback(PINIT_ONCE initOnce, PVOID parameter, PVOI
             g_TcForcedInsets.bottom = (LONG)value;
             g_TcForced = TRUE;
         }
-        if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_TOASTCROP_TOAST_UNION_VALUE, &value, NULL))
-            g_TcToastUnionDefect = (value != 0);
     }
 
     // Logged unconditionally: a captured log must state which condition produced it, the
@@ -343,14 +333,7 @@ static BOOL WINAPI TcInitOnceCallback(PINIT_ONCE initOnce, PVOID parameter, PVOI
         LogInfo("QGATOASTCROP on, forced insets l=%d t=%d r=%d b=%d",
             g_TcForcedInsets.left, g_TcForcedInsets.top, g_TcForcedInsets.right, g_TcForcedInsets.bottom);
     else
-        LogInfo("QGATOASTCROP on, measuring with UIA (toast rule=raw-largest, menu rule=control-union)");
-
-    // WARNING, not Info: a run with this on is deliberately shipping the overcrop defect (the
-    // 2026-09-03 overcrop - the menu rule's control view + union applied to toasts - re-introduced
-    // on purpose by the knob), and the log must say so before any toast geometry in it is read as
-    // the product's.
-    if (g_TcToastUnionDefect)
-        LogWarning("QGATOASTCROP DEFECT ToastCropToastUnion=1: toasts measured with the MENU rule");
+        LogInfo("QGATOASTCROP on, measuring with UIA (toast rule=raw-largest, menu rule=control-union, start rule=raw-union)");
 
     // The async measurement worker. If it cannot start, lookups fall back to the inline
     // synchronous query - the crop still works, only with the old stall risk, and the log
@@ -625,12 +608,18 @@ static BOOL TcFindCardRect(IN IUIAutomationTreeWalker* walker, IN IUIAutomationE
 //            buttons (measured 2026-09-06: 364-wide card cropped to ~214). Raw view because that
 //            is the measured-good configuration for this surface; the menu's ~5 px raw-only padding
 //            container is a MENU artifact, not something a toast tree has been seen to carry.
-// ToastCropToastUnion=1 forces the menu rule onto toasts - the defect, re-introduced on demand.
+//   start -> RAW view + the UNION of every qualifier. On 26H2 (26300, measured 2026-11-19) no
+//            element spans the card: the largest is an inner pane whose rect changes per opening
+//            (insets t=77 b=77, then t=72 b=13) and cut off the search box and the account bar,
+//            while the raw union was 13/29/13/13 against a card whose pixels start 13 px in on
+//            every side (16 px of padding above the search box is the only part still cropped).
+//            The union contains the largest, so where the largest is the card (25H2, 2026-08-11)
+//            the union cannot crop more than the toast rule did.
 //
 // `settle`: TRUE on the worker thread, where the toast path may SLEEP briefly and re-walk to
 // confirm the card is at rest (the slide-in race, see below); FALSE on the inline fallback,
 // which runs on the tracking thread and must never wait.
-static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN BOOL menu, IN BOOL settle,
+static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN TC_RULE rule, IN BOOL settle,
     OUT RECT* insets)
 {
     IUIAutomationElement* windowElement = NULL;
@@ -657,15 +646,14 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
     // measured 2026-08-11; on 24H2 the same menu had no margin at all). The qualifier ("fully
     // inside the window, strictly smaller in both dimensions") and the two selection rules are
     // in toastcrop-pick.h, where they are unit-tested offline (toastcrop_pick_test.c).
-    // Rule and view, decided once so the stability re-walk below mirrors the first walk exactly
-    // (under ToastCropToastUnion the re-walk must reproduce the defect, not veto it).
-    BOOL useMenuRule = menu || g_TcToastUnionDefect;
-    TC_PICK_MODE mode = useMenuRule ? TcPickUnion : TcPickLargest;
+    // Rule and view, decided once so the stability re-walk below mirrors the first walk exactly.
+    BOOL useMenuRule = (rule == TcRuleMenu);
+    TC_PICK_MODE mode = (rule == TcRuleToast) ? TcPickLargest : TcPickUnion;
     BOOL usedControlView = FALSE;   // which view the accepted first walk came from
     {
         TC_CARD_ACC acc;
-        const WCHAR* rule = menu ? L"menu:control-union"
-                          : (g_TcToastUnionDefect ? L"toast:DEFECT-control-union" : L"toast:raw-largest");
+        const WCHAR* ruleName = (rule == TcRuleMenu) ? L"menu:control-union"
+                              : (rule == TcRuleStart ? L"start:raw-union" : L"toast:raw-largest");
         const WCHAR* view = L"raw";
         // 2 s covers a healthy walk (4-6 levels, tens of RPCs) many times over while
         // bounding a pathological one to a small multiple of the per-call timeout.
@@ -704,7 +692,8 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
         }
         else
         {
-            // TOAST RULE: the raw view, exactly as before 2026-09-03.
+            // TOAST and START RULES: the raw view (toasts exactly as before 2026-09-03); they
+            // differ only in the pick, `mode` above.
             if (SUCCEEDED(IUIAutomation_get_RawViewWalker(uia, &walker)) && walker)
             {
                 found = TcFindCardRect(walker, windowElement, raw, 0, deadline, &acc);
@@ -717,7 +706,7 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
         {
             // Expected while the XAML tree is still being built; the caller retries a bounded
             // number of times and then leaves the window uncropped.
-            LogDebug("0x%x: no card element yet (rule=%s view=%s)", window, rule, view);
+            LogDebug("0x%x: no card element yet (rule=%s view=%s)", window, ruleName, view);
             status = ERROR_NOT_FOUND;
             goto end;
         }
@@ -726,7 +715,7 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
         // log then shows which rule picked what and what the other rule would have picked,
         // without a second build. Debug: per measurement, not per frame, shell surfaces only.
         LogDebug("0x%x: card walk rule=%s view=%s qualifiers=%d largest=(%d,%d) %dx%d union=(%d,%d) %dx%d in raw (%d,%d) %dx%d",
-            window, rule, view, acc.Count,
+            window, ruleName, view, acc.Count,
             acc.Largest.left, acc.Largest.top,
             acc.Largest.right - acc.Largest.left, acc.Largest.bottom - acc.Largest.top,
             acc.Union.left, acc.Union.top,
@@ -814,7 +803,7 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
     // it tells the log WHICH failure it was: a card that moved between the two walks is the
     // slide (expected on a managed image where the animation cannot be turned off); a card
     // that is stable yet asymmetric is a shape no toast has produced at rest, worth a look.
-    if (!menu && TcInsetsMidSlide(raw.right - raw.left, insets))
+    if (rule != TcRuleMenu && TcInsetsMidSlide(raw.right - raw.left, insets))
     {
         const WCHAR* verdict = L"asymmetric (inline path, no settle read)";
 
@@ -863,7 +852,7 @@ end:
 
 // Public synchronous query - the fallback when the worker thread is unavailable, and the
 // entry point external callers keep. Uses the shared automation object under g_TcLock.
-ULONG ToastCropQuery(IN HWND window, IN RECT raw, IN BOOL menu, OUT RECT* insets)
+ULONG ToastCropQuery(IN HWND window, IN RECT raw, IN TC_RULE rule, OUT RECT* insets)
 {
     IUIAutomation* uia = NULL;
     ULONG status;
@@ -886,7 +875,7 @@ ULONG ToastCropQuery(IN HWND window, IN RECT raw, IN BOOL menu, OUT RECT* insets
         return ERROR_NOT_SUPPORTED;
     }
     // Inline = on the caller's (tracking) thread: no settle wait here.
-    status = TcQueryCore(uia, window, raw, menu, FALSE, insets);
+    status = TcQueryCore(uia, window, raw, rule, FALSE, insets);
     LeaveCriticalSection(&g_TcLock);
     return status;
 }
@@ -1179,7 +1168,7 @@ static DWORD WINAPI TcWorkerThread(IN void* param)
             }
 
             RECT insets;
-            TcQueryCore(uia, req.Window, req.Raw, req.Menu, TRUE, &insets); // status is in the insets
+            TcQueryCore(uia, req.Window, req.Raw, req.Rule, TRUE, &insets); // status is in the insets
             TcApplyResult(&req, &insets);
         }
     }
@@ -1190,7 +1179,7 @@ static DWORD WINAPI TcWorkerThread(IN void* param)
 // already-queued duplicate is dropped silently - the slot's RetryAt pacing re-requests it.
 // `identity`: an identity read for the toast hold instead of a measurement (one pending per window).
 static BOOL TcEnqueueQueryLocked(IN HWND window, IN HWND cacheKey, IN const RECT* raw, IN DWORD rawWidth, IN DWORD rawHeight,
-    IN BOOL menu, IN BOOL identity, IN LONG incarnation)
+    IN TC_RULE rule, IN BOOL identity, IN LONG incarnation)
 {
     int freeIdx = -1;
 
@@ -1223,7 +1212,7 @@ static BOOL TcEnqueueQueryLocked(IN HWND window, IN HWND cacheKey, IN const RECT
     g_TcQueue[freeIdx].Raw = *raw;
     g_TcQueue[freeIdx].RawWidth = rawWidth;
     g_TcQueue[freeIdx].RawHeight = rawHeight;
-    g_TcQueue[freeIdx].Menu = menu;
+    g_TcQueue[freeIdx].Rule = rule;
     g_TcQueue[freeIdx].Identity = identity;
     g_TcQueue[freeIdx].Incarnation = incarnation;
     g_TcQueue[freeIdx].Valid = TRUE;
@@ -1454,7 +1443,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
     // normal fail-soft. The cost is stated rather than hidden - the flyout shows its ~13 px shadow
     // margin, which is worse pixels than a correct crop and better than a clipped window. It also
     // ends seven "cropped size 728x32 below the floor" warnings per run.
-    if (QgaCardRuleForSurface((int)ShellSurfaceKind(data), IsMenuPopupWindow(data)) == QGA_CARD_RULE_NONE)   // GUARD:cardrule
+    if (QgaCardRuleForSurface((int)ShellSurfaceKind(data), IsMenuPopupWindow(data)) == QGA_CARD_RULE_NONE)
     {
         LogDebug("0x%x: no crop rule for this surface kind - announced uncropped", data->Handle);
         return FALSE;
@@ -1527,7 +1516,8 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
             raw.bottom = data->Y + (LONG)data->Height;
             // Which card rule the measurement uses (TcQueryCore): decided HERE, from the
             // classification the gate already made, so the worker never re-classifies.
-            BOOL menu = IsMenuPopupWindow(data);
+            TC_RULE rule = IsMenuPopupWindow(data) ? TcRuleMenu
+                         : (ShellSurfaceKind(data) == ShellSurfaceStart ? TcRuleStart : TcRuleToast);
 
             // The measurement is a cross-process UIA RPC and this lookup sits on the
             // window-tracking pass of the thread that also dispatches input, so it must
@@ -1537,7 +1527,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
             // tracking pass so the crop lands within one pass of the answer. Attempt
             // pacing (Attempts/RetryAt above) is unchanged: a lost or unanswered request
             // is simply re-queued at the next retry tick.
-            if (!TcEnqueueQueryLocked(data->Handle, TcCacheKey(data), &raw, data->Width, data->Height, menu, FALSE, 0))
+            if (!TcEnqueueQueryLocked(data->Handle, TcCacheKey(data), &raw, data->Width, data->Height, rule, FALSE, 0))
             {
                 // Worker unavailable (thread failed to start, or the queue is full with
                 // other windows). Fall back to the old inline query rather than never
@@ -1547,7 +1537,7 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
                 LeaveCriticalSection(&g_TcLock);
 
                 RECT measured;
-                ToastCropQuery(data->Handle, raw, menu, &measured);
+                ToastCropQuery(data->Handle, raw, rule, &measured);
 
                 EnterCriticalSection(&g_TcLock);
                 slot = TcFindSlotLocked(TcCacheKey(data), data->Width, data->Height);
