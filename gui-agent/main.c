@@ -16235,7 +16235,11 @@ static ULONG WINAPI WatchForEvents(void)
         // (ObserveInputDesktop, ADR-capture 33). The wake is named in the change line: a desktop switch
         // reaches this loop as a window event (EVENT_SYSTEM_DESKTOPSWITCH, QGADESKSWITCHEVT) and a session
         // notification as one too (lifecycle.c).
-        if (g_VchanClientConnected && signaledEvent != 1)
+        // SEAMLESS ONLY. Non-seamless on the secure desktop enters the episode and leaves it again in one call (the
+        // exit block is not the entry's else), and the exit queues a full resync - which signals event 6, which
+        // lands here: on every wake that is a loop feeding itself, AutologonEnsure and two lines per pass.
+        // Non-seamless is observed per desktop frame, as it always was.
+        if (g_VchanClientConnected && g_SeamlessMode && signaledEvent != 1)
             (void)ObserveInputDesktop(
                 signaledEvent == WAIT_TIMEOUT                 ? L"deadline" :
                 signaledEvent == 4                            ? L"vchan" :
