@@ -1653,6 +1653,20 @@ BOOL ShellSurfaceCardless(IN const WINDOW_DATA* data)
             return TRUE;    // entirely off-screen: parked, not open
     }
 
+    // SPANS THE SCREEN = NOT A CARD, whatever card is remembered. On 26H2 the Start host morphs
+    // screen-sized when the user types into its search box and when it closes; the sticky card below
+    // (TcRecallLastGood) then still said "card known", and the stale insets were applied to the
+    // screen-sized rect. Measured 2026-11-19 on st11 (26300, SeamlessStart=1): MAP ovr=1 at 5094x1238
+    // and DESTROY 53 ms later, and on another run a WM-managed announce with SendWindowSizeLock
+    // 5095x1338 - a screen-sized surface on dom0's screen either way. The size read here is the
+    // ANNOUNCED one (GetWindowData has applied the crop), so a 25H2 opening that composes inside a
+    // screen-sized host still passes once its crop resolves to the card. 90% of either axis, the
+    // same bound QgaShellFrameAllowed uses for a frame.
+    if (g_ScreenWidth && g_ScreenHeight &&
+        ((ULONGLONG)data->Width * 10ULL >= (ULONGLONG)g_ScreenWidth * 9ULL ||
+         (ULONGLONG)data->Height * 10ULL >= (ULONGLONG)g_ScreenHeight * 9ULL))
+        return TRUE;
+
     BOOL noCard = TRUE;
     EnterCriticalSection(&g_TcLock);
     {
