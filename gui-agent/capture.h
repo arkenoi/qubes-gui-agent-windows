@@ -158,6 +158,8 @@ size_t CaptureGrantPageCount(IN const CAPTURE_CONTEXT* ctx);
 // Failure (dom0 still maps the pages) is logged and the buffer leaked - the
 // process is exiting.
 void CaptureStagingRevokeOnExit(void);
+// Zeroes the kept staging buffer on the return to seamless (ADR-capture 33 item 4); the caller has stopped capture.
+void CaptureStagingClear(void);
 
 // How long the capture thread lets the main loop chew on one frame before declaring it
 // wedged and forcing the full reinitialization (which destroys and re-announces every

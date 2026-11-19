@@ -112,6 +112,15 @@ static const QerrText QerrTexts[] = {
       QERR_TXT_DESKTOP_STUCK_NEXT,
       QERR_GUI_AGENT_LOG ", line QGADESKSTUCK", NULL },
 
+    /* The windowed (non-seamless) desktop was asked for and the desktop duplication that fills it could not be created
+     * (log line QGADESKENGINE). On 25H2+ that engine exists only while the windowed desktop is shown, so each entry
+     * creates it (docs/ADR-capture.md section 33); nothing was resized or shown, the guest stays seamless and nothing
+     * retries. ACTION: asking again is the retry; a restart if it repeats. */
+    { "desktop-window-refused", "gui-agent", "desktop-window-refused", QERR_SEV_ACTION, "gui-agent.exe", NULL,
+      "Guest desktop window could not be opened",
+      "The guest stays in seamless mode. Try again; if it fails again, restart the qube.",
+      QERR_GUI_AGENT_LOG ", line QGADESKENGINE", NULL },
+
     /* The window-event hook thread exited while the agent keeps running (log line QGAWINEVTDEAD). It is what tells
      * the agent that a window opened, closed, moved or changed; in seamless on 25H2+ nothing substitutes for it
      * (docs/ADR-capture.md section 33), and it is never restarted. ACTION: the qube's restart brings it back. */

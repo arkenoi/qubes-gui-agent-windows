@@ -1066,6 +1066,20 @@ void CaptureStagingRevokeOnExit(void)
     ZeroMemory(&g_Staging, sizeof(g_Staging));
 }
 
+// THE RETURN TO SEAMLESS CLEARS THE KEPT BUFFER (ADR-capture 33 item 4). On 26200+ the duplication is released when
+// window 0 is hidden, but the buffer outlives it and stays granted for the rest of the boot (revoking needs dom0 to drop
+// its mapping, which only DESTROY(0) plus a confirm gives - the dead end CaptureStagingGrantNow records). Cleared, the
+// next visit starts from black and its first frame fills it whole (staging_full_copy), never from the last visit's
+// pixels. The caller has stopped the capture thread first: nothing else writes this buffer.
+void CaptureStagingClear(void)
+{
+    if (!g_Staging.buffer)
+        return;
+    ZeroMemory(g_Staging.buffer, g_Staging.size);
+    LogInfo("STAGING cleared on the return to seamless (%lu pages, still %s)", (ULONG)g_Staging.page_count,
+        g_Staging.grant ? L"granted" : L"ungranted");
+}
+
 // TODO: use callbacks instead of events
 CAPTURE_CONTEXT* CaptureInitialize(HANDLE frame_event, HANDLE error_event)
 {
@@ -1308,12 +1322,12 @@ void CaptureStop(IN OUT CAPTURE_CONTEXT* ctx)
     CaptureEnableSet(FALSE, L"CaptureStop");
     if (ctx->thread)
     {
-        // No TerminateThread (docs/DESIGN-rest-zero-capture.md S4; Jev 2026-10-01): on a direct-capable guest the thread
-        // may sit in an acquire with no timeout, HOLDING ctx->frame.lock, and a terminated owner would leave that lock
-        // held for ever. Every mid-run caller follows the thread's own acquire error, so it has already left the acquire
-        // and this wait returns at once; at exit (CaptureSetExiting) it gets only a moment. A thread still parked is
-        // ABANDONED - never terminated, by design: its generation's stop flag makes it let go of its frame and leave
-        // when it next wakes, and CaptureTeardown leaves this context alone.
+        // No TerminateThread (docs/DESIGN-rest-zero-capture.md S4; Jev 2026-10-01): the thread may be inside an acquire,
+        // HOLDING ctx->frame.lock, and a terminated owner would leave that lock held for ever. The acquire waits at most
+        // FRAME_TIMEOUT, so a stop asked mid-run (a capture error, or the return to seamless releasing the engine on
+        // 26200+, ADR-capture 33) is seen within that and this wait returns; at exit (CaptureSetExiting) it gets only a
+        // moment. A thread still inside past the wait is ABANDONED - never terminated, by design: its generation's stop
+        // flag makes it let go of its frame and leave when it next wakes, and CaptureTeardown leaves this context alone.
         const DWORD waitMs = g_CaptureExiting ? 100 : 2 * FRAME_TIMEOUT;
         if (WaitForSingleObject(ctx->thread, waitMs) != WAIT_OBJECT_0)
         {
@@ -1322,7 +1336,7 @@ void CaptureStop(IN OUT CAPTURE_CONTEXT* ctx)
                 LogInfo("capture thread still in its acquire at exit; the exit ends it");
             else
                 LogWarning("CAPTUREABANDON capture thread still in its acquire %lu ms after stop, abandoned; "
-                           L"it leaves at the next desktop change", waitMs);
+                           L"it leaves when its acquire returns", waitMs);
         }
     }
     ctx->thread = NULL;
@@ -1728,20 +1742,6 @@ end:
     return status;
 }
 
-// docs/DESIGN-rest-zero-capture.md C/S4: on a direct-capable guest the acquire waits with NO timeout while no grant is
-// parked - a desktop at rest must not wake this thread (it woke once a second, FRAME_TIMEOUT, measured 2026-10-01). The
-// one job the timeout did at rest was retrying parked-grant revokes (A6), and at rest none is parked; while one is (a
-// screen-grant change in progress, not rest) the 1 s retry cadence stays. Below the broker floor nothing changes.
-static DWORD CaptureAcquireTimeout(IN OUT CAPTURE_CONTEXT* ctx)
-{
-    if (!DirectRequired())
-        return FRAME_TIMEOUT;
-    EnterCriticalSection(&ctx->stale_lock);
-    const BOOL parked = (ctx->stale_grants != NULL);
-    LeaveCriticalSection(&ctx->stale_lock);
-    return parked ? FRAME_TIMEOUT : INFINITE;
-}
-
 static DWORD WINAPI CaptureThread(void* param)
 {
     DWORD status = ERROR_SUCCESS;
@@ -1780,7 +1780,11 @@ static DWORD WINAPI CaptureThread(void* param)
         // retried here. One attempt per grant per pass - never a wait.
         StaleGrantSweep(capture, FALSE, L"timeout");
 
-        status = GetFrame(capture, CaptureAcquireTimeout(capture));
+        // FRAME_TIMEOUT on every build. The acquire with no timeout (rest-zero S4) was for a seamless desktop at rest
+        // on 26200+, which no longer holds a duplication at all (ADR-capture 33): the engine runs only while window 0
+        // shows the desktop, as on every other build, and a stop asked mid-run - the return to seamless - is seen
+        // within a second instead of waiting on a desktop change that may not come.
+        status = GetFrame(capture, FRAME_TIMEOUT);
         if (FAILED(status))
         {
             // This generation was stopped while the thread was parked: leave WITHOUT the failure path below, which

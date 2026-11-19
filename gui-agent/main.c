@@ -5940,6 +5940,15 @@ BOOL DesktopImageWanted(void)
     return !DirectRequired() || !g_SeamlessMode || g_DesktopGrantWanted;
 }
 
+// WHETHER THE DESKTOP DUPLICATION SHOULD EXIST NOW (ADR-capture 33). Below the floor it is the capture engine and always
+// runs (item 10). On 26200+ a seamless guest holds none (item 1): it exists while window 0 shows the desktop or a switch
+// there is pending (item 2). Keyed on the BUILD FLOOR, not on DirectRequired(): a gui-daemon too old for per-window
+// buffers makes that FALSE, and seamless must still not fall back to the whole desktop (item 7).
+static BOOL CaptureEngineWanted(void)
+{
+    return g_OsBuild < WGC_BROKER_BUILD_FLOOR || !g_SeamlessMode || g_NonSeamlessPending;
+}
+
 // When BrokerState() stops answering BRK_STARTING; 0 = it does not answer it now. The held-window sweep arms the
 // declaration of a frameless window at the later of this and the window's own grace (rest-zero S4).
 static ULONGLONG BrokerGraceEnd(void)
@@ -13035,11 +13044,58 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
     return TRUE;
 }
 
+// ONE RUN OF HOLDS, after a broker-frame consume (the frame walk's and the consume pass's). A FED WINDOW IS NOT
+// STARVING: the run ends, its length goes into the buckets, and the clock disarms so QGAHOLDSTARVED can arm again for a
+// later run - the reset that keeps the healthy-feed population (589 of 594 measured W lines) silent without trusting the
+// reason string. A HELD one arms the clock on the first hold of a run, and a hold that outlasts its bound with no new
+// painted content is the ERROR: not one-shot over the window's life, only over the current run, so a window that
+// starves, recovers and starves again is reported both times.
+static void PwHoldRun(IN OUT WINDOW_DATA* entry, IN BOOL fed, IN const WCHAR* holdWhy)
+{
+    const ULONGLONG now = GetTickCount64();
+    if (fed)
+    {
+        if (entry->PwHoldSince)
+        {
+            const ULONGLONG heldMs = now - entry->PwHoldSince;
+            InterlockedIncrement64(&g_HoldRuns);
+            InterlockedExchangeAdd64(&g_HoldTotalMs, (LONG64)heldMs);
+            if ((LONG64)heldMs > g_HoldMaxMs) g_HoldMaxMs = (LONG64)heldMs;
+            if (heldMs > 250)  InterlockedIncrement64(&g_HoldOver250);
+            if (heldMs > 1000) InterlockedIncrement64(&g_HoldOver1s);
+            if (heldMs > 3000) InterlockedIncrement64(&g_HoldOver3s);
+        }
+        entry->PwHoldSince = 0;
+        entry->PwStarveReported = FALSE;
+        return;
+    }
+    if (entry->PwHoldSince == 0)
+        entry->PwHoldSince = now;
+    if (!entry->PwStarveReported &&
+        QgaHoldStarveDue(entry->PwHoldSince, entry->PwSliceContentTick, now, (ULONGLONG)QGA_HOLD_STARVE_MS))
+    {
+        entry->PwStarveReported = TRUE;
+        // ADR-supervision 7: no frame arrives after a stop WE asked for. Jev 0.89.
+        LogErrorUnlessGoingDown(FALSE, "QGAHOLDSTARVED hwnd 0x%x slot=%d why=%s: held %llu ms with no new "
+            L"frame - the window is on screen showing STALE PIXELS",
+            (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
+            holdWhy ? holdWhy : L"unset",
+            (ULONGLONG)(now - entry->PwHoldSince));
+    }
+}
+
+// The earliest tick a held window's starve report falls due (0 = none), recomputed by every consume pass. With no
+// desktop duplication there is no frame walk to re-read a hold, so the main loop waits for this and runs the pass once
+// more (ADR-capture 33 item 5: one deadline armed by the hold, fired once). Main-loop thread only.
+static ULONGLONG g_HoldStarveDue = 0;
+
 // The broker published a frame (g_WgcFrame): copy every broker-fed window's newest frame now. Before this the agent
 // copied broker frames only on its desktop frame loop, so a window whose content changed while the rest of the desktop
 // did not - a covered window makes no desktop damage at all - sat stale until something unrelated moved.
+// The pass also keeps each window's hold run (PwHoldRun): on 26200+ seamless has no frame walk to do it.
 static void BrokerConsumePass(void)
 {
+    g_HoldStarveDue = 0;
     if (!g_WgcBase || !WgcBrokerActive())
         return;
     // The frame path is frozen while the input desktop is secure (ProcessNewFrame); so is this one.
@@ -13054,7 +13110,19 @@ static void BrokerConsumePass(void)
         if (!PwIsAttached(w) || !w->PwSliceFed || !w->PwBrokerSourced)
             continue;
         const RECT r = { w->X, w->Y, w->X + (int)w->Width, w->Y + (int)w->Height };
-        (void)PwConsumeBrokerFrame(w, &r, NULL);
+        const WCHAR* why = NULL;
+        const BOOL fed = PwConsumeBrokerFrame(w, &r, &why);
+        if (!DirectRequired())
+            continue;
+        PwHoldRun(w, fed, why);
+        if (w->PwHoldSince && !w->PwStarveReported && w->PwSliceContentTick)
+        {
+            // QgaHoldStarveDue's clock: from the later of the hold's start and the last painted content
+            const ULONGLONG from = (w->PwSliceContentTick > w->PwHoldSince) ? w->PwSliceContentTick : w->PwHoldSince;
+            const ULONGLONG due = from + (ULONGLONG)QGA_HOLD_STARVE_MS;
+            if (g_HoldStarveDue == 0 || due < g_HoldStarveDue)
+                g_HoldStarveDue = due;
+        }
     }
     LeaveCriticalSection(&g_csWatchedWindows);
 }
@@ -13652,6 +13720,9 @@ static BOOL SecureDesktopLockedNow(IN BOOL reported, IN OUT BOOL *readDone, IN O
 // The window-event and broker paths freeze on g_OnSecureDesktop themselves. The resume path
 // invalidates the frame signature so the first Default-desktop frame after the prompt cannot be
 // skipped as redundant and repaints promptly.
+// The secure episode's next elapsed-time report (0 = no episode), set below; the main loop waits for it when there is
+// no desktop duplication to bring a frame (ADR-capture 33 item 5). Main-loop thread only.
+static ULONGLONG g_SecureReportDue = 0;
 static BOOL ObserveInputDesktop(IN const WCHAR* wake)
 {
     // Re-observe the input desktop FIRST, BEFORE the freeze decision.
@@ -14009,6 +14080,10 @@ static BOOL ObserveInputDesktop(IN const WCHAR* wake)
                     (unsigned)(SECURE_DESKTOP_NOTIFY_ARMED_MS / 1000));
         }
 
+        // The next elapsed-time report of this episode, for the main loop to wait on when no desktop frame will come
+        // to evaluate it (ADR-capture 33 item 5): armed at entry for the 30 s report, re-armed by each report above.
+        g_SecureReportDue = s_SecureNextWarn;
+
         // Seamless: nothing may flow while this desktop is up. Non-seamless falls through
         // and is processed like any other frame.
         if (g_SeamlessMode)
@@ -14017,6 +14092,7 @@ static BOOL ObserveInputDesktop(IN const WCHAR* wake)
     if (s_WasSecure)
     {
         s_WasSecure = FALSE;
+        g_SecureReportDue = 0;
         // Mode 1 keeps denying fullscreen-sized windows for FS_BOOT_SETTLE_MS after this.
         g_SecureDesktopLeftTick = GetTickCount64();
         LogInfo("secure desktop left after %I64u s - resuming with a full resync and the frame "
@@ -14287,23 +14363,9 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 const WCHAR* holdWhy = NULL;
                 if (PwConsumeBrokerFrame(entry, &pwRect, &holdWhy))
                 {
-                    // fed from its own broker frame (copied now, or already current)
-                    // A FED WINDOW IS NOT STARVING: the run of holds ends here, so the clock
-                    // disarms and QGAHOLDSTARVED can arm again for a LATER run. This is the reset
-                    // that keeps the healthy-feed population (589 of 594 measured W lines) silent
-                    // without needing the reason string to be trusted.
-                    if (entry->PwHoldSince)
-                    {
-                        const ULONGLONG heldMs = GetTickCount64() - entry->PwHoldSince;
-                        InterlockedIncrement64(&g_HoldRuns);
-                        InterlockedExchangeAdd64(&g_HoldTotalMs, (LONG64)heldMs);
-                        if ((LONG64)heldMs > g_HoldMaxMs) g_HoldMaxMs = (LONG64)heldMs;
-                        if (heldMs > 250)  InterlockedIncrement64(&g_HoldOver250);
-                        if (heldMs > 1000) InterlockedIncrement64(&g_HoldOver1s);
-                        if (heldMs > 3000) InterlockedIncrement64(&g_HoldOver3s);
-                    }
-                    entry->PwHoldSince = 0;
-                    entry->PwStarveReported = FALSE;
+                    // fed from its own broker frame (copied now, or already current): the run of
+                    // holds ends (PwHoldRun)
+                    PwHoldRun(entry, TRUE, NULL);
                 }
                 // DIRECT-REQUIRED HOLD - this arm is the fall-through blocker, and the gate is
                 // ELIGIBILITY (DirectRequired), not availability (WgcBrokerActive). We are here
@@ -14339,25 +14401,10 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // for ever - a later hold on the same window for slot-holds-another-hwnd or
                     // dims-mismatch-STUCK would never be said. So the quiet arm returns without
                     // touching it, and the latch is spent only by a line that is actually written.
-                    // THE CLOCK, ARMED ON THE FIRST HOLD OF A RUN. QGAHOLDSTARVED - not the
-                    // one-shot line below - is now the detector for the user-visible consequence:
-                    // a hold that OUTLASTS its bound with no new painted content. It is not
-                    // one-shot over the window's life, only over the current run of holds, so a
-                    // window that starves, recovers and starves again is reported both times.
-                    if (entry->PwHoldSince == 0)
-                        entry->PwHoldSince = GetTickCount64();
-                    if (!entry->PwStarveReported &&
-                        QgaHoldStarveDue(entry->PwHoldSince, entry->PwSliceContentTick,
-                                         GetTickCount64(), (ULONGLONG)QGA_HOLD_STARVE_MS))
-                    {
-                        entry->PwStarveReported = TRUE;
-                        // ADR-supervision 7: no frame arrives after a stop WE asked for. Jev 0.89.
-                        LogErrorUnlessGoingDown(FALSE, "QGAHOLDSTARVED hwnd 0x%x slot=%d why=%s: held %llu ms with no new "
-                            L"frame - the window is on screen showing STALE PIXELS",
-                            (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
-                            holdWhy ? holdWhy : L"unset",
-                            (ULONGLONG)(GetTickCount64() - entry->PwHoldSince));
-                    }
+                    // THE CLOCK, ARMED ON THE FIRST HOLD OF A RUN (PwHoldRun). QGAHOLDSTARVED - not
+                    // the one-shot line below - is the detector for the user-visible consequence:
+                    // a hold that OUTLASTS its bound with no new painted content.
+                    PwHoldRun(entry, FALSE, holdWhy);
                     if (!entry->PwHoldLogged && !QgaHoldReasonIsNormal(holdWhy))
                     {
                         entry->PwHoldLogged = TRUE;
@@ -15371,9 +15418,14 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
     AttachToInputDesktop();
     // The hook thread has its own desktop association, it must follow.
     RearmWindowEvents();
-    // Initialize capture interfaces, this also initializes framebuffer PFNs
-    *capture = CaptureInitialize(newFrameEvent, captureErrorEvent);
-    if (!(*capture))
+    // THE SESSION HALF RUNS ALWAYS, THE CAPTURE HALF ONLY WHEN THE ENGINE IS WANTED (ADR-capture 33). On 26200+ a
+    // seamless guest gets window 0 announced and its mode applied - which builds the watched list - and no duplication;
+    // *capture stays NULL, which every consumer already accepts. The vchan connect, the CAPTUREGATE confirm and the A7
+    // retry all come here, so none of them brings the engine back into seamless.
+    if (CaptureEngineWanted())
+        // Initialize capture interfaces, this also initializes framebuffer PFNs
+        *capture = CaptureInitialize(newFrameEvent, captureErrorEvent);
+    if (CaptureEngineWanted() && !(*capture))
     {
         // ACCESS_LOST/ACCESS_DENIED AT INIT IS THE ROUTINE STALE-DESKTOP SIGNAL, AND THE RETRY
         // WRAPPER IS ITS SINGLE REPORTER - the fourth site of a class already fixed three times in
@@ -15420,6 +15472,15 @@ ULONG StartFrameProcessing(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent,
     }
 
     g_LocalScreenDestroyed = FALSE;
+
+    if (!(*capture))
+    {
+        status = SetSeamlessMode(g_SeamlessMode, TRUE);
+        if (ERROR_SUCCESS != status)
+            return win_perror2(status, "SetSeamlessMode (no desktop duplication)");
+        LogVerbose("end (no desktop duplication)");
+        return ERROR_SUCCESS;
+    }
 
     // send the whole screen framebuffer map
     // ctx->width/height are written once in CaptureInitialize, before the capture thread
@@ -15571,6 +15632,38 @@ ULONG StopFrameProcessing(IN OUT CAPTURE_CONTEXT** capture)
     g_LocalScreenDestroyed = TRUE;
 
     LogVerbose("end");
+    return ERROR_SUCCESS;
+}
+
+// THE DESKTOP DUPLICATION FOR WINDOW 0, MADE ON DEMAND (ADR-capture 33 items 2-3). The capture half of
+// StartFrameProcessing and nothing else: one attempt (no retry wrapper - a refusal is reported, not retried), no
+// CREATE(0) (window 0 was announced at connect) and no mode apply (the caller's SetSeamlessMode(FALSE) is the switch).
+// The caller has set g_DesktopGrantWanted, so the dump goes to dom0 now. On failure nothing is left behind.
+static ULONG DesktopEngineCreate(IN HANDLE newFrameEvent, IN HANDLE captureErrorEvent, OUT CAPTURE_CONTEXT** capture)
+{
+    const ULONGLONG t0 = GetTickCount64();
+    *capture = CaptureInitialize(newFrameEvent, captureErrorEvent);
+    if (!(*capture))
+    {
+        const DWORD gle = GetLastError();
+        return gle ? gle : ERROR_FUNCTION_FAILED;   // a NULL capture never returns ERROR_SUCCESS
+    }
+    ULONG status = SendScreenGrants(CaptureGrantPageCount(*capture), (*capture)->grant_refs,
+        (*capture)->width, (*capture)->height);
+    if (ERROR_SUCCESS == status)
+    {
+        g_DesktopDumpSent = TRUE;   // dom0 now has the desktop image for this plug
+        status = CaptureStart(*capture);
+    }
+    if (ERROR_SUCCESS != status)
+    {
+        CaptureTeardown(*capture);
+        *capture = NULL;
+        return status;
+    }
+    // The cost of create-on-entry, recorded each time (ADR-capture 33, Cost).
+    LogInfo("QGADESKENGINE desktop duplication created for the non-seamless desktop in %I64u ms (%ux%u)",
+        GetTickCount64() - t0, (*capture)->width, (*capture)->height);
     return ERROR_SUCCESS;
 }
 
@@ -15895,6 +15988,16 @@ static ULONG WINAPI WatchForEvents(void)
             const ULONGLONG bdue = BridgeNextDue();
             if (bdue != 0 && (due == 0 || bdue < due))
                 due = bdue;
+            // ADR-capture 33 item 5: with no desktop duplication no frame comes to evaluate an elapsed-time report, so
+            // the loop waits for the one that is due - the secure episode's next report (seamless only: non-seamless
+            // always has the engine) and the earliest held window's starve report. Nothing is armed at rest.
+            if (!capture && g_VchanClientConnected && g_OsBuild >= WGC_BROKER_BUILD_FLOOR)
+            {
+                if (g_SecureReportDue != 0 && g_SeamlessMode && (due == 0 || g_SecureReportDue < due))
+                    due = g_SecureReportDue;
+                if (g_HoldStarveDue != 0 && (due == 0 || g_HoldStarveDue < due))
+                    due = g_HoldStarveDue;
+            }
             if (due != 0)
             {
                 const ULONGLONG now64 = GetTickCount64();
@@ -16252,6 +16355,12 @@ static ULONG WINAPI WatchForEvents(void)
         // fall through - the capture-retry logic after the switch also keys on timeouts).
         if (WAIT_TIMEOUT == signaledEvent && g_VchanClientConnected)
             DaemonSettleSweep();
+        // A held window's starve report fell due with no frame walk to read it (ADR-capture 33 item 5): one more consume
+        // pass re-reads every hold and reports the one past its bound. The secure-desktop report needs nothing here:
+        // the loop observes the input desktop on every wake below.
+        if (WAIT_TIMEOUT == signaledEvent && g_VchanClientConnected && !capture && g_HoldStarveDue != 0 &&
+            GetTickCount64() >= g_HoldStarveDue)
+            BrokerConsumePass();
 
         BrokerSupervise();   // every wake, waits for nothing; no-op unless the WgcBroker gate is on
         NotifBridgeSupervise();   // every wake, waits for nothing; no-op unless the NotifyBridge gate is on
@@ -16290,6 +16399,11 @@ static ULONG WINAPI WatchForEvents(void)
             // covered window's change makes no desktop damage, so waiting for one left it stale indefinitely. The
             // event is auto-reset, so a burst of broker frames folds into one pass that takes each window's newest.
             BrokerConsumePass();
+            // The 2 s safety-net resync (TrackWindows) rode the desktop frames' pixel activity; with no duplication
+            // (seamless on 26200+, ADR-capture 33) a broker frame is that activity, so it asks for the tracking pass
+            // once the interval is up. The window events drive it as before.
+            if (!capture && (GetTickCount() - g_LastResyncTime) >= WINDOW_RESYNC_INTERVAL_MS)
+                PokeWindowTracking();
             continue;
         }
 
@@ -16513,6 +16627,26 @@ static ULONG WINAPI WatchForEvents(void)
 
         case 2:
             LogVerbose("fullscreen on");
+            if (!capture && g_SeamlessMode && g_OsBuild >= WGC_BROKER_BUILD_FLOOR)
+            {
+                // CREATED ON ENTRY, BEFORE ANYTHING IS RESIZED FOR IT (ADR-capture 33 items 2-3). Seamless on 26200+ holds
+                // no duplication; it is made here, on the still-stable desktop, and then today's entry runs unchanged
+                // from "capture is running" on - creating right after the shrink is the mode change that makes init
+                // fail. The monitor is wanted first, so a first visit's buffer is allocated granted and the dump goes
+                // out with it: every entry gives dom0 the refs, a second one included.
+                g_DesktopGrantWanted = TRUE;
+                const ULONG createStatus = DesktopEngineCreate(newFrameEvent, captureErrorEvent, &capture);
+                if (ERROR_SUCCESS != createStatus)
+                {
+                    // Nothing has been resized or shown for the switch: the guest stays seamless, and nothing tries
+                    // again until dom0 asks again.
+                    g_DesktopGrantWanted = FALSE;
+                    LogError("QGADESKENGINE the desktop duplication for the non-seamless desktop could not be created "
+                        L"(0x%x): the guest stays seamless", createStatus);
+                    QerrReportText(QerrTextFind("desktop-window-refused"), NULL, NULL);
+                    break;
+                }
+            }
             status = SetSeamlessMode(FALSE, FALSE);
             if (ERROR_SUCCESS != status)
             {
@@ -16757,6 +16891,14 @@ static ULONG WINAPI WatchForEvents(void)
             break;
 
         case 5: // capture error, can be due to a desktop switch or resolution change
+            if (!capture && g_OsBuild >= WGC_BROKER_BUILD_FLOOR)
+            {
+                // The duplication that raised it was released on the return to seamless (ADR-capture 33) - the return's
+                // own resize can make it fail while it is being stopped. Nothing to stop and no window 0 to destroy:
+                // opening the gate here would wait for a confirm nothing will send.
+                LogInfo("CAPTUREGATE the released desktop duplication's last signal, nothing to stop");
+                break;
+            }
             // The screen window is destroyed; capture waits and can restart only after the gui-daemon confirm
             // arrives.
             LogWarning("CAPTUREGATE capture error, display frozen until gui daemon confirms");
@@ -16779,10 +16921,35 @@ static ULONG WINAPI WatchForEvents(void)
             // error and the restart that follows it); the discarded events are covered
             // by the resync that ResetWatch/DiscardWindowEvents leave pending.
             if (g_VchanClientConnected && g_SeamlessMode && !g_LocalScreenDestroyed)
+            {
                 ProcessWindowEvents();
+                // A window event (a resize, a restyle, a show) is when a window's feed breaks, and the frame walk used
+                // to read that hold off the desktop damage the change made. With no duplication (ADR-capture 33) the
+                // holds are read here too, which also arms the starve deadline for one.
+                if (!capture)
+                    BrokerConsumePass();
+            }
             else
                 DiscardWindowEvents();
             break;
+        }
+
+        // RELEASED ON THE RETURN TO SEAMLESS (ADR-capture 33 items 2 and 4), once per pass after the event, so it follows
+        // whatever SetSeamlessMode decided - a return, a cancelled entry, a coerced pass that keeps the switch pending
+        // (CaptureEngineWanted stays TRUE then). Stopped and torn down directly, not through StopFrameProcessing: that
+        // destroys window 0 and opens a capture gate, and window 0 lives on unmapped. Not while window 0 is destroyed
+        // or A7 is degraded - those restarts go through StartFrameProcessing, which applies the same predicate. Below
+        // the floor the engine is wanted always and this never runs (item 10).
+        if (!exitLoop && capture && !CaptureEngineWanted() && !g_LocalScreenDestroyed && !captureDegraded)
+        {
+            CaptureStop(capture);
+            const BOOL abandoned = capture->thread_abandoned;
+            CaptureTeardown(capture);
+            capture = NULL;
+            if (!abandoned)
+                CaptureStagingClear();   // the next visit starts from black, never from this one's pixels
+            LogInfo("QGADESKENGINE desktop duplication released on the return to seamless%s",
+                abandoned ? L"; its thread did not stop in time (CAPTUREABANDON) and the buffer was left as it is" : L"");
         }
 
         // A DEFERRED SWITCH THAT NEVER COMPLETES MUST NOT BE SILENT. Both completion hooks log
