@@ -10342,6 +10342,7 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry);
 static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
 {
     ULONG status = ERROR_SUCCESS;
+    BOOL judgedThisPass = FALSE;   // ShouldAcceptWindow already answered on this pass's state (see the announce)
 
     LogVerbose("start, 0x%x", windowData->Handle);
 
@@ -10438,15 +10439,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
 
         if (!data.IsVisible || !ShouldAcceptWindow(windowData))
         {
-            // Already-announced window that just became INELIGIBLE (e.g. an app that
-            // animated INTO borderless fullscreen with the feature off): UNMAP it now
-            // instead of waiting for RemoveWindow later in the pass. That gap is a visible
-            // flash of the fullscreen surface (owner-observed 2026-08-19). Light touch:
-            // an immediate unmap hides the dom0 window this pass; RemoveWindow's DESTROY
-            // still follows. A window born fullscreen (LogonUI) is rejected before its first
-            // MAP and never reaches here, so this only affects the transition case.
-            if (windowData->CreateSent && !windowData->Synthesized)
-                (void)SendWindowUnmap(windowData->Handle);
+            // A synthesized window was never announced, so there is nothing to unmap.
             windowData->DeletePending = TRUE; // silent removal via RemoveWindow
             status = ERROR_SUCCESS;
             goto end;
@@ -10522,8 +10515,8 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     }
 
     // Not diffed (nothing is sent to dom0 when they change), but they ARE inputs of
-    // ShouldAcceptWindow(), which is re-evaluated against windowData at the end of this
-    // function. Left stale, a window that turned into chrome - or one whose layered alpha
+    // ShouldAcceptWindow(), which is re-evaluated against windowData before this pass's state
+    // is announced. Left stale, a window that turned into chrome - or one whose layered alpha
     // dropped to 0 - would keep being mapped.
     windowData->Owner = data.Owner;
 
@@ -10618,6 +10611,24 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
 
         windowData->IsOverrideRedirect = data.IsOverrideRedirect;
     }
+
+    // RE-JUDGED BEFORE THIS PASS'S STATE IS ANNOUNCED. Every input of ShouldAcceptWindow() is in
+    // the entry by now, and everything below - the configure, the size-lock hint it carries, the
+    // popup-state toggle and the per-window rebuild - tells dom0 about the new geometry. A window
+    // that has just become ineligible would be announced at that geometry first and refused only
+    // at `end:`, so dom0 drew it for a pass: an app animating into borderless fullscreen with the
+    // feature off, and a Start host that morphs to screen size on close or on a typed search,
+    // which the card rule refuses. Unmap it now; RemoveWindow's DESTROY follows as before.
+    if (!ShouldAcceptWindow(windowData))
+    {
+        LogDebug("0x%x no longer eligible, unmapped before its new state is announced", windowData->Handle);
+        if (windowData->CreateSent)
+            (void)SendWindowUnmap(windowData->Handle);
+        windowData->DeletePending = TRUE;
+        status = ERROR_SUCCESS;
+        goto end;
+    }
+    judgedThisPass = TRUE;   // nothing below changes an input of ShouldAcceptWindow, so `end:` need not ask again
 
     // Order of sending updates to the gui daemon here is important (window size vs popup state):
     // wrong order can trigger the override-redirect protection for large windows.
@@ -11152,7 +11163,7 @@ end:
             windowData->ToastRepaintFrameSeen ? 1 : 0, (unsigned)TH_HOLD_BOUND_MS);
     }
 
-    if (!windowData->DeletePending && !ShouldAcceptWindow(windowData))
+    if (!windowData->DeletePending && !judgedThisPass && !ShouldAcceptWindow(windowData))
     {
         LogDebug("0x%x no longer eligible, marking for removal", windowData->Handle);
         windowData->DeletePending = TRUE;
@@ -15205,11 +15216,20 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                      freshW != (int)entry->Width || freshH != (int)entry->Height) &&
                     freshW > 0 && freshH > 0)
                 {
+                    const BOOL resized = (freshW != (int)entry->Width || freshH != (int)entry->Height);
                     entry->X = fresh.left;
                     entry->Y = fresh.top;
                     entry->Width = freshW;
                     entry->Height = freshH;
-                    SendWindowConfigureIfChanged(entry);
+                    // A RESIZE can make the window ineligible (a 26H2 Start host growing to screen size
+                    // carries the card's insets here, so it reads screen-sized and the card rule refuses
+                    // it). Such a size is not announced from here: the window is queued for the next
+                    // tracking pass, whose re-judge unmaps it before anything announces it. A move keeps
+                    // its old path, unchanged: re-judging here would put that cost on every drag frame.
+                    if (resized && !ShouldAcceptWindow(entry))
+                        PokeWindowTrackingFor(entry->Handle);
+                    else
+                        SendWindowConfigureIfChanged(entry);
                 }
             }
         }
