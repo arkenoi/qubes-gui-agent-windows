@@ -5,21 +5,7 @@
  * gcc on the dev qube, no Windows: the header is pure (a table and a lookup), so the suite holds every row of the
  * table against the rules the owner set on 2026-10-07 - R1 nothing is launched into a session that announced its
  * end; R2 a death is Windows' to recover from (the service fails itself, it never relaunches); R5 a requested or
- * expected exit is not a death. Driven by tools/tests/lifecycle-selftest.sh (main repo), which also builds it with
- * each QGA_LIFECYCLE_DEFECT_* and requires the suite to FAIL on every one (a guard never seen to fail is decoration):
- *   TERMINATEDDEATH   the system's termination status is an ordinary death: relaunched into the ending session (the
- *                     measured defect: three agent instances per shutdown)
- *   RELAUNCHDEATH     the service relaunches a dead agent itself (the old loop) instead of failing for the SCM
- *   RECONNECTDEATH    a reconnect exit writes a death record
- *   REQUESTEDDEATH    a requested exit is a death
- *   REQUESTEDERROR    the agent logs an expected exit as a failure (the stale-GetLastError ERROR line)
- *   HELPERSYSKILLDEATH  a helper the system killed (0x40010004) is written up as a death
- *   HELPERSTOPTEARDOWN  a helper's stop wait expiring during the session's teardown is graded an ERROR miss (the
- *                       measured 2026-10-10 defect: "did not leave within 3 s of the stop file" at every shutdown)
- *   PRESHELLLOCK        a LOCK reading is asserted with no shell seen or found (the measured 2026-10-10 defect:
- *                       "the session is LOCKED after 0 s" on an agent's first secure frame, dom0 notified)
- *   SHELLPROCSILENT     an UNREADABLE process list is read as "no shell" on the LOCK-without-window path (the
- *                       silent-skip shape the review named: a real lock would then be PRE_SHELL, unsaid)
+ * expected exit is not a death.
  * Prints "ok <case>" / "FAIL <case>" lines; exit 0 iff no FAIL.
  */
 #include <stdio.h>

@@ -291,8 +291,7 @@ static __inline int QgaGoingDownRelease(IN DWORD session)
 // ---- THE DECISION ON AN AGENT EXIT (service side) --------------------------------------------------------
 //
 // Pure: exit code + whether this instance's end-session notice was acknowledged -> what the service does.
-// Table-driven; first matching row wins. Every row is held by watchdog/lifecycle_test.c, which also builds the
-// table with each QGA_LIFECYCLE_DEFECT_* below and requires the suite to FAIL on it.
+// Table-driven; first matching row wins. Every row is held by watchdog/lifecycle_test.c.
 typedef enum _QGA_EXIT_DECISION
 {
     QGA_DECIDE_NOTHING = 0,             // a requested exit: no record, no relaunch; the service waits for its next launch trigger
@@ -340,35 +339,23 @@ static const QGA_EXIT_VERDICT QgaExitVerdicts[] =
     { QGA_DECIDE_SESSION_END_REAPED,      FALSE,    TRUE,     FALSE,  FALSE, FALSE, L"SESSIONEND-REAPED" },
     { QGA_DECIDE_NOTICE_MISSED,           FALSE,    TRUE,     FALSE,  FALSE, TRUE,  L"NOTICEMISSED" },
     { QGA_DECIDE_NOGUI_LATCH,             FALSE,    FALSE,    FALSE,  FALSE, FALSE, L"NOGUIDOMAIN" },
-#ifdef QGA_LIFECYCLE_DEFECT_RECONNECTDEATH
-    { QGA_DECIDE_RECONNECT,               TRUE,     FALSE,    TRUE,   FALSE, TRUE,  L"RECONNECT" },   // DEFECT: a reconnect records a death
-#else
     { QGA_DECIDE_RECONNECT,               TRUE,     FALSE,    FALSE,  FALSE, FALSE, L"RECONNECT" },
-#endif
     { QGA_DECIDE_DEATH_IN_ENDING_SESSION, FALSE,    TRUE,     TRUE,   FALSE, TRUE,  L"DEATH-SESSIONENDING" },
-#ifdef QGA_LIFECYCLE_DEFECT_RELAUNCHDEATH
-    { QGA_DECIDE_DEATH,                   TRUE,     FALSE,    TRUE,   FALSE, TRUE,  L"DEATH" },   // DEFECT: the service relaunches a dead agent itself (the old loop)
-#else
     { QGA_DECIDE_DEATH,                   FALSE,    FALSE,    TRUE,   TRUE,  TRUE,  L"DEATH" },
-#endif
 };
 
 // The table. Order matters: the defined codes first, then the system's termination status, then everything else.
 static const QGA_EXIT_ROW QgaExitRows[] =
 {
-#ifndef QGA_LIFECYCLE_DEFECT_REQUESTEDDEATH
     { QGA_EXIT_REQUESTED,         QGA_NOTICE_ANY, QGA_DONE_ANY, QGA_DECIDE_NOTHING },
-#endif
     { QGA_EXIT_NO_GUI_DOMAIN,     QGA_NOTICE_ANY, QGA_DONE_ANY, QGA_DECIDE_NOGUI_LATCH },
     { QGA_EXIT_SESSION_END,       1,              QGA_DONE_ANY, QGA_DECIDE_SESSION_END },
     { QGA_EXIT_SESSION_END,       0,              QGA_DONE_ANY, QGA_DECIDE_SESSION_END_UNNOTICED },
-#ifndef QGA_LIFECYCLE_DEFECT_TERMINATEDDEATH
     // THE SYSTEM'S TERMINATION, split on whether the orderly exit had finished. Before 2026-10-07 both were
     // SESSIONEND-FORCED, so every clean shutdown wrote an ERROR line about an exit that had in fact completed.
     { QGA_EXIT_SYSTEM_TERMINATED, 1,              1,            QGA_DECIDE_SESSION_END_REAPED },
     { QGA_EXIT_SYSTEM_TERMINATED, 1,              0,            QGA_DECIDE_SESSION_END_FORCED },
-    { QGA_EXIT_SYSTEM_TERMINATED, 0,              QGA_DONE_ANY, QGA_DECIDE_NOTICE_MISSED },   // DEFECT (knob TERMINATEDDEATH): the measured relaunch into the ending session
-#endif
+    { QGA_EXIT_SYSTEM_TERMINATED, 0,              QGA_DONE_ANY, QGA_DECIDE_NOTICE_MISSED },   // never a relaunch into the ending session (the measured defect)
     { QGA_EXIT_RECONNECT,         1,              QGA_DONE_ANY, QGA_DECIDE_SESSION_END },     // a notice always wins: nothing is launched into an ending session
     { QGA_EXIT_RECONNECT,         0,              QGA_DONE_ANY, QGA_DECIDE_RECONNECT },
     { QGA_EXIT_ANY,               1,              QGA_DONE_ANY, QGA_DECIDE_DEATH_IN_ENDING_SESSION },
@@ -418,7 +405,6 @@ static __inline QGA_EXIT_VERDICT QgaDecideAgentExit(IN DWORD exitCode, IN BOOL n
 //             unexplained system kill with no shutdown in progress lands here too, so: WARNING, with its own grep
 //             tag per helper (WGCBROKERSYSKILL / NOTIFBRIDGESYSKILL / ETWPROXYSYSKILL).
 // Neither arm writes an Event Log death record, so neither reaches dom0 as a death.
-// The knob QGA_LIFECYCLE_DEFECT_HELPERSYSKILLDEATH restores the measured defect and must make the suite FAIL.
 typedef enum _QGA_HELPER_EXIT_DECISION
 {
     QGA_HELPER_EXPECTED_DISARMED = 0,   // launches disarmed: the session is ending or the agent is leaving. INFO, no record.
@@ -457,24 +443,15 @@ static __inline BOOL QgaExitIsCrash(IN DWORD exitCode)
 // reading). The sweep now counts both, which is the data a later round needs.
 static __inline QGA_HELPER_EXIT_DECISION QgaDecideHelperExit(IN BOOL disarmed, IN BOOL exited, IN DWORD exitCode)
 {
-#ifndef QGA_LIFECYCLE_DEFECT_DISARMHIDESCRASH
-    // BOTH of these are the narrowing, so the knob has to drop BOTH - with only the first one guarded
-    // the second still caught the crash and the knob changed nothing, which the suite reported as
-    // "that guard is decoration". A knob that cannot restore the defect proves nothing.
     if (disarmed && exited && QgaExitIsCrash(exitCode))
         return QGA_HELPER_DEATH;   // the disarm never excuses a crash
     if (disarmed && exited && exitCode != QGA_EXIT_SYSTEM_TERMINATED && exitCode != 0)
         return QGA_HELPER_DEATH;   // its own failure exit, or an external kill: still a death
-#endif
     if (disarmed)
         return QGA_HELPER_EXPECTED_DISARMED;
-#ifndef QGA_LIFECYCLE_DEFECT_HELPERSYSKILLDEATH
     if (exited && exitCode == QGA_EXIT_SYSTEM_TERMINATED)
         return QGA_HELPER_EXPECTED_SYSKILL;
-#else
-    (void)exited; (void)exitCode;   /* the knob drops both facts: that IS the defect */
-#endif
-    return QGA_HELPER_DEATH;   // DEFECT knob: the system's own kill falls through to here and is written up as a death
+    return QGA_HELPER_DEATH;   // an armed helper that ended any other way
 }
 
 // ---- THE GRADE ON A HELPER'S BOUNDED STOP WAIT (agent side: BrokerShutdown, NotifBridgeShutdown) ---------------
@@ -499,7 +476,6 @@ static __inline QGA_HELPER_EXIT_DECISION QgaDecideHelperExit(IN BOOL disarmed, I
 //             delete ends the helper. A failed wait (WAIT_FAILED: a bad handle) is a defect of ours and is never
 //             excused by a teardown.
 // The next start's restore sweep already owns the banner markers a bridge ended this way leaves; no recovery here.
-// The knob QGA_LIFECYCLE_DEFECT_HELPERSTOPTEARDOWN restores the measured defect and must make the suite FAIL.
 typedef enum _QGA_HELPER_STOP_OUTCOME
 {
     QGA_HELPER_STOP_LEFT = 0,   // WAIT_OBJECT_0: the helper left on request
@@ -511,13 +487,9 @@ static __inline QGA_HELPER_STOP_OUTCOME QgaHelperStopOutcome(IN BOOL sessionEndi
 {
     if (waitResult == WAIT_OBJECT_0)
         return QGA_HELPER_STOP_LEFT;
-#ifndef QGA_LIFECYCLE_DEFECT_HELPERSTOPTEARDOWN
     if (waitResult == WAIT_TIMEOUT && sessionEnding)
         return QGA_HELPER_STOP_TEARDOWN;
-#else
-    (void)sessionEnding;   /* the knob drops the one fact that tells a teardown from a miss: that IS the defect */
-#endif
-    return QGA_HELPER_STOP_EXPIRED;   // DEFECT knob: a teardown falls through to here and is written up as a miss
+    return QGA_HELPER_STOP_EXPIRED;   // no teardown, or the wait itself failed
 }
 
 // ---- THE VERDICT ON A SESSION LOCK (agent side: the secure-desktop block of ProcessNewFrame) ------------------
@@ -562,9 +534,6 @@ static __inline QGA_HELPER_STOP_OUTCOME QgaHelperStopOutcome(IN BOOL sessionEndi
 // `shellProcess` is read ONLY on the LOCK-without-window path and is UNREAD everywhere else (the earlier arms
 // return first, so an UNREAD value is never consulted where it was not needed). `infoLevel` is WTSINFOEX.Level as
 // read, 0 when nothing was read; `sessionFlags` likewise, UNKNOWN when nothing was.
-// Two knobs, each the measured or the reviewed defect, each required to make the suite FAIL:
-//   QGA_LIFECYCLE_DEFECT_PRESHELLLOCK     a LOCK reading is asserted with no shell seen or found (the measured one)
-//   QGA_LIFECYCLE_DEFECT_SHELLPROCSILENT  an UNREADABLE Default probe is read as "no shell" (the silent-skip shape)
 #define QGA_WTS_SESSIONSTATE_LOCK     0x00000000UL   // wtsapi32.h's WTS_SESSIONSTATE_LOCK, mirrored so this header
 #define QGA_WTS_SESSIONSTATE_UNLOCK   0x00000001UL   // stays pure and the suite builds without that header;
 #define QGA_WTS_SESSIONSTATE_UNKNOWN  0xFFFFFFFFUL   // main.c C_ASSERTs each against the real one
@@ -596,36 +565,22 @@ static __inline QGA_LOCK_VERDICT QgaLockVerdict(IN BOOL shellSeen, IN QGA_SHELL_
         return QGA_LOCK_NO_FACT;
     if (shellSeen)
         return QGA_LOCK_LOCKED;        // the window was seen on Default by this instance: a lock after a shell
-#ifdef QGA_LIFECYCLE_DEFECT_PRESHELLLOCK
-    (void)shellProcess;   /* the knob asserts a lock on a desktop this agent cannot place: the measured defect */
-    return QGA_LOCK_LOCKED;
-#else
     if (shellProcess == QGA_SHELLPROC_PRESENT)
         return QGA_LOCK_LOCKED;        // no window from the Winlogon desktop, but the session HAS a shell: a real lock
     if (shellProcess == QGA_SHELLPROC_ABSENT)
         return QGA_LOCK_PRE_SHELL;     // the session has not reached a shell: said, not reported
-#ifdef QGA_LIFECYCLE_DEFECT_SHELLPROCSILENT
-    return QGA_LOCK_PRE_SHELL;         /* the knob reads an unreadable list as "no shell": the silent-skip defect */
-#else
     return QGA_LOCK_NO_FACT;           // the one fact that would decide could not be read: said at WARNING
-#endif
-#endif
 }
 
 // ---- THE AGENT'S OWN READING OF ITS EXIT CODE (WinMain) ------------------------------------------------------
 // An expected exit - requested, session end, reconnect, no GUI domain - is logged at INFO naming the reason; anything
 // else is a failure, logged at ERROR with the code that caused it. "WinMain: WatchForEvents failed with error 0xb7"
 // (and "error 0x0: The operation completed successfully") at ERROR on a requested stop was a stale GetLastError
-// (measured 2026-10-07). Held by watchdog/lifecycle_test.c; the knob QGA_LIFECYCLE_DEFECT_REQUESTEDERROR makes an
-// expected exit read as a failure and must make that suite fail.
+// (measured 2026-10-07). Held by watchdog/lifecycle_test.c.
 static __inline BOOL QgaExitIsExpected(IN DWORD code)
 {
-#ifdef QGA_LIFECYCLE_DEFECT_REQUESTEDERROR
-    return code == QGA_EXIT_NO_GUI_DOMAIN;   // DEFECT: a requested, session-end or reconnect exit reads as a failure
-#else
     return code == QGA_EXIT_REQUESTED || code == QGA_EXIT_SESSION_END || code == QGA_EXIT_RECONNECT ||
            code == QGA_EXIT_NO_GUI_DOMAIN;
-#endif
 }
 static __inline const WCHAR *QgaExitReasonName(IN DWORD code)
 {
@@ -695,14 +650,9 @@ static __inline const WCHAR *QgaExitReasonName(IN DWORD code)
 static __inline unsigned long long QgaDesliceAnchor(IN int launched, IN unsigned long long lastLaunch,
                                                     IN unsigned long long readyAt, IN unsigned long long now)
 {
-#ifdef QGA_LIFECYCLE_DEFECT_STALEANCHOR
-    (void)readyAt;   /* DEFECT: re-arm at the original launch even after a healthy run - fires instantly */
-    return (launched && lastLaunch) ? lastLaunch : now;
-#else
     if (launched && lastLaunch && readyAt == 0)
         return lastLaunch;   /* launched and never ready: the outage does start at the launch */
     return now;              /* it was serving, so THIS outage starts now */
-#endif
 }
 /* ---------------------------------------------------------------------------------------------
  * A GRACEFUL STAND-DOWN IS ULTIMATE UNTIL SOMETHING STARTS IT AGAIN.
@@ -739,19 +689,12 @@ static __inline unsigned long long QgaDesliceAnchor(IN int launched, IN unsigned
 static __inline int QgaDesliceSupervisionHeld(IN int stoodDown, IN unsigned long long downSince,
                                               IN unsigned long long now)
 {
-#ifdef QGA_LIFECYCLE_DEFECT_STANDDOWNEXPIRES
-    /* DEFECT: the hold lapses once the first warn interval has passed, so the complaint comes back
-     * on its own - which is the shape measured BEFORE the latch, where the stand-down held only for
-     * the pass that detected it. */
-    return (stoodDown && (downSince == 0 || (now - downSince) < 30000ULL)) ? 1 : 0;
-#else
     /* TIME CANNOT END A STAND-DOWN, and taking no account of it is the whole decision: the inputs
      * are accepted and deliberately unused so that a future reader cannot reintroduce a deadline
      * here without deleting these lines. Only an event clears the latch, in the caller - a launch
      * being issued, or the broker being seen alive - never the clock. */
     (void)downSince; (void)now;
     return stoodDown ? 1 : 0;
-#endif
 }
 /* ---------------------------------------------------------------------------------------------
  * ONE SITUATION IS ONE DOM0 NOTIFICATION.
@@ -795,12 +738,7 @@ static __inline int QgaDesliceSupervisionHeld(IN int stoodDown, IN unsigned long
  */
 static __inline BOOL QgaDesliceTeardownExcused(IN int helpersDisarmed, IN int sessionEnding)
 {
-#ifdef QGA_LIFECYCLE_DEFECT_SHUTDOWNERROR
-    (void)helpersDisarmed; (void)sessionEnding;
-    return FALSE;    /* DEFECT: an ERROR, a flag and a toast while the guest is shutting down */
-#else
     return (BOOL)(helpersDisarmed || sessionEnding);
-#endif
 }
 
 /* THE ONE QUESTION EVERY EMITTER ASKS BEFORE IT COMPLAINS THAT SOMETHING IS GONE.
@@ -835,21 +773,11 @@ static __inline BOOL QgaDesliceTeardownExcused(IN int helpersDisarmed, IN int se
  */
 static __inline BOOL QgaGoingDownSilences(IN int stopRequested, IN int helpersDisarmed, IN int sessionEnding)
 {
-#ifdef QGA_LIFECYCLE_DEFECT_GOINGDOWNCOMPLAINS
-    (void)stopRequested; (void)helpersDisarmed; (void)sessionEnding;
-    return FALSE;    /* DEFECT: an ERROR about an absence that was asked for, at every going-down site */
-#else
     return (BOOL)(stopRequested || QgaDesliceTeardownExcused(helpersDisarmed, sessionEnding));
-#endif
 }
 static __inline BOOL QgaDesliceOwnedByDeath(IN unsigned long long diedAt)
 {
-#ifdef QGA_LIFECYCLE_DEFECT_DOUBLETOAST
-    (void)diedAt;
-    return FALSE;    /* DEFECT: complain AS WELL AS reporting the death - two toasts for one event */
-#else
     return (BOOL)(diedAt != 0);   /* a death is being reported for this outage; that row owns it */
-#endif
 }
 /* The first deadline after a death: the scheduler's whole restart budget while it still owes one, else the usual grace. */
 static __inline unsigned long long QgaDesliceDeathGraceMs(IN int restartOwed, IN unsigned long deaths,
@@ -869,12 +797,8 @@ static __inline unsigned long long QgaDesliceRestartRearm(IN int armed, IN unsig
 static __inline BOOL QgaDesliceWarnDue(IN unsigned long long downSince, IN unsigned long long nextWarn,
                                        IN unsigned long long now)
 {
-#ifdef QGA_LIFECYCLE_DEFECT_ZERODUE
-    (void)downSince;     /* DEFECT: a zeroed clock reads as "due now" - the false toast per cold boot */
-#else
     if (downSince == 0 || nextWarn == 0)
         return FALSE;    /* held: the broker could not have been launched yet - nothing to report */
-#endif
     return (BOOL)(now >= nextWarn);
 }
 /* STARTING IS NOT ABSENT. The report says the helper "is not running". At the first deadline after its launch a
@@ -924,12 +848,8 @@ static __inline int QgaWcsIEqAscii(IN const wchar_t *a, IN const wchar_t *b)
  * Winlogon\Shell value, or NULL/empty when it could not be read. */
 static __inline BOOL QgaIsSessionShellImage(IN const wchar_t *image, IN const wchar_t *configured)
 {
-#ifndef QGA_LIFECYCLE_DEFECT_SHELLBYNAME
     if (configured && configured[0] && QgaWcsIEqAscii(image, configured))
         return TRUE;                       /* the shell this guest is CONFIGURED to run */
-#else
-    (void)configured;   /* DEFECT: only the literal default counts, so a kiosk guest reads ABSENT */
-#endif
     return (BOOL)QgaWcsIEqAscii(image, L"explorer.exe");   /* the default shell, always still a shell */
 }
 
@@ -959,12 +879,7 @@ static __inline BOOL QgaHoldIsStartup(IN BOOL brokerActive, IN BOOL brokerEverRe
 {
     if (brokerActive)
         return FALSE;                       /* not a hold for want of a broker at all */
-#ifndef QGA_LIFECYCLE_DEFECT_HOLDALWAYSLOUD
     return (BOOL)(!brokerEverReadyThisAgent);   /* never ready yet = still starting = normal */
-#else
-    (void)brokerEverReadyThisAgent;         /* DEFECT: every hold is a fault, so normal boots shout */
-    return FALSE;
-#endif
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1012,7 +927,7 @@ static __inline BOOL QgaHoldIsStartup(IN BOOL brokerActive, IN BOOL brokerEverRe
  * the guest the same day: the Escape lands on the focused window now, and the menu is still open
  * 1000 and 1063 ms later, twice. Targeting was never the defect. So: no keystroke is posted, by
  * this predicate or anywhere below it, and QgaStartDismissTarget - which chose between two windows
- * for a message that cannot work - is gone with its knob.
+ * for a message that cannot work - is gone.
  *
  * WHAT CLOSES IT INSTEAD. Start is a LIGHT-DISMISS surface: it closes when something else takes
  * activation, which is what a click on another window does. That is Windows' own close path, so the
@@ -1056,25 +971,13 @@ static __inline QGA_START_VERDICT QgaHiddenStartVerdict(
     {
         /* CLOAKED BEATS FOREGROUND-LEFT when both hold: the surface being gone is the stronger
          * statement, and it is the one the user sees. */
-#ifndef QGA_LIFECYCLE_DEFECT_STARTCLOSEUNSAID
         if (!surfaceVisible)
             return QGA_START_CLOSED_CLOAKED;
         if (!fgIsStartOrSearch)
             return QGA_START_CLOSED_FG_LEFT;
-#else
-        if (!surfaceVisible || !fgIsStartOrSearch)
-            return QGA_START_LOOK_AGAIN;    /* DEFECT: both closures stay silent and re-arm, as before -
-                                             * a dismissal that worked is indistinguishable from one that
-                                             * never ran */
-#endif
         if (sinceAttemptMs < settleMs)
             return QGA_START_CLOSING;
-#ifndef QGA_LIFECYCLE_DEFECT_STARTNEVERSTUCK
         return QGA_START_STUCK;
-#else
-        return QGA_START_CLOSING;           /* DEFECT: never stuck, so a menu that stayed open past the
-                                             * bound is reported as still closing, for ever */
-#endif
     }
 
     /* 25H2 moves the foreground to Start's search box on its own schedule - measured up to 480 ms
@@ -1085,16 +988,10 @@ static __inline QGA_START_VERDICT QgaHiddenStartVerdict(
 
     if (dom0FocusAlive)
         return QGA_START_RETURN_FOCUS;
-#ifndef QGA_LIFECYCLE_DEFECT_STARTRETURNNULL
     if (shellWindowPresent)
         return QGA_START_RETURN_DESKTOP;
     return QGA_START_NO_TARGET;             /* say so and touch nothing: an activation of NULL is not a
                                              * request, and at logon/shutdown there is no shell window */
-#else
-    (void)shellWindowPresent;               /* DEFECT: activate the shell desktop even when there is
-                                             * none, i.e. activate NULL */
-    return QGA_START_RETURN_DESKTOP;
-#endif
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1174,13 +1071,8 @@ static __inline QGA_MENUKEY_POLICY QgaMenuKeyPolicy(
         return QGA_MENUKEY_DROP_BLOCKED;    /* the existing rule, unchanged */
     if (seamlessStart)
         return QGA_MENUKEY_FORWARD;         /* we present what it summons */
-#ifndef QGA_LIFECYCLE_DEFECT_MENUKEYALWAYSFORWARD
     if (replacementKnown && !replacementPresent)
         return QGA_MENUKEY_DROP_UNCLOSABLE; /* nothing may summon a surface we refuse and cannot close */
-#else
-    (void)replacementKnown; (void)replacementPresent;   /* DEFECT: forward regardless, so the key
-                                             * summons a hidden Start that holds the user's focus */
-#endif
     return QGA_MENUKEY_FORWARD;             /* a replacement is present, or we could not tell */
 }
 
@@ -1203,14 +1095,9 @@ static __inline BOOL QgaXcLineKept(IN int level, IN const char* function)
 {
     if (!function)
         return TRUE;                        /* no function name: never drop what cannot be identified */
-#ifndef QGA_LIFECYCLE_DEFECT_XCNOTIFYKEPT
     /* 4 == LOG_LEVEL_DEBUG (windows-utils log.h); xencontrol's levels are the same as ours. */
     if (level == 4 && strcmp(function, "XcEvtchnNotify") == 0)
         return FALSE;
-#else
-    (void)level; (void)function;            /* DEFECT: the per-notify Debug line is kept - 118
-                                             * identical lines in one run saying the transport works */
-#endif
     return TRUE;
 }
 
@@ -1281,9 +1168,7 @@ typedef enum {
  *
  * screenW/screenH of 0 mean "not known yet" and disable only the proportion test, never the rest:
  * at startup g_ScreenWidth is 0 until the first xconf, and refusing every shell frame until then
- * would be a different defect.
- * Knob: QGA_LIFECYCLE_DEFECT_GIANTSHELLFRAME removes the proportion test, so a screen-sized shell
- * surface is announced as a normal window - the 2026-08-12 shape. The suite must fail with it. */
+ * would be a different defect. */
 static __inline BOOL QgaShellFrameAllowed(
     IN unsigned shellManaged,      /* SHELL_MANAGED_NONE / _ALL / _START */
     IN int kind,                   /* QGA_SURFACE_KIND_* */
@@ -1300,16 +1185,12 @@ static __inline BOOL QgaShellFrameAllowed(
         return FALSE;
     if (announcedW == 0 || announcedH == 0)
         return FALSE;
-#ifndef QGA_LIFECYCLE_DEFECT_GIANTSHELLFRAME
     /* 90% of either axis. A real card is at most about half the screen; the measured bad state is
      * the full width. Integer, so no float creeps into a decision. */
     if (screenW != 0 && (unsigned long long)announcedW * 10ULL >= (unsigned long long)screenW * 9ULL)
         return FALSE;
     if (screenH != 0 && (unsigned long long)announcedH * 10ULL >= (unsigned long long)screenH * 9ULL)
         return FALSE;
-#else
-    (void)screenW; (void)screenH;  /* DEFECT: a screen-sized shell surface gets a dom0 frame */
-#endif
     return TRUE;
 }
 
@@ -1325,19 +1206,8 @@ static __inline QGA_SURFACE_POLICY QgaShellSurfacePolicy(
         return QGA_SURFACE_PRESENT;         /* work on Start is enabled: present everything */
     if (kind == QGA_SURFACE_KIND_START)
         return QGA_SURFACE_REFUSE_START;
-#ifndef QGA_LIFECYCLE_DEFECT_COMPANIONSHOWN
     if (kind == QGA_SURFACE_KIND_SEARCH && hiddenStartOpen)
         return QGA_SURFACE_REFUSE_COMPANION;
-#else
-    (void)hiddenStartOpen;                  /* DEFECT: the Search companion of a hidden Start is
-                                             * presented - a menu declared not-shown still puts a
-                                             * slice of itself on the screen */
-#endif
-#ifdef QGA_LIFECYCLE_DEFECT_SEARCHALWAYSHIDDEN
-    if (kind == QGA_SURFACE_KIND_SEARCH)
-        return QGA_SURFACE_REFUSE_COMPANION;   /* DEFECT: a standalone Win+S Search the user asked
-                                                * for is refused too */
-#endif
     return QGA_SURFACE_PRESENT;
 }
 
@@ -1369,12 +1239,6 @@ static __inline QGA_CARD_RULE QgaCardRuleForSurface(IN int kind, IN BOOL isMenuP
 {
     if (isMenuPopup)
         return QGA_CARD_RULE_MENU_UNION;    /* a real menu popup, whatever process owns it */
-#ifdef QGA_LIFECYCLE_DEFECT_SEARCHASTOAST
-    if (kind == QGA_SURFACE_KIND_SEARCH)
-        return QGA_CARD_RULE_TOAST_LARGEST; /* DEFECT: today's construction - the selector was one
-                                             * BOOL, so every non-menu surface got the toast rule
-                                             * and a Search flyout was measured as a toast */
-#endif
     if (kind == QGA_SURFACE_KIND_TOAST || kind == QGA_SURFACE_KIND_START)
         return QGA_CARD_RULE_TOAST_LARGEST; /* the 25H2 Start card is found by this rule today */
     return QGA_CARD_RULE_NONE;              /* search, and anything unclassified: measured above */
@@ -1445,12 +1309,6 @@ static __inline QGA_CARD_RULE QgaCardRuleForSurface(IN int kind, IN BOOL isMenuP
 static __inline BOOL QgaHoldStarveDue(IN unsigned long long holdSince, IN unsigned long long lastContent,
                                       IN unsigned long long now, IN unsigned long long boundMs)
 {
-#ifdef QGA_LIFECYCLE_DEFECT_STARVENEVERDUE
-    /* DEFECT: the inert detector - exactly the shape a zero emitted-count cannot tell apart from a
-     * condition that never occurs. */
-    (void)holdSince; (void)lastContent; (void)now; (void)boundMs;
-    return FALSE;
-#else
     unsigned long long from;
     if (holdSince == 0)
         return FALSE;                       /* not holding: no clock, nothing to declare */
@@ -1460,20 +1318,13 @@ static __inline BOOL QgaHoldStarveDue(IN unsigned long long holdSince, IN unsign
                                              * with nothing on screen cannot show STALE pixels */
     from = (lastContent > holdSince) ? lastContent : holdSince;
     return (BOOL)(now > from && (now - from) >= boundMs);
-#endif
 }
 
 static __inline BOOL QgaHoldReasonIsNormal(IN const WCHAR* why)
 {
     if (!why)
         return FALSE;                       /* no reason recorded: never quiet on an unknown */
-#ifndef QGA_LIFECYCLE_DEFECT_HOLDREASONALLNORMAL
     return (BOOL)(wcscmp(why, L"first-frame-pending") == 0);
-#else
-    (void)why;                              /* DEFECT: every reason reads as normal, so a broker
-                                             * that dropped a slot is as quiet as a first frame */
-    return TRUE;
-#endif
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1503,16 +1354,11 @@ static __inline BOOL QgaHoldReasonIsNormal(IN const WCHAR* why)
  */
 static __inline BOOL QgaLateRegIsStartup(IN BOOL refusedByActiveBroker, IN BOOL everSourcedThisWindow)
 {
-#ifndef QGA_LIFECYCLE_DEFECT_LATEREGALWAYSLOUD
     if (refusedByActiveBroker)
         return FALSE;                       /* the broker was up and had no room: a capacity fault */
     if (everSourcedThisWindow)
         return FALSE;                       /* it had a slot and lost it: the broker died */
     return TRUE;                            /* never registered, never refused: still starting */
-#else
-    (void)refusedByActiveBroker; (void)everSourcedThisWindow;
-    return FALSE;                           /* DEFECT: every cold boot warns about correct behaviour */
-#endif
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1550,12 +1396,7 @@ static __inline BOOL QgaCaptureSlowIsNormal(IN unsigned long waitedMs, IN unsign
 {
     if (wedgeMs == 0)
         return FALSE;                       /* no wedge configured: nothing to be a fraction of */
-#ifndef QGA_LIFECYCLE_DEFECT_SLOWALWAYSLOUD
     return (BOOL)(waitedMs * 2 < wedgeMs);  /* less than half the budget spent: still brief */
-#else
-    (void)waitedMs;                         /* DEFECT: every slow pass warns from its first second */
-    return FALSE;
-#endif
 }
 
 /* ---------------------------------------------------------------------------------------------
@@ -1590,14 +1431,7 @@ static __inline BOOL QgaWindowFaultDue(IN unsigned long long registeredAt, IN un
     unsigned long long from;
     if (registeredAt == 0)
         return FALSE;                       /* never registered: no clock, nothing to declare */
-#ifndef QGA_LIFECYCLE_DEFECT_FAULTFROMREG
     from = (brokerReadyAt > registeredAt) ? brokerReadyAt : registeredAt;
-#else
-    (void)brokerReadyAt;                    /* DEFECT: the clock runs from registration even when the
-                                             * broker could not feed the window yet - the false
-                                             * "a window could not be shown" measured on 2026-10-11 */
-    from = registeredAt;
-#endif
     return (BOOL)(now > from && (now - from) >= graceMs);
 }
 
@@ -1633,13 +1467,7 @@ static __inline QGA_SYSKILL_VERDICT QgaSysKillVerdict(IN int sessionEnding, IN u
         return QGA_SYSKILL_PENDING;        /* nothing pending: no verdict to give */
     if (sessionEnding)
         return QGA_SYSKILL_TEARDOWN;       /* the fact that decides it arrived */
-#ifdef QGA_LIFECYCLE_DEFECT_SYSKILLNOW
-    (void)graceMs; (void)now;              /* DEFECT: decided at the exit, before the session end can
-                                            * arrive - the false anomaly measured 2026-10-19 */
-    return QGA_SYSKILL_ANOMALY;
-#else
     if (now > killedAt && (now - killedAt) >= graceMs)
         return QGA_SYSKILL_ANOMALY;        /* the grace expired and nothing said the session was ending */
     return QGA_SYSKILL_PENDING;
-#endif
 }
