@@ -107,9 +107,6 @@ SHELL_SURFACE_KIND ShellHostKindOfProcess(IN DWORD processId);
 // For a window already classified ShellSurfaceSearch: TRUE when its host is Windows 10's SearchApp.exe.
 BOOL ShellSurfaceHostedBySearchApp(IN const WINDOW_DATA* data);
 
-// Remember card insets measured from a window's own pixels; ToastCropLookup recalls them for a kind with no crop rule.
-void ToastCropRememberPixelCard(IN HWND window, IN const RECT* insets);
-
 // TRUE when this window is the START surface and we do NOT know where its card is
 // (never measured, or the measurement finished finding nothing, and no sticky last-good).
 // StartMenuExperienceHost keeps a top-level surface alive while Start is CLOSED; announcing

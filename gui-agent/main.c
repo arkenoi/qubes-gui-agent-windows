@@ -2503,67 +2503,6 @@ static void ToastFillGapRows(IN OUT WINDOW_DATA* entry)
     free(dark);
 }
 
-// THE SEARCH CARD FROM ITS OWN PIXELS. Windows 11's search view (SearchHost) has no UIA crop rule - the card walk
-// collapses to the search box (toastcrop.c, QGA_CARD_RULE_NONE) - so it was shown with its whole shadow margin, which a
-// premultiplied capture delivers as black: measured l=12 t=13 r=12 b=12 around the card's 1 px border at 800x750
-// (25H2) and 858x890 (26300). This reads that margin off the painted, still uncropped per-window buffer: a row or
-// column belongs to the card when at least half its pixels are lit (any channel above the paint check's black
-// threshold), so a stray lit pixel cannot widen it. A shadow is symmetric, so a margin above SEARCH_CARD_MAX_INSET on
-// any side or a skew above SEARCH_CARD_MAX_SKEW between opposite sides is a card not yet fully drawn, and is refused:
-// no crop beats a clipped card.
-#define SEARCH_CARD_MAX_INSET 40
-#define SEARCH_CARD_MAX_SKEW 4
-static BOOL SearchCardInsetsFromPixels(IN const WINDOW_DATA* entry, OUT RECT* insets)
-{
-    ZeroMemory(insets, sizeof(*insets));
-    const int W = (int)entry->PwWidth, H = (int)entry->PwHeight;
-    if (!entry->PwBuffer || W != (int)entry->Width || H != (int)entry->Height ||
-        W <= 4 * SEARCH_CARD_MAX_INSET || H <= 4 * SEARCH_CARD_MAX_INSET)
-        return FALSE;
-    const BYTE* buf = (const BYTE*)entry->PwBuffer;
-#define SEARCH_CARD_LIT(x, y) (buf[((size_t)(y) * W + (x)) * 4 + 0] > SLICE_PAINT_BLACK_MAX || \
-                               buf[((size_t)(y) * W + (x)) * 4 + 1] > SLICE_PAINT_BLACK_MAX || \
-                               buf[((size_t)(y) * W + (x)) * 4 + 2] > SLICE_PAINT_BLACK_MAX)
-    int t, b, l, r;
-    for (t = 0; t <= SEARCH_CARD_MAX_INSET; t++)
-    {
-        int n = 0;
-        for (int x = 0; x < W; x++) n += SEARCH_CARD_LIT(x, t);
-        if (n * 2 >= W) break;
-    }
-    for (b = 0; b <= SEARCH_CARD_MAX_INSET; b++)
-    {
-        int n = 0;
-        for (int x = 0; x < W; x++) n += SEARCH_CARD_LIT(x, H - 1 - b);
-        if (n * 2 >= W) break;
-    }
-    if (t > SEARCH_CARD_MAX_INSET || b > SEARCH_CARD_MAX_INSET)
-        return FALSE;
-    const int cardH = H - t - b;
-    for (l = 0; l <= SEARCH_CARD_MAX_INSET; l++)
-    {
-        int n = 0;
-        for (int y = t; y < H - b; y++) n += SEARCH_CARD_LIT(l, y);
-        if (n * 2 >= cardH) break;
-    }
-    for (r = 0; r <= SEARCH_CARD_MAX_INSET; r++)
-    {
-        int n = 0;
-        for (int y = t; y < H - b; y++) n += SEARCH_CARD_LIT(W - 1 - r, y);
-        if (n * 2 >= cardH) break;
-    }
-#undef SEARCH_CARD_LIT
-    if (l > SEARCH_CARD_MAX_INSET || r > SEARCH_CARD_MAX_INSET || !(l || t || r || b) ||
-        abs(l - r) > SEARCH_CARD_MAX_SKEW || abs(t - b) > SEARCH_CARD_MAX_SKEW)
-    {
-        LogDebug("QGASEARCHCARD hwnd=0x%x %dx%d margin l=%d t=%d r=%d b=%d refused - shown uncropped",
-            (DWORD)(ULONG_PTR)entry->Handle, W, H, l, t, r, b);
-        return FALSE;
-    }
-    insets->left = l; insets->top = t; insets->right = r; insets->bottom = b;
-    return TRUE;
-}
-
 #define FLATTEN_CORNER_R 12
 static void FlattenBufferCorners(IN OUT WINDOW_DATA* entry)
 {
@@ -11219,23 +11158,6 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                         windowData->HoldNoPendAt ? (LONGLONG)(windowData->HoldNoPendAt - d) : -1,
                         windowData->HoldChromeAt ? (LONGLONG)(windowData->HoldChromeAt - d) : -1,
                         windowData->HoldChecks);
-                }
-                // Windows 11's search view maps uncropped at its first painted frame, as before, so the first key's
-                // window appears without waiting for a buffer re-attach (57-184 ms measured); its card is then
-                // measured off that frame, remembered, and the next pass crops the mapped window - and creates every
-                // later opening of the same window cropped (SearchCardInsetsFromPixels).
-                if (windowData->PwBrokerSourced && ShellSurfaceKind(windowData) == ShellSurfaceSearch &&
-                    !(windowData->CropLeft || windowData->CropTop || windowData->CropRight || windowData->CropBottom))
-                {
-                    RECT card;
-                    if (SearchCardInsetsFromPixels(windowData, &card))
-                    {
-                        ToastCropRememberPixelCard(windowData->Handle, &card);
-                        LogInfo("QGASEARCHCARD hwnd=0x%x %ux%u card insets l=%d t=%d r=%d b=%d - cropped from the next pass",
-                            (DWORD)(ULONG_PTR)windowData->Handle, windowData->Width, windowData->Height,
-                            card.left, card.top, card.right, card.bottom);
-                        QueueWindowEvent(windowData->Handle, EVENT_OBJECT_SHOW, FALSE);
-                    }
                 }
                 (void)SendWindowDamageEvent(windowData->Handle, 0, 0,
                     windowData->Width, windowData->Height);

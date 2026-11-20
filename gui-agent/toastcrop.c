@@ -1413,18 +1413,6 @@ BOOL ShellSurfaceHostedBySearchApp(IN const WINDOW_DATA* data)
     return searchApp;
 }
 
-// Insets the agent measured from a window's own pixels (main.c SearchCardInsetsFromPixels) go into the same last-good
-// store a UIA measurement fills, which ToastCropLookup recalls for a surface kind with no crop rule.
-void ToastCropRememberPixelCard(IN HWND window, IN const RECT* insets)
-{
-    if (!window || !insets)
-        return;
-    TcInit();
-    EnterCriticalSection(&g_TcLock);
-    TcRememberLastGood(window, insets);
-    LeaveCriticalSection(&g_TcLock);
-}
-
 // Which shell host a PROCESS is (Start / Search / toast host), by the same image check ShellSurfaceKind uses, read FRESH: the
 // cached lookup tolerates a recycled pid (a false positive there only asks UIA for a card that is not there), but this answer
 // decides whether the hidden-Start dismissal (main.c) injects an Escape, and a stale hit would send it to an unrelated app.
@@ -1483,29 +1471,12 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
     // 775x777), but at 800x750 BOTH candidates collapse to the same 728x32 sliver - the search
     // input field. A crop from either would clip the flyout, and the sticky last-good crop then
     // carries a wrong one. Jev on those walk lines alone: neither-announce-uncropped 0.72.
-    // So no UIA measurement is queued, which also ends seven "cropped size 728x32 below the floor"
-    // warnings per run. Until its card is measured from its own pixels (below) the window is
-    // announced UNCROPPED, this module's normal fail-soft.
-    // A card measured from the window's OWN PIXELS is the one crop such a kind can have: the agent measures the black
-    // shadow margin on the painted buffer at the window's held map (main.c SearchCardInsetsFromPixels) and leaves it
-    // in the last-good store through ToastCropRememberPixelCard, so this window is cropped from the next pass on and
-    // every later opening of the same window is created cropped.
+    // So no measurement is queued: the window is announced UNCROPPED, which is this module's
+    // normal fail-soft. The cost is stated rather than hidden - the flyout shows its ~13 px shadow
+    // margin, which is worse pixels than a correct crop and better than a clipped window. It also
+    // ends seven "cropped size 728x32 below the floor" warnings per run.
     if (QgaCardRuleForSurface((int)ShellSurfaceKind(data), IsMenuPopupWindow(data)) == QGA_CARD_RULE_NONE)
     {
-        RECT pixelCard;
-        BOOL have = FALSE;
-        EnterCriticalSection(&g_TcLock);
-        if (TcRecallLastGood(data->Handle, &pixelCard))
-        {
-            TcValidateInsets(data->Handle, (LONG)data->Width, (LONG)data->Height, &pixelCard);
-            have = (pixelCard.left || pixelCard.top || pixelCard.right || pixelCard.bottom);
-        }
-        LeaveCriticalSection(&g_TcLock);
-        if (have)
-        {
-            *insets = pixelCard;
-            return TRUE;
-        }
         LogDebug("0x%x: no crop rule for this surface kind - announced uncropped", data->Handle);
         return FALSE;
     }
