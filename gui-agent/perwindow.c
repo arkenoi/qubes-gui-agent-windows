@@ -807,6 +807,7 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
     // buffer holds no established content, so DDA mode must re-enter via prefill.
     // Left stale, the steady-state branch would slice-copy into an unestablished buffer.
     entry->PwDdaActive = FALSE;
+    entry->PwCompositeCopied = FALSE;
     // Same reasoning for the drag-slice: its engine-buffer ownership died with the
     // channel, and a stale flag would make the moving branch skip re-engagement.
     entry->PwDragSlice = FALSE;

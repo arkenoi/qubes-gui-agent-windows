@@ -15128,6 +15128,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 PerfNotePwDecision(FALSE);
                                 if (WcPrefill(entry->Handle) == ERROR_SUCCESS)
                                 {
+                                    entry->PwCompositeCopied = FALSE;   // rendered whole by PrintWindow
                                     (void)SendWindowDamageEvent(entry->Handle, 0, 0,
                                                                 entry->PwWidth, entry->PwHeight);
                                     ddaHandled = TRUE;
@@ -15154,6 +15155,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                                 // PrintWindow too - sending nothing at all for this window.
                                 if (copied)
                                 {
+                                    entry->PwCompositeCopied = TRUE;
                                     PerfNoteDdaCapture();
                                     ddaHandled = TRUE;
                                     // Re-asserted per steady-state frame (sub-us: one SRW
@@ -15173,8 +15175,20 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         }
                         else
                         {
+                            // LEAVING DDA MODE RE-RENDERS THE WINDOW ONCE. Its buffer holds composite copies, and the
+                            // last of them can carry a window that was on screen ABOVE it before the agent tracked
+                            // that window: Windows 10 Start, drawn into Notepad's dom0 picture from the frame Start
+                            // appeared until it closed (row 29 p53, win10-p46). Once Start is tracked and claims its
+                            // area this gate fails and nothing repaints the copy - PwScreenUnchanged sees an
+                            // unchanged screen outside the covered region and skips - so PrintWindow, which renders
+                            // the window's own content, rebuilds the buffer here.
                             if (entry->PwDdaActive)
                                 WcSetDdaOwned(entry->Handle, FALSE);
+                            if (entry->PwCompositeCopied)
+                            {
+                                entry->PwCompositeCopied = FALSE;
+                                WcMarkDirty(entry->Handle);
+                            }
                             entry->PwDdaActive = FALSE;   // left DDA mode; re-establish on return
                         }
 

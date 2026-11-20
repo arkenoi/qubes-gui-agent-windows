@@ -579,6 +579,10 @@ typedef struct _WINDOW_DATA
     // memcmp-class hash (~0.2 ms). Valid ONLY while the window is unoccluded; see
     // PwScreenUnchanged.
     BOOL  PwDdaActive;       // serving this window from the composited desktop
+    // The granted buffer holds DDA copies from the composited desktop made since its last PrintWindow render. They can
+    // carry a window that was above this one before it was tracked, so the first frame it is not eligible re-renders
+    // it once (main.c, the DDA gate's else arm). PwDdaActive cannot stand in: a DDA frame that copies nothing clears it.
+    BOOL  PwCompositeCopied;
     ULONGLONG PwScreenHash;
     BOOL PwScreenHashValid;
 
