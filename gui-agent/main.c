@@ -7545,14 +7545,13 @@ static BOOL ProcessStartedAfterAgent(IN DWORD processId)
     return ok && ((((ULONGLONG)created.dwHighDateTime << 32) | created.dwLowDateTime) > agentStart);
 }
 
-// OPEN AS A NORMAL WINDOW (owner 2026-11-20: «everything should open as normal windows whenever possible», and «the size
-// should match workarea max, not exceed it (keep borders in mind)»). Edge with no remembered placement opened maximized
-// over the whole 5120x1392 guest screen, dom0's panel included. A captioned top-level window that arrives maximized is
-// shown normal ONCE, before dom0 is told of it, with its normal rect clamped inside the work area; the caller then drops
-// it for this pass and the next pass announces it at that size. The work area is the one workarea.c applies, which is
-// inferred from dom0's own placement and so already leaves room for dom0's frame and panel. Once per window, so an app
-// that maximizes itself again keeps it, and only for a process started after the agent (ProcessStartedAfterAgent).
-// WPF_ASYNCWINDOWPLACEMENT: the request is posted to the app's thread, so a hung app cannot stall this one.
+// NOTHING OPENS MAXIMIZED BY DEFAULT (owner 2026-11-20: «everything should open as normal windows whenever possible»;
+// «we may allow explicit maximize, but we do not want anything to open maximized by default»; «only dom0 knows how to fit
+// it properly»). A captioned top-level window that arrives maximized is shown normal ONCE, before dom0 is told of it, at
+// the app's own normal size; the guest picks no size and fits nothing - dom0's window manager places and fits the window
+// it is then announced as. The caller drops it for this pass and the next pass announces it. Once per window, so an
+// explicit maximize afterwards stays, and only for a process started after the agent (ProcessStartedAfterAgent).
+// ShowWindowAsync posts the request to the app's thread, so a hung app cannot stall this one.
 static BOOL RestoreWindowOpenedMaximized(IN const WINDOW_DATA* entry)
 {
     static HWND done[32];
@@ -7567,42 +7566,14 @@ static BOOL RestoreWindowOpenedMaximized(IN const WINDOW_DATA* entry)
         return FALSE;
     done[next++ % RTL_NUMBER_OF(done)] = entry->Handle;
 
-    // rcNormalPosition is in workspace coordinates: relative to the work area's top-left, so the clamp is 0..size.
-    WINDOWPLACEMENT wp = { sizeof(wp) };
-    RECT wa;
-    if (!GetWindowPlacement(entry->Handle, &wp) || !SystemParametersInfo(SPI_GETWORKAREA, 0, &wa, 0))
+    if (!ShowWindowAsync(entry->Handle, SW_SHOWNORMAL))
     {
-        LogWarning("QGAOPENNORMAL 0x%x: opened maximized (%ux%u, pid %lu), its placement or the work area could not be "
-            "read (0x%x) - announced maximized", entry->Handle, entry->Width, entry->Height, entry->ProcessId, GetLastError());
-        return FALSE;
-    }
-    const LONG waW = wa.right - wa.left, waH = wa.bottom - wa.top;
-    LONG w = min(wp.rcNormalPosition.right - wp.rcNormalPosition.left, waW);
-    LONG h = min(wp.rcNormalPosition.bottom - wp.rcNormalPosition.top, waH);
-    LONG x = max(0, min(wp.rcNormalPosition.left, waW - w));
-    LONG y = max(0, min(wp.rcNormalPosition.top, waH - h));
-    // An app with no normal size of its own (its normal rect is the whole work area) gets a smaller default, two thirds
-    // of the work area each way, centred (owner: «if we can default to a smaller one with no side effects, do it»).
-    // A smaller normal size the app remembered is its own and is kept.
-    if (w >= waW && h >= waH)
-    {
-        w = waW * 2 / 3;
-        h = waH * 2 / 3;
-        x = (waW - w) / 2;
-        y = (waH - h) / 2;
-    }
-    SetRect(&wp.rcNormalPosition, x, y, x + w, y + h);
-    wp.showCmd = SW_SHOWNORMAL;
-    wp.flags |= WPF_ASYNCWINDOWPLACEMENT;
-    if (!SetWindowPlacement(entry->Handle, &wp))
-    {
-        LogWarning("QGAOPENNORMAL 0x%x: opened maximized (%ux%u, pid %lu), the normal placement was refused (0x%x) - "
+        LogWarning("QGAOPENNORMAL 0x%x: opened maximized (%ux%u, pid %lu), showing it normal was refused (0x%x) - "
             "announced maximized", entry->Handle, entry->Width, entry->Height, entry->ProcessId, GetLastError());
         return FALSE;
     }
-    LogInfo("QGAOPENNORMAL 0x%x: opened maximized (%ux%u, pid %lu) - shown normal at %ldx%ld+%ld+%ld inside the work area "
-        "(%d,%d)-(%d,%d) before dom0 is told", entry->Handle, entry->Width, entry->Height, entry->ProcessId, w, h, x, y,
-        wa.left, wa.top, wa.right, wa.bottom);
+    LogInfo("QGAOPENNORMAL 0x%x: opened maximized (%ux%u, pid %lu) - shown normal at its own size before dom0 is told",
+        entry->Handle, entry->Width, entry->Height, entry->ProcessId);
     return TRUE;
 }
 
