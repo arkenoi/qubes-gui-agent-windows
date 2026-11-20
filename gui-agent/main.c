@@ -10968,9 +10968,12 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     // resolved (so it appears already cropped) or the bounded timeout elapses (mapped uncropped,
     // never lost). CREATE and the per-window buffer are already in place; the cropped geometry has
     // been announced above via SendWindowConfigureIfChanged, so the map lands at the final rect.
-    // A search view Start covers is outside this arm, timeout included, until it paints again.
-    if (windowData->MapDeferred && windowData->IsVisible && !windowData->IsIconic &&
-        !windowData->Synthesized && !SearchViewCoveredByStart(windowData))
+    // A search view Start covers stays held - outside the release arm, timeout included, and outside the hold-drop
+    // arm at its end, which would leave it neither held nor mapped - until it paints again.
+    if (windowData->MapDeferred && windowData->IsVisible && SearchViewCoveredByStart(windowData))
+        ;
+    else if (windowData->MapDeferred && windowData->IsVisible && !windowData->IsIconic &&
+        !windowData->Synthesized)
     {
         // The toast hold outranks every arm below: while it says hold/suppress nothing here may map the
         // banner, whatever the crop or the timeout say. Its own deadlines and the bridge's verdict event
