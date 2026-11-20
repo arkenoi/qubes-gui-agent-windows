@@ -790,6 +790,9 @@ HANDLE g_ShutdownEvent = NULL;
 
 // Placeholder window of a minimized UAC prompt, see GetWindowData().
 #define UAC_DUMMY_WINDOW_CLASS L"$$$Secure UAP Dummy Window Class For Interim Dialog"
+// consent.exe's prompt window, see ShouldAcceptWindow() (ADR-uac section 11).
+#define CONSENT_HOST_CLASS L"Credential Dialog Xaml Host"
+#define CONSENT_HOST_HOLD_MS 2000
 
 // Frame shadow strips Office draws around its own windows, see ShouldAcceptWindow().
 #define MSO_BORDER_EFFECT_CLASS L"MSO_BORDEREFFECT_WINDOW_CLASS"
@@ -1968,6 +1971,11 @@ static BOOL WindowNotMeasurableThisPass(IN ULONG status)
 // prompt is the owner of this window, so nothing has to look for consent.exe by name. A pointer-sized store,
 // read whole by the resync that checks the prompt.
 static HWND volatile g_UacStandIn = NULL;
+// The consent prompt window ShouldAcceptWindow is withholding for covering the work area, since when, and
+// whether the hold already ran out. One prompt at a time; every ShouldAcceptWindow caller holds g_csWatchedWindows.
+static HWND g_ConsentHostWithheld = NULL;
+static ULONGLONG g_ConsentHostSince = 0;
+static BOOL g_ConsentHostWarned = FALSE;
 
 ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 {
@@ -8474,7 +8482,8 @@ static ULONG ExamineWindow(IN HWND window, IN OUT UINT* interrogated)
         // recomputes from scratch (the UAC placeholder sets g_ShowTaskbar, Start sets
         // g_StartVisible which in turn gates Search), so they must not be skipped.
         if (window != g_StartWindow && window != g_SearchWindow &&
-            0 != wcscmp(data->Class, UAC_DUMMY_WINDOW_CLASS))
+            0 != wcscmp(data->Class, UAC_DUMMY_WINDOW_CLASS) &&
+            0 != wcscmp(data->Class, CONSENT_HOST_CLASS))
         {
             CacheRejectedWindow(window, &signature);
         }
@@ -9871,6 +9880,48 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
             LogDebug("0x%x: owned by the validated broker (pid %ld) - infrastructure, not mapped",
                      data->Handle, bpid);
             return FALSE;
+        }
+    }
+
+    // CONSENT'S PROMPT WINDOW IS WITHHELD WHILE IT COVERS THE WORK AREA (ADR-uac section 11).
+    // consent.exe creates its prompt window at the size of the work area, transparent around the
+    // dialog, then hides it and shows it again at dialog size ~60 ms later (19045: 5120x1400 then
+    // 456x367; 26200: 5120x1392 then 456x432). Announced at the first size, dom0 was given a
+    // work-area-sized window carrying the guest desktop with the prompt in its middle (GWeck row 56).
+    // The show at dialog size re-examines it, so the prompt is not delayed. Kept out of the reject
+    // cache (ExamineWindow), so a host that never shrinks is re-judged each resync and, after
+    // CONSENT_HOST_HOLD_MS, announced anyway with an ERROR: a prompt nobody can see blocks the
+    // program that asked. Identity is the class AND System32's consent.exe as the owning process.
+    if (g_ScreenWidth && g_ScreenHeight && 0 == wcscmp(data->Class, CONSENT_HOST_CLASS))
+    {
+        const BOOL coversWorkArea = data->Width >= (g_ScreenWidth * 9) / 10 &&
+                                    data->Height >= (g_ScreenHeight * 9) / 10;
+        const ULONGLONG now = GetTickCount64();
+        if (coversWorkArea && ProcessImageIsSystemBinary(data->ProcessId, L"consent.exe"))
+        {
+            if (g_ConsentHostWithheld != data->Handle)
+            {
+                g_ConsentHostWithheld = data->Handle;
+                g_ConsentHostSince = now;
+                g_ConsentHostWarned = FALSE;
+                LogInfo("QGAUACHOST 0x%x: prompt window covers the work area (%ux%u), withheld",
+                        data->Handle, data->Width, data->Height);
+            }
+            if (now - g_ConsentHostSince < CONSENT_HOST_HOLD_MS)
+                return FALSE;
+            if (!g_ConsentHostWarned)
+            {
+                g_ConsentHostWarned = TRUE;
+                LogError("QGAUACHOST 0x%x: prompt window still covers the work area (%ux%u) after %llu ms, "
+                         L"announced anyway so the prompt can be answered", data->Handle, data->Width,
+                         data->Height, now - g_ConsentHostSince);
+            }
+        }
+        else if (g_ConsentHostWithheld == data->Handle)
+        {
+            LogInfo("QGAUACHOST 0x%x: shown at %ux%u after %llu ms withheld", data->Handle,
+                    data->Width, data->Height, now - g_ConsentHostSince);
+            g_ConsentHostWithheld = NULL;
         }
     }
 
