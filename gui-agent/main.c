@@ -10829,13 +10829,48 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 goto end;
         }
 
-        // A popup-state flip re-announces through UNMAP+MAP (ToggleMap) - which would MAP a banner the toast hold
-        // is withholding. The daemon learns the flag at the eventual MAP anyway, so a held toast skips the toggle.
-        if (popupStateChanged && !ToastBannerWithheld(windowData))
+        // The MAP of a managed -> popup flip waits for a later pass. dom0 discards an agent configure while one of
+        // its own is still queued for the window (xside.c handle_configure_from_vm re-sends its own instead), and
+        // a MAP carries no size: the override-redirect MAP then lands at dom0's old, large size, and dom0's
+        // large-window protection strips the flag and warns the user. Measured 2026-11-21 on Edge's first-run
+        // overlay (win11de-p46): CONFIGURE 2513x1332 ovr=1 discarded, MAP ovr=1 mapped at 5104x1376.
+        if (popupStateChanged)
         {
-            status = ToggleMap(windowData);
+            windowData->PopupMapPending = TRUE;
+            windowData->DaemonCfgSeen = FALSE;
+        }
+    }
+
+    // The deferred popup MAP. dom0 answering with another size since the flip's configure means that configure was
+    // discarded: send it again and keep waiting (a dom0 resize that made the window large flips it back above,
+    // which clears this). Otherwise dom0 holds the popup's size and the override-redirect MAP is safe.
+    if (popupStateChanged && oldPopupState)
+        windowData->PopupMapPending = FALSE;
+    else if (windowData->PopupMapPending && !popupStateChanged)
+    {
+        if (windowData->DaemonCfgSeen &&
+            (windowData->DaemonCfgW != windowData->Width || windowData->DaemonCfgH != windowData->Height))
+        {
+            LogInfo("QGAPOPUPMAPWAIT 0x%x: dom0 holds %lux%lu, not the popup's %lux%lu - configure sent again, "
+                "override-redirect MAP waits", windowData->Handle, windowData->DaemonCfgW, windowData->DaemonCfgH,
+                windowData->Width, windowData->Height);
+            windowData->DaemonCfgSeen = FALSE;
+            windowData->CfgSentValid = FALSE;
+            status = SendWindowConfigureIfChanged(windowData);
             if (status != ERROR_SUCCESS)
                 goto end;
+        }
+        else
+        {
+            windowData->PopupMapPending = FALSE;
+            // A popup-state flip re-announces through UNMAP+MAP (ToggleMap) - which would MAP a banner the toast
+            // hold is withholding. The daemon learns the flag at the eventual MAP anyway, so a held toast skips it.
+            if (!ToastBannerWithheld(windowData))
+            {
+                status = ToggleMap(windowData);
+                if (status != ERROR_SUCCESS)
+                    goto end;
+            }
         }
     }
 

@@ -1094,6 +1094,11 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
 
         if (data != NULL)
         {
+            // The size dom0 holds for this window: a popup flip's MAP waits on it (UpdateWindowData).
+            data->DaemonCfgSeen = TRUE;
+            data->DaemonCfgW = configureMsg.width;
+            data->DaemonCfgH = configureMsg.height;
+
             // Is a GUEST-NATIVE drag holding this window right now? Both the trace line and
             // the guard below need it, and it is the fact the inbound path never considered.
             const BOOL dragHeld = (window == g_InputDragWindow && g_InputDragOriginValid);

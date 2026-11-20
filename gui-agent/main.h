@@ -353,6 +353,13 @@ typedef struct _WINDOW_DATA
     DWORD DaemonMaxW;
     DWORD DaemonMaxH;
 
+    // A managed -> override-redirect flip whose MAP waits until dom0 holds the popup's size (UpdateWindowData).
+    // DaemonCfgSeen/W/H: the last configure dom0 sent for this window since the flip's own configure went out.
+    BOOL PopupMapPending;
+    BOOL DaemonCfgSeen;
+    DWORD DaemonCfgW;
+    DWORD DaemonCfgH;
+
     // Slice-fed per-window buffer: content is copied from the composited DDA screen
     // framebuffer (agent-side slice) instead of PrintWindow. Used for windows PrintWindow
     // cannot capture (ULW / WS_EX_NOREDIRECTIONBITMAP overlays). Content stays
