@@ -9845,6 +9845,16 @@ static BOOL ErrBoxIsSystemBoxHwnd(IN HWND hwnd)
     }
     return ErrBoxIsSystemBox(&d);
 }
+
+// A SHELL SURFACE IS OPENING ON SCREEN BUT IS NOT TRACKED YET. The genuine-open gate below rejects a shell surface
+// whose card is not measured yet, and until it is accepted nothing knows it covers the windows beneath it - so DDA,
+// which copies those windows from the composited desktop, copied Windows 10 Start into Notepad (row 29 p57,
+// win10-p46: copies 150538.200-.284 after the first rejection at .168, accepted at .384). The rejection stamps this
+// tick and PwDdaEligible refuses for QGA_SHELL_OPENING_MS after it, so the windows beneath are rendered by PrintWindow,
+// their own content. It fires only while Start or search opens: 2-3 rejections per boot, all in that second (p55-p57).
+#define QGA_SHELL_OPENING_MS 1000
+static volatile ULONGLONG g_ShellCardlessAt = 0;
+
 BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 {
     StartDismissMaybeRearm();   // GUARD:startrearm
@@ -10162,6 +10172,7 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     {
         LogDebug("0x%x: shell surface with no card - not presenting a menu, rejecting",
             data->Handle);
+        g_ShellCardlessAt = GetTickCount64();
         return FALSE;
     }
 
@@ -12619,6 +12630,13 @@ static BOOL PwDdaEligible(IN const WINDOW_DATA* entry, IN const RECT* rect,
     if (entry->ExStyle & WS_EX_LAYERED)
     {
         PerfNotePwRefusal(PW_REFUSE_DDA_LAYERED);
+        return FALSE;
+    }
+
+    // E6a: no shell surface is opening untracked above it (g_ShellCardlessAt). Counted as an overlap: that is what it is.
+    if (g_ShellCardlessAt && GetTickCount64() - g_ShellCardlessAt < QGA_SHELL_OPENING_MS)
+    {
+        PerfNotePwRefusal(PW_REFUSE_DDA_OVERLAP);
         return FALSE;
     }
 
