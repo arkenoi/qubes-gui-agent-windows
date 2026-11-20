@@ -2258,8 +2258,12 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         if (settled && QgaShellFrameAllowed(g_ShellManaged, (int)kind,
                                             entry->Width, entry->Height, g_ScreenWidth, g_ScreenHeight))
         {
-            LogDebug("0x%x: %s shell surface kind=%d announced WM-managed (policy %u)",
-                entry->Handle, cropped ? "cropped" : "uncropped", kind, g_ShellManaged);
+            // Cropped only: while Start is open GetWindowData re-reads its withheld search companion
+            // 10-13 thousand times a second (25H2, 2026-11-20), and the companion's CREATE ovr=0 and
+            // size-lock lines already say it is framed.
+            if (cropped)
+                LogDebug("0x%x: cropped shell surface kind=%d announced WM-managed (policy %u)",
+                    entry->Handle, kind, g_ShellManaged);
             entry->IsOverrideRedirect = FALSE;
         }
         else if (settled && kind != ShellSurfaceNone && g_ShellManaged != SHELL_MANAGED_NONE)
