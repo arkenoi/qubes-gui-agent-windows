@@ -1151,10 +1151,12 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                 }
             }
             else if (data->CropLeft != 0 || data->CropTop != 0 ||
-                data->CropRight != 0 || data->CropBottom != 0)
+                data->CropRight != 0 || data->CropBottom != 0 || IsShellToastWindow(data))
             {
                 // These coordinates are in CROPPED space - the rect the agent announced is
-                // the visible card, not the window (toastcrop.c).
+                // the visible card, not the window (toastcrop.c). A shell surface with no
+                // crop (Search) is the zero-inset case of the same thing: slice-fed at its
+                // anchor, so a dom0 drag of its frame must not move the slice source either.
                 //
                 // LATEST-WINS, same as the normal branch below: the newest card-space
                 // geometry is stashed and ApplyPendingDaemonMove posts at most one async

@@ -660,12 +660,14 @@ int main(void)
         check("frame: a card on a 1920x1080 screen is still movable (the test is not tuned to 5120)",
               QgaShellFrameAllowed(QGA_SHELL_MANAGED_START, QGA_SURFACE_KIND_START,
                                    640, 750, 1920, 1080) == TRUE);
-        /* "no crop resolved yet -> no frame" is the CALLER's gate and is deliberately not a
-         * parameter here: at the only call site it would always be TRUE, which is an inert
-         * argument. */
+        /* "the surface has not settled (no crop yet, and its kind has a crop rule) -> no frame" is
+         * the CALLER's gate, not a parameter here. */
         check("frame: policy NONE keeps every surface override-redirect",
               QgaShellFrameAllowed(QGA_SHELL_MANAGED_NONE, QGA_SURFACE_KIND_START,
                                    642, 726, 5120, 1440) == FALSE);
+        check("frame: the START policy frames Start's search view (owner 2026-11-20)",
+              QgaShellFrameAllowed(QGA_SHELL_MANAGED_START, QGA_SURFACE_KIND_SEARCH,
+                                   800, 750, 5120, 1440) == TRUE);
         check("frame: START-only policy does not frame a toast",
               QgaShellFrameAllowed(QGA_SHELL_MANAGED_START, QGA_SURFACE_KIND_TOAST,
                                    364, 326, 5120, 1440) == FALSE);

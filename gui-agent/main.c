@@ -2244,21 +2244,25 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     // that state is the 2026-08-12 shape - a full-screen, framed, draggable window on dom0's
     // screen. The predicate refuses a card that spans the screen and the surface stays
     // override-redirect, which is the safe direction.
-    // The crop gate stays exactly where it was - it is cheap, and it keeps ShellSurfaceKind off the
-    // path of every ordinary override-redirect popup (a combo dropdown, a tooltip), which is what
-    // widening this test would have cost.
-    if (entry->IsOverrideRedirect &&
-        (entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom))
+    // THE SURFACE MUST HAVE SETTLED before it is framed: its crop has resolved, or its kind has no
+    // crop rule and so never gets one (Search, QgaCardRuleForSurface) - for that kind the 90% bound
+    // in QgaShellFrameAllowed is what refuses a compose-time screen-sized rect. ShellSurfaceKind
+    // costs an ordinary popup (a combo dropdown, a tooltip) one class compare.
+    if (entry->IsOverrideRedirect)
     {
+        const BOOL cropped = entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom;
         SHELL_SURFACE_KIND kind = ShellSurfaceKind(entry);
-        if (QgaShellFrameAllowed(g_ShellManaged, (int)kind,
-                                 entry->Width, entry->Height, g_ScreenWidth, g_ScreenHeight))
+        const BOOL settled = cropped ||
+            (kind != ShellSurfaceNone &&
+             QgaCardRuleForSurface((int)kind, IsMenuPopupWindow(entry)) == QGA_CARD_RULE_NONE);
+        if (settled && QgaShellFrameAllowed(g_ShellManaged, (int)kind,
+                                            entry->Width, entry->Height, g_ScreenWidth, g_ScreenHeight))
         {
-            LogDebug("0x%x: cropped shell surface kind=%d announced WM-managed (policy %u)",
-                entry->Handle, kind, g_ShellManaged);
+            LogDebug("0x%x: %s shell surface kind=%d announced WM-managed (policy %u)",
+                entry->Handle, cropped ? "cropped" : "uncropped", kind, g_ShellManaged);
             entry->IsOverrideRedirect = FALSE;
         }
-        else if (kind != ShellSurfaceNone && g_ShellManaged != SHELL_MANAGED_NONE)
+        else if (settled && kind != ShellSurfaceNone && g_ShellManaged != SHELL_MANAGED_NONE)
         {
             // The one case worth a line: the policy wanted a frame and the guard refused it.
             LogDebug("0x%x: shell surface %ux%u spans the %ux%u screen - no frame, left o-r",
@@ -2291,6 +2295,7 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 #define SYNTH_FULL_PATCH_MS 200
 
 static void PwPatchSynthRect(IN WINDOW_DATA* owner, IN const WINDOW_DATA* child);
+static void SendShellFrameSizeLock(IN OUT WINDOW_DATA* entry);
 
 // Square off the black rounded-corner triangles DWM leaves in a captured window. For each of the
 // four corners, sample the window's own background just inside the arc and replace only near-black
@@ -7503,6 +7508,7 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             goto end;
         }
         entry->CreateSent = TRUE;
+        SendShellFrameSizeLock(entry);
 
         // FAULT INJECTION (test builds only, rank 1). Reproduces the 13 duplicate CREATEs
         // observed for live HWNDs during a Start-menu flip storm. It has to sit AFTER
@@ -7916,24 +7922,30 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
             DragAnnounceRecord(entry->X, entry->Y);
         DragSimNoteAnnounce(entry->X, entry->Y);
 
-        // A WM-managed shell surface (or=0 with a crop) must be DRAGGABLE but not
-        // RESIZEABLE. The size-lock hint (PMinSize==PMaxSize) is sent HERE, on the
-        // announce path, because the crop that identifies these as cards resolves
-        // asynchronously AFTER the window is created - sending it at CREATE (as first
-        // tried) always ran with zero insets and never fired. Re-sent only when the
-        // announced card size actually changes.
-        if (!entry->IsOverrideRedirect &&
-            (entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom) &&
-            (entry->SizeLockW != (int)entry->Width || entry->SizeLockH != (int)entry->Height))
-        {
-            if (SendWindowSizeLock(entry->Handle, entry->Width, entry->Height) == ERROR_SUCCESS)
-            {
-                entry->SizeLockW = (int)entry->Width;
-                entry->SizeLockH = (int)entry->Height;
-            }
-        }
+        SendShellFrameSizeLock(entry);
     }
     return status;
+}
+
+// A WM-managed shell surface must be DRAGGABLE but not RESIZEABLE: the size-lock hint
+// (PMinSize==PMaxSize), re-sent only when the announced size actually changes. Two callers,
+// because a surface is framed at two moments: a cropped card when its crop resolves - AFTER the
+// window was created, so that one goes out on the announce path above - and a kind with no crop
+// rule (Search) from its CREATE, which may never be followed by a configure at all.
+static void SendShellFrameSizeLock(IN OUT WINDOW_DATA* entry)
+{
+    if (entry->IsOverrideRedirect)
+        return;
+    if (!(entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom) &&
+        !IsShellToastWindow(entry))
+        return;
+    if (entry->SizeLockW == (int)entry->Width && entry->SizeLockH == (int)entry->Height)
+        return;
+    if (SendWindowSizeLock(entry->Handle, entry->Width, entry->Height) == ERROR_SUCCESS)
+    {
+        entry->SizeLockW = (int)entry->Width;
+        entry->SizeLockH = (int)entry->Height;
+    }
 }
 
 // Apply the newest daemon-dictated geometry (HandleConfigure stashes it; see DaemonMove*
@@ -11477,8 +11489,8 @@ static BOOL ClaimsOcclusionArea(IN const WINDOW_DATA* entry)
 {
     if (entry->IsOverrideRedirect)
         return TRUE;
-    return (entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom) &&
-        IsShellToastWindow(entry);
+    // A managed shell surface is one the flip framed, cropped or not (Search has no crop).
+    return IsShellToastWindow(entry);
 }
 
 static UINT CollectZOrder(WINDOW_DATA** sorted, UINT capacity)

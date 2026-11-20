@@ -169,8 +169,9 @@ extern BOOL     g_ButtonAbsolute;
 // Announce classified shell surfaces (toasts/Start/Search) as WM-managed windows instead
 // of override-redirect, so the dom0 WM can frame and move them. Three-valued policy
 // ("ShellManaged"): 0 = none (every shell surface stays an override-redirect popup,
-// Linux-agent parity), 1 = all classified surfaces, 2 = START ONLY (Start is movable +
-// size-locked, toasts stay corner popups per the 2026-08-12 user spec).
+// Linux-agent parity), 1 = all classified surfaces, 2 = START ONLY (Start, and the search view
+// Start turns into when the user types, are movable + size-locked - owner 2026-11-20, "Frame the
+// search view"; toasts stay corner popups per the 2026-08-12 user spec).
 // THE CODE'S DEFAULT IS 2 (START ONLY) as of 2026-10-18. It was 0 while the comment claimed 2 -
 // a reader checking the documented default got the opposite of the shipped one - and that was
 // corrected the other way, by fixing the comment, because changing the effective default is a

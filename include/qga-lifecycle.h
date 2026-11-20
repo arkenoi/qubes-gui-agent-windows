@@ -1151,10 +1151,18 @@ typedef enum {
  * drags it, and SendWindowSizeLock's PMinSize==PMaxSize offering no resize handle is now the
  * intended behaviour rather than a contradiction.
  *
- * CROP RESOLUTION IS THE CALLER'S GATE, not a parameter here. It was a parameter in the first
- * draft, and at the only call site it was always TRUE - the site is reached only once a crop has
- * resolved - which makes it an inert argument, the shape this project has been caught by before.
- * The caller keeps that test where it already lived; this predicate decides policy, kind and size.
+ * THE START POLICY FRAMES START'S SEARCH VIEW TOO. Typing into Start makes Windows hide Start's host
+ * window and show SearchHost's in its place - measured on the shipping build, the first typed key
+ * is followed within 50 ms by "IsVisible changed to 0" on Start and a SearchHost MAP. An
+ * override-redirect window cannot hold dom0's keyboard focus, so with the search view o-r every key
+ * after that swap reached no window of the qube: the owner typed on dom0 and the agent received no
+ * key after the swap, against 78 clicks on the search window. Owner, 2026-11-20: "Frame the search
+ * view". A toast is
+ * still never framed under this policy.
+ *
+ * WHETHER THE SURFACE HAS SETTLED IS THE CALLER'S GATE, not a parameter here: a crop has resolved,
+ * or the kind has no crop rule and so will never get one (Search, QgaCardRuleForSurface). This
+ * predicate decides policy, kind and size.
  *
  * THE GUARD THIS EXISTS FOR. A shell CoreWindow is SCREEN-SIZED while it composes and card-sized
  * once the menu is placed - measured 2026-10-18, the host's window held 5120x1392 at 0,0 for a whole
@@ -1181,7 +1189,8 @@ static __inline BOOL QgaShellFrameAllowed(
         return FALSE;
     if (shellManaged == QGA_SHELL_MANAGED_NONE)
         return FALSE;
-    if (shellManaged == QGA_SHELL_MANAGED_START && kind != QGA_SURFACE_KIND_START)
+    if (shellManaged == QGA_SHELL_MANAGED_START &&
+        kind != QGA_SURFACE_KIND_START && kind != QGA_SURFACE_KIND_SEARCH)
         return FALSE;
     if (announcedW == 0 || announcedH == 0)
         return FALSE;
