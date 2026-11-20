@@ -4868,11 +4868,13 @@ static void DirectSuppressNotifyUser(IN DWORD count, IN const WCHAR* fault)
 
     WCHAR text[900];
     StringCchPrintf(text, RTL_NUMBER_OF(text),
-        L"Qubes: a window could not be shown\r\n"
-        L"The per-window display path is not working, so %lu window(s) - notifications, menus - "
-        L"were withheld rather than shown blank. Nothing is lost from the guest itself; this is a "
-        L"display fault to fix. See the gui-agent log: QGADIRECTSUPPRESS, QGADESLICEDOWN.",
-        count);
+        L"Qubes: %lu window(s) not shown\r\n"
+        L"Programs in this qube opened %lu window(s) - notifications or menus - that Qubes could "
+        L"not copy to your screen, so they are hidden instead of shown blank. You cannot see or "
+        L"click them; the programs that opened them keep running. This is a Qubes Windows Tools "
+        L"bug, not something for you to fix. To report it, attach the gui-agent log (entries "
+        L"QGADIRECTSUPPRESS and QGADESLICEDOWN).",
+        count, count);
 
     HANDLE h = CreateFile(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h == INVALID_HANDLE_VALUE)
