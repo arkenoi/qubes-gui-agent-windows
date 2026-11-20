@@ -9997,15 +9997,12 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         }
     }
 
-    // START IS DISABLED IN SEAMLESS MODE (user decision 2026-08-13, shipped state).
-    // On 25H2 the Start surface has never rendered acceptably through the seamless path:
-    // it parks off-screen while closed, morphs between a card-sized and a workarea-sized
-    // window, and its content is a DirectComposition surface that neither PrintWindow nor
-    // a framebuffer slice reproduces correctly once it is moved. Rather than ship a menu
-    // that shows wallpaper or a phantom at a random position, do not present it at all -
-    // the Super key is already dropped in seamless (BlockMenuKey), so the usual way to
-    // summon it is closed too. Toasts are NOT affected: they render correctly and stay.
-    // Re-enable with SeamlessStart=1 to work on it.
+    // START IN SEAMLESS MODE (docs/ADR-windows.md sections 7 and 11). With SeamlessStart=1, the
+    // default, a Start that opens is presented: it is a regular dom0 app-menu entry shown as a
+    // normal window, on Windows 10 and 11 (owner, 2026-11-19). Its closed-state phantom - parked
+    // off-screen, or a host with no card in it - is refused by the genuine-open gate below, not
+    // here. With SeamlessStart=0 a Start that opens is not presented, and is closed by returning
+    // activation; its SearchHost companion is refused with it. Toasts are not affected.
     // The kinds this predicate takes are mirrored as plain ints so the header stays free of the
     // agent's headers; keep the two in step.
     C_ASSERT((int)ShellSurfaceNone == QGA_SURFACE_KIND_NONE);

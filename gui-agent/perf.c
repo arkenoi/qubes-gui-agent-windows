@@ -49,7 +49,7 @@ BOOL     g_ButtonAbsolute = TRUE;
 // The screen-sized state that would otherwise be framed full-screen is refused by
 // QgaShellFrameAllowed, not by leaving the policy off for everyone.
 DWORD    g_ShellManaged = SHELL_MANAGED_START;
-BOOL     g_SeamlessStart = FALSE;
+BOOL     g_SeamlessStart = TRUE;
 // Blocked by default; dom0 re-enables per qube with `qvm-features <vm> service.enableWinKey 1`
 // (see the qubesdb read in PerfInit). That is the designed remedy and it is deliberate: the admin
 // decides what a qube may take from the window manager. Forum 42717 post 64 was NOT this default

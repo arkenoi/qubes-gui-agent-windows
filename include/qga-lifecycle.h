@@ -1105,8 +1105,8 @@ static __inline BOOL QgaXcLineKept(IN int level, IN const char* function)
  * IS THIS SHELL SURFACE PRESENTED, AND IF NOT, WHY NOT?  (the settings matrix, as one predicate)
  *
  * Four shipped configurations crossed with the surface kinds, decided in one place so the suite can
- * drive every cell. The axis is SeamlessStart: 0 (the default) means a native Start that opens is
- * not shown, 1 means work on it is enabled and everything is presented.
+ * drive every cell. The axis is SeamlessStart: 1 (the default) presents a native Start that opens,
+ * and its companions; 0 does not show it.
  *
  * THE COMPANION IS THE HALF THAT WAS MISSING. A Start opening on 25H2 brings up TWO surfaces: the
  * StartMenuExperienceHost one, and a SearchHost one ('Suche' on a German guest, WS_EX_TOPMOST,

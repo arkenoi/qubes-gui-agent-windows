@@ -62,7 +62,7 @@
 #define REG_CONFIG_PROTO_VALUE L"ProtoTrace"
 #define REG_CONFIG_PROTO_WOBBLE_VALUE L"ProtoTraceWobble"
 #define REG_CONFIG_BUTTON_ABS_VALUE L"ButtonAbsolute"
-#define REG_CONFIG_SEAMLESS_START_VALUE L"SeamlessStart" // DWORD 0/1, default 0 (Start hidden in seamless)
+#define REG_CONFIG_SEAMLESS_START_VALUE L"SeamlessStart" // DWORD 0/1, default 1 (Start presented; 0 hides and closes it)
 #define REG_CONFIG_SHELL_MANAGED_VALUE L"ShellManaged"
 #define REG_CONFIG_BLOCK_MENU_KEY_VALUE L"BlockMenuKey"
 // Z-order sync experiment: raise the window dom0 focused (see HandleFocus). DWORD 0/1.
@@ -186,10 +186,11 @@ extern BOOL     g_ButtonAbsolute;
 #define SHELL_MANAGED_ALL   1
 #define SHELL_MANAGED_START 2
 extern DWORD    g_ShellManaged;
-// Present the Start menu in seamless mode at all. Default 0: on 25H2 it never rendered
-// acceptably through the seamless path (parks off-screen while closed, morphs size, and its
-// DirectComposition content survives neither PrintWindow nor a framebuffer slice once
-// moved). Toasts are unaffected.
+// Present a Start menu that opens in seamless mode. Default 1: Start is a regular dom0 app-menu
+// entry presented as a normal window, on Windows 10 and 11 (owner, 2026-11-19; docs/ADR-windows.md
+// section 7). The entry opens it guest-side; the dom0-forwarded Windows key stays dropped
+// (BlockMenuKey). 0 does not present a Start that opens, and closes it by returning activation
+// (ADR-windows section 11). Toasts are unaffected.
 extern BOOL     g_SeamlessStart;
 
 // Drop the forwarded Super/Windows key (and whole Mod4 chords) in seamless mode
