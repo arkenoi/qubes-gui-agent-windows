@@ -7928,6 +7928,9 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         entry->CfgPendingPos = FALSE;
     }
 
+    // The lock goes out BEFORE the size it locks: dom0's WM clamps a configure to the lock the
+    // window holds when it arrives.
+    SendShellFrameSizeLock(entry);
     ULONG status = SendWindowConfigure(entry->Handle, annX, annY,
         entry->Width, entry->Height, entry->IsOverrideRedirect);
     if (status == ERROR_SUCCESS)
@@ -7944,8 +7947,6 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         if (entry->Handle == g_InputDragWindow && g_InputDragOriginValid)
             DragAnnounceRecord(entry->X, entry->Y);
         DragSimNoteAnnounce(entry->X, entry->Y);
-
-        SendShellFrameSizeLock(entry);
     }
     return status;
 }
@@ -7955,9 +7956,14 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
 // because a surface is framed at two moments: a cropped card when its crop resolves - AFTER the
 // window was created, so that one goes out on the announce path above - and a kind with no crop
 // rule (Search) from its CREATE, which may never be followed by a configure at all.
+// A POPUP THAT WAS FRAMED KEEPS ITS LOCK FOLLOWING ITS SIZE. Windows 10's search view collapses
+// back to its box (a second entry call) while dom0's window is still managed - the configure
+// precedes the toggle to popup - and is framed again when typing expands it. The X window keeps
+// the hint across both, so a lock left at the other size clamps the configure: measured, the
+// 344x40 box went popup at 784x680 in dom0.
 static void SendShellFrameSizeLock(IN OUT WINDOW_DATA* entry)
 {
-    if (entry->IsOverrideRedirect)
+    if (entry->IsOverrideRedirect && entry->SizeLockW < 0)
         return;
     if (!(entry->CropLeft || entry->CropTop || entry->CropRight || entry->CropBottom) &&
         !IsShellToastWindow(entry))
