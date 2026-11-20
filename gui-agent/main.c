@@ -7115,6 +7115,22 @@ static BOOL CropReadyForMap(IN OUT WINDOW_DATA* entry)
 // dom0 kept its last results beside Start. So when Start maps, a mapped Windows 11 search view is unmapped and held the
 // way the toast hold holds a banner, and SearchViewCoveredByStart keeps it out of the release arm until the broker
 // delivers a newer frame that is painted - the typing that hides Start again.
+// Is a Windows 11 Start window mapped in dom0 now? While it is, the search view Windows keeps behind it stays blank until
+// the user types - it is the same flyout - so an unpainted search view then is waiting, not a display fault (the
+// direct-path fault deadline in UpdateWindowData). Measured row 29 p53, German 25H2: the search companion 0x10198 logged
+// ERROR QGADIRECTSUPPRESS 10 s into every opening (133414.530, 133459.827) while Start was up and drawing.
+static BOOL StartMappedOnScreen(void)
+{
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
+    {
+        const WINDOW_DATA* w = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (w->CreateSent && w->IsVisible && !w->MapDeferred && !w->DeletePending &&
+            ShellSurfaceKind(w) == ShellSurfaceStart)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 static void CoverSearchViewsForStart(IN const WINDOW_DATA* start)
 {
     for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
@@ -11072,6 +11088,10 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             ULONGLONG dsince = windowData->PwDirectSince;
             BOOL windowYoung = !QgaWindowFaultDue(dsince, g_BrokerReadyAt, GetTickCount64(),
                                                   (ULONGLONG)DIRECT_WINDOW_GRACE_MS);
+            // The search view behind a mapped Start is blank by design until the user types (StartMappedOnScreen).
+            if (!windowYoung && ShellSurfaceKind(windowData) == ShellSurfaceSearch &&
+                !ShellSurfaceHostedBySearchApp(windowData) && StartMappedOnScreen())
+                windowYoung = TRUE;
             if (BrokerState() == BRK_STARTING || windowYoung)
             {
                 if (!windowData->PwDirectWaitLogged)

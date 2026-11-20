@@ -163,6 +163,15 @@ static ULONGLONG g_TcClock = 0;
 // LRU like the slot cache. g_TcLock held.
 static struct { HWND Window; RECT Insets; ULONGLONG LastUse; } g_TcLastGood[TOAST_PID_CACHE_SIZE];
 
+// START'S MARGIN CROPS WINDOWS 11'S SEARCH VIEW. The search view has no reliable card of its own (ToastCropLookup's
+// no-rule branch: UIA finds a 728x32 sliver), but it is the same flyout as Start - Windows swaps one for the other on
+// typing - and draws the same shadow margin. Start's measured margin is 13 on every side on 26300 and 12 on 25H2; the
+// search view's own pixels showed 12/13/12/12 on 25H2 (row 29 p51), and on 26300 its raw window IS Start's,
+// (2131,502) 858x890 (p53). So the search view takes Start's last resolved insets at creation, cropped before its
+// first MAP: cropping it after the MAP (ead299a, reverted 4bd985e) made dom0 jump it 200-285 px. g_TcLock held.
+static RECT g_TcStartInsets;
+static BOOL g_TcStartInsetsValid;
+
 static void TcRememberLastGood(IN HWND window, IN const RECT* insets)
 {
     int victim = 0;
@@ -981,6 +990,11 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
         {
             slot->ConfirmAt = GetTickCount64() + TOAST_CROP_CONFIRM_MS;   // see ConfirmAt
             TcRememberLastGood(req->Window, insets);
+            if (req->Rule == TcRuleStart)
+            {
+                g_TcStartInsets = *insets;
+                g_TcStartInsetsValid = TRUE;
+            }
             LogInfo("0x%x: toast card in %ux%u window, insets l=%d t=%d r=%d b=%d",
                 req->Window, req->RawWidth, req->RawHeight,
                 insets->left, insets->top, insets->right, insets->bottom);
@@ -1488,6 +1502,28 @@ BOOL ToastCropLookup(IN const WINDOW_DATA* data, OUT RECT* insets)
     // ends seven "cropped size 728x32 below the floor" warnings per run.
     if (QgaCardRuleForSurface((int)ShellSurfaceKind(data), IsMenuPopupWindow(data)) == QGA_CARD_RULE_NONE)
     {
+        // Windows 11's search view takes Start's margin (g_TcStartInsets). Not Windows 10's: its SearchApp box is a
+        // different window, and Start's insets there are not a margin (l=0 t=4 r=13 b=0).
+        if (ShellSurfaceKind(data) == ShellSurfaceSearch && !ShellSurfaceHostedBySearchApp(data))
+        {
+            RECT s;
+            BOOL have;
+            EnterCriticalSection(&g_TcLock);
+            have = g_TcStartInsetsValid;
+            s = g_TcStartInsets;
+            LeaveCriticalSection(&g_TcLock);
+            if (have)
+            {
+                TcValidateInsets(data->Handle, (LONG)data->Width, (LONG)data->Height, &s);
+                if (s.left || s.top || s.right || s.bottom)
+                {
+                    LogDebug("0x%x: search view cropped by Start's margin l=%d t=%d r=%d b=%d", data->Handle,
+                        s.left, s.top, s.right, s.bottom);
+                    *insets = s;
+                    return TRUE;
+                }
+            }
+        }
         LogDebug("0x%x: no crop rule for this surface kind - announced uncropped", data->Handle);
         return FALSE;
     }
