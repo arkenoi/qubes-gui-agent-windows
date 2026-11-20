@@ -15003,6 +15003,22 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                     // byte-identical - they cost a PrintWindow each and send nothing. Compare
                     // the screen bytes first; skip only when they are provably unchanged AND
                     // the window is unoccluded (see PwScreenUnchanged).
+                    // A WINDOW ABOVE NOW CLAIMS PART OF THIS ONE, ON A FRAME THAT DAMAGES NOTHING OF IT. The DDA gate
+                    // below re-renders a window that leaves DDA mode, but it runs only on a damaged frame, and a window
+                    // nothing damages keeps the composite copies it holds. Measured on row 29 p55 (win10-p46, agent
+                    // f4c57f3): Windows 10 Start was announced as its collapsed 344x40 search-box popup while it drew
+                    // the whole menu, so DDA copied Start into Notepad (seq 30-35, ddacap=1); once Start was re-judged at
+                    // its real size and covered Notepad, Start sat still and Notepad received no damage, so it showed
+                    // Start until Start closed.
+                    if (!pwDamaged && entry->PwCompositeCopied && g_ZOrderValid && rgnCovered &&
+                        RectInRegion(rgnCovered, &pwRect))
+                    {
+                        if (entry->PwDdaActive)
+                            WcSetDdaOwned(entry->Handle, FALSE);
+                        entry->PwDdaActive = FALSE;
+                        entry->PwCompositeCopied = FALSE;
+                        WcMarkDirty(entry->Handle);
+                    }
                     if (pwDamaged)
                     {
                         // DDA source when the screen provably holds this window's pixels:
