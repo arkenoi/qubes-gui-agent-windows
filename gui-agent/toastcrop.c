@@ -1021,15 +1021,13 @@ static void TcApplyResult(IN const TC_QUERY_REQ* req, IN const RECT* insets)
     // pass (and thus the next measurement attempt, paced by RetryAt) so the defer resolves in
     // ~attempts x measurement-time and releases (mapped cropped, or uncropped once the defer
     // budget is spent) instead of stalling for seconds.
+    // Queue THIS window, on every guest: a bare poke re-examines nothing unless a resync is due (rest-zero S4), and a
+    // shell surface rejected while its card was unmeasured is not tracked at all, so nothing else re-examines it.
+    // Measured on Windows 10 (row 29 p56, win10-p46): Start rejected "with no card" at 144428.348, card measured at
+    // 144428.515, accepted at the next resync, 144430.482 - two seconds in which Start was on screen but untracked, so
+    // its pixels were copied into the window beneath it.
     if (attemptDone)
-    {
-        // DirectRequired: queue THIS window - nothing re-checks a held window on a tick there any more, and a bare poke
-        // re-examines nothing unless a resync is due (rest-zero S4). Below 25H2 unchanged (design I).
-        if (DirectRequired())
-            PokeWindowTrackingFor(req->Window);
-        else
-            PokeWindowTracking();
-    }
+        PokeWindowTrackingFor(req->Window);
 }
 
 // ---- the toast hold's identity read (toasthold.c owns the decision; THIS file owns every UIA call) ---
