@@ -284,6 +284,7 @@ static const WCHAR* const g_TcShellHostImages[] = {
     L"ShellExperienceHost.exe",       // notification banners, Action Center
     L"StartMenuExperienceHost.exe",   // Start menu (25H2 shadow margin)
     L"SearchHost.exe",                // search flyout, same XAML shell
+    L"SearchApp.exe",                 // Windows 10's search host: the box and results of Start's search view
 };
 static const WCHAR g_TcToastWindowClass[] = L"Windows.UI.Core.CoreWindow";
 
@@ -1241,12 +1242,13 @@ BOOL ToastCropRequestIdentity(IN HWND window, IN LONG incarnation)
     return queued;
 }
 
-// The order of g_TcShellHostImages defines the kind mapping: [0] -> Toast, [1] -> Start, [2] -> Search.
+// The order of g_TcShellHostImages defines the kind mapping: [0] -> Toast, [1] -> Start, [2] and [3] -> Search.
 // Reads the process image NOW (no cache, no shared state - no lock needed).
 static SHELL_SURFACE_KIND TcShellHostKindUncached(IN DWORD processId)
 {
     static const SHELL_SURFACE_KIND kindByImage[] =
-        { ShellSurfaceToast, ShellSurfaceStart, ShellSurfaceSearch };
+        { ShellSurfaceToast, ShellSurfaceStart, ShellSurfaceSearch, ShellSurfaceSearch };
+    C_ASSERT(RTL_NUMBER_OF(kindByImage) == RTL_NUMBER_OF(g_TcShellHostImages));
 
     if (processId == 0)
         return ShellSurfaceNone;
