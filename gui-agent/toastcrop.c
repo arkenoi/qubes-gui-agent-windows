@@ -781,6 +781,19 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
     if (insets->bottom < 0)
         insets->bottom = 0;
 
+    // START'S MARGIN IS THE SAME ON EVERY SIDE, and UIA cannot see the card's own padding above its first child. On
+    // 26300 the union starts at the search box: card at (2144,531) in an 858x890 window at (2131,502), insets
+    // l=13 t=29 r=13, while the guest's own screen shows the card beginning 13 px in on the left, top and right - so
+    // t=29 cut 16 px off the top of the card. Neither the top nor the bottom inset may exceed the larger side inset.
+    if (rule == TcRuleStart)
+    {
+        const LONG side = insets->left > insets->right ? insets->left : insets->right;
+        if (insets->top > side)
+            insets->top = side;
+        if (insets->bottom > side)
+            insets->bottom = side;
+    }
+
     // MID-SLIDE SIGNATURE (toasts, every path). The slide-in is a XAML translate of the card
     // INSIDE a window that does not move, so the window recheck above cannot see it - but a
     // single read can: a card caught sliding in from the right has its right margin already at
