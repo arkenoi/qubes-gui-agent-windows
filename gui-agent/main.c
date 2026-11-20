@@ -13131,16 +13131,24 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
                 #undef BC_MS
             }
         }
+
+        // Crop-before-show: a NEW per-window broker frame landed, so the crop is now
+        // measurable and the content may now be painted; if this window's MAP is still held,
+        // queue THIS window for the tracking pass, which maps it (the pass is the only legal
+        // release site). Queued by handle, not a bare poke: a poke runs a pass with nothing in
+        // it unless a resync is due, and on a DirectRequired guest nothing re-checks a held
+        // window on a timer any more (rest-zero S4).
+        // ONLY ON A NEW FRAME. A consume pass follows every window-event wake, so queueing a
+        // held window for a frame the pass has already judged makes the pass wake itself with
+        // no end: a held window whose frame is unpainted (Start's search companion, black
+        // until SearchHost draws it) ran the tracking pass 10-14 thousand times a second.
+        // Every other release has its own wake: the crop worker queues the window when its
+        // measurement resolves, MapDeferWakeSweep owns the ceiling and suppression deadlines,
+        // the toast hold wakes its banners.
+        if (entry->MapDeferred)
+            QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
     }
     // else: no new broker frame this pass -> nothing changed, skip
-
-    // Crop-before-show: a per-window broker frame is available, so the crop is now
-    // measurable; if this window's MAP is still held, queue THIS window for the tracking
-    // pass, which maps it (the pass is the only legal release site). Queued by handle, not a
-    // bare poke: a poke runs a pass with nothing in it unless a resync is due, and on a
-    // DirectRequired guest nothing re-checks a held window on a timer any more (rest-zero S4).
-    if (entry->MapDeferred)
-        QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
     return TRUE;
 }
 
