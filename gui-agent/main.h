@@ -177,6 +177,9 @@ typedef struct _WINDOW_DATA
     // release_mapped_mfns), so the re-map must re-announce the buffer first, as ToggleMap does, or the banner comes back with
     // no image. Set at that unmap, cleared when the buffer is re-announced.
     BOOL ToastHoldUnmapped;
+    // Windows 11's search view while Start covers it (main.c SearchViewCoveredByStart): the broker frame id it held when
+    // Start mapped over it and it was unmapped; 0 when not covered. ToastHoldUnmapped is set with it, for the re-announce.
+    UINT64 CoveredFrameId;
     // QGACOMPOSITECOPY said for this window (M4: a composite copy on a DirectRequired guest is an error, said once).
     BOOL PwCompositeLogged;
 

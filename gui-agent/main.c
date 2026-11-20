@@ -7109,6 +7109,44 @@ static BOOL CropReadyForMap(IN OUT WINDOW_DATA* entry)
     return SliceContentReady(entry);
 }
 
+// START AND ITS SEARCH VIEW ARE ONE FLYOUT. A second call of the Start entry while the search view is up reopens Start,
+// and Windows shows Start alone (the guest's own screen, row 29 p51, 25H2 and 26300), but it neither hides nor cloaks the
+// search window: it stays visible at its rect and receives no frame until Windows reports it invisible 20-28 s later, so
+// dom0 kept its last results beside Start. So when Start maps, a mapped Windows 11 search view is unmapped and held the
+// way the toast hold holds a banner, and SearchViewCoveredByStart keeps it out of the release arm until the broker
+// delivers a newer frame that is painted - the typing that hides Start again.
+static void CoverSearchViewsForStart(IN const WINDOW_DATA* start)
+{
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
+    {
+        WINDOW_DATA* c = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        if (c == start || c->MapDeferred || !c->CreateSent || !c->IsVisible || c->Synthesized ||
+            !c->PwBrokerSourced || ShellSurfaceKind(c) != ShellSurfaceSearch || ShellSurfaceHostedBySearchApp(c))
+            continue;
+        (void)SendWindowUnmap(c->Handle);
+        c->ToastHoldUnmapped = TRUE;   // dom0 dropped its image of the buffer: re-announce it before the re-map
+        c->CoveredFrameId = c->PwBrokerLastId ? c->PwBrokerLastId : ~(UINT64)0;
+        c->MapDeferred = TRUE;
+        c->MapDeferSince = GetTickCount64();
+        c->MapDeferDue = 0;
+        LogInfo("QGASEARCHCOVERED hwnd=0x%x Start 0x%x mapped over it: unmapped, held until it paints a newer frame",
+            (DWORD)(ULONG_PTR)c->Handle, (DWORD)(ULONG_PTR)start->Handle);
+    }
+}
+
+static BOOL SearchViewCoveredByStart(IN OUT WINDOW_DATA* entry)
+{
+    if (!entry->CoveredFrameId)
+        return FALSE;
+    if (entry->PwBrokerLastId != 0 && entry->PwBrokerLastId != entry->CoveredFrameId &&
+        SlicePainted((const BYTE*)entry->PwBuffer, (size_t)entry->PwWidth * 4, entry->PwWidth, entry->PwHeight, NULL))
+    {
+        entry->CoveredFrameId = 0;
+        return FALSE;
+    }
+    return TRUE;
+}
+
 // Guest-native window shadows off in seamless, restored in fullscreen. The shell window gives us a
 // process that belongs to the interactive user, which is all the helper needs.
 // TRUE once the helper actually ran. Uses the SESSION token (SpawnHelperInSession), which is
@@ -10930,8 +10968,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     // resolved (so it appears already cropped) or the bounded timeout elapses (mapped uncropped,
     // never lost). CREATE and the per-window buffer are already in place; the cropped geometry has
     // been announced above via SendWindowConfigureIfChanged, so the map lands at the final rect.
+    // A search view Start covers is outside this arm, timeout included, until it paints again.
     if (windowData->MapDeferred && windowData->IsVisible && !windowData->IsIconic &&
-        !windowData->Synthesized)
+        !windowData->Synthesized && !SearchViewCoveredByStart(windowData))
     {
         // The toast hold outranks every arm below: while it says hold/suppress nothing here may map the
         // banner, whatever the crop or the timeout say. Its own deadlines and the bridge's verdict event
@@ -11130,6 +11169,8 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
                 // worked) or the bounded timeout expired with the buffer still unfed
                 // (lead_ms=-1; the flash then shows up in QGASLICECONTENT).
                 PwNoteSliceFedMap(windowData);
+                if (ShellSurfaceKind(windowData) == ShellSurfaceStart)
+                    CoverSearchViewsForStart(windowData);
                 // QGAHELDMAP: the hold every DEFERRED window actually paid, and WHY it ended.
                 // PwNoteSliceFedMap above only fires for PwSliceFed windows, so a MENU - the most
                 // common deferred window there is - produced NO timing line at all and its latency
