@@ -1608,6 +1608,27 @@ static DWORD HandleFocus(IN HWND window)
 static DWORD HandleClose(IN HWND window)
 {
     LogDebug("0x%x", window);
+
+    // START AND ITS SEARCH VIEW IGNORE SC_CLOSE: dom0's titlebar X on the Start window did nothing (owner, 26300,
+    // 4.3.46.1419, 2026-11-20). Both are light-dismiss surfaces that Windows closes when activation leaves them,
+    // which is how the hidden-Start dismissal closes Start (main.c StartOpeningExamine), so the close is the same
+    // here: the foreground goes to the shell desktop. No keystroke - nothing injects input to close Start.
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window, &pid);
+    const SHELL_SURFACE_KIND kind = pid ? ShellHostKindOfProcess(pid) : ShellSurfaceNone;
+    if (kind == ShellSurfaceStart || kind == ShellSurfaceSearch)
+    {
+        const HWND shell = GetShellWindow();
+        FOREGROUND_HOW how = FOREGROUND_REFUSED;
+        if (shell && ApplyForeground(shell, &how))
+            LogInfo("QGASTARTCLOSE 0x%x: dom0 closed the %s window - activation returned to the shell desktop 0x%x",
+                window, kind == ShellSurfaceStart ? L"Start" : L"search", shell);
+        else
+            LogWarning("QGASTARTCLOSE 0x%x: dom0 closed the %s window, but activation to the shell desktop 0x%x was "
+                "refused - it stays open", window, kind == ShellSurfaceStart ? L"Start" : L"search", shell);
+        return ERROR_SUCCESS;
+    }
+
     PostMessage(window, WM_SYSCOMMAND, SC_CLOSE, 0);
 
     return ERROR_SUCCESS;
