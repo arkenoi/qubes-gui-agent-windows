@@ -134,6 +134,7 @@ typedef struct _TOAST_PID_ENTRY
 {
     DWORD     ProcessId;
     SHELL_SURFACE_KIND Kind;   // which g_TcShellHostImages entry matched (None = no match)
+    BOOL      SearchApp;       // the match was SearchApp.exe, Windows 10's search host
     ULONGLONG LastUse;
 } TOAST_PID_ENTRY;
 
@@ -1244,12 +1245,16 @@ BOOL ToastCropRequestIdentity(IN HWND window, IN LONG incarnation)
 
 // The order of g_TcShellHostImages defines the kind mapping: [0] -> Toast, [1] -> Start, [2] and [3] -> Search.
 // Reads the process image NOW (no cache, no shared state - no lock needed).
-static SHELL_SURFACE_KIND TcShellHostKindUncached(IN DWORD processId)
+static SHELL_SURFACE_KIND TcShellHostKindUncached(IN DWORD processId, OUT BOOL* searchApp OPTIONAL)
 {
     static const SHELL_SURFACE_KIND kindByImage[] =
         { ShellSurfaceToast, ShellSurfaceStart, ShellSurfaceSearch, ShellSurfaceSearch };
+    static const BOOL searchAppByImage[] = { FALSE, FALSE, FALSE, TRUE };
     C_ASSERT(RTL_NUMBER_OF(kindByImage) == RTL_NUMBER_OF(g_TcShellHostImages));
+    C_ASSERT(RTL_NUMBER_OF(searchAppByImage) == RTL_NUMBER_OF(g_TcShellHostImages));
 
+    if (searchApp)
+        *searchApp = FALSE;
     if (processId == 0)
         return ShellSurfaceNone;
 
@@ -1270,6 +1275,8 @@ static SHELL_SURFACE_KIND TcShellHostKindUncached(IN DWORD processId)
                 if (0 == _wcsicmp(image, g_TcShellHostImages[i]))
                 {
                     match = kindByImage[i];
+                    if (searchApp)
+                        *searchApp = searchAppByImage[i];
                     break;
                 }
         }
@@ -1279,8 +1286,10 @@ static SHELL_SURFACE_KIND TcShellHostKindUncached(IN DWORD processId)
 }
 
 // g_TcLock must be held. TcShellHostKindUncached behind a small pid cache.
-static SHELL_SURFACE_KIND TcShellHostKind(IN DWORD processId)
+static SHELL_SURFACE_KIND TcShellHostKind(IN DWORD processId, OUT BOOL* searchApp OPTIONAL)
 {
+    if (searchApp)
+        *searchApp = FALSE;
     if (processId == 0)
         return ShellSurfaceNone;
 
@@ -1289,11 +1298,16 @@ static SHELL_SURFACE_KIND TcShellHostKind(IN DWORD processId)
         if (g_TcPidCache[i].ProcessId == processId)
         {
             g_TcPidCache[i].LastUse = ++g_TcClock;
+            if (searchApp)
+                *searchApp = g_TcPidCache[i].SearchApp;
             return g_TcPidCache[i].Kind;
         }
     }
 
-    SHELL_SURFACE_KIND match = TcShellHostKindUncached(processId);
+    BOOL isSearchApp = FALSE;
+    SHELL_SURFACE_KIND match = TcShellHostKindUncached(processId, &isSearchApp);
+    if (searchApp)
+        *searchApp = isSearchApp;
 
     // PIDs are recycled, so a stale hit can misclassify an unrelated process. Harmless by
     // construction: a false positive only asks UIA for a toast card that is not there.
@@ -1306,6 +1320,7 @@ static SHELL_SURFACE_KIND TcShellHostKind(IN DWORD processId)
 
     g_TcPidCache[victim].ProcessId = processId;
     g_TcPidCache[victim].Kind = match;
+    g_TcPidCache[victim].SearchApp = isSearchApp;
     g_TcPidCache[victim].LastUse = ++g_TcClock;
     return match;
 }
@@ -1377,10 +1392,25 @@ SHELL_SURFACE_KIND ShellSurfaceKind(IN const WINDOW_DATA* data)
     TcInit();
 
     EnterCriticalSection(&g_TcLock);
-    SHELL_SURFACE_KIND kind = TcShellHostKind(data->ProcessId);
+    SHELL_SURFACE_KIND kind = TcShellHostKind(data->ProcessId, NULL);
     LeaveCriticalSection(&g_TcLock);
 
     return kind;
+}
+
+// The caller has already classified the window as a Search surface; this says whether its host is Windows 10's
+// SearchApp.exe, whose one window is both the taskbar search box and Start's search view (main.c's frame gate tells
+// the two apart by the window region). The cached lookup's recycled-pid tolerance is the one ShellSurfaceKind has.
+BOOL ShellSurfaceHostedBySearchApp(IN const WINDOW_DATA* data)
+{
+    if (!data)
+        return FALSE;
+    TcInit();
+    BOOL searchApp = FALSE;
+    EnterCriticalSection(&g_TcLock);
+    (void)TcShellHostKind(data->ProcessId, &searchApp);
+    LeaveCriticalSection(&g_TcLock);
+    return searchApp;
 }
 
 // Which shell host a PROCESS is (Start / Search / toast host), by the same image check ShellSurfaceKind uses, read FRESH: the
@@ -1388,7 +1418,7 @@ SHELL_SURFACE_KIND ShellSurfaceKind(IN const WINDOW_DATA* data)
 // decides whether the hidden-Start dismissal (main.c) injects an Escape, and a stale hit would send it to an unrelated app.
 SHELL_SURFACE_KIND ShellHostKindOfProcess(IN DWORD processId)
 {
-    return TcShellHostKindUncached(processId);
+    return TcShellHostKindUncached(processId, NULL);
 }
 
 // g_TcLock must be held.

@@ -2255,18 +2255,37 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         const BOOL settled = cropped ||
             (kind != ShellSurfaceNone &&
              QgaCardRuleForSurface((int)kind, IsMenuPopupWindow(entry)) == QGA_CARD_RULE_NONE);
-        if (settled && QgaShellFrameAllowed(g_ShellManaged, (int)kind,
-                                            entry->Width, entry->Height, g_ScreenWidth, g_ScreenHeight))
+        // WINDOWS 10'S COLLAPSED SEARCH BOX STAYS A POPUP. SearchApp.exe keeps one window for the
+        // taskbar search box and for the search view Start turns into when the user types, and
+        // collapses it to the box with a window region (a 784x680 window cut to 344x40 at (0,640))
+        // while Start is shown. Framed in that state it is a managed window inside Start's area, and
+        // dom0 then focuses neither it nor Start at the next opening. Typing removes the region, and
+        // the flip below frames the search view with a fresh MAP after Start has gone. Keyed on the
+        // host image because SearchHost's window, on Windows 11, is region-cut too while it
+        // composes. Silent: this is re-read on every pass.
+        BOOL collapsedSearchBox = FALSE;
+        if (kind == ShellSurfaceSearch && ShellSurfaceHostedBySearchApp(entry))
         {
-            // Cropped only: while Start is open GetWindowData re-reads its withheld search companion
-            // 10-13 thousand times a second (25H2, 2026-11-20), and the companion's CREATE ovr=0 and
-            // size-lock lines already say it is framed.
+            RECT regionBox, windowRect;
+            const int regionType = GetWindowRgnBox(entry->Handle, &regionBox);
+            collapsedSearchBox = (regionType == SIMPLEREGION || regionType == COMPLEXREGION) &&
+                GetWindowRect(entry->Handle, &windowRect) &&
+                (regionBox.right - regionBox.left < windowRect.right - windowRect.left ||
+                 regionBox.bottom - regionBox.top < windowRect.bottom - windowRect.top);
+        }
+        if (!collapsedSearchBox && settled &&
+            QgaShellFrameAllowed(g_ShellManaged, (int)kind,
+                                 entry->Width, entry->Height, g_ScreenWidth, g_ScreenHeight))
+        {
+            // Cropped only: while Start is open GetWindowData re-reads Windows 11's withheld search
+            // companion thousands of times a second, and the companion's CREATE ovr=0 and size-lock
+            // lines already say it is framed.
             if (cropped)
                 LogDebug("0x%x: cropped shell surface kind=%d announced WM-managed (policy %u)",
                     entry->Handle, kind, g_ShellManaged);
             entry->IsOverrideRedirect = FALSE;
         }
-        else if (settled && kind != ShellSurfaceNone && g_ShellManaged != SHELL_MANAGED_NONE)
+        else if (!collapsedSearchBox && settled && kind != ShellSurfaceNone && g_ShellManaged != SHELL_MANAGED_NONE)
         {
             // The one case worth a line: the policy wanted a frame and the guard refused it.
             LogDebug("0x%x: shell surface %ux%u spans the %ux%u screen - no frame, left o-r",
