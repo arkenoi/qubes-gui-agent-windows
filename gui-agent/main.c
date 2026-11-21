@@ -9985,12 +9985,15 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // draws it, dimmed as Windows draws it. Only a popup without a caption - a dialog keeps its
     // own window - and only into an owner fed by the broker, whose capture is what composites it.
     // The owner's live rect, not its tracked entry: when the owner is maximized or restored, the
-    // popup can be judged in a pass before the owner's entry has caught up. A popup that COVERS
-    // the owner counts too - Edge stretches the overlay to the whole screen for a moment on the
-    // owner's restore - because the capture clips it to the owner. And an owner that is visible
-    // but not tracked yet, or being dropped (the first open, restored before dom0 is told), holds
-    // the popup for this pass instead of letting it reach dom0 as a screen-sized window; the next
-    // pass judges it against the tracked owner.
+    // popup can be judged in a pass before the owner's entry has caught up. Edge resizes the
+    // overlay through sizes of its own on every owner state change - 5136x1408 at (0,0) over a
+    // maximized owner at (8,48)-(5112,1432), 24 px short of its bottom - so no exact containment
+    // test follows it. The capture clips the popup to the owner, so the popup is carried when at
+    // least 90% of it lies over the owner, and also when it is so large that IsPopup would make it
+    // a MANAGED window: dom0's window manager then places it, the agent writes that placement back
+    // onto the popup (DAEMONMOVE), and from there it sits outside its owner, black, for good. A
+    // captioned app frame that is visible but not tracked yet, or being dropped (the first open,
+    // restored before dom0 is told), holds such a popup for the pass; the next pass judges it.
     BOOL insideOwner = FALSE;
     if (IsMenuPopupWindow(data) && data->Owner && WgcBrokerActive())
     {
@@ -10008,12 +10011,17 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         RECT live;
         if (IsWindowVisible(data->Owner) && GetWindowRect(data->Owner, &live))
         {
-            const LONG l = (LONG)data->X, t = (LONG)data->Y;
-            const LONG r = l + (LONG)data->Width, b = t + (LONG)data->Height;
-            const BOOL inside = l >= live.left && t >= live.top && r <= live.right && b <= live.bottom;
-            const BOOL covers = l <= live.left && t <= live.top && r >= live.right && b >= live.bottom;
-            const BOOL pending = !ownerData || ownerData->DeletePending;
-            insideOwner = (inside || covers) && (pending || ownerData->PwSliceFed);
+            RECT popup, overlap;
+            SetRect(&popup, (LONG)data->X, (LONG)data->Y,
+                (LONG)data->X + (LONG)data->Width, (LONG)data->Y + (LONG)data->Height);
+            const LONGLONG area = (LONGLONG)data->Width * data->Height;
+            const LONGLONG over = IntersectRect(&overlap, &popup, &live) ?
+                (LONGLONG)(overlap.right - overlap.left) * (overlap.bottom - overlap.top) : 0;
+            const BOOL mostlyOver = area > 0 && over * 10 >= area * 9;
+            const BOOL wmPlaced = over > 0 && data->IsVisible && !HasFlags(data->ExStyle, WS_EX_APPWINDOW) && !IsPopup(data);
+            const BOOL pending = (!ownerData || ownerData->DeletePending) &&
+                (GetWindowLongW(data->Owner, GWL_STYLE) & WS_CAPTION) == WS_CAPTION;
+            insideOwner = (mostlyOver || wmPlaced) && (pending || (ownerData && ownerData->PwSliceFed));
             if (insideOwner && pending)
             {
                 LogDebug("0x%x: owned popup (class %s, %ux%u at %d,%d) over owner 0x%x, which is not tracked "
@@ -10028,7 +10036,7 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
         const WINDOW_DATA* ownerData = FindWindowByHandle(data->Owner);
         if (ownerData)
         {
-            LogDebug("0x%x: owned popup (class %s, %ux%u at %d,%d) lies wholly inside owner 0x%x "
+            LogDebug("0x%x: owned popup (class %s, %ux%u at %d,%d) is over owner 0x%x "
                 L"(%ux%u at %d,%d) - not announced; the owner's capture carries it",
                 (DWORD)(ULONG_PTR)data->Handle, data->Class, data->Width, data->Height, data->X, data->Y,
                 (DWORD)(ULONG_PTR)data->Owner, ownerData->Width, ownerData->Height, ownerData->X, ownerData->Y);
@@ -10805,6 +10813,19 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             status = SendWindowFlags(windowData->Handle, 0, WINDOW_FLAG_MINIMIZE); // unset minimize
             if (status != ERROR_SUCCESS)
                 goto end;
+            // Clearing the flag does not bring the window back: dom0 iconified it, and gui-daemon
+            // says «Restoring window from minimize state is exactly the same as MSG_MAP»
+            // (xside.c:3349) - for an unmapped window it ignores the flag. A window Windows itself
+            // restores (the app, a script, a notification) needs the MAP. It used to arrive by
+            // accident from the foreground raise, which re-MAPs a window; a broker-fed window
+            // skips that raise, so it stayed unmapped. A restore dom0 started has mapped it
+            // already, and a second MAP of a mapped window only raises it.
+            if (windowData->CreateSent && !windowData->MapDeferred && data.IsVisible)
+            {
+                status = SendWindowMap(windowData);
+                if (status != ERROR_SUCCESS)
+                    goto end;
+            }
             // A window added while minimized never got a per-window buffer (attach is
             // gated on !IsIconic); attach now that it has real content. Failure just
             // leaves it on the legacy path.
