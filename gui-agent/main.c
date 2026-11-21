@@ -7609,10 +7609,15 @@ static HWND OwnedOverlayOver(IN HWND owner)
 }
 
 static HWND g_OpenNormalDeferred[8];
+// The normal placement each had when it was deferred, in screen coordinates (empty if unread). A work-area change while
+// the window stays maximized rewrites that placement (WaRefitProc re-maximizes it through SetWindowPlacement), so this
+// one is applied after the show.
+static RECT g_OpenNormalRect[8];
 
 // Every tracking pass: a window announced maximized under its overlay is shown normal on the pass that finds the overlay
 // gone - its hide or destroy is an event, so that pass follows at once, with no input. A window minimized meanwhile
-// waits; one gone, or no longer maximized (the user or the app restored it), is forgotten.
+// waits; one gone, or no longer maximized (the user or the app restored it), is forgotten. The show and the move to the
+// remembered normal rect are both posted, so the app applies them in order and a hung app stalls nothing here.
 static void ShowNormalOnceOverlayGone(void)
 {
     for (UINT i = 0; i < RTL_NUMBER_OF(g_OpenNormalDeferred); i++)
@@ -7628,11 +7633,20 @@ static void ShowNormalOnceOverlayGone(void)
         if (OwnedOverlayOver(window))
             continue;
         g_OpenNormalDeferred[i] = NULL;
-        if (ShowWindowAsync(window, SW_SHOWNORMAL))
-            LogInfo("QGAOPENNORMAL 0x%x: its overlay is gone - shown normal now", window);
-        else
+        const RECT normal = g_OpenNormalRect[i];
+        if (!ShowWindowAsync(window, SW_SHOWNORMAL))
+        {
             LogWarning("QGAOPENNORMAL 0x%x: its overlay is gone, showing it normal was refused (0x%x) - left maximized",
                 window, GetLastError());
+            continue;
+        }
+        if (!IsRectEmpty(&normal) && !SetWindowPos(window, NULL, normal.left, normal.top,
+            normal.right - normal.left, normal.bottom - normal.top, SWP_ASYNCWINDOWPOS | SWP_NOZORDER | SWP_NOACTIVATE))
+            LogWarning("QGAOPENNORMAL 0x%x: its overlay is gone, shown normal, the move to %d,%d %dx%d was refused (0x%x)",
+                window, normal.left, normal.top, normal.right - normal.left, normal.bottom - normal.top, GetLastError());
+        else
+            LogInfo("QGAOPENNORMAL 0x%x: its overlay is gone - shown normal now, at %d,%d %dx%d", window,
+                normal.left, normal.top, normal.right - normal.left, normal.bottom - normal.top);
     }
 }
 
@@ -7657,10 +7671,23 @@ static BOOL RestoreWindowOpenedMaximized(IN const WINDOW_DATA* entry)
         {
             if (!g_OpenNormalDeferred[i])
             {
+                // rcNormalPosition is in workspace coordinates (origin: the work area of the window's monitor) unless
+                // the window is a tool window.
+                WINDOWPLACEMENT wp = { sizeof(wp) };
+                MONITORINFO mi = { sizeof(mi) };
+                SetRectEmpty(&g_OpenNormalRect[i]);
+                if (GetWindowPlacement(entry->Handle, &wp) &&
+                    GetMonitorInfoW(MonitorFromWindow(entry->Handle, MONITOR_DEFAULTTONEAREST), &mi))
+                {
+                    g_OpenNormalRect[i] = wp.rcNormalPosition;
+                    if (!(GetWindowLongW(entry->Handle, GWL_EXSTYLE) & WS_EX_TOOLWINDOW))
+                        OffsetRect(&g_OpenNormalRect[i], mi.rcWork.left, mi.rcWork.top);
+                }
                 g_OpenNormalDeferred[i] = entry->Handle;
                 LogInfo("QGAOPENNORMAL 0x%x: opened maximized (%ux%u, pid %lu) under its overlay 0x%x - announced maximized, "
-                    "shown normal once the overlay is gone", entry->Handle, entry->Width, entry->Height, entry->ProcessId,
-                    overlay);
+                    "shown normal once the overlay is gone (normal %d,%d %dx%d)", entry->Handle, entry->Width, entry->Height,
+                    entry->ProcessId, overlay, g_OpenNormalRect[i].left, g_OpenNormalRect[i].top,
+                    g_OpenNormalRect[i].right - g_OpenNormalRect[i].left, g_OpenNormalRect[i].bottom - g_OpenNormalRect[i].top);
                 return FALSE;
             }
         }
