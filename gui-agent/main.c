@@ -3078,7 +3078,16 @@ static BOOL WgcCreateSection(void)
 // anywhere in the log, so WHY it failed is unknowable from the evidence. schtasks prints its reason
 // ("ERROR: ...") on its own streams, which CREATE_NO_WINDOW sent nowhere. A transient must never be
 // discarded silently (.claude/skills/experimenter rule 11).
+static BOOL WgcRunSchtasksEx(const WCHAR* argtail, IN BOOL waitForScheduler, OUT DWORD *exitCode, OUT WCHAR *out,
+    IN size_t outCch);
 static BOOL WgcRunSchtasks(const WCHAR* argtail, OUT DWORD *exitCode, OUT WCHAR *out, IN size_t outCch)
+{
+    return WgcRunSchtasksEx(argtail, FALSE, exitCode, out, outCch);
+}
+// waitForScheduler: a helper's /create, which Task Scheduler holds until it can start the task's interactive-token
+// instance - see HelperTaskRegister. It is waited for until schtasks returns or the agent leaves, never ended early.
+static BOOL WgcRunSchtasksEx(const WCHAR* argtail, IN BOOL waitForScheduler, OUT DWORD *exitCode, OUT WCHAR *out,
+    IN size_t outCch)
 {
     WCHAR sys[MAX_PATH];
     HANDLE rd = NULL, wr = NULL;
@@ -3118,10 +3127,25 @@ static BOOL WgcRunSchtasks(const WCHAR* argtail, OUT DWORD *exitCode, OUT WCHAR 
     // WRITER IS STILL OPEN. On expiry the child was left running, holding the write end, so the read
     // after this "bound" had no deadline at all and the 15 s was not a bound on that path. Ending
     // the child closes its handle, so the read returns at EOF and the whole call stays bounded.
-    const DWORD w = WaitForSingleObject(pi.hProcess, 15000);
-    if (w == WAIT_TIMEOUT)
+    BOOL ended = FALSE;
+    if (waitForScheduler)
+    {
+        HANDLE hs[2] = { pi.hProcess, g_ShutdownEvent };
+        const DWORD w = WaitForMultipleObjects(g_ShutdownEvent ? 2 : 1, hs, FALSE, INFINITE);
+        if (w != WAIT_OBJECT_0)
+        {
+            LogInfo("schtasks still waiting on Task Scheduler as the agent leaves (%s, wait=0x%lx) - ending it",
+                argtail, w);
+            ended = TRUE;
+        }
+    }
+    else if (WaitForSingleObject(pi.hProcess, 15000) == WAIT_TIMEOUT)
     {
         LogWarning("schtasks did not finish within 15 s (%s) - ending it and treating the call as failed", argtail);
+        ended = TRUE;
+    }
+    if (ended)
+    {
         (void)TerminateProcess(pi.hProcess, 1);
         (void)WaitForSingleObject(pi.hProcess, 1000);   // let it die so the pipe's write end closes
     }
@@ -3406,32 +3430,24 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
     StringCchPrintfW(cmd, RTL_NUMBER_OF(cmd), L"/create /tn %s /xml \"%s\" /f", taskName, file);
     DWORD rc = 0;
     WCHAR why[512] = L"";
-    ok = WgcRunSchtasks(cmd, &rc, why, RTL_NUMBER_OF(why));
-    _mt2 = GetTickCount64();   /* the first schtasks /create returned */
-    if (!ok)
-    {
-        // ONE BOUNDED RETRY, because this failure was MEASURED TRANSIENT and treating it as
-        // terminal costs the whole feature. 2026-10-10 on win11r-up during an install:
-        // `/create /xml` failed for Qubes-WgcBroker, and BrokerSupervise then said "the de-slice
-        // broker's one launch failed and is not retried ... until the next GUI agent start" - so
-        // per-window surfaces were withheld for the rest of the agent's life. Probed on that same
-        // guest afterwards: Task Scheduler Running, the task present and Status: Running, and a
-        // fresh `/create /xml` returning rc=0 SUCCESS. A momentary refusal cost the session.
-        // This is NOT a relaunch loop (owner 2026-10-07 forbids relaunching a helper that relaunches
-        // itself): it retries a REGISTRATION, which starts nothing by itself.
-        LogWarning("QGAHELPERTASK schtasks /create /xml failed for %s (rc=%lu: %s) - retrying once",
-            taskName, rc, why[0] ? why : L"schtasks said nothing");
-        Sleep(500);
-        _mretry = 1;
-        ok = WgcRunSchtasks(cmd, &rc, why, RTL_NUMBER_OF(why));
-    }
+    // WAITED FOR, NEVER ENDED EARLY, NEVER RETRIED. Task Scheduler holds a /create whose registration trigger fires
+    // until it can start the task's InteractiveToken instance, and early in a boot that waits for the user's logon.
+    // Measured 2026-11-21 on win11de (build 1433, uptime 17 s), the scheduler's own log: the bridge registered and
+    // its trigger fired at 12:40:13.041, the broker's trigger at 13.051 with its registration NOT complete; both
+    // processes started at 12:40:29.08-.11, and only then did the broker's registration complete. The old 15 s bound
+    // ended that schtasks at 12:40:27.98 and called it failed - but it had registered, and its broker launched - and
+    // the retry registered AGAIN, which queued a second broker instance behind the first (event 324). On build 1431
+    // the wait outlasted both 15 s windows and the bridge was declared dead (QGANOTIFLAUNCHFAIL). The wait costs
+    // nothing here: this runs on the helper's launch thread, off the main loop, and the agent's exit ends it.
+    ok = WgcRunSchtasksEx(cmd, TRUE, &rc, why, RTL_NUMBER_OF(why));
+    _mt2 = GetTickCount64();   /* schtasks /create returned */
     _mt3 = GetTickCount64();   /* registration done, before the temp file goes */
     DeleteFileW(file);
     if (!ok)
         // THE REASON IS IN THE LINE NOW. It used to carry neither the exit code nor schtasks' own
         // text, because CREATE_NO_WINDOW sent both nowhere - so the one occurrence in the field
         // could not be diagnosed from the evidence at all.
-        LogError("QGAHELPERTASK schtasks /create /xml failed TWICE for %s (resident=%d, rc=%lu: %s) - "
+        LogError("QGAHELPERTASK schtasks /create /xml failed for %s (resident=%d, rc=%lu: %s) - "
             L"the helper does not start",
             taskName, resident, rc, why[0] ? why : L"schtasks said nothing");
     else
@@ -4726,15 +4742,12 @@ static void BrokerShutdown(void)
     // schtasks against the SAME task: without this wait a /delete here could overtake the /create
     // there and leave the task registered with the agent gone - which is a broker Task Scheduler
     // keeps restarting and nothing supervises.
-    // THE BOUND IS SIZED ON THE MEASUREMENT, NOT ON STACKED WORST CASES. Measured registrations on
-    // this rig: 0.374, 1.040, 1.676 and 7.524 s. What the code GUARANTEES is 48.5 s - three schtasks
-    // subprocesses (WgcLaunch's /delete, HelperTaskRegister's /create and its retry) at 15 s plus a
-    // second to end a child that outstays it, plus the 500 ms gap - but that is bound arithmetic, a
-    // duration nothing here has ever taken. Waiting it out on the EXIT path would turn a rare
-    // schtasks stall into an agent that hangs on shutdown, and the Service Control Manager's
-    // patience on a stop is shorter than that. So: 20 s, which is 2.7x the slowest registration ever
-    // measured; an expiry is an anomaly, said at ERROR, and the disarm below then runs anyway
-    // because the task must not outlive us. This is the only place the agent waits on the launch.
+    // The launch's /create waits for Task Scheduler without a bound of its own, but it also ends on
+    // g_ShutdownEvent (WgcRunSchtasksEx), which is set by now - so the launch thread returns within
+    // a second of it; WgcLaunch's /delete keeps its 15 s bound. 20 s is the ceiling on the EXIT path,
+    // where the Service Control Manager's patience on a stop is short: an expiry is an anomaly, said
+    // at ERROR, and the disarm below then runs anyway because the task must not outlive us. This is
+    // the only place the agent waits on the launch.
     if (g_WgcLaunchThread)
     {
         const DWORD lw = WaitForSingleObject(g_WgcLaunchThread, 20000);
@@ -10813,19 +10826,22 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             status = SendWindowFlags(windowData->Handle, 0, WINDOW_FLAG_MINIMIZE); // unset minimize
             if (status != ERROR_SUCCESS)
                 goto end;
-            // Clearing the flag does not bring the window back: dom0 iconified it, and gui-daemon
-            // says «Restoring window from minimize state is exactly the same as MSG_MAP»
-            // (xside.c:3349) - for an unmapped window it ignores the flag. A window Windows itself
-            // restores (the app, a script, a notification) needs the MAP. It used to arrive by
-            // accident from the foreground raise, which re-MAPs a window; a broker-fed window
-            // skips that raise, so it stayed unmapped. A restore dom0 started has mapped it
-            // already, and a second MAP of a mapped window only raises it.
-            if (windowData->CreateSent && !windowData->MapDeferred && data.IsVisible)
+            // Clearing the flag does not bring the window back. dom0 iconified it, and gui-daemon
+            // ignores the flag for that window (xside.c:3349: restoring «is exactly the same as
+            // MSG_MAP»), while its MAP handler returns early for a window it still counts as mapped
+            // (`if (vm_window->is_mapped) return;`) - and only a guest MSG_UNMAP clears that, never
+            // the iconify. So a window Windows itself restores (the app, a script, a notification)
+            // needs UNMAP then MAP, the way upstream's Linux agent unmaps and maps its windows. A
+            // restore dom0 asked for is mapped by dom0's window manager already: left alone.
+            if (windowData->CreateSent && !windowData->MapDeferred && data.IsVisible &&
+                !(windowData->Dom0RestoreTick && GetTickCount64() - windowData->Dom0RestoreTick < 5000))
             {
-                status = SendWindowMap(windowData);
+                LogInfo("0x%x restored from minimized by Windows, not by dom0 - re-mapped", windowData->Handle);
+                status = ToggleMap(windowData);
                 if (status != ERROR_SUCCESS)
                     goto end;
             }
+            windowData->Dom0RestoreTick = 0;
             // A window added while minimized never got a per-window buffer (attach is
             // gated on !IsIconic); attach now that it has real content. Failure just
             // leaves it on the legacy path.

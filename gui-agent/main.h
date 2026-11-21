@@ -339,6 +339,9 @@ typedef struct _WINDOW_DATA
     // Restart placement (P3, owner 2026-10-01): when the window was re-created in dom0 by a bulk enumeration (agent start,
     // seamless re-entry), the GetTickCount64() of that create; 0 = none pending. See HandleConfigure.
     ULONGLONG RestartPlacementTick;
+    // GetTickCount64() of dom0's last restore-from-minimized request (HandleWindowFlags); 0 = none. A restore dom0
+    // asked for is mapped by dom0 itself, so UpdateWindowData does not UNMAP+MAP it.
+    ULONGLONG Dom0RestoreTick;
 
     // Card size the dom0 size-lock hint was last sent for (WM-managed shell surfaces only).
     // -1 = never sent; re-sent when the announced card size changes.

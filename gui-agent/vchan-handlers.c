@@ -1666,6 +1666,11 @@ static DWORD HandleWindowFlags(IN HWND window)
 
     if (flagsMsg.flags_unset & WINDOW_FLAG_MINIMIZE) // restore
     {
+        EnterCriticalSection(&g_csWatchedWindows);
+        WINDOW_DATA* data = FindWindowByHandle(window);
+        if (data)
+            data->Dom0RestoreTick = GetTickCount64();
+        LeaveCriticalSection(&g_csWatchedWindows);
         ShowWindowAsync(window, SW_RESTORE);
     }
     else if (flagsMsg.flags_set & WINDOW_FLAG_MINIMIZE) // minimize
