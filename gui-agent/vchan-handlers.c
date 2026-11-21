@@ -1091,14 +1091,18 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
             LogWarning("configure for synthesized window 0x%x, ignoring", window);
             data = NULL;
         }
+        if (data && data->RecreatePending)
+        {
+            // About the window a popup re-create destroyed (UpdateWindowData): dom0 has no such window any more, so
+            // its geometry is not applied, and no ACK goes back - it would name a window dom0 does not have.
+            LogDebug("configure (%d,%d) %ux%u for 0x%x, which is being re-created as a popup - ignored",
+                configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height, window);
+            LeaveCriticalSection(&g_csWatchedWindows);
+            return ERROR_SUCCESS;
+        }
 
         if (data != NULL)
         {
-            // The size dom0 holds for this window: a popup flip's MAP waits on it (UpdateWindowData).
-            data->DaemonCfgSeen = TRUE;
-            data->DaemonCfgW = configureMsg.width;
-            data->DaemonCfgH = configureMsg.height;
-
             // Is a GUEST-NATIVE drag holding this window right now? Both the trace line and
             // the guard below need it, and it is the fact the inbound path never considered.
             const BOOL dragHeld = (window == g_InputDragWindow && g_InputDragOriginValid);
@@ -1303,9 +1307,18 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
                         data->Height = configureMsg.height;
                     }
 
-                    // Inference sample for the work-area sync: a daemon-dictated
-                    // origin reveals the dom0 panel + frame margins.
-                    WorkAreaNoteDaemonOrigin(configureMsg.x, configureMsg.y);
+                    // Inference sample for the work-area sync: an origin dom0's window manager chose for a
+                    // managed window reveals dom0's panel + frame margins. Not every configure is one: dom0
+                    // re-sends the geometry it holds when it refuses ours (xside.c handle_configure_from_vm),
+                    // and that can be a position this guest announced itself; an override-redirect window is
+                    // never placed by the window manager; a size-only change carries the guest's own origin.
+                    // Measured 2026-11-21, win11r-sup, build-4.3.46.1425: the work area went (16,56) ->
+                    // (16,31) -> (11,31) -> (5,31) while dom0 held the maximized window at y=56, and its last
+                    // 20 rows ran off dom0's 1440-row screen.
+                    if (!noMove && !data->IsOverrideRedirect &&
+                        !(configureMsg.x == data->CreateX && configureMsg.y == data->CreateY) &&
+                        !(data->CfgSentValid && configureMsg.x == data->LastCfgX && configureMsg.y == data->LastCfgY))
+                        WorkAreaNoteDaemonOrigin(configureMsg.x, configureMsg.y);
 
                     // The daemon knows this geometry (it dictated it); record it as
                     // last-sent so the tracking pass does not echo it back.
@@ -1669,6 +1682,19 @@ static DWORD HandleDestroy(IN HWND window, OUT BOOL* screenDestroyed)
     if (window == NULL) // desktop
     {
         *screenDestroyed = TRUE;
+    }
+    else
+    {
+        // dom0's confirm of a popup re-create's DESTROY (UpdateWindowData): every message dom0 sent about the old
+        // window has arrived, so the tracking pass may now CREATE it again.
+        EnterCriticalSection(&g_csWatchedWindows);
+        WINDOW_DATA* data = FindWindowByHandle(window);
+        BOOL release = data != NULL && data->RecreatePending;
+        if (release)
+            data->RecreateConfirmed = TRUE;
+        LeaveCriticalSection(&g_csWatchedWindows);
+        if (release)
+            PokeWindowTrackingFor(window);
     }
     return ERROR_SUCCESS;
 }

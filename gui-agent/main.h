@@ -353,12 +353,17 @@ typedef struct _WINDOW_DATA
     DWORD DaemonMaxW;
     DWORD DaemonMaxH;
 
-    // A managed -> override-redirect flip whose MAP waits until dom0 holds the popup's size (UpdateWindowData).
-    // DaemonCfgSeen/W/H: the last configure dom0 sent for this window since the flip's own configure went out.
-    BOOL PopupMapPending;
-    BOOL DaemonCfgSeen;
-    DWORD DaemonCfgW;
-    DWORD DaemonCfgH;
+    // A managed -> override-redirect flip re-creates the window in dom0 (UpdateWindowData). RecreatePending: DESTROY
+    // went out and dom0 has no window for this hwnd, so nothing may be sent for it. RecreateConfirmed: dom0's
+    // confirming MSG_DESTROY arrived (HandleDestroy), so every message dom0 sent about the old window is behind us;
+    // the next tracking pass sends CREATE (override-redirect, the popup's size) and MAP.
+    BOOL RecreatePending;
+    BOOL RecreateConfirmed;
+
+    // The origin this window's CREATE announced. dom0 holds it until its window manager moves the window and can send
+    // it back (a refused configure is answered with the geometry dom0 holds), so it is no sample of dom0's placement.
+    int CreateX;
+    int CreateY;
 
     // Slice-fed per-window buffer: content is copied from the composited DDA screen
     // framebuffer (agent-side slice) instead of PrintWindow. Used for windows PrintWindow

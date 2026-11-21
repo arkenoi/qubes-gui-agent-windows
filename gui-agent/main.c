@@ -7645,6 +7645,8 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
             goto end;
         }
         entry->CreateSent = TRUE;
+        entry->CreateX = entry->X;
+        entry->CreateY = entry->Y;
         SendShellFrameSizeLock(entry);
 
         // FAULT INJECTION (test builds only, rank 1). Reproduces the 13 duplicate CREATEs
@@ -10519,6 +10521,42 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         goto end;
     }
 
+    // A popup re-create in flight (the flip below). Until dom0 confirms the DESTROY it has no window for this hwnd,
+    // so nothing is sent for it; once it has, the window is announced with the state the flip recorded (popup flag,
+    // size, position) exactly as AddWindow announces one, and the rest of this pass sends whatever changed since.
+    if (windowData->RecreatePending)
+    {
+        if (!windowData->RecreateConfirmed)
+            goto end;
+        windowData->RecreatePending = FALSE;
+        windowData->RecreateConfirmed = FALSE;
+        status = SendWindowCreate(windowData);
+        if (status != ERROR_SUCCESS)
+            goto end;
+        windowData->CreateSent = TRUE;
+        windowData->CreateX = windowData->X;
+        windowData->CreateY = windowData->Y;
+        windowData->CfgSentValid = FALSE;
+        SendShellFrameSizeLock(windowData);
+        // dom0 released its mapping of the per-window buffer with the old window; the grants are still valid.
+        if (PwIsAttached(windowData))
+        {
+            status = PwRemapWindow(windowData);
+            if (status != ERROR_SUCCESS)
+                goto end;
+        }
+        if (!windowData->MapDeferred && (windowData->IsVisible || windowData->IsIconic))
+            status = SendWindowMap(windowData);
+        if (status == ERROR_SUCCESS && windowData->IsVisible)
+            status = SendWindowDamageEvent(windowData->Handle, 0, 0, windowData->Width, windowData->Height);
+        if (status == ERROR_SUCCESS && windowData->IsIconic)
+            status = SendWindowFlags(windowData->Handle, WINDOW_FLAG_MINIMIZE, 0);
+        if (status == ERROR_SUCCESS)
+            status = SendWindowName(windowData->Handle, windowData->Caption);
+        if (status != ERROR_SUCCESS)
+            goto end;
+    }
+
     // get current window state
     status = GetWindowData(windowData->Handle, &ptr);
     if (status != ERROR_SUCCESS)
@@ -10821,56 +10859,41 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     }
     else
     {
-        // configure first, then popup state
-        if (coordsChanged)
+        // configure first, then popup state - unless the flip re-creates the window (below): a configure dom0
+        // accepted just before the DESTROY would draw the managed frame at the popup's size for that instant.
+        const BOOL recreate = popupStateChanged && !ToastBannerWithheld(windowData) &&
+            windowData->CreateSent && PwIsAttached(windowData);
+        if (coordsChanged && !recreate)
         {
             status = SendWindowConfigureIfChanged(windowData);
             if (status != ERROR_SUCCESS)
                 goto end;
         }
 
-        // The MAP of a managed -> popup flip waits for a later pass. dom0 discards an agent configure while one of
-        // its own is still queued for the window (xside.c handle_configure_from_vm re-sends its own instead), and
-        // a MAP carries no size: the override-redirect MAP then lands at dom0's old, large size, and dom0's
-        // large-window protection strips the flag and warns the user. Measured 2026-11-21 on Edge's first-run
-        // overlay (win11de-p46): CONFIGURE 2513x1332 ovr=1 discarded, MAP ovr=1 mapped at 5104x1376.
-        if (popupStateChanged)
+        // A managed -> popup flip RE-CREATES the window in dom0; an UNMAP+MAP cannot carry it. A MAP carries no
+        // size, and dom0 discards an agent configure while one of its own is still queued for the window (xside.c
+        // handle_configure_from_vm re-sends its own instead), so the override-redirect MAP landed at dom0's old,
+        // large size and dom0's large-window protection stripped the flag and warned the user. Measured 2026-11-21
+        // on Edge's first-run overlay (win11de-p46): CONFIGURE 2513x1332 ovr=1 discarded, MAP ovr=1 at 5104x1376.
+        // dom0 answers a DESTROY with its own MSG_DESTROY once the window is gone (xside.c handle_destroy, protocol
+        // 1.5+; an attached per-window buffer proves 1.7+), so everything it sent about the old window arrives
+        // before that confirm. The CREATE sent after it carries the popup's size and flag on a window with nothing
+        // queued: no wait on a timer, no re-send, and dom0 never draws the managed frame at the popup's size.
+        // A held toast banner skips it as it skipped the toggle; a window without a buffer keeps the toggle.
+        if (popupStateChanged && !ToastBannerWithheld(windowData))
         {
-            windowData->PopupMapPending = TRUE;
-            windowData->DaemonCfgSeen = FALSE;
-        }
-    }
-
-    // The deferred popup MAP. dom0 answering with another size since the flip's configure means that configure was
-    // discarded: send it again and keep waiting (a dom0 resize that made the window large flips it back above,
-    // which clears this). Otherwise dom0 holds the popup's size and the override-redirect MAP is safe.
-    if (popupStateChanged && oldPopupState)
-        windowData->PopupMapPending = FALSE;
-    else if (windowData->PopupMapPending && !popupStateChanged)
-    {
-        if (windowData->DaemonCfgSeen &&
-            (windowData->DaemonCfgW != windowData->Width || windowData->DaemonCfgH != windowData->Height))
-        {
-            LogInfo("QGAPOPUPMAPWAIT 0x%x: dom0 holds %lux%lu, not the popup's %lux%lu - configure sent again, "
-                "override-redirect MAP waits", windowData->Handle, windowData->DaemonCfgW, windowData->DaemonCfgH,
-                windowData->Width, windowData->Height);
-            windowData->DaemonCfgSeen = FALSE;
-            windowData->CfgSentValid = FALSE;
-            status = SendWindowConfigureIfChanged(windowData);
-            if (status != ERROR_SUCCESS)
-                goto end;
-        }
-        else
-        {
-            windowData->PopupMapPending = FALSE;
-            // A popup-state flip re-announces through UNMAP+MAP (ToggleMap) - which would MAP a banner the toast
-            // hold is withholding. The daemon learns the flag at the eventual MAP anyway, so a held toast skips it.
-            if (!ToastBannerWithheld(windowData))
+            if (recreate)
             {
-                status = ToggleMap(windowData);
-                if (status != ERROR_SUCCESS)
-                    goto end;
+                LogDebug("0x%x: managed -> popup at %ux%u, re-created in dom0 after its confirm",
+                    windowData->Handle, windowData->Width, windowData->Height);
+                status = SendWindowDestroy(windowData->Handle);
+                windowData->CreateSent = FALSE;
+                windowData->RecreatePending = TRUE;
+                goto end;
             }
+            status = ToggleMap(windowData);
+            if (status != ERROR_SUCCESS)
+                goto end;
         }
     }
 
