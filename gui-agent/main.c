@@ -3431,10 +3431,12 @@ static BOOL HelperTaskRegister(IN const WCHAR *taskName, IN const WCHAR *exePath
     DWORD rc = 0;
     WCHAR why[512] = L"";
     // WAITED FOR, NEVER ENDED EARLY, NEVER RETRIED. Task Scheduler holds a /create whose registration trigger fires
-    // until it can start the task's InteractiveToken instance, and early in a boot that waits for the user's logon.
-    // Measured 2026-11-21 on win11de (build 1433, uptime 17 s), the scheduler's own log: the bridge registered and
-    // its trigger fired at 12:40:13.041, the broker's trigger at 13.051 with its registration NOT complete; both
-    // processes started at 12:40:29.08-.11, and only then did the broker's registration complete. The old 15 s bound
+    // until the task's process is created, and creating a never-run binary waits for Smart App Control's reputation
+    // lookup: on a template whose WinHTTP proxy is 127.0.0.1:8082 with nothing listening, ~8 s per new binary
+    // (measured 2026-11-21 on win11de: schtasks /create 8146 ms with that proxy, 65-75 ms with Defender's cloud hosts
+    // bypassed). Scheduler log, build 1433, uptime 17 s: the bridge registered and its trigger fired at
+    // 12:40:13.041, the broker's trigger at 13.051 with its registration NOT complete; both processes started at
+    // 12:40:29.08-.11, and only then did the broker's registration complete. The old 15 s bound
     // ended that schtasks at 12:40:27.98 and called it failed - but it had registered, and its broker launched - and
     // the retry registered AGAIN, which queued a second broker instance behind the first (event 324). On build 1431
     // the wait outlasted both 15 s windows and the bridge was declared dead (QGANOTIFLAUNCHFAIL). The wait costs
