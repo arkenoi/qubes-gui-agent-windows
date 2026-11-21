@@ -1093,9 +1093,9 @@ static DWORD HandleConfigure(IN HWND window, BOOL replyToMessages)
         }
         if (data && data->RecreatePending)
         {
-            // About the window a popup re-create destroyed (UpdateWindowData): dom0 has no such window any more, so
-            // its geometry is not applied, and no ACK goes back - it would name a window dom0 does not have.
-            LogDebug("configure (%d,%d) %ux%u for 0x%x, which is being re-created as a popup - ignored",
+            // About the window a popup-state re-create destroyed (UpdateWindowData): dom0 has no such window any more,
+            // so its geometry is not applied, and no ACK goes back - it would name a window dom0 does not have.
+            LogDebug("configure (%d,%d) %ux%u for 0x%x, which is being re-created - ignored",
                 configureMsg.x, configureMsg.y, configureMsg.width, configureMsg.height, window);
             LeaveCriticalSection(&g_csWatchedWindows);
             return ERROR_SUCCESS;
@@ -1690,7 +1690,7 @@ static DWORD HandleDestroy(IN HWND window, OUT BOOL* screenDestroyed)
     }
     else
     {
-        // dom0's confirm of a popup re-create's DESTROY (UpdateWindowData): every message dom0 sent about the old
+        // dom0's confirm of a popup-state re-create's DESTROY (UpdateWindowData): every message dom0 sent about the old
         // window has arrived, so the tracking pass may now CREATE it again.
         EnterCriticalSection(&g_csWatchedWindows);
         WINDOW_DATA* data = FindWindowByHandle(window);

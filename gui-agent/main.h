@@ -356,10 +356,11 @@ typedef struct _WINDOW_DATA
     DWORD DaemonMaxW;
     DWORD DaemonMaxH;
 
-    // A managed -> override-redirect flip re-creates the window in dom0 (UpdateWindowData). RecreatePending: DESTROY
-    // went out and dom0 has no window for this hwnd, so nothing may be sent for it. RecreateConfirmed: dom0's
-    // confirming MSG_DESTROY arrived (HandleDestroy), so every message dom0 sent about the old window is behind us;
-    // the next tracking pass sends CREATE (override-redirect, the popup's size) and MAP.
+    // A popup-state flip re-creates the window in dom0 (UpdateWindowData): managed -> override-redirect always, and
+    // override-redirect -> managed when the window also moves. RecreatePending: DESTROY went out and dom0 has no
+    // window for this hwnd, so nothing may be sent for it. RecreateConfirmed: dom0's confirming MSG_DESTROY arrived
+    // (HandleDestroy), so every message dom0 sent about the old window is behind us; the next tracking pass sends
+    // CREATE (the flag, size and origin the flip recorded) and MAP.
     BOOL RecreatePending;
     BOOL RecreateConfirmed;
 

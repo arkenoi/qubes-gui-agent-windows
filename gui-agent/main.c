@@ -10792,7 +10792,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         goto end;
     }
 
-    // A popup re-create in flight (the flip below). Until dom0 confirms the DESTROY it has no window for this hwnd,
+    // A re-create in flight (the popup-state flips below). Until dom0 confirms the DESTROY it has no window for this hwnd,
     // so nothing is sent for it; once it has, the window is announced with the state the flip recorded (popup flag,
     // size, position) exactly as AddWindow announces one, and the rest of this pass sends whatever changed since.
     if (windowData->RecreatePending)
@@ -11068,6 +11068,7 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     // coords
     BOOL coordsChanged = (windowData->X != data.X || windowData->Y != data.Y ||
         windowData->Width != data.Width || windowData->Height != data.Height);
+    const BOOL originMoved = (windowData->X != data.X || windowData->Y != data.Y);   // the popup -> managed flip below
 
     if (coordsChanged)
     {
@@ -11129,6 +11130,21 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     // For other combinations the order doesn't matter, so we use the old popup state to determine the order.
     if (oldPopupState)
     {
+        // A popup -> managed flip that also moves the window re-creates it in dom0, as the opposite flip does (below):
+        // after an UNMAP+MAP dom0 manages the window at the popup's old origin and only the configure after it moves
+        // it - a visible jump - and dom0 discards that configure while one of its own is queued, leaving the window
+        // where the popup was. Windows 10's search box grows from the taskbar's 344x40 at (48,1400) to 784x680 at
+        // (48,760) on the first key: mapped at y 1395, then moved; once left at y 1425, 15 px on screen.
+        if (popupStateChanged && originMoved && !ToastBannerWithheld(windowData) &&
+            windowData->CreateSent && PwIsAttached(windowData))
+        {
+            LogDebug("0x%x: popup -> managed at (%d,%d) %ux%u, re-created in dom0 after its confirm",
+                windowData->Handle, windowData->X, windowData->Y, windowData->Width, windowData->Height);
+            status = SendWindowDestroy(windowData->Handle);
+            windowData->CreateSent = FALSE;
+            windowData->RecreatePending = TRUE;
+            goto end;
+        }
         // popup state first, then configure
         // A popup-state flip re-announces through UNMAP+MAP (ToggleMap) - which would MAP a banner the toast hold
         // is withholding. The daemon learns the flag at the eventual MAP anyway, so a held toast skips the toggle.
