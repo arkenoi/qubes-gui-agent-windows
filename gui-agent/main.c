@@ -1038,6 +1038,167 @@ static void DiscardWindowEvents(void)
     LeaveCriticalSection(&g_csWindowEvents);
 }
 
+// THE POPUP STAYS ON THE WINDOW THE AGENT SHOWED NORMAL (ADR-windows 17). A window that opens maximized is shown normal
+// before dom0 is told (RestoreWindowOpenedMaximized), and an app can own a captionless popup laid out for the maximized
+// window: Edge 145's first-run card puts its popup on the maximized frame whenever it lays the card out again (a minimize
+// and restore, a work-area change), so the card is cut off at the window's edge. Edge 152 keeps the same popup on the
+// window's client area itself, and that is the rect it is kept on here: the owner's client rect in screen coordinates -
+// not the window rect, which carries the invisible resize borders, nor the DWM bounds, a pixel or two off it. Read and set
+// in physical pixels whatever this process's DPI awareness, so a scaled guest cannot round it off. Kept from the hook
+// thread on the popup's and the window's own events, so it is put back as soon as the app moves it; the owner's capture
+// carries the popup (it is never announced on its own, ShouldAcceptWindow). The popup is the one found when the restore
+// lands whose rect contains the whole client area - a menu, a dropdown or a tooltip never does; a window with none is
+// forgotten then. Only reads that send the app no message, and the move is posted, so a hung app cannot stall the hook.
+#define OVERLAY_FIT_SLOTS 8
+#define OVERLAY_FIT_MAX 200   // refits of one popup before it is let go, loudly: an app that threw it back every time would spin
+
+static HWND volatile g_FitOwner[OVERLAY_FIT_SLOTS];     // set by the main thread from NULL, cleared by the hook thread
+static HWND volatile g_FitOverlay[OVERLAY_FIT_SLOTS];   // hook thread, while the slot's owner is set
+static UINT g_FitTimes[OVERLAY_FIT_SLOTS];              // refits of that popup, hook thread
+static LONG volatile g_FitActive;                       // slots in use: the hook's one read for every other window
+
+typedef struct _OVERLAY_COVER
+{
+    HWND Owner;
+    RECT Client;
+    HWND Found;
+} OVERLAY_COVER;
+
+// The window's client rect in screen coordinates; physical pixels under the caller's per-monitor context.
+static BOOL OwnerClientOnScreen(IN HWND owner, OUT RECT* client)
+{
+    POINT origin = { 0, 0 };
+    if (!GetClientRect(owner, client) || IsRectEmpty(client) || !ClientToScreen(owner, &origin))
+        return FALSE;
+    OffsetRect(client, origin.x, origin.y);
+    return TRUE;
+}
+
+static BOOL CALLBACK OverlayCoverProc(IN HWND window, IN LPARAM context)
+{
+    OVERLAY_COVER* cover = (OVERLAY_COVER*)context;
+    const LONG style = GetWindowLongW(window, GWL_STYLE);
+    RECT popup, both;
+    if (GetWindow(window, GW_OWNER) != cover->Owner || !IsWindowVisible(window) || !(style & WS_POPUP) ||
+        (style & WS_CAPTION) == WS_CAPTION || !GetWindowRect(window, &popup) ||
+        !UnionRect(&both, &popup, &cover->Client) || !EqualRect(&both, &popup))
+        return TRUE;
+    cover->Found = window;
+    return FALSE;
+}
+
+// A visible captionless popup the window owns whose rect contains the window's whole client area, or NULL.
+static HWND OwnedOverlayOver(IN HWND owner, IN const RECT* client)
+{
+    OVERLAY_COVER cover = { owner, *client, NULL };
+    EnumWindows(OverlayCoverProc, (LPARAM)&cover);
+    return cover.Found;
+}
+
+static void OverlayFitForget(IN UINT i)
+{
+    g_FitOverlay[i] = NULL;
+    InterlockedExchangePointer((PVOID volatile*)&g_FitOwner[i], NULL);
+    InterlockedDecrement(&g_FitActive);
+}
+
+// Puts slot i's popup exactly on its window's client area when the two differ. Hook thread.
+static void OverlayFitApply(IN UINT i)
+{
+    const HWND owner = g_FitOwner[i];
+    const HWND overlay = g_FitOverlay[i];
+    if (!owner || !overlay || IsIconic(owner))
+        return;
+    const DPI_AWARENESS_CONTEXT previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    RECT client, popup;
+    if (OwnerClientOnScreen(owner, &client) && GetWindowRect(overlay, &popup) && !EqualRect(&client, &popup))
+    {
+        if (++g_FitTimes[i] > OVERLAY_FIT_MAX)
+        {
+            LogWarning("QGAOVERLAYFIT 0x%x: popup 0x%x moved away again after %u refits - no longer kept on the client area",
+                owner, overlay, OVERLAY_FIT_MAX);
+            OverlayFitForget(i);
+        }
+        else if (SetWindowPos(overlay, NULL, client.left, client.top, client.right - client.left, client.bottom - client.top,
+            SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS))
+        {
+            LogDebug("QGAOVERLAYFIT 0x%x: popup 0x%x put on the client area %ld,%ld %ldx%ld from %ld,%ld %ldx%ld (#%u)",
+                owner, overlay, client.left, client.top, client.right - client.left, client.bottom - client.top,
+                popup.left, popup.top, popup.right - popup.left, popup.bottom - popup.top, g_FitTimes[i]);
+        }
+        else
+        {
+            LogWarning("QGAOVERLAYFIT 0x%x: moving popup 0x%x onto the client area was refused (0x%x)", owner, overlay,
+                GetLastError());
+        }
+    }
+    if (previous)
+        SetThreadDpiAwarenessContext(previous);
+}
+
+// RestoreWindowOpenedMaximized showed this window normal: a popup it arrived under is kept on its client area. Main thread,
+// the only writer of a slot's owner from NULL.
+static void OverlayFitRegister(IN HWND owner)
+{
+    for (UINT i = 0; i < OVERLAY_FIT_SLOTS; i++)
+    {
+        if (g_FitOwner[i])
+            continue;
+        g_FitOverlay[i] = NULL;
+        g_FitTimes[i] = 0;
+        InterlockedExchangePointer((PVOID volatile*)&g_FitOwner[i], owner);
+        InterlockedIncrement(&g_FitActive);
+        return;
+    }
+    LogWarning("QGAOVERLAYFIT 0x%x: no slot free - a popup it arrived under is not kept on its client area", owner);
+}
+
+// The hook's call for EVENT_OBJECT_SHOW, LOCATIONCHANGE and DESTROY of a top-level window: one read and a return for every
+// window while none is kept. The window's first event once the restore has landed finds the popup, or forgets the window.
+static void OverlayFitNoteChanged(IN HWND window, IN DWORD event)
+{
+    if (g_FitActive == 0 || !window)
+        return;
+    for (UINT i = 0; i < OVERLAY_FIT_SLOTS; i++)
+    {
+        const HWND owner = g_FitOwner[i];
+        if (!owner || (window != owner && window != g_FitOverlay[i]))
+            continue;
+        if (event == EVENT_OBJECT_DESTROY)
+        {
+            if (g_FitOverlay[i])
+                LogInfo("QGAOVERLAYFIT 0x%x: %s 0x%x gone, %u refits", owner, window == owner ? L"the window" : L"its popup",
+                    window, g_FitTimes[i]);
+            OverlayFitForget(i);
+        }
+        else if (g_FitOverlay[i])
+        {
+            OverlayFitApply(i);
+        }
+        else if (!IsZoomed(owner) && !IsIconic(owner))
+        {
+            const DPI_AWARENESS_CONTEXT previous = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+            RECT client = { 0 };
+            const HWND overlay = OwnerClientOnScreen(owner, &client) ? OwnedOverlayOver(owner, &client) : NULL;
+            if (previous)
+                SetThreadDpiAwarenessContext(previous);
+            if (!overlay)
+            {
+                LogDebug("QGAOVERLAYFIT 0x%x: shown normal with no popup over its client area", owner);
+                OverlayFitForget(i);
+            }
+            else
+            {
+                LogInfo("QGAOVERLAYFIT 0x%x: popup 0x%x is kept on its client area %ld,%ld %ldx%ld", owner, overlay,
+                    client.left, client.top, client.right - client.left, client.bottom - client.top);
+                g_FitOverlay[i] = overlay;
+                OverlayFitApply(i);
+            }
+        }
+        return;
+    }
+}
+
 // WinEvent hook callback, runs on the hook thread.
 //
 // This must stay cheap: the same thread has to keep retrieving messages for
@@ -1121,6 +1282,8 @@ static void CALLBACK WindowEventProc(
     // content may be new. One volatile read and a return for every window the hold does not track.
     if (event == EVENT_OBJECT_LOCATIONCHANGE || event == EVENT_OBJECT_NAMECHANGE)
         ToastHoldNoteChanged(window);
+    if (event == EVENT_OBJECT_LOCATIONCHANGE || event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_DESTROY)
+        OverlayFitNoteChanged(window, event);
 
     QueueWindowEvent(window, event, FALSE);
 }
@@ -7581,6 +7744,7 @@ static BOOL RestoreWindowOpenedMaximized(IN const WINDOW_DATA* entry)
         return FALSE;
     done[next++ % RTL_NUMBER_OF(done)] = entry->Handle;
 
+    OverlayFitRegister(entry->Handle);   // before the restore, so its first event finds the window registered
     if (!ShowWindowAsync(entry->Handle, SW_SHOWNORMAL))
     {
         LogWarning("QGAOPENNORMAL 0x%x: opened maximized (%ux%u, pid %lu), showing it normal was refused (0x%x) - "
