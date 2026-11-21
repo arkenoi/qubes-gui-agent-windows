@@ -9976,14 +9976,41 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // fully inside that owner, and only while the broker is active - because the broker is what
     // composites it. A popup that extends past its owner (most context menus) fails the
     // containment test and is announced exactly as before; a popup with no tracked owner likewise.
+    //
+    // THE SAME HOLDS FOR ANY APP'S CAPTIONLESS OWNED POPUP, judged against the owner's LIVE rect.
+    // Edge's first-run welcome overlay (Chrome_WidgetWin_1, WS_POPUP, owned by the browser window)
+    // covers its owner with a translucent dimming backdrop and the dialog card in the middle.
+    // Announced on its own, the backdrop is opaque black over the whole browser, and on every
+    // resize of the owner it is a second window chasing the first. The owner's capture already
+    // draws it, dimmed as Windows draws it. Only a popup without a caption - a dialog keeps its
+    // own window - and only into an owner fed by the broker, whose capture is what composites it.
+    // The owner's live rect, not its tracked entry: when the owner is maximized or restored, the
+    // popup can be judged in a pass before the owner's entry has caught up.
+    BOOL insideOwner = FALSE;
     if (IsMenuPopupWindow(data) && data->Owner && WgcBrokerActive())
     {
         const WINDOW_DATA* ownerData = FindWindowByHandle(data->Owner);
-        if (ownerData && ownerData->IsVisible &&
+        insideOwner = ownerData && ownerData->IsVisible &&
             (LONG)data->X >= (LONG)ownerData->X &&
             (LONG)data->Y >= (LONG)ownerData->Y &&
             (LONG)data->X + (LONG)data->Width  <= (LONG)ownerData->X + (LONG)ownerData->Width &&
-            (LONG)data->Y + (LONG)data->Height <= (LONG)ownerData->Y + (LONG)ownerData->Height)
+            (LONG)data->Y + (LONG)data->Height <= (LONG)ownerData->Y + (LONG)ownerData->Height;
+    }
+    else if (data->Owner && (data->Style & WS_POPUP) && (data->Style & WS_CAPTION) != WS_CAPTION &&
+        WgcBrokerActive())
+    {
+        const WINDOW_DATA* ownerData = FindWindowByHandle(data->Owner);
+        RECT live;
+        insideOwner = ownerData && ownerData->PwSliceFed && IsWindowVisible(data->Owner) &&
+            GetWindowRect(data->Owner, &live) &&
+            (LONG)data->X >= live.left && (LONG)data->Y >= live.top &&
+            (LONG)data->X + (LONG)data->Width  <= live.right &&
+            (LONG)data->Y + (LONG)data->Height <= live.bottom;
+    }
+    if (insideOwner)
+    {
+        const WINDOW_DATA* ownerData = FindWindowByHandle(data->Owner);
+        if (ownerData)
         {
             LogDebug("0x%x: owned popup (class %s, %ux%u at %d,%d) lies wholly inside owner 0x%x "
                 L"(%ux%u at %d,%d) - not announced; the owner's capture carries it",
