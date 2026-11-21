@@ -7567,6 +7567,75 @@ static BOOL ProcessStartedAfterAgent(IN DWORD processId)
 // it is then announced as. The caller drops it for this pass and the next pass announces it. Once per window, so an
 // explicit maximize afterwards stays, and only for a process started after the agent (ProcessStartedAfterAgent).
 // ShowWindowAsync posts the request to the app's thread, so a hung app cannot stall this one.
+// A window that arrives maximized under an overlay of its own (OwnedOverlayOver: Edge's first-run card, laid out for
+// the maximized size and never re-fitted after) is announced maximized and shown normal by the pass that finds the
+// overlay gone (ShowNormalOnceOverlayGone; owner 2026-11-21: «so it snaps to normal size in milliseconds without click?
+// then its fine»).
+typedef struct _OVERLAY_COVER
+{
+    HWND Owner;
+    RECT OwnerRect;
+    HWND Found;
+} OVERLAY_COVER;
+
+static BOOL CALLBACK OverlayCoverProc(IN HWND window, IN LPARAM context)
+{
+    OVERLAY_COVER* cover = (OVERLAY_COVER*)context;
+    const LONG style = GetWindowLongW(window, GWL_STYLE);
+    RECT popup, overlap;
+    if (GetWindow(window, GW_OWNER) != cover->Owner || !IsWindowVisible(window) || !(style & WS_POPUP) ||
+        (style & WS_CAPTION) == WS_CAPTION || !GetWindowRect(window, &popup) ||
+        !IntersectRect(&overlap, &popup, &cover->OwnerRect))
+        return TRUE;
+    const LONGLONG ownerArea = (LONGLONG)(cover->OwnerRect.right - cover->OwnerRect.left) *
+        (cover->OwnerRect.bottom - cover->OwnerRect.top);
+    const LONGLONG over = (LONGLONG)(overlap.right - overlap.left) * (overlap.bottom - overlap.top);
+    if (ownerArea > 0 && over * 10 >= ownerArea * 9)
+    {
+        cover->Found = window;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+// A visible captionless popup the window owns that covers at least nine tenths of the window's rect, or NULL.
+static HWND OwnedOverlayOver(IN HWND owner)
+{
+    OVERLAY_COVER cover = { owner, { 0 }, NULL };
+    if (!GetWindowRect(owner, &cover.OwnerRect))
+        return NULL;
+    EnumWindows(OverlayCoverProc, (LPARAM)&cover);
+    return cover.Found;
+}
+
+static HWND g_OpenNormalDeferred[8];
+
+// Every tracking pass: a window announced maximized under its overlay is shown normal on the pass that finds the overlay
+// gone - its hide or destroy is an event, so that pass follows at once, with no input. A window minimized meanwhile
+// waits; one gone, or no longer maximized (the user or the app restored it), is forgotten.
+static void ShowNormalOnceOverlayGone(void)
+{
+    for (UINT i = 0; i < RTL_NUMBER_OF(g_OpenNormalDeferred); i++)
+    {
+        const HWND window = g_OpenNormalDeferred[i];
+        if (!window || IsIconic(window))
+            continue;
+        if (!IsWindow(window) || !(GetWindowLongW(window, GWL_STYLE) & WS_MAXIMIZE))
+        {
+            g_OpenNormalDeferred[i] = NULL;
+            continue;
+        }
+        if (OwnedOverlayOver(window))
+            continue;
+        g_OpenNormalDeferred[i] = NULL;
+        if (ShowWindowAsync(window, SW_SHOWNORMAL))
+            LogInfo("QGAOPENNORMAL 0x%x: its overlay is gone - shown normal now", window);
+        else
+            LogWarning("QGAOPENNORMAL 0x%x: its overlay is gone, showing it normal was refused (0x%x) - left maximized",
+                window, GetLastError());
+    }
+}
+
 static BOOL RestoreWindowOpenedMaximized(IN const WINDOW_DATA* entry)
 {
     static HWND done[32];
@@ -7580,6 +7649,25 @@ static BOOL RestoreWindowOpenedMaximized(IN const WINDOW_DATA* entry)
     if (!ProcessStartedAfterAgent(entry->ProcessId))
         return FALSE;
     done[next++ % RTL_NUMBER_OF(done)] = entry->Handle;
+
+    const HWND overlay = OwnedOverlayOver(entry->Handle);
+    if (overlay)
+    {
+        for (UINT i = 0; i < RTL_NUMBER_OF(g_OpenNormalDeferred); i++)
+        {
+            if (!g_OpenNormalDeferred[i])
+            {
+                g_OpenNormalDeferred[i] = entry->Handle;
+                LogInfo("QGAOPENNORMAL 0x%x: opened maximized (%ux%u, pid %lu) under its overlay 0x%x - announced maximized, "
+                    "shown normal once the overlay is gone", entry->Handle, entry->Width, entry->Height, entry->ProcessId,
+                    overlay);
+                return FALSE;
+            }
+        }
+        LogWarning("QGAOPENNORMAL 0x%x: opened maximized (%ux%u, pid %lu) under its overlay 0x%x, and %u windows already "
+            "wait for theirs - shown normal now", entry->Handle, entry->Width, entry->Height, entry->ProcessId, overlay,
+            (UINT)RTL_NUMBER_OF(g_OpenNormalDeferred));
+    }
 
     if (!ShowWindowAsync(entry->Handle, SW_SHOWNORMAL))
     {
@@ -11670,6 +11758,7 @@ static ULONG TrackWindows(OUT TRACK_STATS* stats)
     // Every interrogation of this pass is done (and removals settled): push the
     // capture-mask updates they deferred, at most one per owner (SynthFlushMasks).
     SynthFlushMasks();
+    ShowNormalOnceOverlayGone();
 
     stats->RemoveTicks = PerfNow() - perfPhase - (g_PerfSendTicks - perfSendPhase);
     return status;
