@@ -10024,7 +10024,11 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     {
         const WINDOW_DATA* ownerData = FindWindowByHandle(data->Owner);
         RECT live;
-        if (IsWindowVisible(data->Owner) && GetWindowRect(data->Owner, &live))
+        // An owner not shown yet (Edge creates its first-run overlay before it shows the browser) holds only a popup
+        // too large for override-redirect - the one dom0's window manager would take as a frame of its own. A small
+        // popup over a hidden owner, a splash over a main window still hidden, keeps its own window.
+        const BOOL ownerShown = IsWindowVisible(data->Owner);
+        if (GetWindowRect(data->Owner, &live))
         {
             RECT popup, overlap;
             SetRect(&popup, (LONG)data->X, (LONG)data->Y,
@@ -10034,14 +10038,16 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
                 (LONGLONG)(overlap.right - overlap.left) * (overlap.bottom - overlap.top) : 0;
             const BOOL mostlyOver = area > 0 && over * 10 >= area * 9;
             const BOOL wmPlaced = over > 0 && data->IsVisible && !HasFlags(data->ExStyle, WS_EX_APPWINDOW) && !IsPopup(data);
-            const BOOL pending = (!ownerData || ownerData->DeletePending) &&
-                (GetWindowLongW(data->Owner, GWL_STYLE) & WS_CAPTION) == WS_CAPTION;
-            insideOwner = (mostlyOver || wmPlaced) && (pending || (ownerData && ownerData->PwSliceFed));
+            const BOOL captioned = (GetWindowLongW(data->Owner, GWL_STYLE) & WS_CAPTION) == WS_CAPTION;
+            const BOOL pending = captioned &&
+                (ownerShown ? (!ownerData || ownerData->DeletePending) : (mostlyOver && !IsPopup(data)));
+            insideOwner = ownerShown ?
+                (mostlyOver || wmPlaced) && (pending || (ownerData && ownerData->PwSliceFed)) : pending;
             if (insideOwner && pending)
             {
-                LogDebug("0x%x: owned popup (class %s, %ux%u at %d,%d) over owner 0x%x, which is not tracked "
-                    L"yet - held this pass", (DWORD)(ULONG_PTR)data->Handle, data->Class, data->Width,
-                    data->Height, data->X, data->Y, (DWORD)(ULONG_PTR)data->Owner);
+                LogDebug("0x%x: owned popup (class %s, %ux%u at %d,%d) over owner 0x%x, which is %s - held this pass",
+                    (DWORD)(ULONG_PTR)data->Handle, data->Class, data->Width, data->Height, data->X, data->Y,
+                    (DWORD)(ULONG_PTR)data->Owner, ownerShown ? L"not tracked yet" : L"not shown yet");
                 return FALSE;
             }
         }
