@@ -10952,9 +10952,11 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
 
     if (windowData->IsVisible != data.IsVisible)
     {
+        // ShellSurfaceKind answers None for an invisible window, so it is asked before IsVisible changes.
+        const BOOL wasStart = windowData->IsVisible && ShellSurfaceKind(windowData) == ShellSurfaceStart;
         windowData->IsVisible = data.IsVisible;
         LogDebug("0x%x IsVisible changed to %d", data.Handle, data.IsVisible);
-        if (!data.IsVisible && ShellSurfaceKind(windowData) == ShellSurfaceStart)
+        if (!data.IsVisible && wasStart)
             g_StartLeftAt = GetTickCount64();   // the search view's window grace runs again from here
         if (!data.IsVisible && !data.IsIconic)
             goto end; // skip other stuff, this window will be removed
