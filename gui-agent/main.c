@@ -9985,7 +9985,12 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // draws it, dimmed as Windows draws it. Only a popup without a caption - a dialog keeps its
     // own window - and only into an owner fed by the broker, whose capture is what composites it.
     // The owner's live rect, not its tracked entry: when the owner is maximized or restored, the
-    // popup can be judged in a pass before the owner's entry has caught up.
+    // popup can be judged in a pass before the owner's entry has caught up. A popup that COVERS
+    // the owner counts too - Edge stretches the overlay to the whole screen for a moment on the
+    // owner's restore - because the capture clips it to the owner. And an owner that is visible
+    // but not tracked yet, or being dropped (the first open, restored before dom0 is told), holds
+    // the popup for this pass instead of letting it reach dom0 as a screen-sized window; the next
+    // pass judges it against the tracked owner.
     BOOL insideOwner = FALSE;
     if (IsMenuPopupWindow(data) && data->Owner && WgcBrokerActive())
     {
@@ -10001,11 +10006,22 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     {
         const WINDOW_DATA* ownerData = FindWindowByHandle(data->Owner);
         RECT live;
-        insideOwner = ownerData && ownerData->PwSliceFed && IsWindowVisible(data->Owner) &&
-            GetWindowRect(data->Owner, &live) &&
-            (LONG)data->X >= live.left && (LONG)data->Y >= live.top &&
-            (LONG)data->X + (LONG)data->Width  <= live.right &&
-            (LONG)data->Y + (LONG)data->Height <= live.bottom;
+        if (IsWindowVisible(data->Owner) && GetWindowRect(data->Owner, &live))
+        {
+            const LONG l = (LONG)data->X, t = (LONG)data->Y;
+            const LONG r = l + (LONG)data->Width, b = t + (LONG)data->Height;
+            const BOOL inside = l >= live.left && t >= live.top && r <= live.right && b <= live.bottom;
+            const BOOL covers = l <= live.left && t <= live.top && r >= live.right && b >= live.bottom;
+            const BOOL pending = !ownerData || ownerData->DeletePending;
+            insideOwner = (inside || covers) && (pending || ownerData->PwSliceFed);
+            if (insideOwner && pending)
+            {
+                LogDebug("0x%x: owned popup (class %s, %ux%u at %d,%d) over owner 0x%x, which is not tracked "
+                    L"yet - held this pass", (DWORD)(ULONG_PTR)data->Handle, data->Class, data->Width,
+                    data->Height, data->X, data->Y, (DWORD)(ULONG_PTR)data->Owner);
+                return FALSE;
+            }
+        }
     }
     if (insideOwner)
     {
