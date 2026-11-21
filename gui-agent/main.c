@@ -7331,6 +7331,7 @@ static BOOL CropReadyForMap(IN OUT WINDOW_DATA* entry)
 // the user types - it is the same flyout - so an unpainted search view then is waiting, not a display fault (the
 // direct-path fault deadline in UpdateWindowData). Measured row 29 p53, German 25H2: the search companion 0x10198 logged
 // ERROR QGADIRECTSUPPRESS 10 s into every opening (133414.530, 133459.827) while Start was up and drawing.
+static ULONGLONG g_StartLeftAt;   // when a Start window last stopped being visible (UpdateWindowData), main thread; 0 never
 static BOOL StartMappedOnScreen(void)
 {
     for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
@@ -10953,6 +10954,8 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     {
         windowData->IsVisible = data.IsVisible;
         LogDebug("0x%x IsVisible changed to %d", data.Handle, data.IsVisible);
+        if (!data.IsVisible && ShellSurfaceKind(windowData) == ShellSurfaceStart)
+            g_StartLeftAt = GetTickCount64();   // the search view's window grace runs again from here
         if (!data.IsVisible && !data.IsIconic)
             goto end; // skip other stuff, this window will be removed
     }
@@ -11490,9 +11493,14 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             ULONGLONG dsince = windowData->PwDirectSince;
             BOOL windowYoung = !QgaWindowFaultDue(dsince, g_BrokerReadyAt, GetTickCount64(),
                                                   (ULONGLONG)DIRECT_WINDOW_GRACE_MS);
-            // The search view behind a mapped Start is blank by design until the user types (StartMappedOnScreen).
+            // The search view behind a mapped Start is blank by design until the user types (StartMappedOnScreen), and the
+            // typing that hides Start is what makes it paint - in the same pass that sees Start go - so its window grace
+            // runs again from Start leaving the screen (g_StartLeftAt). One that never paints after that still reports.
             if (!windowYoung && ShellSurfaceKind(windowData) == ShellSurfaceSearch &&
-                !ShellSurfaceHostedBySearchApp(windowData) && StartMappedOnScreen())
+                !ShellSurfaceHostedBySearchApp(windowData) &&
+                (StartMappedOnScreen() ||
+                 (g_StartLeftAt != 0 && !QgaWindowFaultDue(g_StartLeftAt, 0, GetTickCount64(),
+                                                           (ULONGLONG)DIRECT_WINDOW_GRACE_MS))))
                 windowYoung = TRUE;
             if (BrokerState() == BRK_STARTING || windowYoung)
             {
