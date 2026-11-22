@@ -397,6 +397,16 @@ static void StopOwnAgent(IN HANDLE agentProcess, IN DWORD agentPid, IN const WCH
     {
         LogWarning("service stopping: '%s' (PID %u) still running %u ms after the exit request, killing it (wait 0x%x)",
             exeName, agentPid, AGENT_STOP_GRACE_MS, wait);
+        // A killed agent's vchan is closed by the kernel's handle cleanup on the dying process's own threads:
+        // confine them to the lowest CPU first, where the guest dispatches the channel's events (QGAPIN,
+        // gui-agent vchan.c / main.c).
+        {
+            DWORD_PTR procMask = 0, sysMask = 0;
+            if (!GetProcessAffinityMask(agentProcess, &procMask, &sysMask) || !sysMask ||
+                !SetProcessAffinityMask(agentProcess, sysMask & (~sysMask + 1)))
+                LogWarning("QGAPIN could not confine '%s' (PID %u) to one CPU before the kill (error 0x%x)",
+                    exeName, agentPid, GetLastError());
+        }
         if (!TerminateProcess(agentProcess, 1))
             win_perror("TerminateProcess(agent)");
         wait = WaitForSingleObject(agentProcess, AGENT_KILL_WAIT_MS);

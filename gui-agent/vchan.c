@@ -648,7 +648,20 @@ BOOL VchanInit(IN int domain, IN int port)
         return FALSE;
     }
 
+    // THE OPEN RUNS ON THE LOWEST CPU (the CPU qrexec-agent pins itself to, QREXECPIN). Stock xenbus's
+    // bucket lock wedges when two users of one bucket run on two CPUs, and the guest dispatches this
+    // channel's events on that CPU; an open from any other CPU is the second user. Only this thread and
+    // only for the open: capture and encoding keep every CPU. The close is confined in the exit path.
+    DWORD_PTR procMask = 0, sysMask = 0, oldThreadMask = 0;
+    if (GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask) && sysMask)
+    {
+        oldThreadMask = SetThreadAffinityMask(GetCurrentThread(), sysMask & (~sysMask + 1));
+        if (!oldThreadMask)
+            LogWarning("QGAPIN could not confine the vchan open to one CPU (error 0x%x) - opening UNPINNED", GetLastError());
+    }
     g_Vchan = VchanInitServer(domain, port, VCHAN_WRITE_RING_SIZE, 5 * 60 * 1000);
+    if (oldThreadMask)
+        SetThreadAffinityMask(GetCurrentThread(), oldThreadMask);
     if (!g_Vchan)
     {
         LogError("VchanInitServer failed");

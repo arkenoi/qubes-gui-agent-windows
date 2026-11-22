@@ -17812,6 +17812,8 @@ static ULONG WINAPI WatchForEvents(void)
     // the screen UNMAP/DESTROY went out after g_VchanClientConnected dropped, i.e. was
     // silently discarded. New order: notify dom0 of everything while the vchan is still
     // open, drain the queued grant revocations with a hard time budget, then close.
+    // (The notify half is gone again: the revoke-skip under a live daemon, A6LEAK below,
+    // left it with no purpose - see A6QUIET.)
     // A dead daemon must not stall exit: VchanSendBuffer blocks FOREVER on a full ring,
     // so when the ring lacks headroom the client is declared gone (every send below is
     // already gated on g_VchanClientConnected) and the exit proceeds notification-less.
@@ -17822,6 +17824,22 @@ static ULONG WINAPI WatchForEvents(void)
     // the sends that follow. PwShutdown below still runs the rest of the per-window
     // shutdown (WcShutdown is idempotent).
     WcShutdown();
+
+    // THE CLOSE RUNS ON THE LOWEST CPU (the CPU the vchan was opened on, vchan.c VchanInit). Capture has
+    // stopped, so the whole process goes there: the libvchan_close below and, on the no-client branch, the
+    // kernel's handle cleanup at process exit - which closes the event channel on whichever of this process's
+    // threads runs it - both stay on the CPU that dispatches the channel's events.
+    {
+        DWORD_PTR procMask = 0, sysMask = 0;
+        if (GetProcessAffinityMask(GetCurrentProcess(), &procMask, &sysMask) && sysMask)
+        {
+            DWORD_PTR one = sysMask & (~sysMask + 1);
+            if (SetProcessAffinityMask(GetCurrentProcess(), one))
+                LogInfo("QGAPIN exit confined to CPU mask 0x%Ix (system 0x%Ix) before the vchan close", one, sysMask);
+            else
+                LogWarning("QGAPIN could not confine the exit to one CPU (error 0x%x) - closing UNPINNED", GetLastError());
+        }
+    }
 
     BOOL closeVchan = g_VchanClientConnected;
     if (g_VchanClientConnected &&
@@ -17835,11 +17853,35 @@ static ULONG WINAPI WatchForEvents(void)
         LeaveCriticalSection(&g_VchanCriticalSection);
     }
 
+    // NO TEARDOWN SWEEP WHILE THE DAEMON IS ALIVE. The sweep below (UNMAP/DESTROY for every window, then the
+    // screen's) exists so dom0 unmaps before the single revoke pass - and that pass runs only when the daemon
+    // is gone. With it alive, the revokes are skipped (A6LEAK, below), so the sweep bought nothing and its only
+    // effect was a burst of traffic on this vchan right before the close removes its port: more chance for an
+    // event on that port, dispatched on CPU 0, to overlap the remove running on another CPU - a reader against
+    // a writer on one event-channel bucket, the overlap stock xenbus's bucket lock does not survive (the
+    // pre-existing QWT bug, findings/wedge.md:12; that this exit tripped it in a specimen is not proven).
+    // dom0 does that unmapping itself when the close reaches it:
+    // gui-daemon exits on EOF (qubes-gui-daemon gui-common/txrx-vchan.c:47-49, "EOF" then exit(0)),
+    // and its windows and grant mappings go with its process. Stock closes the same way, with no burst - the
+    // Windows agent (431e451 main.c:1413-1420) and the Linux one (vmside.c, MSG_DESTROY only for a window X
+    // destroyed). Declaring the client gone for the SENDS makes every send below a no-op, the exact state the
+    // dead-vchan branch above already uses; the local teardown still runs. The revoke decision must not read
+    // that flag, so it keys on quietExit and asks the vchan itself.
+    BOOL quietExit = FALSE;
+    if (g_VchanClientConnected && libvchan_is_open(g_Vchan))
+    {
+        quietExit = TRUE;
+        EnterCriticalSection(&g_VchanCriticalSection);
+        g_VchanClientConnected = FALSE;
+        LeaveCriticalSection(&g_VchanCriticalSection);
+        LogInfo("A6QUIET daemon alive at exit: no teardown sweep, the vchan is closed with nothing in flight");
+    }
+
     // Detach-all, at last: RemoveWindow detaches the per-window buffer (queueing its
-    // grant revocation) and sends MSG_UNMAP/MSG_DESTROY for every tracked window;
-    // ResetWatch(FALSE) is the existing machinery for exactly that sweep. Then the
-    // screen window gets its UNMAP/DESTROY too, still on the open vchan. Both paths
-    // no-op their sends if the client was declared gone above.
+    // grant revocation) for every tracked window; ResetWatch(FALSE) is the existing
+    // machinery for that. Its MSG_UNMAP/MSG_DESTROY sends, and the screen window's,
+    // no-op on every path now: the client is declared gone above (quietExit), was
+    // declared gone by the dead-vchan branch, or never connected.
     ResetWatch(FALSE);
     // The capture thread may be blocked in an acquire with no timeout (a direct-capable guest at rest); from here on
     // the process is exiting, so it is left to the exit instead of waited on or terminated (CaptureStop).
@@ -17869,7 +17911,9 @@ static ULONG WINAPI WatchForEvents(void)
     // but reported UNRESPONSIVE rather than DEAD. Both mean a live mapper.
     BOOL daemonUnresponsive = VchanSendDegraded() ||
         (VchanSendWedged() && VchanWedgeResult() == VCHAN_SEND_UNRESPONSIVE);
-    if ((!g_VchanClientConnected && !daemonUnresponsive) || !libvchan_is_open(g_Vchan))
+    // quietExit cleared g_VchanClientConnected for the sends only; it says nothing about the daemon, so it must
+    // not count as "gone" here - revoking under a live mapper is the race this branch exists to avoid.
+    if ((!g_VchanClientConnected && !quietExit && !daemonUnresponsive) || !libvchan_is_open(g_Vchan))
     {
         Sleep(A6_EXIT_SETTLE_MS);
         PwRevokeTick();
