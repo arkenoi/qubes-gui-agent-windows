@@ -18370,7 +18370,20 @@ static ULONG Init(void)
         return GetLastError();
     }
 
-    PerfInit();
+    // ONE qubesdb SESSION FOR THE AGENT'S WHOLE START (QUBESDBCONNECTPERREAD): PerfInit's reads, every dom0 service gate
+    // and GetDomainName/GetGuiDomainId below, then the work-area feed - its two synchronous reads at the vchan connect
+    // and its watch thread, which keeps it (WorkAreaAdoptQdb). The protocol has no goodbye, so every closed session
+    // costs the daemon a `QpsRead ... failed: 109` WARNING (perf.c). Measured on 4.3.47.1459 (daemon LogLevel 5, pids
+    // from its pipe names): gui-agent opened 5 sessions in 0.82 s at start - PerfInit, the gates, two
+    // WorkAreaSyncReadDom0, the watch thread - and closed 4. Init, HandleXconf and WorkAreaInit run on this thread in
+    // that order, and a reconnect is a new process (QGA_EXIT_RECONNECT), so the session is never used by two threads at
+    // once. An open failure is what it was for the gates: loud, and Init fails so the watchdog respawns into a readable
+    // qubesdb - the agent could not survive past GetGuiDomainId without one.
+    qdb_handle_t initQdb = qdb_open(NULL);
+    if (!initQdb)
+        return win_perror("qdb_open (Init)");
+
+    PerfInit(initQdb);
     // Same place and same reason as PerfInit: the switches must be resolved and logged
     // before anything can consult them, and before any window or frame work starts.
     // Compiles to nothing unless the build was made with -p:QgaFaultInjection=1.
@@ -18426,16 +18439,10 @@ static ULONG Init(void)
     // that can never start would hold every direct-path window for ever and never declare a fault -
     // the same undefined limbo, just quieter. See BrokerState().
     g_AgentStartTick = GetTickCount64();
-    // ONE qubesdb connection for every dom0 service gate below (notify-bridge,
-    // legacy-toasts, gui-fullscreen, uac-disable). Five throwaway qdb_open() calls each failed
-    // SILENTLY into the registry base, so a qubesdb briefly unreachable during a watchdog respawn
-    // applied a dropped dom0 override as its opposite - and the gate-off branch ACTS at once
-    // (deletes the bridge task, writes its stop file). An open failure is treated as
-    // GetGuiDomainId treats it further down: loud, and Init fails so the watchdog respawns into a
-    // readable qubesdb - the agent could not have survived past GetGuiDomainId anyway.
-    qdb_handle_t gateQdb = qdb_open(NULL);
-    if (!gateQdb)
-        return win_perror("qdb_open (dom0 service gates)");
+    // Every dom0 service gate below (notify-bridge, legacy-toasts, gui-fullscreen, uac-disable) reads Init's one
+    // session, opened before PerfInit. Five throwaway qdb_open() calls each used to fail SILENTLY into the registry
+    // base, so a qubesdb briefly unreachable during a watchdog respawn applied a dropped dom0 override as its opposite -
+    // and the gate-off branch ACTS at once (deletes the bridge task, writes its stop file).
     BOOL gateReadFailed = FALSE;
     {
         // Slice retirement (broker-only per-window slice) is the shipped behaviour on 25H2+ and
@@ -18501,9 +18508,9 @@ static ULONG Init(void)
         g_NotifBridge = (nb != 0);
         // Shared handle + failed-vs-absent read (see ReadServiceGate): a dropped notify-bridge=1
         // used to run the gate-off branch below, killing a bridge the operator turned on.
-        char* v = ReadServiceGate(gateQdb, "/qubes-service/notify-bridge", &gateReadFailed);
+        char* v = ReadServiceGate(initQdb, "/qubes-service/notify-bridge", &gateReadFailed);
         if (v) { g_NotifBridge = (v[0] != '0'); free(v); nbSrc = L"qubesdb"; }
-        if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
+        if (gateReadFailed) { qdb_close(initQdb); return ERROR_GEN_FAILURE; }
         // legacy_toasts: the explicit opt-OUT. When set (registry "LegacyToasts" or qubesdb
         // /qubes-service/legacy-toasts, dom0 wins) it FORCES the bridge off regardless of the
         // NotifyBridge gate, so toasts render as override-redirect windows exactly as before
@@ -18512,9 +18519,9 @@ static ULONG Init(void)
         DWORD legacy = 0;
         (void)CfgReadDword(moduleName, REG_CONFIG_LEGACY_TOASTS_VALUE, &legacy, NULL);
         BOOL legacyToasts = (legacy != 0);
-        v = ReadServiceGate(gateQdb, "/qubes-service/legacy-toasts", &gateReadFailed);
+        v = ReadServiceGate(initQdb, "/qubes-service/legacy-toasts", &gateReadFailed);
         if (v) { legacyToasts = (v[0] != '0'); free(v); }
-        if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
+        if (gateReadFailed) { qdb_close(initQdb); return ERROR_GEN_FAILURE; }
         if (legacyToasts && g_NotifBridge)
         {
             g_NotifBridge = FALSE;
@@ -18575,9 +18582,9 @@ static ULONG Init(void)
         if (ERROR_SUCCESS == CfgReadDword(moduleName, REG_CONFIG_NOTIF_ERRORS_VALUE, &ne, NULL))
             neSrc = L"registry";
         g_NotifyErrors = (ne != 0);
-        v = ReadServiceGate(gateQdb, "/qubes-service/notify-errors", &gateReadFailed);
+        v = ReadServiceGate(initQdb, "/qubes-service/notify-errors", &gateReadFailed);
         if (v) { g_NotifyErrors = (v[0] != '0'); free(v); neSrc = L"qubesdb"; }
-        if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
+        if (gateReadFailed) { qdb_close(initQdb); return ERROR_GEN_FAILURE; }
         // The route needs qrexec-agent; the log stays the primary record either way.
         LogInfo("NOTIFYERR gate: enabled=%d source=%s (ACTION faults also go to dom0 as a notification via "
                 L"notifhost/qubes.Notifications)",
@@ -18628,13 +18635,13 @@ static ULONG Init(void)
             // `service.`-prefixed features are exported into the guest qubesdb as
             // /qubes-service/<name>; dom0 wins over the registry base. Absent -> keep base;
             // a FAILED read aborts Init (ReadServiceGate) rather than silently keeping it.
-            char *v = ReadServiceGate(gateQdb, "/qubes-service/gui-fullscreen", &gateReadFailed);
+            char *v = ReadServiceGate(initQdb, "/qubes-service/gui-fullscreen", &gateReadFailed);
             if (v)
             {
                 g_ShowFullscreenScreen = (v[0] != '0'); // any non-'0' shows; "0" hides
                 free(v); // match perf.c's qubesdb-read convention (same binary, proven)
             }
-            if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
+            if (gateReadFailed) { qdb_close(initQdb); return ERROR_GEN_FAILURE; }
         }
         LogInfo("QGAFSFLASH show full-desktop at boot/shutdown: %s",
             g_ShowFullscreenScreen ? L"on (opt-in)" : L"off (default, hidden)");
@@ -18665,8 +18672,8 @@ static ULONG Init(void)
     {
         // Shared Init handle; a failed read aborts Init (ReadServiceGate) - before, a transport
         // error read as "absent" here and, with UacDisabledByFeature set, silently UNDID the disable.
-        char *uacOff = ReadServiceGate(gateQdb, "/qubes-service/uac-disable", &gateReadFailed);
-        if (gateReadFailed) { qdb_close(gateQdb); return ERROR_GEN_FAILURE; }
+        char *uacOff = ReadServiceGate(initQdb, "/qubes-service/uac-disable", &gateReadFailed);
+        if (gateReadFailed) { qdb_close(initQdb); return ERROR_GEN_FAILURE; }
         const BOOL wantDisable = (uacOff && uacOff[0] == '1');
         DWORD wasOurs = 0;
         (void)CfgReadDword(moduleName, L"UacDisabledByFeature", &wasOurs, NULL);
@@ -18680,7 +18687,7 @@ static ULONG Init(void)
         // pretending it worked; the feature belongs on the TEMPLATE.
         if (wantDisable)
         {
-            char *cls = qdb_read(gateQdb, "/type", NULL);
+            char *cls = qdb_read(initQdb, "/type", NULL);
             if (cls && strcmp(cls, "TemplateVM") != 0 && strcmp(cls, "StandaloneVM") != 0)
                 // An AppVM's C: is reset from its template at every boot and EnableLUA is read at boot, so the feature
                 // can NEVER take effect here.
@@ -18733,10 +18740,10 @@ static ULONG Init(void)
     // GetDomainName and GetGuiDomainId then opened a session each of their own, a hundred lines
     // below, inside this same single-threaded Init. Three sessions where one does, and each close
     // costs the daemon a WARNING it has no protocol way to avoid (owner, 2026-10-24: "reuse the
-    // connection whenever possible"). The session now lives until the last reader and is closed
-    // there, on every path: no `return` or `goto` exists between here and that point (asserted by
-    // tools/tests/lifecycle-selftest.sh), and the six gate-read failure arms above close it
-    // themselves before returning.
+    // connection whenever possible"). The session now lives until the last reader, which closes it
+    // or hands it to the work-area feed, on every path: no `return` or `goto` exists between here and
+    // that point (the suite that asserted it, lifecycle-selftest.sh, was dropped in 9366f5f4; nothing
+    // enforces it now), and the five gate-read failure arms above close it themselves before returning.
 
     DWORD stagingGrant;
     status = CfgReadDword(moduleName, REG_CONFIG_STAGING_VALUE, &stagingGrant, NULL);
@@ -18809,7 +18816,7 @@ static ULONG Init(void)
         // try to continue
     }
 
-    status = GetDomainName(gateQdb, g_DomainName, RTL_NUMBER_OF(g_DomainName));
+    status = GetDomainName(initQdb, g_DomainName, RTL_NUMBER_OF(g_DomainName));
     if (ERROR_SUCCESS != status)
     {
         LogWarning("Failed to read domain name, using host name");
@@ -18830,10 +18837,13 @@ static ULONG Init(void)
         }
     }
 
-    status = GetGuiDomainId(gateQdb, &g_GuiDomainId);
-    // THE ONE CLOSE, and it is BEFORE the status check so no path leaks the session: the next line
-    // returns on failure. Last reader of Init's qubesdb session.
-    qdb_close(gateQdb);
+    status = GetGuiDomainId(initQdb, &g_GuiDomainId);
+    // Init's last reader. On failure the agent exits, so the session is closed here; on success it is NOT closed: the
+    // work-area feed keeps it for its synchronous reads at the vchan connect and then its watch thread.
+    if (status != ERROR_SUCCESS)
+        qdb_close(initQdb);
+    else
+        WorkAreaAdoptQdb(initQdb);
     if (status != ERROR_SUCCESS)
         return status;
 

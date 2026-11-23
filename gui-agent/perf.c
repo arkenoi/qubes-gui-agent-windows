@@ -227,7 +227,7 @@ static volatile LONG g_PwRefuse[PW_REFUSE_MAX];  // why the fast path declined, 
 static volatile LONG g_RedundantFrames = 0;      // frames dropped: damage reported, pixels identical
 static volatile LONG g_DdaCaptures = 0;          // windows served from the composited desktop
 
-void PerfInit(void)
+void PerfInit(qdb_handle_t initQdb)
 {
     LARGE_INTEGER freq;
     WCHAR moduleName[CFG_MODULE_MAX];
@@ -329,11 +329,10 @@ void PerfInit(void)
     // strict 1:1:1, and EVERY connect line says `connected (1 total)` - never two clients at once,
     // which is the proof that nothing anywhere held a handle. Twelve land in 4.0 s at this agent's
     // Init, and PerfInit opened TWO of them by itself, a hundred lines apart, both single-threaded
-    // Init-time reads. One handle serves both; it is closed once, at the end of this function.
-    qdb_handle_t initQdb = qdb_open(NULL);
-    if (!initQdb)
-        LogWarning("QGAQDBINIT could not open qubesdb for the Init-time reads - each is skipped and "
-            "the dom0-owned switches keep their registry or default values");
+    // Init-time reads. One handle served both. Now it is not this function's at all: Init opens one
+    // session for its whole start and passes it in (QUBESDBCONNECTPERREAD, main.c Init), so nothing
+    // here opens or closes. Init fails before this point if qubesdb cannot be opened; a NULL still
+    // skips each read and keeps the registry or default values.
     {
         qdb_handle_t qdb = initQdb;
         if (qdb)
@@ -603,10 +602,7 @@ void PerfInit(void)
         g_PerfFreq, g_PerfEveryN, qpcCostNs, QGA_PERF_DEFAULT, sink);
     LogInfo("QGAPERF-HEADER v=%d fields: seq,n,mode,dt,acq,wak,drq,upd,enu,rem,dmg,snd,tot,dr,area,win,iwn,wev,sends,skip,pwskip,pwcap,pwnofb,pwoff,pwocc,pwnofg,pwovl,pwfirst,pwchg,frdrop,ddacap,ddmov,ddgeo,ddoff,ddlay,ddfg,ddovl,log (times in microseconds)",
         PERF_RECORD_VERSION);
-
-    // THE ONE CLOSE, on the single exit every caller reaches. qdb_close is a no-op on NULL, so
-    // the could-not-open case above needs no guard.
-    qdb_close(initQdb);
+    // No close: the session is Init's.
 }
 
 void PerfNoteSkippedFrame(void)

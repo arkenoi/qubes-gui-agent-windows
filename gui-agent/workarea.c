@@ -359,11 +359,25 @@ static BOOL WaReadDom0(qdb_handle_t h)
     return ok;
 }
 
+// INIT'S qubesdb SESSION, kept for this feed (QUBESDBCONNECTPERREAD, main.c Init). The two synchronous reads at the
+// vchan connect (HandleXconf, then WorkAreaInit) read through it, and WorkAreaInit hands it to the watch thread as its
+// first connection, so the agent's start costs the daemon no closed session here (each close is a `QpsRead ... failed:
+// 109` WARNING; the protocol has no goodbye). Main thread only: Init, HandleXconf and WorkAreaInit all run there, before
+// the thread exists, and WorkAreaInit drops this copy before CreateThread - a sync read after that opens its own.
+static qdb_handle_t g_WaQdb = NULL;
+
+void WorkAreaAdoptQdb(qdb_handle_t h)
+{
+    g_WaQdb = h;
+}
+
 BOOL WorkAreaSyncReadDom0(void)
 {
     if (!g_WaLockInit)
         return FALSE; // WorkAreaSetDom0 takes g_WaLock; too early to read
 
+    if (g_WaQdb)
+        return WaReadDom0(g_WaQdb);
     qdb_handle_t h = qdb_open(NULL);
     if (!h)
         return FALSE;
@@ -378,7 +392,8 @@ BOOL WorkAreaSyncReadDom0(void)
 // restarts. Runs for the life of the process.
 static DWORD WINAPI WaWatchThread(PVOID param)
 {
-    UNREFERENCED_PARAMETER(param);
+    // The first connection is Init's session when WorkAreaInit had it (g_WaQdb above); every reconnect opens its own.
+    qdb_handle_t adopted = (qdb_handle_t)param;
     // qubesdb already answered in Init() (GetGuiDomainId is fatal without it), so a
     // failed open here is the daemon having GONE, not "not up yet". It used to be a
     // silent flat Sleep(30000): a daemon that never came back was indistinguishable
@@ -390,7 +405,8 @@ static DWORD WINAPI WaWatchThread(PVOID param)
     unsigned failures = 0;
     for (;;)
     {
-        qdb_handle_t h = qdb_open(NULL);
+        qdb_handle_t h = adopted ? adopted : qdb_open(NULL);
+        adopted = NULL;
         if (!h)
         {
             failures++;
@@ -636,9 +652,15 @@ void WorkAreaInit(void)
     // Failure is fine - the thread retries for the life of the process.
     WorkAreaSyncReadDom0(); // apply happens in the connect sequence right after
 
-    HANDLE t = CreateThread(NULL, 0, WaWatchThread, NULL, 0, NULL);
+    // Init's session goes to the thread; this copy is dropped first, so no later sync read shares it.
+    qdb_handle_t handOver = g_WaQdb;
+    g_WaQdb = NULL;
+    HANDLE t = CreateThread(NULL, 0, WaWatchThread, (PVOID)handOver, 0, NULL);
     if (t)
         CloseHandle(t); // fire-and-forget; lives until process exit
     else
+    {
         win_perror("CreateThread(WaWatchThread)");
+        qdb_close(handOver);    // no-op on NULL
+    }
 }

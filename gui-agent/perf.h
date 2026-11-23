@@ -40,6 +40,7 @@
 
 #pragma once
 #include <windows.h>
+#include <qubesdb-client.h>   // qdb_handle_t: PerfInit reads through Init's session
 
 // Compile-time default for the master switch, used when neither the registry
 // value nor the environment variable is present.
@@ -337,8 +338,9 @@ typedef struct _PERF_CAPTURE
     UINT64   dirty_area;        // sum of dirty rect areas, pixels
 } PERF_CAPTURE;
 
-// Read config, calibrate QPC, log the banner + CSV header. Call once from Init().
-void PerfInit(void);
+// Read config, calibrate QPC, log the banner + CSV header. Call once from Init(), with Init's qubesdb
+// session (not closed here).
+void PerfInit(qdb_handle_t initQdb);
 
 // Capture thread: a frame arrived with no dirty rects and was dropped.
 void PerfNoteSkippedFrame(void);

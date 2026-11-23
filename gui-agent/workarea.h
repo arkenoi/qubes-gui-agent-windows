@@ -16,6 +16,7 @@
  */
 #pragma once
 #include <windows.h>
+#include <qubesdb-client.h>   // qdb_handle_t: WorkAreaAdoptQdb
 
 // Initialize the module lock only. MUST run before any thread that can execute
 // WaWndProc exists, i.e. before the window-event thread is started (the broadcast
@@ -75,6 +76,10 @@ BOOL WorkAreaGetApplied(OUT RECT* applied);
 // runs it). Returns TRUE if a valid value was read and stored; FALSE = feed
 // unavailable, stored values untouched.
 BOOL WorkAreaSyncReadDom0(void);
+
+// Init's qubesdb session, kept for this feed instead of closed (QUBESDBCONNECTPERREAD): the sync reads above use it
+// until WorkAreaInit hands it to the watch thread as its first connection. Main thread, before WorkAreaInit.
+void WorkAreaAdoptQdb(qdb_handle_t h);
 
 // Inference sample: a daemon-dictated window origin from MSG_CONFIGURE.
 void WorkAreaNoteDaemonOrigin(int x, int y);
