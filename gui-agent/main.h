@@ -331,6 +331,11 @@ typedef struct _WINDOW_DATA
      * was paid left no trace of what held it (findings/issues.md TOASTSWAPBLACKINDOM0). */
     const WCHAR* ToastRepaintWhy;
     ULONG ToastRepaintDeclines;
+    /* What the frame gate kept from dom0 besides damage (ToastGateHoldsGeometry, main.c): configures withheld and
+     * tracking passes whose buffer rebuild was withheld. Printed on the paid= line and reset there, so a swap the
+     * shell reshaped under the gate is told from one it did not. */
+    ULONG ToastGateCfgHeld;
+    ULONG ToastGateRebuildHeld;
 
     // FROZEN ANCHOR (WM-managed shell surfaces, ShellManaged != none). dom0 owns this
     // window's PLACEMENT: the guest HWND is never moved (it must keep painting at its

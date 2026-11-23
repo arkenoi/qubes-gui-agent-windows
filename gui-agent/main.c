@@ -7321,6 +7321,30 @@ BOOL ToastBannerWithheld(IN const WINDOW_DATA* entry)
     return entry != NULL && entry->MapDeferred && entry->ToastHoldOwned;
 }
 
+// THE FRAME GATE HOLDS THE WINDOW, NOT ONLY ITS DAMAGE (docs/ADR-toasts.md 10, findings/issues.md TOASTSWAPBLACKINDOM0).
+// The gate's contract is "dom0 keeps the frame it has" until the swapped-in toast is identified, but send.c drops only
+// SendWindowDamageEvent: a configure and a rebuilt buffer still went out under it. dom0 answers a resize by moving and
+// resizing its window and repainting it on the X expose from whatever image it has mapped (xside.c
+// handle_configure_from_vm -> moveresize_vm_window; process_xevent_expose -> do_shm_update), and handle_window_dump maps a
+// rebuilt buffer without repainting it, while the rebuild's own damage is the one the gate drops. Toast-hold 2026-11-23,
+// build 4.3.47.1459 run 3: the shell reshaped the banner 364x109 -> 396x43 -> 364x109 under the gate, both rebuilds went
+// out, the second buffer held only 13 rows carried from the first's zeroed rows, and dom0's capture showed a black window
+// inside the red frame at y=1331 - the 364x109@1379 configure clamped by force_on_screen. So while the gate holds a banner
+// that dom0 has MAPPED, its configure and its buffer rebuild are withheld too; the ungate's debt sweep flushes the resting
+// geometry and queues the rebuild (ToastDebtWakeSweep). Not for an unmapped banner (a held or suppressed one keeps its gate,
+// toasthold.c): its re-map lands at the geometry announced before it, so that must stay current.
+static BOOL ToastGateHoldsGeometry(IN const WINDOW_DATA* entry)
+{
+    return entry != NULL && entry->CreateSent && !entry->MapDeferred && SendWindowFrameGated(entry->Handle);
+}
+
+// The per-window buffer is size-bound: granted for PwWidth x PwHeight, it must be rebuilt before it is painted at another
+// live size (the rebuild arm in UpdateWindowData; ToastPayRepaintNow declines meanwhile).
+static BOOL PwSlabSizeStale(IN const WINDOW_DATA* entry)
+{
+    return PwIsAttached(entry) && (entry->PwWidth != entry->Width || entry->PwHeight != entry->Height);
+}
+
 // Crop-before-show readiness: is the shadow-crop for this toast/menu resolved enough to map it
 // already cropped? Menu -> the broker has reported opaque bounds (preferred) OR the UIA measurement
 // resolved; toast -> UIA resolved. A non-cropped surface is always ready.
@@ -8141,6 +8165,9 @@ static void CfgFlushPendingMove(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->CfgPendingPos)
         return;
+    // A gated banner's geometry is held with its frames (ToastGateHoldsGeometry); the ungate's debt sweep flushes it.
+    if (ToastGateHoldsGeometry(entry))
+        return;
     if (GetTickCount() - entry->CfgLastSentTick < CFG_POS_MIN_INTERVAL_MS)
         return; // still inside the window; the next pass will flush it
     // While the daemon is dictating this window's geometry, dom0 already knows where its
@@ -8291,6 +8318,16 @@ static ULONG SendWindowConfigureIfChanged(IN OUT WINDOW_DATA* entry)
         // resting geometry once, and only if it differs from dom0's - a size the window refused. Override-redirect changes
         // still go out at once.
         const BOOL geomOnly = entry->CfgSentValid && entry->LastCfgOvr == entry->IsOverrideRedirect;
+        // FRAME GATE: a gated banner dom0 has mapped keeps the window dom0 has, geometry included
+        // (ToastGateHoldsGeometry). Withheld like the daemon drive below; flushed by the ungate's debt sweep.
+        if (geomOnly && ToastGateHoldsGeometry(entry))
+        {
+            entry->CfgPendingPos = TRUE;
+            entry->CfgPendingX = entry->X;
+            entry->CfgPendingY = entry->Y;
+            entry->ToastGateCfgHeld++;
+            return ERROR_SUCCESS;
+        }
         if (geomOnly &&
             ((entry->DaemonStreamTick != 0 && (now - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS) ||
              DaemonGeometryUnsettled(entry)))
@@ -11264,11 +11301,13 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     // catches dom0-initiated resizes, where HandleConfigure pre-writes Width/Height and
     // a plain sizeChanged never fires. Failure inside PwResizeWindow already forces the
     // daemon back to the legacy path via unmap/map.
-    if (PwIsAttached(windowData) &&
-        (windowData->PwWidth != windowData->Width ||
-         windowData->PwHeight != windowData->Height))
+    // A gated banner keeps the buffer dom0 has mapped (ToastGateHoldsGeometry): its rebuild waits for the ungate, whose debt
+    // sweep queues the pass that runs it.
+    if (PwSlabSizeStale(windowData))
     {
-        if (PwResizeWindow(windowData) == ERROR_SUCCESS)
+        if (ToastGateHoldsGeometry(windowData))
+            windowData->ToastGateRebuildHeld++;
+        else if (PwResizeWindow(windowData) == ERROR_SUCCESS)
         {
             ULONG damageStatus = SendWindowDamageEvent(windowData->Handle, 0, 0,
                 windowData->Width, windowData->Height);
@@ -11466,6 +11505,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         windowData->MapDeferred = TRUE;
         windowData->MapDeferSince = GetTickCount64();
         windowData->MapDeferDue = 0;
+        // Unmapped, the banner's geometry is no longer held by its gate (ToastGateHoldsGeometry): announce what the gate
+        // withheld now, so the re-map below lands at the window's current rect rather than the one from before the gate.
+        CfgFlushPendingMove(windowData);
         LogInfo("QGATOASTHOLD hwnd=0x%x unmapped a MAPPED banner: the hold governs it again (re-mapped when it says show)",
             (DWORD)(ULONG_PTR)windowData->Handle);
     }
@@ -12856,6 +12898,11 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     // leave. Broker-sourced only, the measured case (src=broker): a composite-fed toast keeps its payment as it was.
     if (PwIsAttached(entry) && entry->PwSliceFed && entry->PwBrokerSourced && entry->PwSlabUnfed)
         return ToastPayDeclined(entry, L"slab-unfed");
+    // A BUFFER OF ANOTHER SIZE IS NOT THIS WINDOW'S PICTURE. A banner the shell resized under its gate keeps the buffer dom0
+    // has mapped until the ungate (ToastGateHoldsGeometry); painting it at the live rect would hand dom0 the old size's
+    // pixels. Declining keeps the debt for ToastDebtWakeSweep, which queues the pass whose rebuild arm fixes the size.
+    if (PwSlabSizeStale(entry))
+        return ToastPayDeclined(entry, L"slab-size-stale");
 
     // THE DAMAGE HOLD IS NOT OURS TO BREAK. While the daemon dictates this window's geometry (a dom0
     // WM drag) or a guest-native drag has latched it, position announces are withheld, so dom0's
@@ -12954,12 +13001,15 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     // never run, and that is the difference between "no popup was above the banner" and "the
     // composite is not this window's source, so nothing could be withheld".
     LogInfo("QGATOASTREPAINT hwnd=0x%x paid=at-release after %llu ms feed=slice occluders=%d rects=%lu src=%s "
-        L"declined=%lu last=%s "
+        L"declined=%lu last=%s gated_cfg=%lu gated_rebuild=%lu "
         L"(the visible region was repainted without waiting for a capture frame: dom0 now has this toast's pixels)",
         (DWORD)(ULONG_PTR)entry->Handle,
         (unsigned long long)(entry->ToastRepaintOwedAt ? GetTickCount64() - entry->ToastRepaintOwedAt : 0),
         walk.n, rects, direct ? L"broker" : L"composite",
-        entry->ToastRepaintDeclines, entry->ToastRepaintWhy ? entry->ToastRepaintWhy : L"-");
+        entry->ToastRepaintDeclines, entry->ToastRepaintWhy ? entry->ToastRepaintWhy : L"-",
+        entry->ToastGateCfgHeld, entry->ToastGateRebuildHeld);
+    entry->ToastGateCfgHeld = 0;
+    entry->ToastGateRebuildHeld = 0;
     entry->ToastRepaintOwed = FALSE;
     entry->ToastRepaintOwedAt = 0;
     entry->ToastRepaintFrameSeen = FALSE;
@@ -12995,7 +13045,14 @@ static void ToastDebtWakeSweep(void)
             continue;
         CfgFlushPendingMove(entry);
         if (!ToastPayRepaintNow(entry))
+        {
             next = now + TOAST_DEBT_RETRY_MS;
+            // The gate withheld a rebuild (ToastGateHoldsGeometry) and the shell left the banner at another size: the
+            // tracking pass owns the rebuild, so queue one - after the flush above, so dom0 has the size first - exactly as
+            // BrokerDimsWakeSweep queues its repair. Bounded with the debt, by TH_HOLD_BOUND_MS.
+            if (PwSlabSizeStale(entry))
+                QueueWindowEvent(entry->Handle, EVENT_OBJECT_SHOW, FALSE);
+        }
     }
     LeaveCriticalSection(&g_csWatchedWindows);
     g_ToastDebtWake = next;
