@@ -25,8 +25,7 @@
 extern DWORD g_DisableCursor;
 
 ULONG HideCursors(void);
-ULONG EnableEffects(void);    // undo DisableEffects when the guest leaves seamless
-ULONG DisableEffects(void);
+ULONG DisableEffects(void);   // agent init only: the logon desktop's own values (util.c)
 HANDLE CreateNamedEvent(IN const WCHAR *name); // returns NULL on failure
 HANDLE CreateNamedMailslot(IN const WCHAR *name); // returns NULL on failure
 ULONG IncreaseProcessWorkingSetSize(IN SIZE_T minimumSize, IN SIZE_T maximumSize);

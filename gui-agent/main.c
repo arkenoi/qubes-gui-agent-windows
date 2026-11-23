@@ -7454,8 +7454,8 @@ static BOOL SearchViewCoveredByStart(IN OUT WINDOW_DATA* entry)
     return TRUE;
 }
 
-// Guest-native window shadows off in seamless, restored in fullscreen. The shell window gives us a
-// process that belongs to the interactive user, which is all the helper needs.
+// Guest-native window shadows off in seamless, and in fullscreen put back to the user's own setting, which the helper
+// recorded at seamless entry (SetShadowsMain). The helper runs on the interactive user's session token.
 // TRUE once the helper actually ran. Uses the SESSION token (SpawnHelperInSession), which is
 // available as soon as the user is logged on - i.e. before seamless capture even starts - so the
 // single call at seamless entry normally succeeds without waiting for the shell window. The
@@ -7472,7 +7472,7 @@ static BOOL ApplyGuestShadows(IN BOOL enable)
         // slide-in race, SetShadowsMain); it records the read-back in the user's hive as
         // gui-agent\ClientAreaAnimation, which is where the rig checks it.
         LogInfo("guest window shadows %s; client-area animation disabled (toast slide-in)",
-            enable ? L"restored (fullscreen)" : L"disabled (seamless)");
+            enable ? L"put back to the user's setting (fullscreen)" : L"disabled (seamless)");
         return TRUE;
     }
     // Token missing, profile not loaded yet, a spawn that failed, or the helper did not exit 0
@@ -7773,14 +7773,15 @@ static void ApplySeamlessTweaks(IN BOOL seamless)
         g_SeamlessShadowsDone = TRUE;                       // nothing retries this direction
     }
 
-    // 2. Drop shadow and window animation: dom0 draws the shadow, and the animation can never be
-    //    smooth across the protocol. Inside one desktop window, Windows should look like Windows.
-    if (seamless)
-        DisableEffects();
-    else
-        EnableEffects();
+    // No SYSTEM-side effects step (EFFECTSPREFOVERWRITTEN). It was DisableEffects / EnableEffects here: drop shadow and
+    // min/max animation through SystemParametersInfo from this SYSTEM process. Their SPIF_UPDATEINIFILE persists to
+    // HKU\S-1-5-18, never to the user, but the live set reaches the user's session (measured 2026-11-23 with
+    // SPI_SETANIMATION) - so leaving seamless switched the user's animation ON whatever they had. A guest that booted into
+    // seamless showed the user's own animation value at steady state anyway (same probe: live minanimate=1), and
+    // docs/ADR-windows.md 9 has no row for animation. The drop shadow is the helper's in step 1, which records the user's
+    // value and puts it back. DisableEffects stays at agent init, for the logon desktop (S-1-5-18 is its own hive).
 
-    // 3. Per-window captions: dom0 draws the frame in seamless, so the guest's own is a second
+    // 2. Per-window captions: dom0 draws the frame in seamless, so the guest's own is a second
     //    title bar. In non-seamless there is no dom0 frame and Windows must draw its own.
     // Captions come back from the stripped SET, which the caption code owns and which survives
     // ResetWatch. Entering seamless needs no pass here: every window is re-announced and the
@@ -18896,50 +18897,129 @@ static int SetShadowsMain(LPSTR cmdLine)
     if (sscanf_s(cmdLine, "--set-shadows %d", &enable) != 1)
         return ERROR_INVALID_PARAMETER;
 
-    HKEY key = NULL;
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, L"Control Panel\\Desktop", 0, KEY_READ | KEY_WRITE, &key))
+    // THE USER'S OWN DROP-SHADOW PREFERENCE IS RECORDED AT SEAMLESS ENTRY AND PUT BACK ON LEAVING (EFFECTSPREFOVERWRITTEN,
+    // docs/ADR-windows.md 9 "restored"). Until 4.3.47 leaving seamless wrote shadows ON whatever the user had, and this
+    // helper also cleared and set UserPreferencesMask byte 1 bit 0x04 as "the drop-shadow preference". Measured
+    // 2026-11-23 on win11r as the user: SPI_SETSELECTIONFADE flips byte 1 0x04, SPI_SETDROPSHADOW flips byte 2 0x04. So
+    // every mode switch overwrote the user's SELECTION FADE, and SPI_SETDROPSHADOW with SPIF_UPDATEINIFILE already
+    // persists the real bit. That write is gone; nothing here touches selection fade except the one seed below.
+    //
+    // The record lives beside ClientAreaAnimation, in the user's own hive, and is DURABLE: EffectsHeld is 1 while the
+    // seamless setting holds the user's values and 0 once they are put back. A record deleted on leaving could not tell a
+    // finished round trip from a profile this code never ran in, and an entry that finds EffectsHeld 1 (a shutdown in
+    // seamless, then a boot into it - the common case) must not record the seamless value as the user's.
+    //
+    // A PROFILE ONLY EARLIER RELEASES RAN IN. Every release since 2026-09-06 wrote ClientAreaAnimation on every run and
+    // kept no record; one whose last run was the seamless direction left shadows and selection fade OFF in this hive
+    // (the rig's user: mask 9e 1a 03, the Windows default 9e 1e 07). Recording that as the user's preference would leave
+    // an upgrader shadowless on leaving seamless, where 4.3.46 put them back on. So ClientAreaAnimation without
+    // EffectsHeld gets the record the shipped restore wrote: shadow on, its mirror 1, selection fade on.
+    //
+    // FROM THE PERSISTED VALUES, NOT SPI_GET: the agent's own init DisableEffects runs as SYSTEM and a live set from it
+    // reaches this session (measured 2026-11-23 with SPI_SETANIMATION), so after an agent restart in a live session the
+    // live value can be the agent's. Its SPIF_UPDATEINIFILE lands in HKU\S-1-5-18, never in this hive.
+    static const WCHAR veShadowKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects\\DropShadow";
+    HKEY ga = NULL;
+    if (RegCreateKeyEx(HKEY_CURRENT_USER, L"Software\\Invisible Things Lab\\Qubes Tools\\gui-agent",
+            0, NULL, 0, KEY_READ | KEY_WRITE, NULL, &ga, NULL))
         return ERROR_ACCESS_DENIED;
 
-    BYTE mask[8] = { 0 };
-    DWORD cb = sizeof(mask), type = 0;
-    if (RegQueryValueEx(key, L"UserPreferencesMask", NULL, &type, mask, &cb) || cb < 1)
-    {
-        RegCloseKey(key);
-        return ERROR_FILE_NOT_FOUND;
-    }
+    DWORD held = 0, cb = sizeof(held);
+    const BOOL heldKnown = !RegGetValueW(ga, NULL, L"EffectsHeld", RRF_RT_REG_DWORD, NULL, &held, &cb);
+    const BOOL holding = heldKnown && held == 1;
+    const BOOL earlierOnly = !heldKnown &&
+        !RegGetValueW(ga, NULL, L"ClientAreaAnimation", RRF_RT_REG_DWORD, NULL, NULL, NULL);
 
-    // Byte 1, bit 0x04 is the drop-shadow preference.
-    const BYTE saved = mask[1];
-    if (enable)
-        mask[1] |= 0x04;
-    else
-        mask[1] &= (BYTE)~0x04;
-
-    if (saved != mask[1])
-        RegSetValueEx(key, L"UserPreferencesMask", 0, REG_BINARY, mask, cb);
-    RegCloseKey(key);
-
-    // The VisualEffects mirror is what the Performance Options UI reads back.
     HKEY ve = NULL;
-    if (!RegCreateKeyEx(HKEY_CURRENT_USER,
-            L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\VisualEffects\\DropShadow",
-            0, NULL, 0, KEY_WRITE, NULL, &ve, NULL))
+    if (!enable)
     {
-        DWORD v = enable ? 1 : 0;
-        RegSetValueEx(ve, L"DefaultValue", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
-        RegCloseKey(ve);
-    }
+        if (!holding)
+        {
+            DWORD shadow = 1, mirror = 1;
+            BOOL mirrorSet = TRUE;
+            if (!earlierOnly)
+            {
+                BYTE mask[16] = { 0 };
+                DWORD mcb = sizeof(mask);
+                if (RegGetValueW(HKEY_CURRENT_USER, L"Control Panel\\Desktop", L"UserPreferencesMask",
+                        RRF_RT_REG_BINARY, NULL, mask, &mcb) || mcb < 3)
+                {
+                    RegCloseKey(ga);
+                    return ERROR_FILE_NOT_FOUND;
+                }
+                shadow = (mask[2] & 0x04) ? 1 : 0;      // SPI_SETDROPSHADOW's bit (measured, above)
+                cb = sizeof(mirror);
+                mirrorSet = !RegGetValueW(HKEY_CURRENT_USER, veShadowKey, L"DefaultValue", RRF_RT_REG_DWORD,
+                    NULL, &mirror, &cb);
+            }
+            RegSetValueEx(ga, L"SavedDropShadow", 0, REG_DWORD, (const BYTE*)&shadow, sizeof(shadow));
+            if (mirrorSet)
+                RegSetValueEx(ga, L"SavedDropShadowMirror", 0, REG_DWORD, (const BYTE*)&mirror, sizeof(mirror));
+            else
+                RegDeleteValue(ga, L"SavedDropShadowMirror");
+            if (earlierOnly)
+            {
+                const DWORD on = 1;
+                RegSetValueEx(ga, L"SavedSelectionFade", 0, REG_DWORD, (const BYTE*)&on, sizeof(on));
+            }
+            else
+                RegDeleteValue(ga, L"SavedSelectionFade");
+            held = 1;                                   // last: a run cut off before here holds no half record
+            RegSetValueEx(ga, L"EffectsHeld", 0, REG_DWORD, (const BYTE*)&held, sizeof(held));
+        }
 
-    // The UserPreferencesMask bit governs the DWM "show shadows under windows" effect, but the
-    // CLASSIC per-window drop shadow (CS_DROPSHADOW - what menus/context-menus/tooltips draw, and
-    // what surfaces to dom0 as a separate o-r shadow companion window) is governed by
-    // SPI_SETDROPSHADOW. That is a PER-USER setting, so it must be set HERE (this helper runs on
-    // the interactive user's token) - the agent's own DisableEffects() runs as SYSTEM and does not
-    // reach the user session. Setting it off globally drops menu shadows without any per-window
-    // filtering (verified: a context menu drops from 2 o-r windows to 1). Restored (TRUE) on the
-    // fullscreen direction, mirroring the mask above.
-    SystemParametersInfo(SPI_SETDROPSHADOW, 0, (void*)(INT_PTR)(enable ? TRUE : FALSE),
-                         SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+        // Off. SPI_SETDROPSHADOW is the classic per-window drop shadow (CS_DROPSHADOW - what menus, context menus and
+        // tooltips draw, and what surfaces to dom0 as a separate o-r shadow companion window). It is PER-USER, so it is
+        // set HERE, on the interactive user's token. Off globally drops menu shadows without any per-window filtering
+        // (verified: a context menu drops from 2 o-r windows to 1). The VisualEffects mirror is what the Performance
+        // Options UI reads back.
+        SystemParametersInfo(SPI_SETDROPSHADOW, 0, (void*)(INT_PTR)FALSE, SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+        if (!RegCreateKeyEx(HKEY_CURRENT_USER, veShadowKey, 0, NULL, 0, KEY_WRITE, NULL, &ve, NULL))
+        {
+            const DWORD off = 0;
+            RegSetValueEx(ve, L"DefaultValue", 0, REG_DWORD, (const BYTE*)&off, sizeof(off));
+            RegCloseKey(ve);
+        }
+    }
+    else if (holding || earlierOnly)
+    {
+        DWORD shadow = 1, mirror = 1, fade = 1;
+        BOOL mirrorSet = TRUE, fadeSet = TRUE;          // an earlier release's profile: what the shipped restore wrote
+        if (holding)
+        {
+            cb = sizeof(shadow);
+            if (RegGetValueW(ga, NULL, L"SavedDropShadow", RRF_RT_REG_DWORD, NULL, &shadow, &cb))
+                shadow = 1;
+            cb = sizeof(mirror);
+            mirrorSet = !RegGetValueW(ga, NULL, L"SavedDropShadowMirror", RRF_RT_REG_DWORD, NULL, &mirror, &cb);
+            cb = sizeof(fade);
+            fadeSet = !RegGetValueW(ga, NULL, L"SavedSelectionFade", RRF_RT_REG_DWORD, NULL, &fade, &cb);
+        }
+        SystemParametersInfo(SPI_SETDROPSHADOW, 0, (void*)(INT_PTR)(shadow ? TRUE : FALSE),
+                             SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+        if (!mirrorSet)
+            RegDeleteKeyValueW(HKEY_CURRENT_USER, veShadowKey, L"DefaultValue");
+        else if (!RegCreateKeyEx(HKEY_CURRENT_USER, veShadowKey, 0, NULL, 0, KEY_WRITE, NULL, &ve, NULL))
+        {
+            RegSetValueEx(ve, L"DefaultValue", 0, REG_DWORD, (const BYTE*)&mirror, sizeof(mirror));
+            RegCloseKey(ve);
+        }
+        if (fadeSet)
+            SystemParametersInfo(SPI_SETSELECTIONFADE, 0, (void*)(INT_PTR)(fade ? TRUE : FALSE),
+                                 SPIF_UPDATEINIFILE | SPIF_SENDCHANGE);
+        RegDeleteValue(ga, L"SavedDropShadow");
+        RegDeleteValue(ga, L"SavedDropShadowMirror");
+        RegDeleteValue(ga, L"SavedSelectionFade");
+        held = 0;
+        RegSetValueEx(ga, L"EffectsHeld", 0, REG_DWORD, (const BYTE*)&held, sizeof(held));
+    }
+    else
+    {
+        // The user's own values stand: nothing was taken, nothing is put back. EffectsHeld 0 is still written, so a
+        // later run cannot take this profile for one only an earlier release ran in.
+        held = 0;
+        RegSetValueEx(ga, L"EffectsHeld", 0, REG_DWORD, (const BYTE*)&held, sizeof(held));
+    }
 
     // CLIENT-AREA ANIMATION OFF - BOTH DIRECTIONS, NEVER RESTORED. This is not a shadow; it is
     // the toast slide-in. A shell toast slides in from the right as a XAML translate of the
@@ -18972,33 +19052,22 @@ static int SetShadowsMain(LPSTR cmdLine)
         RegSetValueEx(ve, L"DefaultValue", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
         RegCloseKey(ve);
     }
-    // VERIFIABLE: the spawner (SpawnHelperInSession) is fire-and-forget, so this helper's exit
-    // code is never seen. Read the setting back the way the shell will and record it in the
-    // user's own hive under the gui-agent key - ClientAreaAnimation = 0 means "off, confirmed",
-    // 1 means the SPI call did not take (policy?), and an ABSENT value means this helper never
-    // ran in that session. The rig asserts it from a user-session task; the SYSTEM agent can
-    // read it as HKEY_USERS\<sid>\... too.
+    // VERIFIABLE: the spawner (SpawnHelperInSession) sees only this helper's exit code, 0 for every
+    // path. Read the setting back the way the shell will and record it in the user's own hive under
+    // the gui-agent key - ClientAreaAnimation = 0 means "off, confirmed", 1 means the SPI call did
+    // not take (policy?), and an ABSENT value means this helper never ran in that profile. The
+    // SYSTEM agent and a probe can read it, and the shadow record above, as HKEY_USERS\<sid>\...
     {
         BOOL anim = TRUE;
         if (!SystemParametersInfo(SPI_GETCLIENTAREAANIMATION, 0, &anim, 0))
             anim = TRUE;
-        HKEY ga = NULL;
-        if (!RegCreateKeyEx(HKEY_CURRENT_USER,
-                L"Software\\Invisible Things Lab\\Qubes Tools\\gui-agent",
-                0, NULL, 0, KEY_WRITE, NULL, &ga, NULL))
-        {
-            DWORD v = anim ? 1 : 0;
-            RegSetValueEx(ga, L"ClientAreaAnimation", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
-            RegCloseKey(ga);
-        }
+        DWORD v = anim ? 1 : 0;
+        RegSetValueEx(ga, L"ClientAreaAnimation", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
     }
-
-    // Make it live without a logoff.
-    // SPI_SETUSERPREFERENCESMASK (0x1045) is not in this SDK's headers; the broadcast only needs
-    // the numeric wParam, and "WindowMetrics" is the section name listeners match on.
-    DWORD_PTR res = 0;
-    SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, 0x1045,
-        (LPARAM)L"WindowMetrics", SMTO_ABORTIFHUNG, 1000, &res);
+    RegCloseKey(ga);
+    // No UserPreferencesMask broadcast any more: it announced the direct mask write this helper no
+    // longer makes, and every setting it changes goes through SystemParametersInfo with
+    // SPIF_SENDCHANGE, which broadcasts that change itself.
     return ERROR_SUCCESS;
 }
 

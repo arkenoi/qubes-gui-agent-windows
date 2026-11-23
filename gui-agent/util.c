@@ -240,29 +240,11 @@ ULONG HideCursors(void)
     return ERROR_SUCCESS;
 }
 
-// Undo DisableEffects. The tweaks below are SEAMLESS-MODE tweaks: dom0 draws the shadow and the
-// animation can never be smooth across the protocol, so both are turned off while each guest
-// window is its own dom0 window. In NON-SEAMLESS the guest desktop is one ordinary window showing
-// a whole Windows desktop, and inside it Windows should look like Windows - so they are restored
-// on the way out and re-applied on the way back in (owner, 2026-09-24: the seamless tweaks we
-// enable on start now have to follow the switch, "and also disable them on exit").
-ULONG EnableEffects(void)
-{
-    ANIMATIONINFO animationInfo;
-
-    LogDebug("start");
-    if (!SystemParametersInfo(SPI_SETDROPSHADOW, 0, (void *) TRUE, SPIF_UPDATEINIFILE))
-        return win_perror("SystemParametersInfo(SPI_SETDROPSHADOW, TRUE)");
-
-    animationInfo.cbSize = sizeof(animationInfo);
-    animationInfo.iMinAnimate = TRUE;
-
-    if (!SystemParametersInfo(SPI_SETANIMATION, sizeof(animationInfo), &animationInfo, SPIF_UPDATEINIFILE))
-        return win_perror("SystemParametersInfo(SPI_SETANIMATION, TRUE)");
-
-    return ERROR_SUCCESS;
-}
-
+// Called once, at agent init, as SYSTEM. SPIF_UPDATEINIFILE persists to HKU\S-1-5-18, the logon desktop's own hive;
+// the live set reaches whatever session the agent runs in (measured 2026-11-23 with SPI_SETANIMATION), and a user's
+// logon reloads that user's own values. It no longer follows the seamless switch, and EnableEffects is gone: leaving
+// seamless switched the USER's animation and shadow on whatever they had (EFFECTSPREFOVERWRITTEN). The user's drop
+// shadow is the session helper's (main.c SetShadowsMain), which records it and puts it back.
 ULONG DisableEffects(void)
 {
     ANIMATIONINFO animationInfo;
