@@ -3,31 +3,28 @@
  *
  * toastcrop.c walks a live XAML tree over cross-process RPC and feeds every element's
  * bounding rect through TcCardAccumulate(); afterwards TcCardPick() turns the accumulator
- * into "the card" under one of two rules. Nothing here touches COM, UIA, or any agent
- * state, so the rule can be unit-tested offline against a recorded tree
- * (toastcrop_pick_test.c) - which is what makes the per-surface selection below a checked
- * property instead of a belief.
+ * into "the card": the UNION of every qualifying element, for every surface. Nothing here
+ * touches COM, UIA, or any agent state, so the rule can be unit-tested offline against a
+ * recorded tree (toastcrop_pick_test.c).
  *
- * WHY TWO RULES (measured 2026-09-06, win11 24H2, a real two-button reminder toast):
- *   window 396x200, FlexibleToastView card 364x157 (insets 16/30/16/13 - the historical
- *   baseline in toastcrop.h). The 2026-09-03 finder (control view first + UNION of every
- *   qualifying element, 9399acd/78a602e) cropped that toast to ~214x157: the height is the
- *   card's, the width is a content box well inside it, and both action buttons were cut.
- *   The card element itself is the LARGEST descendant strictly smaller than the window in
- *   both dimensions, so the pre-09-03 rule picks it. The union rule exists for WinUI MENU
- *   bodies, whose presenter spans the full window height so no single element is the card
- *   and the item UNION is the drawn extent (toastcrop.c, TcFindCardRect header). Hence:
- *     TcPickLargest - toasts (shell CoreWindow banners): one card element nests everything.
- *                     WRONG FOR A STACK: several toasts stack as several cards in the one window, which
- *                     is normal and required (owner 2026-11-24, docs/ADR-toasts.md 13); picking the largest
- *                     card cuts the stack to one (measured win11-nfy: 364x326 -> 364x157). A defect,
- *                     findings/issues.md TOASTSTACKNOTSHOWN.
- *     TcPickUnion   - WinUI menus: no single card element; union of the rows.
- *   Both are GEOMETRIC. No class name is consulted (FlexibleToastView is cited above as
- *   evidence only): class names are undocumented XAML internals that changed between
- *   builds once already, which is why the class-keyed finder was retired.
+ * WHY THE UNION, FOR TOASTS TOO (2026-11-24). Several toasts STACK as several cards in the one
+ * banner window, which is normal and required (owner 2026-11-24, docs/ADR-toasts.md 13): dom0
+ * must be sent every card. Measured on win11r 26300 (guest/toast-uia-tree.ps1 -Hwnd, raw view):
+ * one card = one FlexibleToastView 364x157 whose every child ends inside it (rightmost 5097 <
+ * card right 5104), so the union IS the card; three cards = three FlexibleToastViews 364x157
+ * sharing x=4740, walked OLDEST FIRST, union 364x495. The rule this replaces, the single
+ * LARGEST qualifier, tied the equal cards and kept the first-seen - the oldest - so the newest
+ * toast was cut off (findings/issues.md TOASTSTACKNOTSHOWN). Over every toast-rule walk ever
+ * logged on this rig (536 lines) the union equals the largest on every one-card banner.
+ * The 2026-09-06 overcrop (a toast cut to ~214 wide) was the CONTROL view's union - a text
+ * column, the card element absent; toasts walk the RAW view, where the card is present.
+ * WinUI menu bodies have no single card element (the presenter spans the full height), so
+ * the union of the rows is their drawn extent too (toastcrop.c, TcFindCardRect header).
+ * The rule is GEOMETRIC. No class name is consulted (FlexibleToastView is cited above as
+ * evidence only): class names are undocumented XAML internals that changed between builds
+ * once already, which is why the class-keyed finder was retired.
  *
- * Qualification (shared by both rules, unchanged since the geometric finder was written):
+ * Qualification (unchanged since the geometric finder was written):
  * an element counts iff it is fully INSIDE the raw window rect and STRICTLY SMALLER than
  * it in both dimensions, with positive width and height. The shadow margin contains no
  * elements, so it never qualifies; a container spanning the window's full width or height
@@ -53,16 +50,11 @@ typedef struct tagRECT { LONG left; LONG top; LONG right; LONG bottom; } RECT;
 #endif
 #endif
 
-typedef enum _TC_PICK_MODE
-{
-    TcPickLargest = 0,   // the single largest qualifying element (toasts)
-    TcPickUnion   = 1,   // the union of every qualifying element (WinUI menus)
-} TC_PICK_MODE;
-
 typedef struct _TC_CARD_ACC
 {
     RECT Union;          // running union of every qualifier; valid iff Count > 0
-    RECT Largest;        // the qualifier with the greatest area; valid iff Count > 0
+    RECT Largest;        // the qualifier with the greatest area; valid iff Count > 0 - logged next to the
+                         // union (toastcrop.c's card-walk line) so a field log shows both, never picked
     LONG LargestArea;
     int  Count;          // qualifiers seen so far
 } TC_CARD_ACC;
@@ -120,23 +112,23 @@ static __inline BOOL TcCardAccumulate(RECT raw, RECT r, TC_CARD_ACC* acc)
     return TRUE;
 }
 
-// The card under `mode`. FALSE (and *out untouched) when nothing qualified.
-static __inline BOOL TcCardPick(const TC_CARD_ACC* acc, TC_PICK_MODE mode, RECT* out)
+// The card: the union of every qualifier. FALSE (and *out untouched) when nothing qualified.
+static __inline BOOL TcCardPick(const TC_CARD_ACC* acc, RECT* out)
 {
     if (acc->Count == 0)
         return FALSE;
-    *out = (mode == TcPickUnion) ? acc->Union : acc->Largest;
+    *out = acc->Union;
     return TRUE;
 }
 
 // Convenience for a recorded tree: accumulate `count` rects (in walk order) and pick.
-static __inline BOOL TcPickCard(RECT raw, const RECT* rects, int count, TC_PICK_MODE mode, RECT* out)
+static __inline BOOL TcPickCard(RECT raw, const RECT* rects, int count, RECT* out)
 {
     TC_CARD_ACC acc;
     TcCardAccInit(&acc);
     for (int i = 0; i < count; i++)
         TcCardAccumulate(raw, rects[i], &acc);
-    return TcCardPick(&acc, mode, out);
+    return TcCardPick(&acc, out);
 }
 
 // ---- mid-slide guard --------------------------------------------------------------------
@@ -171,16 +163,9 @@ static __inline BOOL TcPickCard(RECT raw, const RECT* rects, int count, TC_PICK_
 // The offline suite asserts the routing on the measured shapes (toastcrop_pick_test.c).
 static __inline BOOL TcInsetsMidSlide(LONG rawWidth, const RECT* insets)
 {
-#ifdef TOASTCROP_PICK_DEFECT_NOGUARD
-    // Defect re-introduction: the guard never fires, so a mid-slide read is latched as
-    // the crop - which is exactly what shipped before 2026-09-06.
-    (void)rawWidth; (void)insets;
-    return FALSE;
-#else
     (void)rawWidth;
     LONG diff = insets->left - insets->right;
     if (diff < 0)
         diff = -diff;
     return diff > TOAST_CROP_MAX_LR_ASYMMETRY;
-#endif
 }

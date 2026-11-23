@@ -7,8 +7,6 @@
 
   Build:
     msbuild agent\vs2022\toastcrop-pick-test\toastcrop-pick-test.vcxproj /p:Configuration=Release /p:Platform=x64
-  Defect-reintroduction proof (the suite must then FAIL - CI inverts the exit code):
-    msbuild ... /t:Rebuild /p:ToastCropPickDefect=TOASTCROP_PICK_DEFECT_UNION
   Output pinned to agent\vs2022\toastcrop-pick-test\x64\Release\toastcrop_pick_test.exe.
 -->
 <Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
@@ -29,9 +27,6 @@
     <RootNamespace>toastcrop_pick_test</RootNamespace>
     <ProjectName>toastcrop_pick_test</ProjectName>
     <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
-    <!-- empty by default; CI passes /p:ToastCropPickDefect=TOASTCROP_PICK_DEFECT_UNION
-         for the defect-reintroduction build -->
-    <ToastCropPickDefect Condition="'$(ToastCropPickDefect)'==''"></ToastCropPickDefect>
   </PropertyGroup>
 
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
@@ -65,7 +60,7 @@
     <ClCompile>
       <WarningLevel>Level4</WarningLevel>
       <SDLCheck>false</SDLCheck>
-      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;$(ToastCropPickDefect);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>_DEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <CompileAs>CompileAsC</CompileAs>
       <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
       <TreatWarningAsError>false</TreatWarningAsError>
@@ -83,7 +78,7 @@
       <SDLCheck>false</SDLCheck>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
-      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;$(ToastCropPickDefect);%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions>NDEBUG;_CONSOLE;_CRT_SECURE_NO_WARNINGS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <CompileAs>CompileAsC</CompileAs>
       <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
       <TreatWarningAsError>false</TreatWarningAsError>
