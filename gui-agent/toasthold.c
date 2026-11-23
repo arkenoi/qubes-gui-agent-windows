@@ -499,8 +499,7 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             ThRequestReadLocked(e, now);
         else if (secondLookDue || failedRetryDue)
             ThRequestReadLocked(e, now);
-        else if (successorQueued && e->Core.Phase == ThPhaseDecided && since >= recheck)
-            ThRequestReadLocked(e, now);   // a newer toast is queued: is it painted in this window yet?
+        // MEASUREMENT BUILD: the queued-successor re-read is removed here too (see the tick below).
         // Whatever happened above, arm the moment the next attempt becomes due - anchored at the attempt
         // just made (or the refused one), so a refused request waits its back-off instead of spinning.
         if (!e->ReadInFlight && !e->NotBanner)
@@ -588,8 +587,9 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // ...and ANY decided banner, shown or suppressed, while a newer toast is queued behind it: the tick
     // is what brings the re-read above. It ends when that toast's record is consumed (some banner was
     // decided for it) or ages past TH_RECORD_TTL_MS, and the entry is dropped with its window.
-    if (successorQueued && e->Core.Phase == ThPhaseDecided)
-        e->Due = ThMinTick(e->Due, now + TH_HOLD_RECHECK_MS);
+    // MEASUREMENT BUILD (2026-11-24, branch measure-noreread-1124, never merged): the tick that stood
+    // here and the read it brought (the request above) are removed, the ONE variable, to test whether these re-reads keep a queued-behind banner on screen
+    // (hold-on lives of 177-180 re-reads, hold-off lives 6-12 s; findings/issues.md TOASTBANNERLOSTONDIRECTPATH).
     if (armRetry)
         e->Due = ThMinTick(e->Due, retryAt);
     if (swapGateHold)
