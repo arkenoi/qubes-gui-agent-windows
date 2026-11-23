@@ -1279,6 +1279,26 @@ static void CALLBACK WindowEventProc(
 
     if (event == EVENT_SYSTEM_FOREGROUND)
     {
+        // QGATOASTFOREGROUND - TOASTBANNERLOSTONDIRECTPATH shape (2). Measured 2026-11-23 over that day's toast-hold runs: in 4
+        // of 57 banner appearances the shell's banner stayed 37-96 s instead of 6 or 12, a second toast queued behind it never
+        // painted, and each time the next dom0 focus found the banner HOLDING THE GUEST FOREGROUND ("dom0 focus NOT applied -
+        // foreground held by" it, ApplyForeground refused through the attach path too). Nothing in the agent activates a
+        // banner: the daemon move carries SWP_NOACTIVATE and HandleFocus never forwards dom0 focus to a shell surface. So
+        // Windows did, and when, and from which window, is recorded nowhere - the console that fired the toast closed
+        // 0.55-1.26 s into EVERY one of the 57, stuck or not. This line is that record: the toast host's window taking
+        // the foreground, the window that had it, whether that window still exists (a destroyed foreground window hands
+        // activation to another), and for how long it had it. Toast host only; the hook thread alone keeps these two.
+        static HWND prevForeground = NULL;
+        static ULONGLONG prevForegroundAt = 0;
+        const ULONGLONG fgNow = GetTickCount64();
+        DWORD fgPid = 0;
+        if (window && GetWindowThreadProcessId(window, &fgPid) && ShellHostKindOfProcess(fgPid) == ShellSurfaceToast)
+            LogInfo("QGATOASTFOREGROUND 0x%x (pid %lu) has the foreground; before it 0x%x (%s) for %llu ms",
+                window, fgPid, prevForeground, !prevForeground ? L"none" : IsWindow(prevForeground) ? L"exists" : L"gone",
+                prevForeground ? fgNow - prevForegroundAt : 0ULL);
+        prevForeground = window;
+        prevForegroundAt = fgNow;
+
         // Nothing else is queued for a foreground change: only an open hidden Start is looked at again (see g_StartSurfaceOpen).
         HWND start = (HWND)InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, NULL);
         if (start && !IsWindow(start))
