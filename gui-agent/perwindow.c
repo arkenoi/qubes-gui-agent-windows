@@ -700,6 +700,7 @@ static ULONG PwAttachWindowCarry(IN OUT WINDOW_DATA* entry, IN const PW_CARRY* c
     // its normal state; the ledger marks it so a reader does not mistake NONE for a missing source.
     entry->PwLedgerEngineFed = !sliceFed;
     entry->PwSliceNeedsFull = sliceFed; // first frame does one full-window copy
+    entry->PwSlabUnfed = sliceFed;      // carried rows and zeros until that copy lands
     // Fresh attach: re-arm the one-shot BROKERHOLD diagnostic (see the ProcessNewFrame hold arm)
     // and the one-shot QGASLICEBLACK diagnostic (PwNoteSliceContent: copied-but-black hold).
     entry->PwHoldLogged = FALSE;
@@ -793,6 +794,7 @@ void PwDetachWindow(IN OUT WINDOW_DATA* entry)
     entry->PwDumpSent = FALSE;
     entry->PwSliceFed = FALSE;
     entry->PwSliceNeedsFull = FALSE;
+    entry->PwSlabUnfed = FALSE;
     // The channel (and the mask it held) is gone; move state dies with it.
     entry->SynthMaskLastCount = 0;
     entry->PwFrameXYValid = FALSE;

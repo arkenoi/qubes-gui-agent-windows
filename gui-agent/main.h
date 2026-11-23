@@ -378,6 +378,12 @@ typedef struct _WINDOW_DATA
     // fullscreen overlay below its panel).
     BOOL PwSliceFed;
     BOOL PwSliceNeedsFull; // one full-window copy pending (fresh attach/remap)
+    // The slab was (re)built by an attach and no full frame has been copied into it since: it holds the rows
+    // PwCarryContent carried and zeros. Set by PwAttachWindowCarry for a slice-fed window, cleared only where a frame
+    // lands (the broker consume, the composite full copy). NOT PwSliceNeedsFull, which a MOVE also sets over a slab
+    // that holds a good frame. Read by BrokerRetarget (a request owed a frame) and ToastPayRepaintNow (nothing to
+    // repay with) - findings/issues.md TOASTSWAPBLACKINDOM0.
+    BOOL PwSlabUnfed;
 
     // WGC broker (25H2+): this sliceFed window's pixels come from the user-session broker's
     // per-HWND WGC capture instead of the composited-desktop slice. See BrokerRegister/

@@ -6520,9 +6520,28 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     WGCBRK_HEADER* h = WGCBRK_HDR(g_WgcBase);
     WGCBRK_SLOT* slots = WGCBRK_SLOTS(g_WgcBase);
     WgcArenaReapPending(FALSE);   // regions the broker has released since the last supervise pass (R4)
-    int slot = -1;
-    for (int i = 0; i < WGCBRK_MAX_SLOTS; i++)
-        if (slots[i].Hwnd == 0 && slots[i].ReqState == WGCBRK_FREE) { slot = i; break; }
+    // A FREE SLOT WHOSE RELEASE THE BROKER HAS NOT HANDLED YET IS TAKEN LAST (findings/issues.md TOASTSWAPBLACKINDOM0).
+    // The broker opens a fresh WGC session only when a slot's Hwnd differs from its channel's (wgcbroker.cpp
+    // Reconcile, `wantOpen && c.hwnd != want`). BrokerUnregister frees the slot at once, so the BROKERREREG repair -
+    // BrokerUnregister then this, in one pass, for the SAME window, to get the fresh session the arm's comment
+    // promises - took the slot it had just released whenever no lower slot was free; unless the broker ran in
+    // between, it saw the same hwnd on the same slot, kept the old session and answered with a republish of its
+    // retained capture, the very request that had gone unanswered. CtlAck reaching ControlSeq says the broker has
+    // handled every request on the slot, its release included (the acknowledgement WgcArenaFreeDeferred waits for),
+    // so an acknowledged slot is preferred. An unacknowledged one is still taken when no other is free, so this can
+    // never turn into a registration failure; a slot never used reads CtlAck == ControlSeq == 0, acknowledged.
+    int slot = -1, unacked = -1;
+    for (int i = 0; i < WGCBRK_MAX_SLOTS && slot < 0; i++)
+    {
+        if (slots[i].Hwnd != 0 || slots[i].ReqState != WGCBRK_FREE)
+            continue;
+        if ((LONG)((ULONG)slots[i].CtlAck - (ULONG)slots[i].ControlSeq) >= 0)
+            slot = i;
+        else if (unacked < 0)
+            unacked = i;
+    }
+    if (slot < 0)
+        slot = unacked;
     if (slot < 0)
     {
         // LOUD (docs/DESIGN-rest-zero-capture.md F): a window with no slot is withheld with no source at all. Was a
@@ -6605,6 +6624,20 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
     return TRUE;
 }
 
+// How long a broker-frame/slab dimension mismatch may persist before it is treated as a desync
+// to repair rather than a resize in flight. A resize settles within a pass or two (~100 ms).
+#define BROKER_DIMS_STUCK_MS 750
+
+// THE STUCK CLOCK NEEDS A WAKE. A mismatch is flagged stuck by BrokerFreshFrame when another rejected frame arrives past
+// BROKER_DIMS_STUCK_MS, or by UpdateWindowData's clock check when a tracking pass examines the window - and on a quiet
+// desktop neither happens: a window that stopped painting sends no frame, and the main loop waits INFINITE (rest-zero S4),
+// so no pass runs. The window keeps the stale frame's picture until something unrelated wakes the loop. So the first
+// rejected frame of a run - or a retarget of a slab that holds no frame yet (BrokerRetarget) - arms ONE deadline at the
+// end of the grace, the main loop caps its wait by it, and BrokerDimsWakeSweep queues every window whose mismatch is still
+// outstanding then for the pass that repairs it. One wake per mismatch run and none at rest (0 = nothing armed). Main-loop
+// thread only, like g_MapDeferWake: BrokerFreshFrame, BrokerRetarget and the sweep run there.
+static ULONGLONG g_BrokerDimsWake = 0;   // earliest outstanding dims deadline (tick), 0 = none armed
+
 BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG newHeight)
 {
     if (!g_WgcBase || !WgcBrokerActive()) return FALSE;
@@ -6660,8 +6693,31 @@ BOOL BrokerRetarget(IN OUT WINDOW_DATA* entry)
     // between the request and the broker acting on it, and never admits a stale-sized frame.
     entry->PwBrokerSourced = TRUE;
     entry->PwDimsLogged = FALSE;   // re-arm the one-shot dims diagnostic for the new geometry
-    entry->PwDimsSince = 0;
     entry->PwDimsStuck = FALSE;
+    // A SLAB THAT HOLDS NO FRAME IS OWED ONE, AND THIS REQUEST IS WHAT OWES IT (findings/issues.md
+    // TOASTSWAPBLACKINDOM0, CAPTIONSTRIPLEAVESASHIFTEDFROZENIMAGE). This zeroed PwDimsSince unconditionally, which
+    // ENDED the mismatch run BrokerFreshFrame had started - the clock the BROKERREREG arm exists for, "a window that
+    // stops painting sends no frame". Measured 2026-11-23 (toast-hold run 5, build 1455, which carries the wake of
+    // 6edb658; the full log from the run's log volume): an in-place toast swap rebuilt the banner 364x109 -> 396x43 ->
+    // 364x109 in 19 ms, the 396x43 frame was rejected at 110302.433 (clock armed), this retarget ran 3 ms later for
+    // the crop (BROKERRECROP: clock cleared), the broker published nothing for the new request, and dom0 showed the
+    // rebuilt slab - 13 carried rows of 109, the rest zero - for the banner's whole remaining life, 6.1 s, with no
+    // line above INFO. Only a frame whose dims agree ends a run (BrokerFreshFrame). So a slab that holds no frame
+    // (PwSlabUnfed: set by the attach, cleared only where a frame is copied in) starts the clock from THIS request and
+    // arms the wake; a slab that already holds one - a crop-only retarget of a painted window, a menu card that moves
+    // - keeps the reset. NOT for a registration the broker has never published into (FrameId 0): that is
+    // first-frame-pending, which BrokerFreshFrame keeps off the clock because re-registering a slow first frame
+    // restarts the wait it was waiting out. Every request restarts the clock, so a window resizing continuously is
+    // re-registered only if its LAST request goes BROKER_DIMS_STUCK_MS unanswered.
+    if (entry->PwSlabUnfed && s->FrameId != 0)
+    {
+        entry->PwDimsSince = GetTickCount64();
+        const ULONGLONG due = entry->PwDimsSince + BROKER_DIMS_STUCK_MS + 10;
+        if (g_BrokerDimsWake == 0 || due < g_BrokerDimsWake)
+            g_BrokerDimsWake = due;
+    }
+    else
+        entry->PwDimsSince = 0;
     LogDebug("QGABROKERKEEP hwnd=0x%x slot=%d %ux%u t=%llu (slot kept, session not recreated)",
             (DWORD)(ULONG_PTR)entry->Handle, entry->PwBrokerSlot,
             entry->Width, entry->Height, (ULONGLONG)GetTickCount64());
@@ -6704,19 +6760,6 @@ static ULONGLONG g_LastRaiseTick = 0;
 // `debounced` counts raises suppressed because they answered our own previous raise - which is the
 // loop itself, so a non-zero value there names it explicitly instead of leaving it to inference.
 static DWORD g_RaiseSent = 0, g_RaiseSkipped = 0, g_RaiseDebounced = 0;
-
-// How long a broker-frame/slab dimension mismatch may persist before it is treated as a desync
-// to repair rather than a resize in flight. A resize settles within a pass or two (~100 ms).
-#define BROKER_DIMS_STUCK_MS 750
-
-// THE STUCK CLOCK NEEDS A WAKE. A mismatch is flagged stuck by BrokerFreshFrame when another rejected frame arrives past
-// BROKER_DIMS_STUCK_MS, or by UpdateWindowData's clock check when a tracking pass examines the window - and on a quiet
-// desktop neither happens: a window that stopped painting sends no frame, and the main loop waits INFINITE (rest-zero S4),
-// so no pass runs. The window keeps the stale frame's picture until something unrelated wakes the loop. So the first
-// rejected frame of a run arms ONE deadline at the end of the grace, the main loop caps its wait by it, and this sweep
-// queues every window whose mismatch is still outstanding then for the pass that repairs it. One wake per mismatch run and
-// none at rest (0 = nothing armed). Main-loop thread only, like g_MapDeferWake: BrokerFreshFrame and the sweep run there.
-static ULONGLONG g_BrokerDimsWake = 0;   // earliest outstanding dims deadline (tick), 0 = none armed
 
 static void BrokerDimsWakeSweep(void)
 {
@@ -11258,18 +11301,20 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
         // THE CLOCK ARMS THE SAME REPAIR. BrokerFreshFrame flags PwDimsStuck only when a rejected frame arrives more
         // than BROKER_DIMS_STUCK_MS after the first, and a window that stops painting sends no such frame: a caption
         // strip resizes the slab, the last frame the broker published was cut for the old request, and the window
-        // keeps its pre-strip picture until it paints again. No frame is needed to get here: the first rejected frame
-        // armed BrokerDimsWakeSweep, which queues this window when the grace ends. The slab equals the live geometry
-        // here, so a mismatch this old is a desync, not a resize in flight.
+        // keeps its pre-strip picture until it paints again. No frame is needed to get here: the first rejected frame,
+        // or a retarget of a slab that holds no frame yet (BrokerRetarget), armed BrokerDimsWakeSweep, which queues this
+        // window when the grace ends. The slab equals the live geometry here, so a mismatch this old is a desync, not a
+        // resize in flight.
         if (windowData->PwBrokerSourced && !windowData->PwDimsStuck && windowData->PwDimsSince != 0)
         {
             const ULONGLONG dimsAge = GetTickCount64() - windowData->PwDimsSince;
             if (dimsAge > BROKER_DIMS_STUCK_MS)
             {
                 windowData->PwDimsStuck = TRUE;
-                LogInfo("BROKERDIMS hwnd 0x%x stuck by the clock: %I64u ms since the first rejected frame, none past "
-                    L"%d ms (slab %ux%u) - re-registering", (DWORD)(ULONG_PTR)windowData->Handle, dimsAge,
-                    BROKER_DIMS_STUCK_MS, windowData->PwWidth, windowData->PwHeight);
+                LogInfo("BROKERDIMS hwnd 0x%x stuck by the clock: %I64u ms since its request or first rejected frame "
+                    L"with no frame of the slab's size past %d ms (slab %ux%u, unfed=%d) - re-registering",
+                    (DWORD)(ULONG_PTR)windowData->Handle, dimsAge, BROKER_DIMS_STUCK_MS,
+                    windowData->PwWidth, windowData->PwHeight, windowData->PwSlabUnfed ? 1 : 0);
             }
         }
         // NEVER REGISTERED. A slice-fed window added while the broker could not take it - it was not ready yet, or it had
@@ -12774,6 +12819,17 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     if (entry->Width == 0 || entry->Height == 0 || !entry->IsVisible || entry->DeletePending)
         return FALSE;
 
+    // A SLAB NO FRAME HAS REACHED HAS NOTHING TO REPAY WITH (findings/issues.md TOASTSWAPBLACKINDOM0). The damage below
+    // tells dom0 to re-read the window's own buffer, and after a rebuild that buffer holds the rows PwCarryContent
+    // could carry and zeros until the first full frame is copied in (PwSlabUnfed). Measured 2026-11-23 (toast-hold run 5, build 1455): this paid at 110303.805 over a slab with 13 carried rows of
+    // 109 and logged "dom0 now has this toast's pixels" while dom0's capture of that second was nonblack=0.047 - and,
+    // the debt being cleared, UpdateWindowData's owed=overdue warning could never report the black banner. Declining
+    // keeps the debt: the consume path damages the window when a frame lands, the next pass pays here, and a debt no
+    // frame ever settles reaches owed=overdue - the one line a toast whose re-registration also got no frame would
+    // leave. Broker-sourced only, the measured case (src=broker): a composite-fed toast keeps its payment as it was.
+    if (PwIsAttached(entry) && entry->PwSliceFed && entry->PwBrokerSourced && entry->PwSlabUnfed)
+        return FALSE;
+
     // THE DAMAGE HOLD IS NOT OURS TO BREAK. While the daemon dictates this window's geometry (a dom0
     // WM drag) or a guest-native drag has latched it, position announces are withheld, so dom0's
     // framebuffer read origin for a slice-fed window is FROZEN at the old position - damage sent now
@@ -13548,6 +13604,8 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
         // broker frames - the mirror image of QGALEDGERGAP, and the quieter one, because an
         // inflated success breaches nothing (PWLEDGERCOUNTSATTEMPTS, 2026-10-25).
         const BOOL brokerCopied = PwBrokerCopyDiff(entry, bsrc, bpitch, &pwRect);
+        if (brokerCopied)
+            entry->PwSlabUnfed = FALSE;   // a whole frame of the slab's size is in it now
         // Buffer is complete for this window: square off DWM's black rounded
         // corners before the content check judges it.
         FlattenBufferCorners(entry);
@@ -15102,8 +15160,11 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                         if (IntersectRect(&pwHit, &frame->dirty_rects[pdi], &pwRect))
                             sliceEvidence = TRUE;
                     entry->PwSliceNeedsFull = FALSE;
+                    const BOOL fullCopied = PwSliceCopyAndDamage(entry, frame, framebuffer, &pwRect);
+                    if (fullCopied)
+                        entry->PwSlabUnfed = FALSE;   // the whole window rect is in the slab now
                     if (PwLedgerHit(entry, &entry->PwLedgerDdaSlice,   /* LEDGER C1 */
-                                    PwSliceCopyAndDamage(entry, frame, framebuffer, &pwRect)) &&
+                                    fullCopied) &&
                         sliceEvidence)
                         PwNoteSliceContent(entry);
                 }
