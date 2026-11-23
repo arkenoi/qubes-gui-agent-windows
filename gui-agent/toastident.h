@@ -12,8 +12,10 @@
  *
  * THE PROBLEM THIS HEADER SOLVES: tying a banner to a notification. Measured on retail 26300 and on
  * 19045 (scratchpad/toast-banner-probe, 2026-10-04): ONE ShellExperienceHost CoreWindow 'New
- * notification' serves every toast of the session (same HWND for all), the shell shows banners one at
- * a time FIFO by arrival (a queued one appears seconds later - 6.9 s measured), and a new banner arrives
+ * notification' serves every toast of the session (same HWND for all), in that probe the shell showed banners
+ * one at a time FIFO by arrival (a queued one appears seconds later - 6.9 s measured) - NOT how the shell
+ * always behaves: toasts also STACK as several cards in this one window (2026-09-13 win11-up; win11-nfy
+ * daily), and a stack is normal and required (owner 2026-11-24, docs/ADR-toasts.md 13). A new banner arrives
  * either as a collapse-and-grow cycle (396x152 -> 396x0 -> 396x43 -> 396x152) or IN PLACE (same rect, a
  * burst of EVENT_OBJECT_LOCATIONCHANGE). So neither the HWND, nor its geometry, nor timing identifies
  * the toast a banner shows. Its CONTENT does: the card's UI Automation tree carries the app display

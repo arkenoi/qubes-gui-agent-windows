@@ -24,7 +24,9 @@
  *                mapped; a banner that arrives IN PLACE (same window, same rect - measured 2026-10-04)
  *                while a window-path toast is mapped is pre-empted: once the bridge has published a
  *                record that is still unconsumed and is `bridge`/`forwarded` or `pending`, and that
- *                record is NEWER than the displayed banner's own (the shell shows banners FIFO), the
+ *                record is NEWER than the displayed banner's own (assumed: the shell shows banners FIFO;
+ *                it also STACKS them, and a stack must never be held - owner 2026-11-24, ADR-toasts 13,
+ *                findings/issues.md TOASTSTACKNOTSHOWN: this rule is a defect on a stack), the
  *                displayed banner is unmapped BEFORE the swap can paint, and re-mapped if the record
  *                turns out `window` without a swap. Pre-emption is evaluated on EVERY pass, whether or
  *                not an identity read is in flight - the swap's own LOCATIONCHANGE queues a read first,
@@ -618,7 +620,9 @@ decided:
                 if (out->Event == ThEvNone) out->Event = ThEvPreemptStart;
             }
             /* SWAP-EDGE GATING, replacing rule 5's unmap (ADR-toasts 10). Windows toasts reuse ONE banner
-             * window, so a newer toast repaints the window dom0 was told carries this one. Rule 5 unmapped it
+             * window, so a newer toast repaints the window dom0 was told carries this one. (Owner 2026-11-24,
+             * ADR-toasts 13: a newer toast may instead STACK beside this one, which is normal and required -
+             * gating a stack holds it, a defect, TOASTSTACKNOTSHOWN.) Rule 5 unmapped it
              * to avoid showing B's pixels as A - but ThCorePreemptBy fires as soon as an unconsumed newer
              * record EXISTS, measured 4.47 s before that toast's content arrived (run 40407378739, id=12 shown
              * for 680 ms and withdrawn for good). So the cure ran far ahead of the disease and the banner was

@@ -11513,7 +11513,9 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
     }
 
     // TOAST HOLD ON A MAPPED BANNER (docs/ADR-toasts.md 10, toasthold.c). The shell's ONE banner window
-    // serves every toast and a new banner can arrive IN PLACE (same rect), so a banner already mapped for
+    // serves every toast and a new banner can arrive IN PLACE (same rect) - or STACK as a further card, which
+    // is normal and required and must never be held (owner 2026-11-24, ADR-toasts 13, TOASTSTACKNOTSHOWN) -
+    // so a banner already mapped for
     // a window-path toast may now show - or be about to show - a toast the bridge forwards. When the hold
     // says so (new content held for its verdict, or a bridge-bound toast queued behind this one), the
     // window is UNMAPPED and handed back to the defer machinery, whose release arm below re-maps it the

@@ -18,6 +18,10 @@
  *   bodies, whose presenter spans the full window height so no single element is the card
  *   and the item UNION is the drawn extent (toastcrop.c, TcFindCardRect header). Hence:
  *     TcPickLargest - toasts (shell CoreWindow banners): one card element nests everything.
+ *                     WRONG FOR A STACK: several toasts stack as several cards in the one window, which
+ *                     is normal and required (owner 2026-11-24, docs/ADR-toasts.md 13); picking the largest
+ *                     card cuts the stack to one (measured win11-nfy: 364x326 -> 364x157). A defect,
+ *                     findings/issues.md TOASTSTACKNOTSHOWN.
  *     TcPickUnion   - WinUI menus: no single card element; union of the rows.
  *   Both are GEOMETRIC. No class name is consulted (FlexibleToastView is cited above as
  *   evidence only): class names are undocumented XAML internals that changed between

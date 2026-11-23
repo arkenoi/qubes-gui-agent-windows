@@ -86,6 +86,9 @@ static ULONG g_DamageDrops;  // MSG_SHMIMAGE
 // already has, but none of that window's NEW frames may go out. Windows toasts reuse one banner
 // window, so the queued toast repaints the very window dom0 was told carries the displayed one;
 // forwarding that repaint would show toast B's pixels inside the window announced as toast A.
+// That reasoning covers one toast REPLACING another. Toasts also STACK as several cards in the window,
+// which is normal and required (owner 2026-11-24, docs/ADR-toasts.md 13): a stack's frames must never be
+// held here - findings/issues.md TOASTSTACKNOTSHOWN.
 // toasthold.c owns the policy and the bound - this file only holds the frames back.
 //
 // WHY HERE. Every frame-forwarding path in the agent passes through SendWindowDamageEvent: the WGC
