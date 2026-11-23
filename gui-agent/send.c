@@ -113,6 +113,20 @@ static HWND volatile g_FrameGates[SEND_FRAME_GATES];
 // ungate, which is per toast - and it is also the measurement that says how much the gate really held.
 static volatile LONG g_FrameGateHeld[SEND_FRAME_GATES];
 
+// Is this window's damage being dropped by the gate right now? Same plain loads as the drop path in
+// SendWindowDamageEvent, so the answer is exactly what that path would do with a rect sent next.
+BOOL SendWindowFrameGated(IN HWND window)
+{
+    if (!window)
+        return FALSE;
+    for (int i = 0; i < SEND_FRAME_GATES; i++)
+    {
+        if (g_FrameGates[i] == window)
+            return TRUE;
+    }
+    return FALSE;
+}
+
 int SendWindowFrameGate(IN HWND window)
 {
     if (!window)
@@ -122,11 +136,8 @@ int SendWindowFrameGate(IN HWND window)
     // the pre-emption lasts, and the hook thread on every change notice - so a second call must not
     // consume a second slot. SEND_GATE_NEW tells the caller this call is the one that closed it,
     // which is what keeps a log line per swap from becoming a log line per mouse-move.
-    for (int i = 0; i < SEND_FRAME_GATES; i++)
-    {
-        if (g_FrameGates[i] == window)
-            return SEND_GATE_ALREADY;
-    }
+    if (SendWindowFrameGated(window))
+        return SEND_GATE_ALREADY;
     for (int i = 0; i < SEND_FRAME_GATES; i++)
     {
         if (InterlockedCompareExchangePointer((PVOID volatile *)&g_FrameGates[i], window, NULL) == NULL)

@@ -6638,6 +6638,11 @@ BOOL BrokerRegister(IN OUT WINDOW_DATA* entry)
 // thread only, like g_MapDeferWake: BrokerFreshFrame, BrokerRetarget and the sweep run there.
 static ULONGLONG g_BrokerDimsWake = 0;   // earliest outstanding dims deadline (tick), 0 = none armed
 
+// The toast gate's repaint debt, same shape: armed when ToastHeldByBridge records a debt, re-armed every TOAST_DEBT_RETRY_MS
+// by ToastDebtWakeSweep while one is still owed inside TH_HOLD_BOUND_MS, 0 at rest. Main-loop thread only.
+#define TOAST_DEBT_RETRY_MS 100
+static ULONGLONG g_ToastDebtWake = 0;    // next retry of an unpaid toast repaint debt (tick), 0 = none owed
+
 BOOL BrokerCanKeepSlot(IN const WINDOW_DATA* entry, IN ULONG newWidth, IN ULONG newHeight)
 {
     if (!g_WgcBase || !WgcBrokerActive()) return FALSE;
@@ -7285,6 +7290,12 @@ static BOOL ToastHeldByBridge(IN OUT WINDOW_DATA* entry)
             entry->ToastRepaintOwedAt = GetTickCount64();
             entry->ToastRepaintFrameSeen = FALSE;
             entry->ToastRepaintOverdueLogged = FALSE;
+            entry->ToastRepaintWhy = NULL;
+            entry->ToastRepaintDeclines = 0;
+            // Due at once: if this pass's exit pays it the sweep finds nothing and disarms; if not - a decline there, or a
+            // caller that is not UpdateWindowData - the next loop iteration retries it (ToastDebtWakeSweep).
+            if (g_ToastDebtWake == 0 || entry->ToastRepaintOwedAt < g_ToastDebtWake)
+                g_ToastDebtWake = entry->ToastRepaintOwedAt;
             LogInfo("QGATOASTREPAINT hwnd=0x%x owed=deferred feed=slice (the debt is recorded here and "
                 L"settled at the end of this tracking pass; only if that declines does it ride the next "
                 L"capture frame, and until then dom0 keeps the frame from before the hold)",
@@ -11744,11 +11755,12 @@ end:
         // and the log sweep can both see it. frame_seen discriminates the two causes: 0 means no
         // capture frame ever arrived, 1 means one did and the payment was still withheld.
         windowData->ToastRepaintOverdueLogged = TRUE;
-        LogWarning("QGATOASTREPAINT hwnd=0x%x owed=overdue after %llu ms feed=slice frame_seen=%d "
+        LogWarning("QGATOASTREPAINT hwnd=0x%x owed=overdue after %llu ms feed=slice frame_seen=%d declined=%lu last=%s "
             L"(past the %u ms hold bound dom0 may still be showing the PREVIOUS toast)",
             (DWORD)(ULONG_PTR)windowData->Handle,
             (unsigned long long)(GetTickCount64() - windowData->ToastRepaintOwedAt),
-            windowData->ToastRepaintFrameSeen ? 1 : 0, (unsigned)TH_HOLD_BOUND_MS);
+            windowData->ToastRepaintFrameSeen ? 1 : 0, windowData->ToastRepaintDeclines,
+            windowData->ToastRepaintWhy ? windowData->ToastRepaintWhy : L"-", (unsigned)TH_HOLD_BOUND_MS);
     }
 
     if (!windowData->DeletePending && !judgedThisPass && !ShouldAcceptWindow(windowData))
@@ -12811,13 +12823,28 @@ static BOOL CALLBACK ToastOccWalkProc(HWND window, LPARAM lParam)
 // the reason to copy the frame path's arithmetic rather than invent a cheaper test. A maximised or
 // bottom-right window in the field would overlap.
 //
+// Every decline below leaves the debt standing; this records which guard it was, for the paid= and
+// owed=overdue lines - a debt that waited 953-3391 ms left no trace of what held it.
+static BOOL ToastPayDeclined(IN OUT WINDOW_DATA* entry, IN const WCHAR* why)
+{
+    entry->ToastRepaintWhy = why;
+    if (entry->ToastRepaintDeclines < 0xFFFFFFFFu)
+        entry->ToastRepaintDeclines++;
+    return FALSE;
+}
+
 // Caller must hold g_csWatchedWindows (the walk reads the watched list).
 static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
 {
     if (!entry || !entry->ToastRepaintOwed || !entry->Handle)
         return FALSE;
     if (entry->Width == 0 || entry->Height == 0 || !entry->IsVisible || entry->DeletePending)
-        return FALSE;
+        return ToastPayDeclined(entry, L"not-visible");
+    // A GATE CLOSED AGAIN (the next swap began before this debt was paid) drops every damage below without a word,
+    // and this would then log `paid` and clear a debt dom0 never received. The ungate that ends that gate records the
+    // debt afresh, so declining here loses nothing.
+    if (SendWindowFrameGated(entry->Handle))
+        return ToastPayDeclined(entry, L"frames-gated");
 
     // A SLAB NO FRAME HAS REACHED HAS NOTHING TO REPAY WITH (findings/issues.md TOASTSWAPBLACKINDOM0). The damage below
     // tells dom0 to re-read the window's own buffer, and after a rebuild that buffer holds the rows PwCarryContent
@@ -12828,7 +12855,7 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     // frame ever settles reaches owed=overdue - the one line a toast whose re-registration also got no frame would
     // leave. Broker-sourced only, the measured case (src=broker): a composite-fed toast keeps its payment as it was.
     if (PwIsAttached(entry) && entry->PwSliceFed && entry->PwBrokerSourced && entry->PwSlabUnfed)
-        return FALSE;
+        return ToastPayDeclined(entry, L"slab-unfed");
 
     // THE DAMAGE HOLD IS NOT OURS TO BREAK. While the daemon dictates this window's geometry (a dom0
     // WM drag) or a guest-native drag has latched it, position announces are withheld, so dom0's
@@ -12839,22 +12866,24 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     // ended. A banner is not normally dragged, so this is the rare arm, not the common one.
     if (entry->DaemonStreamTick != 0 &&
         (GetTickCount() - entry->DaemonStreamTick) < DAEMON_DRIVE_ACTIVE_MS)
-        return FALSE;
+        return ToastPayDeclined(entry, L"daemon-drive");
     if (g_InputDragFreeze && g_InputDragOriginValid && entry->Handle == g_InputDragWindow &&
         entry->CfgPendingPos)
-        return FALSE;
+        return ToastPayDeclined(entry, L"input-drag");
     // The same hazard without a drag: dom0 reads the framebuffer at the origin it was last TOLD,
     // so any withheld or unlanded position makes a region send paint the wrong part of the desktop.
     // The frame path answers this by running CfgFlushPendingMove + ApplyPendingDaemonMove
     // immediately before it builds rgnVisible; this site DECLINES instead, because
     // ApplyPendingDaemonMove posts a SetWindowPos and calling it from the event path would move
-    // windows at moments nothing moves them today - an unrequested behaviour change to buy a case
-    // that does not arise (a banner's first announce is a full configure, which the position-only
-    // limiter never suppresses, so CfgPendingPos is clear for the toast this fix is for). The debt
-    // then rides the frame path, or the timer-driven settle sweep that already exists for exactly
-    // the no-frame-ever-arrives case.
-    if (entry->CfgPendingPos || DaemonGeometryUnsettled(entry))
-        return FALSE;
+    // windows at moments nothing moves them today. Whatever declines, ToastDebtWakeSweep retries the
+    // debt every TOAST_DEBT_RETRY_MS inside TH_HOLD_BOUND_MS, after a CfgFlushPendingMove; before it
+    // did, a gated in-place swap's debt waited 953-3391 ms for an unrelated tracking pass (toast-hold
+    // 2026-11-23, 6 of 7 gated swaps). The old premise here - that a banner never carries a withheld
+    // position - is not measured either way; last= on the paid= line now records the guard.
+    if (entry->CfgPendingPos)
+        return ToastPayDeclined(entry, L"position-withheld");
+    if (DaemonGeometryUnsettled(entry))
+        return ToastPayDeclined(entry, L"daemon-geometry-unsettled");
 
     const BOOL direct = DirectRequired();
     RECT occ[PW_MAX_OCCLUDERS];
@@ -12874,7 +12903,7 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
         // with no error - so foundSelf, not the return value, is what says the walk is usable.
         (void)EnumWindows(ToastOccWalkProc, (LPARAM)&walk);
         if (!walk.foundSelf || walk.n < 0)
-            return FALSE;
+            return ToastPayDeclined(entry, L"occluder-walk");
     }
     // walk.n stays 0 on the direct path, so the region below is the whole window and rects=1.
 
@@ -12884,7 +12913,7 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     {
         if (rgnVis) DeleteObject(rgnVis);
         if (rgnOne) DeleteObject(rgnOne);
-        return FALSE;
+        return ToastPayDeclined(entry, L"region-alloc");
     }
     for (int i = 0; i < walk.n; i++)
     {
@@ -12919,21 +12948,57 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     DeleteObject(rgnVis);
 
     if (!sent)
-        return FALSE;       // the debt stands; ProcessNewFrame's release still owes it
+        return ToastPayDeclined(entry, L"send-failed");   // the debt stands; ProcessNewFrame's release still owes it
 
     // src= is not decoration: occluders=0 alone cannot say whether the walk found nothing or was
     // never run, and that is the difference between "no popup was above the banner" and "the
     // composite is not this window's source, so nothing could be withheld".
     LogInfo("QGATOASTREPAINT hwnd=0x%x paid=at-release after %llu ms feed=slice occluders=%d rects=%lu src=%s "
+        L"declined=%lu last=%s "
         L"(the visible region was repainted without waiting for a capture frame: dom0 now has this toast's pixels)",
         (DWORD)(ULONG_PTR)entry->Handle,
         (unsigned long long)(entry->ToastRepaintOwedAt ? GetTickCount64() - entry->ToastRepaintOwedAt : 0),
-        walk.n, rects, direct ? L"broker" : L"composite");
+        walk.n, rects, direct ? L"broker" : L"composite",
+        entry->ToastRepaintDeclines, entry->ToastRepaintWhy ? entry->ToastRepaintWhy : L"-");
     entry->ToastRepaintOwed = FALSE;
     entry->ToastRepaintOwedAt = 0;
     entry->ToastRepaintFrameSeen = FALSE;
     entry->ToastRepaintOverdueLogged = FALSE;
+    entry->ToastRepaintWhy = NULL;
+    entry->ToastRepaintDeclines = 0;
     return TRUE;
+}
+
+// THE GATE'S REPAINT DEBT HAS A WAKE OF ITS OWN (findings/issues.md TOASTSWAPBLACKINDOM0). ToastPayRepaintNow ran only at
+// UpdateWindowData's exit, so a debt declined there - or recorded by a ToastHeldByBridge caller that is not that pass -
+// waited for an unrelated tracking pass: 953 to 3391 ms on 6 of the 7 gated in-place swaps in the toast-hold runs of
+// 2026-11-23 (builds 1455 and 1458), with dom0's banner black on the witness capture spanning that wait in 5 of the 6; the
+// swap paid at once (0 ms) was the one whose last move had gone out under the gate. Called at the top of every main-loop
+// iteration, whatever woke it, like BrokerDimsWakeSweep. It flushes a withheld position first - the same announce the
+// settle sweep and the frame loop make, and ToastPayRepaintNow's own guard against an origin dom0 was not told - then
+// retries the payment, and re-arms every TOAST_DEBT_RETRY_MS while one is still owed. Past TH_HOLD_BOUND_MS the debt is
+// left to the tracking pass and its owed=overdue line, exactly as before, so the wake is bounded per debt.
+static void ToastDebtWakeSweep(void)
+{
+    if (g_ToastDebtWake == 0)
+        return;
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_ToastDebtWake)
+        return;
+    ULONGLONG next = 0;
+    EnterCriticalSection(&g_csWatchedWindows);
+    for (LIST_ENTRY* le = g_WatchedWindowsList.Flink; le != &g_WatchedWindowsList; le = le->Flink)
+    {
+        WINDOW_DATA* entry = CONTAINING_RECORD(le, WINDOW_DATA, ListEntry);
+        if (!entry->ToastRepaintOwed || entry->ToastRepaintOwedAt == 0 || entry->DeletePending ||
+            now - entry->ToastRepaintOwedAt > TH_HOLD_BOUND_MS)
+            continue;
+        CfgFlushPendingMove(entry);
+        if (!ToastPayRepaintNow(entry))
+            next = now + TOAST_DEBT_RETRY_MS;
+    }
+    LeaveCriticalSection(&g_csWatchedWindows);
+    g_ToastDebtWake = next;
 }
 
 // ABI 5 reads the broker's first-frame stage ticks as QPC counts; this is the matching agent-side
@@ -15961,7 +16026,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             // a frame from before the hold and needs the current content once. It is
             // paid HERE and not from toasthold.c precisely so that it gets rgnVisible -
             // a banner is slice-fed, so the bleed above is not excluded for it either.
-            // Deliberately NOT read by the drive-end settle, which sends the whole window.
+            // The drive-end settle's whole-window send deliberately leaves it alone; the
+            // other payer is ToastPayRepaintNow, whose occluder walk clips the same way.
             entry->DaemonDamageHeld = FALSE;
             // Whose debt this release pays: the drag hold and the toast gate share it, and only the toast
             // half is the one the toast log must account for.
@@ -15972,6 +16038,8 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
             entry->ToastRepaintOwedAt = 0;
             entry->ToastRepaintFrameSeen = FALSE;
             entry->ToastRepaintOverdueLogged = FALSE;
+            entry->ToastRepaintWhy = NULL;
+            entry->ToastRepaintDeclines = 0;
             DWORD needed = GetRegionData(rgnVisible, 0, NULL);
             if (needed > rgnDataSize)
             {
@@ -16807,6 +16875,17 @@ static ULONG WINAPI WatchForEvents(void)
             const DWORD toDims = (g_BrokerDimsWake > now64) ? (DWORD)(g_BrokerDimsWake - now64) : 0;
             if (waitTimeout == INFINITE || toDims < (DWORD)waitTimeout)
                 waitTimeout = toDims;
+        }
+
+        // TOAST DEBT WAKE (ToastDebtWakeSweep): retry a toast gate repaint that was not paid, then cap the wait by the next
+        // retry. Inert (0) unless a debt is owed inside its hold bound.
+        ToastDebtWakeSweep();
+        if (g_ToastDebtWake != 0)
+        {
+            const ULONGLONG now64 = GetTickCount64();
+            const DWORD toDebt = (g_ToastDebtWake > now64) ? (DWORD)(g_ToastDebtWake - now64) : 0;
+            if (waitTimeout == INFINITE || toDebt < (DWORD)waitTimeout)
+                waitTimeout = toDebt;
         }
 
         // TOAST-HOLD DEADLINE (toasthold.c): the fail-open bound of a banner held for its verdict - a

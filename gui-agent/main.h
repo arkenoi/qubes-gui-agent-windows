@@ -309,10 +309,11 @@ typedef struct _WINDOW_DATA
     // fires when the drive ends.
     BOOL  DaemonDamageHeld;
     // One full repaint owed to dom0 because the toast frame gate held this window's frames and dom0 is
-    // still holding a frame from before the hold (toasthold.c, ADR-toasts 10). Consumed ONLY by the
-    // region-aware release in WatchForEvents, which repaints rgnVisible - never by the drive-end settle,
-    // which sends the whole window. A full-window send would hand this window the pixels of anything
-    // stacked above it, which is the bleed that corrupts a menu's host window on hover.
+    // still holding a frame from before the hold (toasthold.c, ADR-toasts 10). Paid only by region-aware
+    // sends - ToastPayRepaintNow (UpdateWindowData's exit, and ToastDebtWakeSweep's retries inside the
+    // hold bound) and the release in ProcessNewFrame, which repaints rgnVisible - never by the
+    // drive-end settle's whole-window send. A full-window send would hand this window the pixels of
+    // anything stacked above it, which is the bleed that corrupts a menu's host window on hover.
     BOOL  ToastRepaintOwed;
     /* When ToastRepaintOwed was recorded, so the payment below can state how long dom0 held the
      * PRE-HOLD frame. A slice-fed banner's repaint waits for the next capture frame, which on a
@@ -325,6 +326,11 @@ typedef struct _WINDOW_DATA
     /* One-shot latch for the overdue notice. The debt is retried on every tracking pass, so without
      * this the notice would repeat for as long as the window lives. */
     BOOL  ToastRepaintOverdueLogged;
+    /* The guard in ToastPayRepaintNow that last declined this debt (a literal; NULL = none) and how many
+     * declines it took, printed on the paid= and owed=overdue lines. A debt that waited seconds before it
+     * was paid left no trace of what held it (findings/issues.md TOASTSWAPBLACKINDOM0). */
+    const WCHAR* ToastRepaintWhy;
+    ULONG ToastRepaintDeclines;
 
     // FROZEN ANCHOR (WM-managed shell surfaces, ShellManaged != none). dom0 owns this
     // window's PLACEMENT: the guest HWND is never moved (it must keep painting at its

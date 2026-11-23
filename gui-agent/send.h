@@ -101,6 +101,7 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
 #define SEND_GATE_NEW     1   // this call closed the gate (log the swap here, not on every re-assert)
 #define SEND_GATE_ALREADY 2   // it was already closed
 int  SendWindowFrameGate(IN HWND window);
+BOOL SendWindowFrameGated(IN HWND window);
 BOOL SendWindowFrameUngate(IN HWND window, OUT ULONG *framesHeld OPTIONAL);
 ULONG SendWindowName(IN HWND window, IN const WCHAR *caption OPTIONAL);
 ULONG SendProtocolVersion(void);
