@@ -13734,6 +13734,32 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
     }
     if (bid != entry->PwBrokerLastId || entry->PwSliceNeedsFull)
     {
+        // A BLANK FRAME NEVER ENTERS A PAINTED TOAST BANNER'S BUFFER (findings/issues.md TOASTSWAPBLACKINDOM0). The granted
+        // buffer below IS the image dom0 maps: dom0 re-reads it on every damage, on the swap gate's release repaint and on
+        // any X expose. The gate withholds damage, configures and rebuilds, never this copy, so the frame gate cannot keep
+        // what dom0 shows - and the hook notice that closes it follows the swap's first frame (ADR-toasts 10). Measured
+        // 2026-11-23, toast-hold geo5 on ca80ce2: the only damages dom0 got for banner 0x801a8 were its map, 225503.853,
+        // the release repaint at .958 and .971 (send.c logs every forwarded damage; "resumed after 0 held"), the gate
+        // closed at .907, and dom0's capture spanning them was black - 0 of 37800 pixels lit inside its frame - between a
+        // capture of the first toast and one of the second. Which frame was blank is NOT recorded (Jev: blank frame 0.49
+        // against insufficient 0.46, design 0.60 conf 0.47 - no verdict); QGATOASTBLANK below records it from now on.
+        // So the content is judged, not the timing: once a toast banner's buffer holds painted content, a frame that
+        // fails SlicePainted - the predicate the first-map hold already trusts - is consumed and not copied, no damage
+        // goes out, and dom0 keeps the last painted frame. Not covered: a painted frame of the wrong toast; a
+        // high-contrast card that SlicePainted reads as black keeps dom0 on the previous frame, logged on every frame.
+        if (entry->PwSliceContentTick != 0 && ShellSurfaceKind(entry) == ShellSurfaceToast)
+        {
+            SLICE_PAINT_STATS st;
+            if (!SlicePainted(bsrc, (size_t)bpitch, entry->PwWidth, entry->PwHeight, &st))
+            {
+                if (bid != entry->PwBrokerLastId)
+                    LogInfo("QGATOASTBLANK hwnd=0x%x frame %llu has no painted card (nonblack %lu/%lu): not copied, "
+                        "dom0's banner keeps its last painted frame",
+                        (DWORD)(ULONG_PTR)entry->Handle, (unsigned long long)bid, (ULONG)st.NonBlack, (ULONG)st.Sampled);
+                entry->PwBrokerLastId = bid;   // judged: a re-read of the same frame is not logged again
+                return TRUE;                   // current: the buffer already holds this window's last painted frame
+            }
+        }
         BOOL firstBrokerFrame = (entry->PwBrokerLastId == 0);
         entry->PwSliceNeedsFull = FALSE;
         entry->PwBrokerLastId = bid;
