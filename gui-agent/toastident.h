@@ -47,11 +47,13 @@
  * the offline suites (agent/gui-agent/toasthold_test.c, tools/notifhost/toasthold_bridge_test.cpp)
  * build with gcc/g++ as well as MSVC.
  *
- * VERDICT LIFECYCLE the bridge drives: PENDING at listing (or WINDOW/BRIDGE when the listing already
- * settles it: window-only app, allowlisted app over a live connection); the classifier's answer only
- * while PENDING (compare-exchange); the listing's final word unconditionally - WINDOW when the toast
- * cannot be forwarded (dom0 unreachable, server rejections exhausted, no verdict in time), FORWARDED
- * once dom0 acknowledged the forward. The agent suppresses on BRIDGE and FORWARDED, shows on WINDOW,
+ * VERDICT LIFECYCLE (ADR-toasts 13, "Claim, no timer"): PENDING at listing (or WINDOW/BRIDGE when the
+ * listing already settles it: window-only app, allowlisted app over a live connection). PENDING leaves by
+ * ONE compare-exchange from EITHER side (ThIpcClaimSeq) - the bridge's pending -> bridge|window (the
+ * classifier's answer, the listing's pass), the agent's pending -> bridge at its banner's end or pending ->
+ * window when it maps with the bridge down - and the winner decides; no side compares a clock. After that
+ * the listing's later word on a record it owns: FORWARDED once dom0 acknowledged the forward, WINDOW when
+ * the forward is given up. The agent writes Verdict (its claim) and AgentShownSeq. The agent suppresses on BRIDGE and FORWARDED, shows on WINDOW,
  * reopens a suppressed banner whose record turns WINDOW, and reopens one whose record is still BRIDGE
  * (not FORWARDED) when the bridge dies.
  *
@@ -392,7 +394,7 @@ TI_INLINE int TiSelect(const TI_CANDIDATE* c, int n, const TOAST_IDENT* seen, TI
  * when its own identity read lands, or at its bounded fail-open deadline. */
 
 #define TH_IPC_MAGIC     0x54534E51u   /* 'QNST' */
-#define TH_IPC_ABI       1u
+#define TH_IPC_ABI       2u    /* 2: the Verdict word carries its record's sequence (ThVerdictWord) - a mixed install fails ThIpcValid */
 #define TH_IPC_RECORDS   32            /* toasts are sparse; a record outlives any hold by a wide margin */
 
 #define TH_VERDICT_NONE      0         /* empty slot */
@@ -402,13 +404,30 @@ TI_INLINE int TiSelect(const TI_CANDIDATE* c, int n, const TOAST_IDENT* seen, TI
 #define TH_VERDICT_FORWARDED 4         /* forwarded AND acknowledged by dom0: the suppression stands even if the
                                           bridge dies now (a `bridge` without this is reopened on bridge death) */
 
-/* How long a banner may be held waiting for its verdict (owner: an occasional ~3 s delay of a first toast is fine,
- * faster is better) - and, for a PENDING record, the bridge's limit too: both run it from the record's ArrivalTick
- * (ADR-toasts 13). A FAILURE-STATE deadline: armed only while a banner is held. Here, not in toasthold-core.h, because
- * the bridge includes only this header. */
+/* How long a SHOWN banner's new frames may be held for a read to name them (the settle hold, ADR-toasts 13) - the one use
+ * left. NOT a verdict bound, and the bridge never reads it. */
 #define TH_HOLD_BOUND_MS      3000
+/* THE BANNER'S END, on the AGENT's clock only (ADR-toasts 13, "Claim, no timer"): this long after a held banner's first
+ * sight the agent stops waiting for its verdict. It does NOT map it: it claims the record pending -> bridge
+ * (ThIpcClaimSeq) and the bridge forwards the toast to dom0 - mapped this late, the banner would be dismissed by the shell
+ * before anyone saw it (its life is ~6 s, p5 6.03 s over 1077 banners). */
+#define TH_BANNER_END_MS      4500
 
 TI_INLINE BOOL TiVerdictSuppresses(LONG v) { return v == TH_VERDICT_BRIDGE || v == TH_VERDICT_FORWARDED; }
+
+/* THE VERDICT WORD NAMES ITS RECORD: (sequence << 3) | TH_VERDICT_*. Every compare-exchange compares the whole word, so one
+ * that lands after the bridge republished the slot finds another sequence and fails - the reason AgentShownSeq stores a
+ * sequence and not a flag. Unsigned shifts only (C99 and C++17). */
+#define TH_VERDICT_BITS 3
+TI_INLINE LONG ThVerdictWord(LONG seq, LONG verdict)
+{
+    return (LONG)((((ULONG)seq) << TH_VERDICT_BITS) | ((ULONG)verdict & 7u));
+}
+TI_INLINE LONG ThVerdictOf(LONG word, LONG seq)
+{
+    return ((ULONG)word >> TH_VERDICT_BITS) == ((((ULONG)seq) << TH_VERDICT_BITS) >> TH_VERDICT_BITS)
+               ? (LONG)((ULONG)word & 7u) : TH_VERDICT_NONE;
+}
 
 #define TH_REC_FLAG_ALLOWLISTED 0x1u   /* informational only */
 #define TH_REC_FLAG_WINDOWONLY  0x2u
@@ -494,7 +513,7 @@ TI_INLINE LONG ThIpcPublish(TH_IPC_HEADER* h, UINT32 notifId, UINT32 flags, UINT
     r->Ident = *ident;
     TI_STORE32(&r->AgentShownSeq, 0);   /* hygiene only: a stale mark could never equal the new sequence anyway */
     r->Reserved = 0;
-    TI_STORE32(&r->Verdict, verdict);
+    TI_STORE32(&r->Verdict, ThVerdictWord(seq, verdict));
     TI_BARRIER();
     TI_STORE32(&r->Seq, seq);
     return seq;
@@ -510,26 +529,37 @@ TI_INLINE int ThIpcFindSeq(const TH_IPC_HEADER* h, LONG seq)
     return -1;
 }
 
-/* Writer side: update the verdict of the record for `notifId` (the newest if several). With
- * onlyIfPending a verdict already decided is kept - the classifier's late answer must never override
- * a route the listing already settled (WindowOnly app, allowlist, forward outcome). TRUE if found;
- * *seqOut (optional) receives the record's sequence, found or not stored, so the caller can read the
- * agent's mark on exactly that record later (ThIpcAgentState).
- *
- * THE RECORD'S 3 s (ADR-toasts 13, owner 2026-11-24: "Any verdict that arrives after a record has been pending for
- * 3 s goes to the window path and is never forwarded"). The agent stops holding a banner for a pending record at
- * that record's ArrivalTick + TH_HOLD_BOUND_MS and maps it. With onlyIfPending, an answer written at or after that
- * tick (`now`, read by the caller at the write) is LATE: `bridge` is stored as `window`, and *lateOut (optional)
- * says so whatever verdict was asked for, so the caller never forwards it. 2999 ms is in time, 3000 ms is late -
- * the same >= the agent uses. */
-TI_INLINE BOOL ThIpcSetVerdictSeq(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, BOOL onlyIfPending, LONG* seqOut,
-                                  UINT64 now, BOOL* lateOut)
+/* THE CLAIM (ADR-toasts 13, "Claim, no timer"): ONE compare-exchange on the record with sequence `seq`, from -> to.
+ * Returns what the record holds AFTER the attempt: `to` when this call stored it, the other side's verdict when that
+ * side was first, TH_VERDICT_NONE when the record is not in the ring. *won (optional): THIS call made the move. No clock.
+ * A store into a slot being republished (Seq 0, old word still there) is overwritten by the publish; the re-read of Seq
+ * then reports the record gone - the bridge cannot find it by id any more either. */
+TI_INLINE LONG ThIpcClaimSeq(TH_IPC_HEADER* h, LONG seq, LONG from, LONG to, BOOL* won)
+{
+    int i = ThIpcFindSeq(h, seq);
+    LONG seen;
+    if (won) *won = FALSE;
+    if (i < 0) return TH_VERDICT_NONE;
+    seen = TiCas32(&ThIpcRecords(h)[i].Verdict, ThVerdictWord(seq, to), ThVerdictWord(seq, from));
+    TI_BARRIER();
+    if (TI_LOAD32(&ThIpcRecordsC(h)[i].Seq) != seq) return TH_VERDICT_NONE;
+    if (seen == ThVerdictWord(seq, from)) { if (won) *won = TRUE; return to; }
+    return ThVerdictOf(seen, seq);
+}
+
+/* Writer (bridge) side, by notification id (the newest record). onlyIfPending: the bridge's CLAIM pending -> verdict;
+ * TRUE only when this call won it. Otherwise the listing's later word on a record it owns (bridge -> forwarded on dom0's
+ * ack, bridge -> window when the forward is given up, forwarded -> window on a failed dom0 click): a compare-exchange
+ * loop on the tagged word, so a republished slot is left alone. *seqOut (optional): the record's sequence, found or not
+ * stored, for the agent-mark read-back (ThIpcAgentState). *heldOut (optional): the verdict the record holds after the
+ * call (TH_VERDICT_NONE: not in the ring). */
+TI_INLINE BOOL ThIpcSetVerdictSeq(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, BOOL onlyIfPending, LONG* seqOut, LONG* heldOut)
 {
     int i, best = -1;
     LONG bestSeq = 0;
     TH_IPC_RECORD* recs = ThIpcRecords(h);
     if (seqOut) *seqOut = 0;
-    if (lateOut) *lateOut = FALSE;
+    if (heldOut) *heldOut = TH_VERDICT_NONE;
     for (i = 0; i < TH_IPC_RECORDS; i++)
     {
         LONG s = TI_LOAD32(&recs[i].Seq);
@@ -537,25 +567,26 @@ TI_INLINE BOOL ThIpcSetVerdictSeq(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict
     }
     if (best < 0) return FALSE;
     if (seqOut) *seqOut = bestSeq;
-    /* A real compare-exchange, not a read-then-write: the classifier's late answer (shadow worker) and the
-     * listing's final word (main thread) race on this field, and PENDING -> v must be the ONLY transition the
-     * late answer can make. */
     if (onlyIfPending)
     {
-        const BOOL late = (now >= recs[best].ArrivalTick + TH_HOLD_BOUND_MS);
-        if (late && verdict == TH_VERDICT_BRIDGE) verdict = TH_VERDICT_WINDOW;
-        if (TiCas32(&recs[best].Verdict, verdict, TH_VERDICT_PENDING) != TH_VERDICT_PENDING) return FALSE;
-        if (lateOut) *lateOut = late;
-        return TRUE;
+        BOOL won = FALSE;
+        const LONG held = ThIpcClaimSeq(h, bestSeq, TH_VERDICT_PENDING, verdict, &won);
+        if (heldOut) *heldOut = held;
+        return won;
     }
-    TI_STORE32(&recs[best].Verdict, verdict);
+    for (;;)
+    {
+        const LONG w = TI_LOAD32(&recs[best].Verdict);
+        if (ThVerdictOf(w, bestSeq) == TH_VERDICT_NONE) return FALSE;
+        if (TiCas32(&recs[best].Verdict, ThVerdictWord(bestSeq, verdict), w) == w) break;
+    }
+    if (heldOut) *heldOut = verdict;
     return TRUE;
 }
 
-/* Suites only: no clock (now = 0 is before every ArrivalTick + bound, so nothing is late). */
 TI_INLINE BOOL ThIpcSetVerdict(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, BOOL onlyIfPending)
 {
-    return ThIpcSetVerdictSeq(h, notifId, verdict, onlyIfPending, (LONG*)0, 0, (BOOL*)0);
+    return ThIpcSetVerdictSeq(h, notifId, verdict, onlyIfPending, (LONG*)0, (LONG*)0);
 }
 
 /* AGENT side, the store itself: "I map a banner for the record with sequence `seq`" into `slot`. This is the
@@ -608,7 +639,7 @@ TI_INLINE BOOL ThIpcRead(const TH_IPC_HEADER* h, int index, TH_IPC_RECORD* out)
     out->Ident = r->Ident;
     out->AgentShownSeq = TI_LOAD32(&r->AgentShownSeq);
     out->Reserved = 0;
-    v = TI_LOAD32(&r->Verdict);
+    v = ThVerdictOf(TI_LOAD32(&r->Verdict), s1);   /* a word of another sequence reads NONE, then window below */
     TI_BARRIER();
     s2 = TI_LOAD32(&r->Seq);
     if (s1 != s2) return FALSE;

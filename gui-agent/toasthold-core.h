@@ -9,26 +9,23 @@
  * whether a bridge record matched it and what that record's verdict is NOW, whether the bridge is
  * alive, and whether the window turned out not to be a toast banner at all.
  *
- * THE OWNER'S FOUR REQUIREMENTS AND HOW EACH IS CARRIED HERE:
- *   no doubles   a banner is never mapped before its toast's verdict is known; verdict=bridge keeps it
- *                unmapped for as long as that content is displayed (it times out unseen in the guest).
- *   nothing lost every hold is BOUNDED (TH_HOLD_BOUND_MS) and every doubt - no identity, no record, a
- *                verdict that never comes, a bridge that is down or dies mid-hold - ends in SHOW: the
- *                behaviour that shipped for years (docs/ADR-toasts.md 3). A SUPPRESSED banner is NOT
- *                final: its record is re-read every pass, and it is shown again when the bridge turns
- *                the record to `window` (a forward that failed for good, a toast listed while dom0 was
- *                unreachable) or when the bridge dies before dom0 acknowledged the forward
- *                (`forwarded`). A fail-open is a FAILURE STATE and the glue logs it loudly.
+ * THE OWNER'S REQUIREMENTS AND HOW EACH IS CARRIED HERE (ADR-toasts 13, "Claim, no timer", 2026-11-24):
+ *   no doubles   while the bridge is up a banner is mapped ONLY on a `window` record: the classifier's, the
+ *                bridge's own word, or the agent's won claim pending -> window (bridge down). verdict=bridge
+ *                keeps it unmapped for as long as that content is displayed (it times out unseen in the guest).
+ *   never lost   the agent waits for the verdict for as long as the banner lives. At its end (TH_BANNER_END_MS
+ *                after first sight) with the record still pending it does NOT map it - mapped that late the shell
+ *                dismisses it unseen - it claims the record pending -> bridge (ThCoreClaimWanted; the glue makes
+ *                the compare-exchange) and the bridge forwards it, logged as an ERROR. A banner that ends with no
+ *                record is not mapped either: the glue remembers its identity and claims the record listed later.
+ *                A SUPPRESSED banner is re-read every pass and shown when the bridge turns its record `window`
+ *                (the bridge gave it back). Bridge down or dying (a lesser problem, owner): shown, as before.
  *   no flash     the hold starts the moment the banner is first examined, before anything of it is
  *                mapped. A SHOWN banner is not this core's: its new frames are held by the glue until a
  *                read names the cards they show, at most 3 s (ADR-toasts 13, owner-confirmed 2026-11-24:
  *                "A toast is never held back because another toast is on screen or queued. Pre-emption is
  *                removed."). Pre-emption - unmapping or gating a shown banner because a newer record
  *                existed - is gone from here with its input, state, events and reason.
- *   ~3 s max     TH_HOLD_BOUND_MS = 3000 from the banner's first examination - except a banner held for a
- *                PENDING record, which is held to that record's ArrivalTick + 3000: the bridge stores `bridge`
- *                until exactly then and never after (ADR-toasts 13, owner 2026-11-24), and a banner is first
- *                seen up to 1.9 s before its record is listed (measured), so its own 3 s ended too early.
  *
  * PURE: no Windows calls, no allocation, no I/O - the same header compiles with gcc for the offline
  * suite (toasthold_test.c), which drives every transition.
@@ -65,7 +62,7 @@ extern "C" {
 #endif
 
 /* While held with NO record (the bridge has not listed the toast yet, or the identity read saw a
- * half-built card), re-read the identity and re-match this often - bounded by TH_HOLD_BOUND_MS. */
+ * half-built card), re-read the identity and re-match this often - up to the banner's end (TH_BANNER_END_MS). */
 #define TH_HOLD_RECHECK_MS     500
 /* A window whose first read found no toast card gets ONE more look this long after it: a banner's card
  * is built within the collapse-and-grow animation (~300 ms measured), a Quick Settings / volume flyout
@@ -107,11 +104,13 @@ typedef enum _TH_EVENT   /* what changed in THIS call, for the glue to log (none
     ThEvSuppress,        /* verdict=bridge: never mapped */
     ThEvShowVerdict,     /* verdict=window: mapped */
     ThEvShowNoBridge,    /* bridge not running: window path at once (by design, ADR-toasts 3) */
-    ThEvFailOpen,        /* the hold ended by its bound or by the bridge dying: mapped - a FAILURE STATE */
+    ThEvFailOpen,        /* the bridge died with this banner held or suppressed-unconfirmed: mapped - a FAILURE STATE */
     ThEvContentChanged,  /* the displayed content changed under a decided banner (in-place swap) */
     ThEvShowCorrected,   /* a suppressed banner's record turned `window`: shown after all */
     ThEvNotBanner,       /* the window is not a toast banner (no card after two reads): shown, never held again */
-    ThEvAckConfirmed     /* dom0 acknowledged the forward: the suppression stands - reported for its TIMING */
+    ThEvAckConfirmed,    /* dom0 acknowledged the forward: the suppression stands - reported for its TIMING */
+    ThEvBannerEnd,       /* the banner's end with nothing to claim (no identity, or no record): NOT mapped */
+    ThEvForwardLate      /* suppressed with no dom0 ack within TH_FORWARD_BOUND_MS: said once, NOT mapped */
 } TH_EVENT;
 
 typedef enum _TH_REASON
@@ -141,8 +140,8 @@ typedef struct _TH_CORE          /* per banner window; zero-initialised = idle *
     int         NotBanner;       /* not a toast banner: SHOW for good, nothing is ever held again */
     ULONGLONG   SuppressSince;   /* tick the current SUPPRESS was decided: the forward bound counts from here */
     int         AckSeen;         /* dom0's ack has been reported once for THIS suppression (ThEvAckConfirmed) */
-    ULONGLONG   PendDue;         /* the pending-verdict hold's fail-open deadline: the matched record's ArrivalTick +
-                                    TH_HOLD_BOUND_MS, fixed on the pass that takes the record; 0 = none */
+    int         Ended;           /* the banner reached its end unshown with no record: a record listed later is adopted */
+    int         LateSaid;        /* ThEvForwardLate reported for this suppression */
 } TH_CORE;
 
 typedef struct _TH_INPUT         /* gathered by the glue for one pass */
@@ -155,8 +154,8 @@ typedef struct _TH_INPUT         /* gathered by the glue for one pass */
                                     match (FULL, or the unique PARTIAL) */
     LONG      MatchSeq;
     UINT32    MatchNotifId;
-    LONG      MatchVerdict;      /* TH_VERDICT_PENDING / BRIDGE / WINDOW / FORWARDED, as of this pass */
-    ULONGLONG MatchArrival;      /* that record's ArrivalTick (bridge-written, untrusted) */
+    LONG      MatchVerdict;      /* TH_VERDICT_PENDING / BRIDGE / WINDOW / FORWARDED, as of this pass - after the
+                                    glue's claim (ThCoreClaimWanted), so a lost claim reads the winner's verdict */
     int       NotBanner;         /* the glue found no toast card twice: not a banner */
 } TH_INPUT;
 
@@ -309,13 +308,14 @@ TI_INLINE void ThCoreStartHold(TH_CORE* c, ULONGLONG now, UINT64 ident)
     c->Phase = ThPhaseHolding;
     c->Ident = ident;
     c->HoldSince = now;
-    c->Due = now + TH_HOLD_BOUND_MS;
+    c->Due = now + TH_BANNER_END_MS;
     c->RecordSeq = 0;
     c->NotifId = 0;
     c->FailedOpen = 0;
     c->SuppressSince = 0;
     c->AckSeen = 0;
-    c->PendDue = 0;
+    c->Ended = 0;
+    c->LateSaid = 0;
 }
 
 TI_INLINE void ThCoreDecideNow(TH_CORE* c, TH_DECISION d, int failedOpen)
@@ -347,6 +347,19 @@ TI_INLINE TH_DECISION ThCoreFailOpenDecision(void)
 }
 
 TI_INLINE ULONGLONG ThMinTick(ULONGLONG a, ULONGLONG b) { return (a == 0) ? b : (b == 0) ? a : (a < b ? a : b); }
+
+/* The claim the GLUE must make on the matched record before this pass decides (the core is pure and cannot touch the
+ * ring). `in->MatchVerdict` is the ring's own PENDING here. TH_VERDICT_WINDOW: the pass would map without a window verdict
+ * (the bridge is down). TH_VERDICT_BRIDGE: the banner reached its end unshown (ADR-toasts 13) - held past
+ * TH_BANNER_END_MS, or ended earlier with no record and this record was listed since. TH_VERDICT_NONE: keep waiting. */
+TI_INLINE LONG ThCoreClaimWanted(const TH_CORE* c, const TH_INPUT* in, ULONGLONG now)
+{
+    if (!in->MatchFound || in->MatchVerdict != TH_VERDICT_PENDING) return TH_VERDICT_NONE;
+    if (!in->BridgeUp) return TH_VERDICT_WINDOW;
+    if (c->Phase == ThPhaseDecided && c->Decision == ThDecSuppress && c->Ended && c->RecordSeq == 0) return TH_VERDICT_BRIDGE;
+    if (c->Phase == ThPhaseHolding && ThCoreBoundPassed(c->Due, now)) return TH_VERDICT_BRIDGE;
+    return TH_VERDICT_NONE;
+}
 
 /* The decision for one pass. `c` persists per banner window; `in` is this pass's view. */
 TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OUTPUT* out)
@@ -397,8 +410,10 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
 #endif
         if (ThCoreBoundPassed(c->Due, now))
         {
-            ThCoreDecideNow(c, ThCoreFailOpenDecision(), 1);
-            out->Event = ThEvFailOpen;
+            /* THE BANNER'S END WITH NOTHING TO CLAIM: never mapped (a banner is mapped only on a window record). */
+            ThCoreDecideNow(c, ThDecSuppress, 0);
+            c->Ended = 1;
+            out->Event = ThEvBannerEnd;
             out->Reason = ThReasonNoIdentity;
             goto decided;
         }
@@ -434,7 +449,6 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
             out->ReleaseSeq = c->RecordSeq;
             c->RecordSeq = 0;
             c->NotifId = 0;
-            c->PendDue = 0;
         }
         c->Ident = in->Ident;
     }
@@ -442,14 +456,6 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
 
     if (in->MatchFound)
     {
-        /* THE PENDING HOLD RUNS ON THE RECORD'S CLOCK (ADR-toasts 13, owner 2026-11-24): the bridge may store `bridge`
-         * until the record's ArrivalTick + TH_HOLD_BOUND_MS and never after (ThIpcSetVerdictSeq), so the banner is held
-         * until then - not until its own first sight + 3 s, which starts up to 1.9 s before the record exists
-         * (measured, runs 45438672842 and 45411516056). Fixed ONCE, on the pass that takes the record: the tick is
-         * bridge-written, and one in the future is taken as now (clamping it every pass would move the deadline for
-         * ever). A record already 3 s old is shown on this pass: the bridge can no longer make it `bridge`. */
-        if (c->RecordSeq != in->MatchSeq || c->PendDue == 0)
-            c->PendDue = (in->MatchArrival > now ? now : in->MatchArrival) + TH_HOLD_BOUND_MS;
         c->RecordSeq = in->MatchSeq;
         c->NotifId = in->MatchNotifId;
         if (TiVerdictSuppresses(in->MatchVerdict))
@@ -474,16 +480,12 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
             out->Reason = ThReasonBridgeExited;
             goto decided;
         }
-        if (ThCoreBoundPassed(c->PendDue, now))
-        {
-            ThCoreDecideNow(c, ThCoreFailOpenDecision(), 1);
-            out->Event = ThEvFailOpen;
-            out->Reason = ThReasonVerdictPending;
-            goto decided;
-        }
+        /* THE AGENT WAITS FOR AS LONG AS THE BANNER LIVES. A pending record is never mapped here: at the banner's end the
+         * glue claims it pending -> bridge (ThCoreClaimWanted) and passes what the record then holds, so this is reached
+         * past the end only when no claim could be made. */
         out->Decision = ThDecHold;
         out->Reason = ThReasonVerdictPending;
-        out->Due = c->PendDue;                   /* the verdict event wakes us earlier */
+        out->Due = ThCoreBoundPassed(c->Due, now) ? now + TH_HOLD_RECHECK_MS : c->Due;   /* the verdict event wakes us earlier */
         return;
     }
 
@@ -499,8 +501,11 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
     }
     if (ThCoreBoundPassed(c->Due, now))
     {
-        ThCoreDecideNow(c, ThCoreFailOpenDecision(), 1);
-        out->Event = ThEvFailOpen;
+        /* THE BANNER'S END WITH NO RECORD: never mapped. The glue remembers its identity; the record listed later is
+         * claimed for the bridge (adopted in `decided` below while this window lives). */
+        ThCoreDecideNow(c, ThDecSuppress, 0);
+        c->Ended = 1;
+        out->Event = ThEvBannerEnd;
         out->Reason = ThReasonNoRecord;
         goto decided;
     }
@@ -515,6 +520,14 @@ decided:
 
     if (c->Decision == ThDecSuppress)
     {
+        if (c->Ended && c->RecordSeq == 0 && in->MatchFound)
+        {
+            /* A record listed after this banner ended unshown. The glue claimed it for the bridge before this call:
+             * MatchVerdict is what it holds now - bridge/forwarded stands, window (the bridge was first) is shown below. */
+            c->RecordSeq = in->MatchSeq;
+            c->NotifId = in->MatchNotifId;
+            if (TiVerdictSuppresses(in->MatchVerdict)) { c->SuppressSince = now; c->AckSeen = 0; out->Event = ThEvSuppress; }
+        }
 #ifndef TOASTHOLD_DEFECT_SUPPRESS_FINAL
         /* A suppression is not final (nothing lost). THE BRIDGE'S LATER CORRECTION: our record turned
          * `window` - the forward failed for good, or the toast was listed while dom0 was unreachable - so
@@ -536,16 +549,13 @@ decided:
         }
         else if (!(in->MatchFound && in->MatchVerdict == TH_VERDICT_FORWARDED))
         {
-            /* Awaiting dom0's ack. The bridge's slow failure paths (ack timeout, reconnect, rejection cap)
-             * correct the record long after a 5 s banner is gone, so the AGENT bounds the wait: shown after
-             * TH_FORWARD_BOUND_MS, loudly. The deadline is armed only here - only while a suppression awaits. */
+            /* Awaiting dom0's ack. NOT shown when it is late (ADR-toasts 13: a banner is mapped only on a window record,
+             * and this record is the bridge's - mapping it while the bridge may still forward is a double): said once,
+             * loudly, at TH_FORWARD_BOUND_MS. The bridge's own give-up turns the record window and shows it above. */
 #ifndef TOASTHOLD_DEFECT_NOFORWARDBOUND
             if (c->SuppressSince != 0 && now >= c->SuppressSince + TH_FORWARD_BOUND_MS)
             {
-                c->Decision = ThCoreFailOpenDecision();
-                c->FailedOpen = 1;
-                out->Event = ThEvFailOpen;
-                out->Reason = ThReasonForwardUnconfirmed;
+                if (!c->LateSaid) { c->LateSaid = 1; out->Event = ThEvForwardLate; out->Reason = ThReasonForwardUnconfirmed; }
             }
             else if (c->SuppressSince != 0)
                 out->Due = c->SuppressSince + TH_FORWARD_BOUND_MS;
