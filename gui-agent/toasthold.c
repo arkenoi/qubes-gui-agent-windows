@@ -224,7 +224,9 @@ static void ThEndUnshownLocked(IN TH_ENTRY* e, IN ULONGLONG now, OUT TH_END_REPO
     }
 }
 static ULONGLONG g_ThClock = 0;
-static ULONGLONG g_ThNextDue = 0;    // earliest armed deadline over all entries; 0 = nothing armed
+static ULONGLONG g_ThNextDue = 0;    // earliest armed deadline over all entries and the no-banner scan; 0 = nothing armed
+static ULONGLONG g_ThScanDue = 0;    // the no-banner scan's next deadline (ThScanUnbanneredLocked); 0 = no record waiting
+static ULONGLONG g_ThScanFloor = 0;  // records listed before this tick (attach, the last mode switch) are never scanned
 
 static void ThEnsureLock(void)
 {
@@ -263,6 +265,8 @@ void ToastHoldInit(IN BOOL bridgeGate)
     const BOOL worker = ToastCropWorkerAvailable();
     const BOOL ipc = (g_ThIpc != NULL && g_ThEvt != NULL);
     g_ThActive = g_ThGate && !g_ThKnobOff && worker && ipc;
+    g_ThScanFloor = GetTickCount64();   // a record listed before the hold existed is not the scan's (an agent restart)
+    if (g_ThIpc) TI_STORE32(&g_ThIpc->HoldActive, g_ThActive ? 1 : 0);   // the bridge waits for our word only when we give one
 
     // Logged unconditionally and in one shape: a captured log must state which condition produced
     // it. INERT with the gate ON is the state the owner must never find silently - every bridged
@@ -293,6 +297,16 @@ void ToastHoldInit(IN BOOL bridgeGate)
 BOOL ToastHoldActive(void)
 {
     return g_ThActive;
+}
+
+void ToastHoldNoteMode(void)
+{
+    if (!g_ThLockInit) return;
+    EnterCriticalSection(&g_ThLock);
+    // A toast listed before a mode switch belongs to the mode it was listed in: non-seamless, the desktop banner showed it
+    // and the bridge settled it window; the no-banner scan must not claim it once seamless returns.
+    g_ThScanFloor = GetTickCount64();
+    LeaveCriticalSection(&g_ThLock);
 }
 
 // ---- entries ----------------------------------------------------------------------------------
@@ -336,6 +350,7 @@ static void ThRecomputeDueLocked(void)
     for (int i = 0; i < TH_ENTRIES; i++)
         if (g_Th[i].Window && g_Th[i].Due != 0 && (next == 0 || g_Th[i].Due < next))
             next = g_Th[i].Due;
+    if (g_ThScanDue != 0 && (next == 0 || g_ThScanDue < next)) next = g_ThScanDue;
     g_ThNextDue = next;
 }
 
@@ -452,6 +467,70 @@ static void ThClaimEndedLocked(IN ULONGLONG now, IN OUT TH_END_REPORT* rep)
         ThEndClaimLocked(recs[pick].Seq, recs[pick].NotifId, g_ThEnded[i].Ident.Combined, rep);
         g_ThEnded[i].At = 0;
     }
+}
+
+// g_ThLock held. A live banner entry, or a card stacked in one, holds this record: that banner decides it.
+static BOOL ThSeqHeldLocked(IN LONG seq)
+{
+    for (int i = 0; i < TH_ENTRIES; i++)
+    {
+        const TH_ENTRY* e = &g_Th[i];
+        if (!e->Window || e->NotBanner) continue;
+        if (e->Core.RecordSeq == seq) return TRUE;
+        for (int k = 0; k < e->StackCount - 1 && k < TOAST_CARDS_MAX; k++)
+            if (e->Stack[k].Seq == seq) return TRUE;
+    }
+    return FALSE;
+}
+
+typedef struct _TH_NOBANNER { LONG Seq; UINT32 NotifId; LONG From; LONG Held; BOOL Won; ULONGLONG AgeMs; } TH_NOBANNER;
+
+// g_ThLock held. THE TOAST NO BANNER SHOWED (ADR-toasts 13: never dropped). Nothing either side reads says "this toast has
+// no banner" - per-app banners off, do-not-disturb, an open Notification Center, a banner queued behind others - so it is
+// decided here, by the agent's clock, the one side allowed one: a record that no live banner holds, still `pending`, or
+// `window` with no shown mark, TH_BANNER_END_MS after the bridge listed it, is claimed for the bridge by one
+// compare-exchange, and the bridge forwards it. A banner that turns up later finds it `bridge` and is suppressed, so the
+// claim arbitrates and nothing doubles; such a toast is misrouted to dom0, loudly, never lost. Arms g_ThScanDue for the next.
+static int ThScanUnbanneredLocked(IN ULONGLONG now, OUT TH_NOBANNER* out, IN int cap)
+{
+    TH_IPC_RECORD recs[TH_IPC_RECORDS];
+    ULONGLONG due = 0;
+    int n = 0;
+    g_ThScanDue = 0;
+    if (!g_ThActive || !g_ThIpc || !g_ThBridgeUp || !ThIpcValid(g_ThIpc) || TI_LOAD32(&g_ThIpc->Seamless) == 0) return 0;
+    const int nrec = ThSnapshotRecords(recs, TH_IPC_RECORDS);
+    for (int i = 0; i < nrec; i++)
+    {
+        const TH_IPC_RECORD* r = &recs[i];
+        const LONG from = r->Verdict;
+        if (from != TH_VERDICT_PENDING && !(from == TH_VERDICT_WINDOW && r->AgentShownSeq != r->Seq)) continue;
+        const ULONGLONG arrival = r->ArrivalTick > now ? now : r->ArrivalTick;   // a future tick never defers it
+        if (arrival < g_ThScanFloor || now - arrival >= TH_RECORD_TTL_MS) continue;
+        if (ThSeqHeldLocked(r->Seq)) continue;
+        if (now < arrival + TH_BANNER_END_MS) { due = ThMinTick(due, arrival + TH_BANNER_END_MS); continue; }
+        BOOL won = FALSE;
+        const LONG held = ThIpcClaimSeq(g_ThIpc, r->Seq, from, TH_VERDICT_BRIDGE, &won);
+        if (n < cap)
+        {
+            out[n].Seq = r->Seq; out[n].NotifId = r->NotifId; out[n].From = from; out[n].Held = held; out[n].Won = won;
+            out[n].AgeMs = now - arrival;
+            n++;
+        }
+    }
+    g_ThScanDue = due;
+    ThRecomputeDueLocked();
+    return n;
+}
+
+// Outside g_ThLock. One ERROR per no-banner claim: the log sweep flags every one.
+static void ThLogNoBanner(IN const TH_NOBANNER* nb, IN int n)
+{
+    for (int i = 0; i < n; i++)
+        LogError("QGATOASTNOBANNER id=%lu seq=%ld no banner showed this toast within %llu ms of its listing (bound %u ms): claim "
+            L"%s->bridge %s, record now %s - %s", (ULONG)nb[i].NotifId, nb[i].Seq, nb[i].AgeMs, (unsigned)TH_BANNER_END_MS,
+            ThVerdictName(nb[i].From), nb[i].Won ? L"WON by the agent" : L"LOST", ThVerdictName(nb[i].Held),
+            TiVerdictSuppresses(nb[i].Held) ? L"the bridge forwards it to dom0" :
+            nb[i].Held == TH_VERDICT_NONE ? L"the record left the ring: shown NOWHERE" : L"a banner shows it after all");
 }
 
 // ---- the decision -----------------------------------------------------------------------------
@@ -780,6 +859,12 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     if (in.MatchFound && in.MatchVerdict == TH_VERDICT_WINDOW && out.Decision == ThDecShow &&
         e->Core.Phase == ThPhaseDecided && g_ThIpc)
         ThIpcAgentMarkShown(g_ThIpc, in.MatchSeq);
+    // The same mark for a card stacked above the bottom one that this window shows (not kept out by the crop): the bridge
+    // waits for it before it counts a `window` toast as shown (ADR-toasts 13), and the no-banner scan skips a marked record.
+    if (out.Decision == ThDecShow && g_ThIpc && !e->NotBanner)
+        for (int k = 0; k < e->StackCount - 1 && k < TOAST_CARDS_MAX; k++)
+            if (e->Stack[k].Seq && !e->Stack[k].Excluded && e->Stack[k].Verdict == TH_VERDICT_WINDOW)
+                ThIpcAgentMarkShown(g_ThIpc, e->Stack[k].Seq);
 
     // Reads, bounded by the hold's own deadlines and never while one is in flight. Every interval is measured
     // from the last ATTEMPT and stretched by ThCoreRetryDelayMs while the worker's queue refuses (review N7),
@@ -1433,16 +1518,21 @@ void ToastHoldOnSignal(void)
     HWND wake[TH_ENTRIES];
     int n = 0;
     TH_END_REPORT endRep;
+    TH_NOBANNER nb[TH_IPC_RECORDS];
+    int nnb;
     if (!g_ThActive) return;
     ZeroMemory(&endRep, sizeof(endRep));
     EnterCriticalSection(&g_ThLock);
-    // The bridge's verdict event: a record listed AFTER its banner ended unshown with no record is claimed for the bridge.
+    // The bridge's verdict event: a record listed AFTER its banner ended unshown with no record is claimed for the bridge,
+    // and the no-banner scan arms its deadline for a record listed now (or claims one already past it).
     ThClaimEndedLocked(GetTickCount64(), &endRep);
+    nnb = ThScanUnbanneredLocked(GetTickCount64(), nb, TH_IPC_RECORDS);
     for (int i = 0; i < TH_ENTRIES; i++)
         if (g_Th[i].Window && !g_Th[i].NotBanner)
             wake[n++] = g_Th[i].Window;
     LeaveCriticalSection(&g_ThLock);
     ThLogEndReport(NULL, L"ended earlier", &endRep);
+    ThLogNoBanner(nb, nnb);
     for (int i = 0; i < n; i++)
         PokeWindowTrackingFor(wake[i]);
 }
@@ -1465,11 +1555,14 @@ ULONGLONG ToastHoldNextDue(void)
 void ToastHoldSweep(void)
 {
     HWND wake[TH_ENTRIES];
-    int n = 0;
+    TH_NOBANNER nb[TH_IPC_RECORDS];
+    int n = 0, nnb = 0;
     if (!g_ThActive || g_ThNextDue == 0) return;
     const ULONGLONG now = GetTickCount64();
     if (now < g_ThNextDue) return;
     EnterCriticalSection(&g_ThLock);
+    if (g_ThScanDue != 0 && now >= g_ThScanDue)
+        nnb = ThScanUnbanneredLocked(now, nb, TH_IPC_RECORDS);
     for (int i = 0; i < TH_ENTRIES; i++)
     {
         if (g_Th[i].Window && g_Th[i].Due != 0 && now >= g_Th[i].Due)
@@ -1484,6 +1577,7 @@ void ToastHoldSweep(void)
     }
     ThRecomputeDueLocked();
     LeaveCriticalSection(&g_ThLock);
+    ThLogNoBanner(nb, nnb);
     for (int i = 0; i < n; i++)
         PokeWindowTrackingFor(wake[i]);
 }

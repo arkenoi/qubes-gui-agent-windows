@@ -21,6 +21,9 @@
  *     (TH_BANNER_END_MS after first sight) it is NOT mapped - the record is claimed pending -> bridge by
  *     one compare-exchange and the bridge forwards the toast, said as an ERROR (QGATOASTCLAIM); a banner
  *     that ends with no record is remembered and the record listed later is claimed (QGATOASTUNSHOWN).
+ *     A toast NO banner showed (banners off, do-not-disturb, Notification Center open): a record no
+ *     live banner holds, still pending or window without the shown mark, TH_BANNER_END_MS after its
+ *     listing, is claimed for the bridge the same way (QGATOASTNOBANNER, the no-banner scan).
  *     Never lost, never double (ADR-toasts 13, "Claim, no timer"). Bridge not running or dying
  *     mid-hold: mapped at once. A suppressed banner is re-examined on every pass: it is shown after all
  *     when the bridge turns its record to `window` (the forward failed for good) or dies before dom0
@@ -44,7 +47,8 @@
  * Log tokens (hashes only - never toast text or window titles): QGATOASTHOLD (hold/suppress/show
  * transitions), QGATOASTHOLDLATE (a fail-open on bridge death, WARNING), QGATOASTCLAIM (every claim the
  * agent makes; ERROR at a banner's end), QGATOASTUNSHOWN (a banner that ended with no record or identity),
- * QGATOASTFWDLATE (no dom0 ack within the forward bound, ERROR), QGATOASTIDENT (identity reads worth a
+ * QGATOASTFWDLATE (no dom0 ack within the forward bound, ERROR), QGATOASTNOBANNER (a toast no banner
+ * showed, claimed for the bridge, ERROR), QGATOASTIDENT (identity reads worth a
  * look: partial matches, unreadable cards).
  */
 #pragma once
@@ -66,6 +70,9 @@ HANDLE ToastHoldVerdictEvent(void);
 
 // TRUE when the hold governs toast banners on this run (gate + knob + IPC + worker, decided at init).
 BOOL ToastHoldActive(void);
+
+// main.c, at every seamless/non-seamless publish: records listed before this tick are never claimed by the no-banner scan.
+void ToastHoldNoteMode(void);
 
 // The agent's view of the bridge process: TRUE once its validated handle is held, FALSE on exit.
 // Going down fails every held banner open at once (nothing can arrive any more).

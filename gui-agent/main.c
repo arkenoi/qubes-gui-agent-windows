@@ -5232,6 +5232,7 @@ static void NotifHoldPublishMode(void)
 {
     if (g_NotifHoldBase)
         TI_STORE32(&((TH_IPC_HEADER*)g_NotifHoldBase)->Seamless, g_SeamlessMode ? 1 : 0);
+    ToastHoldNoteMode();   // a toast listed before the switch belongs to the old mode (the no-banner scan, ADR-toasts 13)
 }
 // THE SESSION GOING DOWN, for the bridge (docs/ADR-supervision.md item 2b, by mode): it runs as the user and cannot
 // open the SYSTEM-only latch, so it reads this copy beside Seamless. Called at the section's creation and by the

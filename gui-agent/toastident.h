@@ -412,6 +412,10 @@ TI_INLINE int TiSelect(const TI_CANDIDATE* c, int n, const TOAST_IDENT* seen, TI
  * (ThIpcClaimSeq) and the bridge forwards the toast to dom0 - mapped this late, the banner would be dismissed by the shell
  * before anyone saw it (its life is ~6 s, p5 6.03 s over 1077 banners). */
 #define TH_BANNER_END_MS      4500
+/* A record older than this can no longer be the toast of a banner appearing now (the shell's queue drains far faster).
+ * BOTH sides stop at it: the agent stops matching and scanning a record, and the bridge stops waiting for the agent's word
+ * on a window record nobody showed (ADR-toasts 13). */
+#define TH_RECORD_TTL_MS    120000
 
 TI_INLINE BOOL TiVerdictSuppresses(LONG v) { return v == TH_VERDICT_BRIDGE || v == TH_VERDICT_FORWARDED; }
 
@@ -468,7 +472,10 @@ typedef struct _TH_IPC_HEADER
     volatile LONG GoingDown;   /* agent: 1 while the session is going down (WM_QUERYENDSESSION until a cancel). With
                                   Seamless set, the bridge's own launches refuse (docs/ADR-supervision.md item 2b, by
                                   mode). The bridge cannot open the SYSTEM-only going-down latch; this is its copy. */
-    LONG Reserved0;
+    volatile LONG HoldActive;  /* agent: 1 when its toast hold runs (ToastHoldInit decided it). The bridge then never gives a
+                                  toast up by counting listing passes: a pending record waits for a claim, and a window
+                                  record is done only when the agent marks it shown - else the agent's no-banner scan claims
+                                  it for the bridge (ADR-toasts 13). 0: nobody claims, the bridge routes alone. */
     UINT64 Reserved[3];
 } TH_IPC_HEADER;              /* 64 bytes */
 

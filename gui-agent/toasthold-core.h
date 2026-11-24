@@ -68,9 +68,6 @@ extern "C" {
  * is built within the collapse-and-grow animation (~300 ms measured), a Quick Settings / volume flyout
  * never has one. Two card-less reads = not a banner: shown at once, never held for the 3 s bound. */
 #define TH_NOCARD_RETRY_MS     250
-/* A record older than this can no longer be the toast of a banner appearing now (the shell's queue
- * drains far faster); the glue stops considering it. */
-#define TH_RECORD_TTL_MS    120000
 /* Records the agent has tied to a banner, by sequence. Toasts are sparse; 64 outlasts the TTL. */
 #define TH_CONSUMED_SLOTS       64
 /* A SUPPRESSED banner whose record has not turned `forwarded` (dom0's ack) within this long after the
