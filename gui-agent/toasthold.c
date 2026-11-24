@@ -523,12 +523,14 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     if (!e->NotBanner && e->StackCount > 1)
     {
         UINT mask = 0;
-        BOOL rereadUntitled = FALSE;
+        BOOL rereadUntitled = FALSE, recordMoved = FALSE;
         stackN = e->StackCount;
         for (int k = 0; k < e->StackCount - 1; k++)
         {
             TH_STACK_CARD* sc = &e->Stack[k];
             TH_IPC_RECORD r;
+            const UINT32 notifBefore = sc->NotifId;
+            const LONG verdictBefore = sc->Verdict;
             if (sc->Seq == 0 && sc->Ident.Combined != 0)
             {
                 TI_CANDIDATE cand[TH_IPC_RECORDS];
@@ -558,6 +560,9 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
                 if (!sc->Titled) rereadUntitled = TRUE;
             }
             if (sc->Excluded) mask |= 1u << k;
+            // A card's record found, or its verdict moved, is said too: the line then names the toast each
+            // kept-out card IS (toast-hold-grade.py keys on card=id<N>/.../out), not only that one is out.
+            if (sc->NotifId != notifBefore || sc->Verdict != verdictBefore) recordMoved = TRUE;
             stackNotif[k] = sc->NotifId;
             stackVerdict[k] = sc->Verdict;
         }
@@ -569,7 +574,7 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         if (rereadUntitled && !e->ReadInFlight && (now - e->LastReadAttempt) >= TH_HOLD_RECHECK_MS)
             ThRequestReadLocked(e, now);
         stackMask = mask;
-        stackChanged = (mask != e->StackMask || e->StackCount != e->StackMaskN);
+        stackChanged = (mask != e->StackMask || e->StackCount != e->StackMaskN || recordMoved);
         stackGap = e->AppliedGap;
         e->StackMask = mask;
         e->StackMaskN = e->StackCount;
