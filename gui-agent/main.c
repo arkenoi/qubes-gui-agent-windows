@@ -2194,6 +2194,8 @@ static HWND g_ConsentHostWithheld = NULL;
 static ULONGLONG g_ConsentHostSince = 0;
 static BOOL g_ConsentHostWarned = FALSE;
 
+static BOOL CapStripTaken(IN HWND hwnd);   // the stripped set, defined with it (RestyleGuestCaption)
+
 ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 {
     WINDOW_DATA* entry = NULL;
@@ -2263,6 +2265,10 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     entry->Handle = window;
     entry->Style = GetWindowLong(window, GWL_STYLE);
     entry->ExStyle = GetWindowLong(window, GWL_EXSTYLE);
+    // The caption decision survives a fresh entry (CapStripTaken): made once per handle, and a strip only where the
+    // caption is gone - a strip whose helper failed is announced with its caption and never launched again.
+    entry->CaptionHidden = CapStripTaken(window);
+    entry->CaptionWasStripped = entry->CaptionHidden && (entry->Style & WS_CAPTION) != WS_CAPTION;
     // Must be set unconditionally: ZeroMemory() above leaves it at 0, which would read as
     // "fully transparent". No-ops for non-layered windows.
     entry->IsIconic = IsIconic(window);
@@ -7622,6 +7628,85 @@ static void CapStripForget(IN HWND hwnd)
     LeaveCriticalSection(&s_csCapStrip);
 }
 
+// `hwnd` is in the stripped set: a strip helper was launched for it (GetWindowData's caption fields read this). A window
+// re-examined from scratch (DeletePending) gets a fresh entry, which without it read as never decided - a second helper
+// for a strip that had failed, and a maximized stripped window hidden as a borderless fullscreen (mode-2 test).
+static BOOL CapStripTaken(IN HWND hwnd)
+{
+    BOOL found = FALSE;
+    if (!s_csCapStripReady || !hwnd) return FALSE;
+    EnterCriticalSection(&s_csCapStrip);
+    for (ULONG i = 0; i < s_CapStrippedCount && !found; i++)
+        found = (s_CapStripped[i] == hwnd);
+    LeaveCriticalSection(&s_csCapStrip);
+    return found;
+}
+
+// THE STRIP IS DONE WHEN ITS HELPER HAS EXITED, and a window is announced only then (GWeck 2026-11-24, post 241 item B).
+// The strip changes the frame: WS_CAPTION includes WS_DLGFRAME, so a fixed dialog's DWM bounds - what GetRealWindowRect
+// reads - change with it. Launched fire-and-forget, the helper landed after CREATE and the buffer attach: dom0's
+// placement then compared unequal in size (vchan-handlers.c noSize), the dialog was moved AND resized, and a dialog
+// that does not re-lay out showed its old image displaced with the live button repainting at its true place - two OK
+// buttons. No clock: the process handle is waited on by the thread pool, and its exit re-examines that one window.
+// Main tracking thread only (AddWindow); the callback touches nothing here.
+typedef struct _CAP_HELPER { HWND Window; HANDLE Proc; HANDLE Wait; } CAP_HELPER;
+static CAP_HELPER s_CapHelpers[CAPSTRIP_MAX];
+static ULONG s_CapHelperCount = 0;
+
+static VOID CALLBACK CapHelperExited(PVOID context, BOOLEAN timedOut)
+{
+    UNREFERENCED_PARAMETER(timedOut);
+    PokeWindowTrackingFor((HWND)context);
+}
+
+// Takes `proc`. FALSE (and `proc` closed): nothing is owed, announce now - said as an error, never silently.
+static BOOL CapHelperRunning(IN HWND hwnd);
+
+static BOOL CapHelperAdd(IN HWND hwnd, IN HANDLE proc)
+{
+    HANDLE wait = NULL;
+    // A window destroyed while its helper ran is never examined again: release every exited helper here (backwards:
+    // CapHelperRunning moves the last slot into the one it frees).
+    for (ULONG i = s_CapHelperCount; i-- > 0; )
+        if (WaitForSingleObject(s_CapHelpers[i].Proc, 0) != WAIT_TIMEOUT)
+            (void)CapHelperRunning(s_CapHelpers[i].Window);
+    if (s_CapHelperCount >= CAPSTRIP_MAX ||
+        !RegisterWaitForSingleObject(&wait, proc, CapHelperExited, (PVOID)hwnd, INFINITE, WT_EXECUTEONLYONCE))
+    {
+        LogError("QGACAPSTRIPWAIT 0x%x: the caption helper's exit cannot be waited on (%lu helpers, error %lu) - announced "
+            "before its strip lands, the frame may change under dom0's placement", (DWORD)(ULONG_PTR)hwnd,
+            s_CapHelperCount, GetLastError());
+        CloseHandle(proc);
+        return FALSE;
+    }
+    s_CapHelpers[s_CapHelperCount].Window = hwnd;
+    s_CapHelpers[s_CapHelperCount].Proc = proc;
+    s_CapHelpers[s_CapHelperCount].Wait = wait;
+    s_CapHelperCount++;
+    return TRUE;
+}
+
+// TRUE while the helper launched for `hwnd` runs. Its exit is consumed here, once: wait and handle released, and a
+// failed strip said (the window is then announced with its own caption, and not stripped again).
+static BOOL CapHelperRunning(IN HWND hwnd)
+{
+    for (ULONG i = 0; i < s_CapHelperCount; i++)
+    {
+        if (s_CapHelpers[i].Window != hwnd) continue;
+        if (WaitForSingleObject(s_CapHelpers[i].Proc, 0) == WAIT_TIMEOUT) return TRUE;
+        DWORD code = 0;
+        (void)GetExitCodeProcess(s_CapHelpers[i].Proc, &code);
+        UnregisterWaitEx(s_CapHelpers[i].Wait, INVALID_HANDLE_VALUE);   // not the callback's thread: waits for it
+        CloseHandle(s_CapHelpers[i].Proc);
+        s_CapHelpers[i] = s_CapHelpers[--s_CapHelperCount];
+        if (code != ERROR_SUCCESS)
+            LogWarning("QGACAPSTRIPWAIT 0x%x: the caption helper exited with %lu - announced with its own caption",
+                (DWORD)(ULONG_PTR)hwnd, code);
+        return FALSE;
+    }
+    return FALSE;
+}
+
 // hide==FALSE puts the caption BACK. The strip is a seamless-only tweak (dom0 draws the frame)
 // and had no inverse, so a guest leaving seamless kept every window stripped - no title bar and a
 // black band where the frame belonged, inside the desktop window. See RestyleCaptionMain.
@@ -7666,10 +7751,10 @@ static void RestyleGuestCaption(IN WINDOW_DATA* entry, IN BOOL hide)
     // genuinely running as that user succeeds, which an Explorer window restyled by hand proved
     // by staying correct and dom0-managed for hours.
     //
-    // Fire and forget: the caption change does not move the window (SWP_NOMOVE|SWP_NOSIZE keeps
-    // the outer rect), so the geometry being announced below stays correct whether the helper
-    // lands before or after it. Blocking the frame loop on a process spawn would be far worse
-    // than a repaint.
+    // Not waited for here - the frame loop never blocks on a process - but NOT fire and forget either: SWP_NOMOVE|
+    // SWP_NOSIZE keeps the outer rect, yet removing WS_CAPTION (which includes WS_DLGFRAME) changes the DWM frame
+    // bounds the announce reads. A strip keeps its process handle (CapHelperAdd) and AddWindow announces the window only
+    // after the helper has exited (GWeck post 241 item B: two OK buttons).
     //
     // SEAMLESS MODE, SESSION GOING DOWN: no strip (docs/ADR-supervision.md item 2b, by mode). The cost is accepted
     // collateral: a window announced during the end - a "save changes?" prompt among them - shows the guest's own
@@ -7712,7 +7797,10 @@ static void RestyleGuestCaption(IN WINDOW_DATA* entry, IN BOOL hide)
                     CREATE_NO_WINDOW, NULL, NULL, &si, &pi))
             {
                 CloseHandle(pi.hThread);
-                CloseHandle(pi.hProcess);
+                // A strip is owed to the announce (CapHelperRunning); a restore is not - the window is not announced
+                // again for it.
+                if (hide) (void)CapHelperAdd(entry->Handle, pi.hProcess);
+                else      CloseHandle(pi.hProcess);
                 spawned = TRUE;
             }
             else
@@ -7959,9 +8047,18 @@ ULONG AddWindow(IN WINDOW_DATA* entry)
         return ERROR_SUCCESS;
     }
 
-    // Strip the guest caption BEFORE the announce, so dom0 never sees the two-titlebar
-    // version even briefly. The outer rect is unchanged, so entry's geometry stays valid.
-    HideGuestCaption(entry);
+    // Strip the guest caption BEFORE the announce, so dom0 never sees the two-titlebar version even briefly - and
+    // announce only once the strip has LANDED: it changes the frame (CapHelperExited's comment). While the helper runs
+    // nothing is sent; its exit re-examines this window from scratch, with the frame it then has. A window whose helper
+    // is still running is never given a second one.
+    if (!CapHelperRunning(entry->Handle))
+        HideGuestCaption(entry);
+    if (CapHelperRunning(entry->Handle))
+    {
+        LogDebug("QGACAPSTRIPWAIT 0x%x: announce deferred until the caption helper exits", entry->Handle);
+        entry->DeletePending = TRUE;
+        return ERROR_SUCCESS;
+    }
 
     // send window creation info to gui daemon
     if (g_VchanClientConnected)
