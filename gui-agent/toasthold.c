@@ -833,7 +833,14 @@ void ToastHoldNoteChanged(IN HWND window)
         // window whose every move event lands here would hold the frames of its own animation and then
         // force a repaint on release - a stutter and a repaint storm. Decided-and-shown is the state in
         // which a change notice means content, not motion.
-        gateSwap = (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecShow);
+        //
+        // NEVER FOR A WINDOW CLASSED NOT-A-BANNER. ThRequestReadLocked above returns at once for it, so the
+        // read that is the gate's only release is never requested and the gate holds to TH_HOLD_BOUND_MS.
+        // Measured 2026-11-24, crop-before-map on b848fded: 0x4018e was "not a toast banner (no
+        // NormalToastView in 2 reads)", then each card added to its stack logged "frames gated at the swap
+        // edge" and, with no read between, "frames resumed after 2 held, swap gate open 3000 ms" and "after
+        // 11 held, ... 3000 ms" - dom0 kept the old stack for 3 s while the new card was on the guest.
+        gateSwap = (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecShow && !e->NotBanner);
         // EVERY DECIDED BANNER ARMS THE DEADLINE, NOT ONLY A SHOWN ONE. This is the toast loss that
         // kept coming back (findings/issues.md TOASTBANNERLOSTONDIRECTPATH, four times, last on
         // 2026-11-07 02:45:49Z as toast-hold S3i-2=LOST with its pair 838 ms apart - inside the first
