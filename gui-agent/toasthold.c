@@ -1668,6 +1668,7 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
     }
     e->ReadInFlight = FALSE;
     e->ReadStatus = status;
+    const BOOL uiaFailed = (status == TH_READ_UIAFAIL);   // on a banner still tracked: a read racing a close was dropped above
     if (status == TH_READ_OK)
     {
         before = e->IdentValid ? e->Ident.Combined : 0;
@@ -1845,6 +1846,12 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
             "becomes the first of a new pair and the hold continues to the banner's end (%u ms)",
             (DWORD)(ULONG_PTR)window, (long)e_firstW, (long)e_firstH, (long)e_seenW, (long)e_seenH,
             (unsigned)TH_BANNER_END_MS);
+    // A UIA call that FAILED (ElementFromHandle/Find) is not a card still building: it does not happen in normal
+    // operation (owner 2026-11-24: "classification errors and timeouts should not happen. it is a sign of something
+    // going wrong") - said when it happens, not only by the banner's end. The read is re-requested as before.
+    if (uiaFailed)
+        LogError("QGATOASTIDENT hwnd=0x%x identity read FAILED (%s): the UI Automation call on a tracked banner failed - "
+            L"the banner stays held, the next read is requested", (DWORD)(ULONG_PTR)window, ThReadStatusName(status));
     if (logNoCard)
         LogInfo("QGATOASTIDENT hwnd=0x%x card not readable yet (%s, read %u): no card / no Title|TitleText block - "
             L"held until a read succeeds, a second card-less read says not-a-banner, or the banner's end (%u ms, NOT mapped) ends it",
