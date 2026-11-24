@@ -912,9 +912,22 @@ void ToastHoldNoteFrame(IN HWND window)
     const ULONGLONG now = GetTickCount64();
     EnterCriticalSection(&g_ThLock);
     TH_ENTRY* e = ThFindLocked(window);
+    BOOL issued = FALSE;
+    UINT32 queued = 0;
     if (e && e->QueuedNotif != 0 && e->Core.Phase == ThPhaseDecided)
+    {
+        const BOOL wasInFlight = e->ReadInFlight;
         ThRequestReadLocked(e, now);
+        issued = !wasInFlight && e->ReadInFlight;   // a new request, not a dirty mark on one in flight
+        queued = e->QueuedNotif;
+    }
     LeaveCriticalSection(&g_ThLock);
+    // The only record that this path fired: a frame-triggered read leaves no other line, and the decision it
+    // brings looks the same as one a window event brought (2026-11-24: five toast-hold runs on 1db3aae could
+    // not say which of the two decided S3i-2). Once per issued read, not per frame.
+    if (issued)
+        LogInfo("QGATOASTFRAMEREAD hwnd=0x%x id=%u queued behind this decided banner: its new frame requested an "
+            "identity read", (DWORD)(ULONG_PTR)window, (ULONG)queued);
 }
 
 // Collected by main.c's tracking pass, which owns WINDOW_DATA and the visible-region arithmetic. One
