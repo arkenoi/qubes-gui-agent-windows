@@ -23,7 +23,9 @@
  *     that ends with no record is remembered and the record listed later is claimed (QGATOASTUNSHOWN).
  *     A toast NO banner showed (banners off, do-not-disturb, Notification Center open): a record no
  *     live banner holds, still pending or window without the shown mark, TH_BANNER_END_MS after its
- *     listing, is claimed for the bridge the same way (QGATOASTNOBANNER, the no-banner scan).
+ *     turn, is claimed for the bridge the same way (QGATOASTNOBANNER, the no-banner scan). Its turn is
+ *     its listing, or - while a read banner occupies the shell's one banner window (FIFO queue, 6.9 s
+ *     measured) - the moment the last such banner leaves.
  *     Never lost, never double (ADR-toasts 13, "Claim, no timer"). Bridge not running or dying
  *     mid-hold: mapped at once. A suppressed banner is re-examined on every pass: it is shown after all
  *     when the bridge turns its record to `window` (the forward failed for good) or dies before dom0

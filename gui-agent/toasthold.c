@@ -227,6 +227,7 @@ static ULONGLONG g_ThClock = 0;
 static ULONGLONG g_ThNextDue = 0;    // earliest armed deadline over all entries and the no-banner scan; 0 = nothing armed
 static ULONGLONG g_ThScanDue = 0;    // the no-banner scan's next deadline (ThScanUnbanneredLocked); 0 = no record waiting
 static ULONGLONG g_ThScanFloor = 0;  // records listed before this tick (attach, the last mode switch) are never scanned
+static ULONGLONG g_ThBusyEnd = 0;    // when the last banner with a read card left the shell's window (ToastHoldEvict)
 
 static void ThEnsureLock(void)
 {
@@ -483,14 +484,27 @@ static BOOL ThSeqHeldLocked(IN LONG seq)
     return FALSE;
 }
 
-typedef struct _TH_NOBANNER { LONG Seq; UINT32 NotifId; LONG From; LONG Held; BOOL Won; ULONGLONG AgeMs; } TH_NOBANNER;
+// g_ThLock held. The shell's banner window shows a real toast card now: a live entry whose card was read (a suppressed
+// bridged banner counts - it occupies the shell's window though dom0 never sees it; the text-less twin surface does not).
+static BOOL ThBannerBusyLocked(void)
+{
+    for (int i = 0; i < TH_ENTRIES; i++)
+        if (g_Th[i].Window && !g_Th[i].NotBanner && g_Th[i].IdentValid) return TRUE;
+    return FALSE;
+}
+
+typedef struct _TH_NOBANNER { LONG Seq; UINT32 NotifId; LONG From; LONG Held; BOOL Won; ULONGLONG AgeMs; ULONGLONG QueuedMs; } TH_NOBANNER;
 
 // g_ThLock held. THE TOAST NO BANNER SHOWED (ADR-toasts 13: never dropped). Nothing either side reads says "this toast has
-// no banner" - per-app banners off, do-not-disturb, an open Notification Center, a banner queued behind others - so it is
-// decided here, by the agent's clock, the one side allowed one: a record that no live banner holds, still `pending`, or
-// `window` with no shown mark, TH_BANNER_END_MS after the bridge listed it, is claimed for the bridge by one
-// compare-exchange, and the bridge forwards it. A banner that turns up later finds it `bridge` and is suppressed, so the
-// claim arbitrates and nothing doubles; such a toast is misrouted to dom0, loudly, never lost. Arms g_ThScanDue for the next.
+// no banner" - per-app banners off, do-not-disturb, an open Notification Center - so it is decided here, by the agent's
+// clock, the one side allowed one: a record that no live banner holds, still `pending`, or `window` with no shown mark,
+// TH_BANNER_END_MS after it became the shell's turn, is claimed for the bridge by one compare-exchange, and the bridge
+// forwards it. THE SHELL'S TURN: the shell can show banners one at a time, FIFO - a queued one appeared 6.9 s after its
+// toast (toastident.h, 2026-10-04 probe), about one banner life (p50 6.07 s) behind the one on screen - so while a read
+// banner occupies the window an unmatched record is QUEUED, not bannerless, and its 4.5 s starts when the last such banner
+// leaves (g_ThBusyEnd, set by ToastHoldEvict, which re-runs this scan). A window busy for half the TTL is not a queue: the
+// record is claimed then. A banner that turns up after a claim finds the record `bridge` and is suppressed - misrouted to
+// dom0, loudly, never lost or doubled. Arms g_ThScanDue for the next.
 static int ThScanUnbanneredLocked(IN ULONGLONG now, OUT TH_NOBANNER* out, IN int cap)
 {
     TH_IPC_RECORD recs[TH_IPC_RECORDS];
@@ -498,6 +512,7 @@ static int ThScanUnbanneredLocked(IN ULONGLONG now, OUT TH_NOBANNER* out, IN int
     int n = 0;
     g_ThScanDue = 0;
     if (!g_ThActive || !g_ThIpc || !g_ThBridgeUp || !ThIpcValid(g_ThIpc) || TI_LOAD32(&g_ThIpc->Seamless) == 0) return 0;
+    const BOOL busy = ThBannerBusyLocked();
     const int nrec = ThSnapshotRecords(recs, TH_IPC_RECORDS);
     for (int i = 0; i < nrec; i++)
     {
@@ -507,13 +522,17 @@ static int ThScanUnbanneredLocked(IN ULONGLONG now, OUT TH_NOBANNER* out, IN int
         const ULONGLONG arrival = r->ArrivalTick > now ? now : r->ArrivalTick;   // a future tick never defers it
         if (arrival < g_ThScanFloor || now - arrival >= TH_RECORD_TTL_MS) continue;
         if (ThSeqHeldLocked(r->Seq)) continue;
-        if (now < arrival + TH_BANNER_END_MS) { due = ThMinTick(due, arrival + TH_BANNER_END_MS); continue; }
+        const ULONGLONG queueCap = arrival + TH_RECORD_TTL_MS / 2;
+        if (busy && now < queueCap) { due = ThMinTick(due, queueCap); continue; }   // queued: the evict that frees the window re-scans
+        const ULONGLONG turn = (g_ThBusyEnd > arrival && now < queueCap) ? g_ThBusyEnd : arrival;
+        if (now < turn + TH_BANNER_END_MS) { due = ThMinTick(due, turn + TH_BANNER_END_MS); continue; }
         BOOL won = FALSE;
         const LONG held = ThIpcClaimSeq(g_ThIpc, r->Seq, from, TH_VERDICT_BRIDGE, &won);
         if (n < cap)
         {
             out[n].Seq = r->Seq; out[n].NotifId = r->NotifId; out[n].From = from; out[n].Held = held; out[n].Won = won;
             out[n].AgeMs = now - arrival;
+            out[n].QueuedMs = turn - arrival;
             n++;
         }
     }
@@ -526,8 +545,9 @@ static int ThScanUnbanneredLocked(IN ULONGLONG now, OUT TH_NOBANNER* out, IN int
 static void ThLogNoBanner(IN const TH_NOBANNER* nb, IN int n)
 {
     for (int i = 0; i < n; i++)
-        LogError("QGATOASTNOBANNER id=%lu seq=%ld no banner showed this toast within %llu ms of its listing (bound %u ms): claim "
-            L"%s->bridge %s, record now %s - %s", (ULONG)nb[i].NotifId, nb[i].Seq, nb[i].AgeMs, (unsigned)TH_BANNER_END_MS,
+        LogError("QGATOASTNOBANNER id=%lu seq=%ld no banner showed this toast within %llu ms of its listing (queued behind a shown "
+            L"banner for %llu ms, then bound %u ms): claim %s->bridge %s, record now %s - %s", (ULONG)nb[i].NotifId, nb[i].Seq,
+            nb[i].AgeMs, nb[i].QueuedMs, (unsigned)TH_BANNER_END_MS,
             ThVerdictName(nb[i].From), nb[i].Won ? L"WON by the agent" : L"LOST", ThVerdictName(nb[i].Held),
             TiVerdictSuppresses(nb[i].Held) ? L"the bridge forwards it to dom0" :
             nb[i].Held == TH_VERDICT_NONE ? L"the record left the ring: shown NOWHERE" : L"a banner shows it after all");
@@ -1456,9 +1476,12 @@ void ToastHoldEvict(IN HWND window)
     UINT queuedSameReads = 0;
     ULONGLONG sinceSameRead = 0;
     TH_END_REPORT endRep;
+    TH_NOBANNER nb[TH_IPC_RECORDS];
+    int nnb = 0;
     ZeroMemory(&endRep, sizeof(endRep));
     if (e)
     {
+        const BOOL wasCard = !e->NotBanner && e->IdentValid;
         // THE BANNER ENDS UNSHOWN (ADR-toasts 13): a record it was still waiting on is claimed for the bridge, which
         // forwards the toast - mapped nowhere is not an end; content that ended with no record is remembered and the
         // record listed later is claimed. A decided record stays consumed (its banner was shown or suppressed).
@@ -1469,9 +1492,17 @@ void ToastHoldEvict(IN HWND window)
         sinceSameRead = e->QueuedLastSameRead ? GetTickCount64() - e->QueuedLastSameRead : 0;
         ZeroMemory(e, sizeof(*e));
         InterlockedDecrement(&g_ThEntryCount);
+        // The shell's banner window is free: a toast queued behind this banner gets its turn now - TH_BANNER_END_MS from
+        // here for its own banner to appear before the no-banner scan claims it (ThScanUnbanneredLocked).
+        if (wasCard && !ThBannerBusyLocked())
+        {
+            g_ThBusyEnd = GetTickCount64();
+            nnb = ThScanUnbanneredLocked(g_ThBusyEnd, nb, TH_IPC_RECORDS);
+        }
     }
     ThRecomputeDueLocked();
     LeaveCriticalSection(&g_ThLock);
+    ThLogNoBanner(nb, nnb);
     ThLogEndReport(window, L"destroyed", &endRep);
     // Whether Windows ever painted the queued toast here is otherwise unrecorded: a re-read that finds the
     // same content logs nothing. One line per banner that ends with a newer toast still queued behind it.
