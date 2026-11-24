@@ -436,6 +436,8 @@ TI_INLINE LONG ThVerdictOf(LONG word, LONG seq)
 #define TH_REC_FLAG_ALLOWLISTED 0x1u   /* informational only */
 #define TH_REC_FLAG_WINDOWONLY  0x2u
 #define TH_REC_FLAG_NO_SENDER   0x4u   /* the listener could not resolve the app display name */
+#define TH_REC_FLAG_GONE        0x8u   /* the toast left the bridge's listing (dismissed, cleared, removed by its app): the
+                                          agent's no-banner scan never claims it - there is nothing left to forward */
 
 /* The agent's word on a record, as ThIpcAgentState reports it (the one agent-written field, see the header). */
 #define TH_AGENT_NONE   0              /* the agent has not mapped a banner for this record */
@@ -524,6 +526,18 @@ TI_INLINE LONG ThIpcPublish(TH_IPC_HEADER* h, UINT32 notifId, UINT32 flags, UINT
     TI_BARRIER();
     TI_STORE32(&r->Seq, seq);
     return seq;
+}
+
+/* BRIDGE ONLY, listing thread (the one writer of Flags, so a load and a store race nobody): the toast of the record in
+ * slot `index` with sequence `seq` is no longer listed - set TH_REC_FLAG_GONE. FALSE when the slot holds another record. */
+TI_INLINE BOOL ThIpcMarkGone(TH_IPC_HEADER* h, int index, LONG seq)
+{
+    TH_IPC_RECORD* r;
+    if (!h || index < 0 || index >= TH_IPC_RECORDS || seq == 0) return FALSE;
+    r = &ThIpcRecords(h)[index];
+    if (TI_LOAD32(&r->Seq) != seq) return FALSE;
+    TI_STORE32(&r->Flags, TI_LOAD32(&r->Flags) | (LONG)TH_REC_FLAG_GONE);
+    return TI_LOAD32(&r->Seq) == seq;
 }
 
 /* The slot holding sequence `seq`, or -1 (the record was overwritten by the ring turning, or never existed). */

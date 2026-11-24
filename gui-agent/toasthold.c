@@ -519,6 +519,7 @@ static int ThScanUnbanneredLocked(IN ULONGLONG now, OUT TH_NOBANNER* out, IN int
         const TH_IPC_RECORD* r = &recs[i];
         const LONG from = r->Verdict;
         if (from != TH_VERDICT_PENDING && !(from == TH_VERDICT_WINDOW && r->AgentShownSeq != r->Seq)) continue;
+        if (r->Flags & TH_REC_FLAG_GONE) continue;   // its toast left the listing (dismissed, cleared): nothing to forward
         const ULONGLONG arrival = r->ArrivalTick > now ? now : r->ArrivalTick;   // a future tick never defers it
         if (arrival < g_ThScanFloor || now - arrival >= TH_RECORD_TTL_MS) continue;
         if (ThSeqHeldLocked(r->Seq)) continue;
