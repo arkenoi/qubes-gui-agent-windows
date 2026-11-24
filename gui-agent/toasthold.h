@@ -17,14 +17,17 @@
  *     worker thread (bounded by the same 500 ms UIA timeouts; never inline on the tracking thread)
  *     and matches it against the records (toastident.h: content first, FIFO only to break ties);
  *   * verdict=bridge: the banner is never mapped (it times out unseen in the guest); verdict=window:
- *     mapped at once; no record / no identity within TH_HOLD_BOUND_MS (3 s) of first sight, or a record
- *     still pending at its ArrivalTick + 3 s (the bridge never stores `bridge` after that): mapped and
- *     the fall-back REPORTED (QGATOASTHOLDLATE) - a double is better than a loss, and neither is the
- *     target; bridge not running or dying mid-hold: mapped at once. A suppressed banner is re-examined
- *     on every pass: it is shown after all when the bridge turns its record to `window` (the forward
- *     failed for good) or dies before dom0 acknowledged the forward (`forwarded`).
- *   * a bridge-bound toast queued behind a mapped window-path banner pre-empts it (unmapped before the
- *     in-place swap can paint; evaluated on every pass, read in flight or not; see toasthold-core.h).
+ *     mapped at once. With no verdict the agent waits for as long as the banner lives; at its end
+ *     (TH_BANNER_END_MS after first sight) it is NOT mapped - the record is claimed pending -> bridge by
+ *     one compare-exchange and the bridge forwards the toast, said as an ERROR (QGATOASTCLAIM); a banner
+ *     that ends with no record is remembered and the record listed later is claimed (QGATOASTUNSHOWN).
+ *     Never lost, never double (ADR-toasts 13, "Claim, no timer"). Bridge not running or dying
+ *     mid-hold: mapped at once. A suppressed banner is re-examined on every pass: it is shown after all
+ *     when the bridge turns its record to `window` (the forward failed for good) or dies before dom0
+ *     acknowledged the forward (`forwarded`).
+ *   * a SHOWN banner's new frames reach dom0 only after a read has named the cards they show, at most
+ *     3 s later (the settle hold, ADR-toasts 13); a newer record dom0 has, or one still pending, keeps
+ *     dom0 on its last frame past that. Nothing is pre-empted or unmapped for a queued toast.
  *   * only the BANNER is held: main.c admits ShellExperienceHost surfaces under a size ceiling, and a
  *     window whose card (NormalToastView) is not found in two reads is a flyout - shown, never held.
  *   * NON-SEAMLESS mode has no hold (the guest draws its banner inside the one desktop window): the
@@ -39,8 +42,10 @@
  *   ToastHoldDisable  DWORD 0/1 - escape hatch: banners map as before (bridged toasts show twice).
  *
  * Log tokens (hashes only - never toast text or window titles): QGATOASTHOLD (hold/suppress/show
- * transitions), QGATOASTHOLDLATE (every fail-open, WARNING), QGATOASTPREEMPT (pre-emption start/end),
- * QGATOASTIDENT (identity reads worth a look: partial matches, unreadable cards).
+ * transitions), QGATOASTHOLDLATE (a fail-open on bridge death, WARNING), QGATOASTCLAIM (every claim the
+ * agent makes; ERROR at a banner's end), QGATOASTUNSHOWN (a banner that ended with no record or identity),
+ * QGATOASTFWDLATE (no dom0 ack within the forward bound, ERROR), QGATOASTIDENT (identity reads worth a
+ * look: partial matches, unreadable cards).
  */
 #pragma once
 #include <windows.h>

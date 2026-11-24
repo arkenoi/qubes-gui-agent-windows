@@ -9850,6 +9850,12 @@ ULONG SetSeamlessMode(IN BOOL seamlessMode, IN BOOL forceUpdate)
     else
         ApplySeamlessTweaks(FALSE);
 
+    // Leaving seamless: the bridge is told BEFORE ResetWatch evicts the held banners. Each eviction claims its pending
+    // record for the bridge (ADR-toasts 13), and a bridge still reading Seamless=1 would forward a toast the full desktop
+    // is about to show; reading 0 it gives the record back as window (ADR-toasts 10).
+    if (!seamlessMode && g_NotifHoldBase)
+        TI_STORE32(&((TH_IPC_HEADER*)g_NotifHoldBase)->Seamless, 0);
+
     status = ResetWatch(seamlessMode);
     if (ERROR_SUCCESS != status)
     {
