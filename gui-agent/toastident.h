@@ -262,6 +262,52 @@ TI_INLINE int TiIsCardAutomationId(const WCHAR* aid)
 {
     return TiUnitsEqualAsciiThenDigits(aid, "NormalToastView") || TiUnitsEqualAsciiThenDigits(aid, "PriorityToastView");
 }
+
+/* --- a card stack's shown run (ADR-toasts 13) ------------------------------------------------
+ * A stacked banner is ONE window holding several cards, newest on top. dom0 must show a card at most
+ * once: a card the bridge forwarded is shown by dom0's own notification, so the window must not show
+ * it too (no doubles). The window is ONE rectangle in dom0, so what it can show is one contiguous run
+ * of cards. TiCardRun takes the window rect and the card rects top to bottom, each with a flag
+ * "not shown here", and writes the crop insets of the contiguous run of shown cards that holds the
+ * BOTTOM-MOST shown card (the oldest: the one dom0 has been showing longest). *gap counts shown cards
+ * outside that run - cards this rectangle cannot show (QGATOASTCARDGAP). Returns 0 when there is
+ * nothing to override: every card shown (the crop worker's union stands), none shown (the hold's own
+ * decision stands), or a rect outside the window. Measured, win11r 26300, 2026-11-24: window
+ * (4724,1071)-(5120,1392), forwarded card (4740,1101) 364x109 on top, reminder (4740,1222) 364x157 at
+ * the bottom -> insets l=16 t=151 r=16 b=13, the reminder alone, as it was before the other stacked. */
+typedef struct _TI_CARD_BOX { LONG Left, Top, Right, Bottom; } TI_CARD_BOX;
+TI_INLINE int TiCardRun(const TI_CARD_BOX* raw, const TI_CARD_BOX* cards, const int* excluded, int n,
+                        TI_CARD_BOX* insets, int* runTop, int* runBottom, int* gap)
+{
+    int k, top, bottom, shown = 0;
+    LONG l, r;
+    *gap = 0;
+    if (!raw || !cards || !excluded || n <= 0) return 0;
+    for (k = 0; k < n; k++)
+    {
+        if (cards[k].Left < raw->Left || cards[k].Top < raw->Top || cards[k].Right > raw->Right ||
+            cards[k].Bottom > raw->Bottom || cards[k].Right <= cards[k].Left || cards[k].Bottom <= cards[k].Top)
+            return 0;
+        if (!excluded[k]) shown++;
+    }
+    if (shown == 0 || shown == n) return 0;
+    for (bottom = n - 1; bottom >= 0 && excluded[bottom]; bottom--) {}
+    for (top = bottom; top > 0 && !excluded[top - 1]; top--) {}
+    *gap = shown - (bottom - top + 1);
+    l = cards[top].Left; r = cards[top].Right;
+    for (k = top + 1; k <= bottom; k++)
+    {
+        if (cards[k].Left < l) l = cards[k].Left;
+        if (cards[k].Right > r) r = cards[k].Right;
+    }
+    insets->Left = l - raw->Left;
+    insets->Top = cards[top].Top - raw->Top;
+    insets->Right = raw->Right - r;
+    insets->Bottom = raw->Bottom - cards[bottom].Bottom;
+    *runTop = top;
+    *runBottom = bottom;
+    return 1;
+}
 TI_INLINE int TiIsSenderAutomationId(const WCHAR* aid)  { return TiUnitsEqualAscii(aid, "SenderName"); }
 TI_INLINE int TiIsTitleAutomationId(const WCHAR* aid)   { return TiUnitsEqualAscii(aid, "Title") || TiUnitsEqualAscii(aid, "TitleText"); }
 /* MessageText, and any numbered sibling a build may add (MessageText2...). DismissTextBlock, VerbText

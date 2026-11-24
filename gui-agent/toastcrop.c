@@ -1090,54 +1090,17 @@ static void TcAppendText(IN OUT WCHAR* dst, IN size_t cap, IN OUT size_t* len, I
 // request whose TreeFilter is the raw-view condition drives both finds, so template-part TextBlocks that
 // the control view hides are seen. Name + AutomationId are cached: two RPC round trips for the whole read.
 // Fills the three raw texts; the hold normalizes and hashes them (toastident.h).
-static TOAST_CARD_STATUS TcReadCardTexts(IN IUIAutomation* uia, IN HWND window, OUT TOAST_CARD_TEXTS* texts)
+// One card element's texts: every Text control under it, SenderName and Title|TitleText the first
+// block each, MessageText blocks joined by ' '. TRUE when the card has a title.
+static BOOL TcReadOneCard(IN IUIAutomationElement* card, IN IUIAutomationCondition* condText,
+    IN IUIAutomationCacheRequest* cache, OUT TOAST_CARD_ONE* out)
 {
-    IUIAutomationElement* root = NULL;
-    IUIAutomationElement* card = NULL;
-    IUIAutomationCondition* condCard = NULL;
-    IUIAutomationCondition* condText = NULL;
-    IUIAutomationCondition* rawView = NULL;
-    IUIAutomationCacheRequest* cache = NULL;
     IUIAutomationElementArray* found = NULL;
-    VARIANT v;
-    HRESULT hr;
-    TOAST_CARD_STATUS status = ToastCardUiaFailed;
     int count = 0;
     size_t senderLen = 0, titleLen = 0, messageLen = 0;
 
-    ZeroMemory(texts, sizeof(*texts));
-
-    hr = IUIAutomation_ElementFromHandle(uia, window, &root);
-    if (FAILED(hr) || !root) goto end;
-
-    hr = IUIAutomation_CreateCacheRequest(uia, &cache);
-    if (FAILED(hr) || !cache) goto end;
-    IUIAutomationCacheRequest_AddProperty(cache, UIA_NamePropertyId);
-    IUIAutomationCacheRequest_AddProperty(cache, UIA_AutomationIdPropertyId);
-    if (SUCCEEDED(IUIAutomation_get_RawViewCondition(uia, &rawView)) && rawView)
-        IUIAutomationCacheRequest_put_TreeFilter(cache, rawView);   // RAW view for both finds below
-
-    // The card, by AutomationId NormalToastView (Win10 and Win11 alike). ClassName is NOT used: it is
-    // FlexibleToastView on 11 only. The card's Name is a localized composite and is NOT parsed.
-    VariantInit(&v);
-    V_VT(&v) = VT_BSTR;
-    V_BSTR(&v) = SysAllocString(L"NormalToastView");
-    hr = IUIAutomation_CreatePropertyCondition(uia, UIA_AutomationIdPropertyId, v, &condCard);
-    VariantClear(&v);
-    if (FAILED(hr) || !condCard) goto end;
-    hr = IUIAutomationElement_FindFirstBuildCache(root, TreeScope_Descendants, condCard, cache, &card);
-    if (FAILED(hr)) goto end;
-    if (!card) { status = ToastCardNoCard; goto end; }
-
-    // Every Text control under the card.
-    VariantInit(&v);
-    V_VT(&v) = VT_I4;
-    V_I4(&v) = UIA_TextControlTypeId;
-    hr = IUIAutomation_CreatePropertyCondition(uia, UIA_ControlTypePropertyId, v, &condText);
-    VariantClear(&v);
-    if (FAILED(hr) || !condText) goto end;
-    hr = IUIAutomationElement_FindAllBuildCache(card, TreeScope_Descendants, condText, cache, &found);
-    if (FAILED(hr) || !found) { status = ToastCardNoTitle; goto end; }
+    if (FAILED(IUIAutomationElement_FindAllBuildCache(card, TreeScope_Descendants, condText, cache, &found)) || !found)
+        return FALSE;
     if (FAILED(IUIAutomationElementArray_get_Length(found, &count))) count = 0;
 
     for (int i = 0; i < count; i++)
@@ -1153,23 +1116,131 @@ static TOAST_CARD_STATUS TcReadCardTexts(IN IUIAutomation* uia, IN HWND window, 
             const WCHAR* name = (V_VT(&vn) == VT_BSTR && V_BSTR(&vn)) ? V_BSTR(&vn) : L"";
             const size_t nameLen = (V_VT(&vn) == VT_BSTR && V_BSTR(&vn)) ? SysStringLen(V_BSTR(&vn)) : 0;
             if (TiIsSenderAutomationId(aid) && senderLen == 0)
-                TcAppendText(texts->Sender, RTL_NUMBER_OF(texts->Sender), &senderLen, name, nameLen);
+                TcAppendText(out->Sender, RTL_NUMBER_OF(out->Sender), &senderLen, name, nameLen);
             else if (TiIsTitleAutomationId(aid) && titleLen == 0)
-                TcAppendText(texts->Title, RTL_NUMBER_OF(texts->Title), &titleLen, name, nameLen);
+                TcAppendText(out->Title, RTL_NUMBER_OF(out->Title), &titleLen, name, nameLen);
             else if (TiIsMessageAutomationId(aid))
-                TcAppendText(texts->Message, RTL_NUMBER_OF(texts->Message), &messageLen, name, nameLen);   // blocks joined by ' '
+                TcAppendText(out->Message, RTL_NUMBER_OF(out->Message), &messageLen, name, nameLen);   // blocks joined by ' '
         }
         VariantClear(&va); VariantClear(&vn);
         IUIAutomationElement_Release(el);
     }
+    IUIAutomationElementArray_Release(found);
+    return titleLen != 0;
+}
 
-    status = (titleLen == 0) ? ToastCardNoTitle : ToastCardOk;
+// EVERY card of the window (ADR-toasts 13), each with its rect, in visual order top to bottom. The cards
+// are found by AutomationId (TiIsCardAutomationId: NormalToastView*, PriorityToastView* - the reminder
+// card and a stack's numbered cards; the same predicate the crop walk keys on), Win10 and Win11 alike.
+// ClassName is NOT used: it is FlexibleToastView on 11 only. A card's Name is a localized composite and is
+// NOT parsed. One FindAll caches every element's id and rect (one cross-process call), then one FindAll
+// per card for its texts. Before this read found only the first element named exactly NormalToastView,
+// so a reminder (PriorityToastView) read as "no card", was classed not-a-banner, and a bridged toast that
+// stacked into it was shown in dom0 inside the reminder's window: a DOUBLE (run 45353589359 S3iv).
+static TOAST_CARD_STATUS TcReadCardTexts(IN IUIAutomation* uia, IN HWND window, OUT TOAST_CARD_TEXTS* texts)
+{
+    IUIAutomationElement* root = NULL;
+    IUIAutomationCondition* condAll = NULL;
+    IUIAutomationCondition* condText = NULL;
+    IUIAutomationCondition* rawView = NULL;
+    IUIAutomationCacheRequest* cache = NULL;
+    IUIAutomationElementArray* all = NULL;
+    IUIAutomationElement* cards[TOAST_CARDS_MAX] = { 0 };
+    VARIANT v;
+    HRESULT hr;
+    TOAST_CARD_STATUS status = ToastCardUiaFailed;
+    int count = 0, kept = 0;
+    BOOL bottomTitled = FALSE;
+    RECT rawAfter;
+
+    ZeroMemory(texts, sizeof(*texts));
+    if (ERROR_SUCCESS != GetRealWindowRect(window, &texts->Raw))
+        ZeroMemory(&texts->Raw, sizeof(texts->Raw));
+
+    hr = IUIAutomation_ElementFromHandle(uia, window, &root);
+    if (FAILED(hr) || !root) goto end;
+
+    hr = IUIAutomation_CreateCacheRequest(uia, &cache);
+    if (FAILED(hr) || !cache) goto end;
+    IUIAutomationCacheRequest_AddProperty(cache, UIA_NamePropertyId);
+    IUIAutomationCacheRequest_AddProperty(cache, UIA_AutomationIdPropertyId);
+    IUIAutomationCacheRequest_AddProperty(cache, UIA_BoundingRectanglePropertyId);
+    if (SUCCEEDED(IUIAutomation_get_RawViewCondition(uia, &rawView)) && rawView)
+        IUIAutomationCacheRequest_put_TreeFilter(cache, rawView);   // RAW view for every find below
+
+    hr = IUIAutomation_CreateTrueCondition(uia, &condAll);
+    if (FAILED(hr) || !condAll) goto end;
+    hr = IUIAutomationElement_FindAllBuildCache(root, TreeScope_Descendants, condAll, cache, &all);
+    if (FAILED(hr) || !all) goto end;
+    if (FAILED(IUIAutomationElementArray_get_Length(all, &count))) count = 0;
+
+    for (int i = 0; i < count; i++)
+    {
+        IUIAutomationElement* el = NULL;
+        VARIANT va;
+        BOOL isCard = FALSE;
+        if (FAILED(IUIAutomationElementArray_GetElement(all, i, &el)) || !el) continue;
+        BOOL stacks = FALSE;
+        VariantInit(&va);
+        if (SUCCEEDED(IUIAutomationElement_GetCachedPropertyValue(el, UIA_AutomationIdPropertyId, &va)) &&
+            V_VT(&va) == VT_BSTR && V_BSTR(&va))
+        {
+            isCard = TiIsCardAutomationId(V_BSTR(&va));
+            stacks = TiUnitsEqualAsciiThenDigits(V_BSTR(&va), "PriorityToastView");
+        }
+        VariantClear(&va);
+        if (isCard)
+        {
+            RECT r;
+            texts->Found++;
+            if (kept < TOAST_CARDS_MAX && SUCCEEDED(IUIAutomationElement_get_CachedBoundingRectangle(el, &r)))
+            {
+                // Insert in visual order (top ascending): Card[kept - 1] ends up the bottom card.
+                int at = kept;
+                while (at > 0 && texts->Card[at - 1].Rect.top > r.top)
+                {
+                    texts->Card[at].Rect = texts->Card[at - 1].Rect;
+                    texts->Card[at].Stacks = texts->Card[at - 1].Stacks;
+                    cards[at] = cards[at - 1];
+                    at--;
+                }
+                texts->Card[at].Rect = r;
+                texts->Card[at].Stacks = stacks;
+                cards[at] = el;
+                kept++;
+                continue;   // the reference is kept in cards[]
+            }
+        }
+        IUIAutomationElement_Release(el);
+    }
+    texts->Count = kept;
+    if (texts->Found == 0) { status = ToastCardNoCard; goto end; }
+
+    VariantInit(&v);
+    V_VT(&v) = VT_I4;
+    V_I4(&v) = UIA_TextControlTypeId;
+    hr = IUIAutomation_CreatePropertyCondition(uia, UIA_ControlTypePropertyId, v, &condText);
+    VariantClear(&v);
+    if (FAILED(hr) || !condText) goto end;
+
+    for (int k = 0; k < kept; k++)
+    {
+        texts->Card[k].Titled = TcReadOneCard(cards[k], condText, cache, &texts->Card[k]);
+        if (k == kept - 1) bottomTitled = texts->Card[k].Titled;
+    }
+    status = bottomTitled ? ToastCardOk : ToastCardNoTitle;
+
+    texts->RectsValid = (texts->Raw.right > texts->Raw.left &&
+                         ERROR_SUCCESS == GetRealWindowRect(window, &rawAfter) &&
+                         rawAfter.left == texts->Raw.left && rawAfter.top == texts->Raw.top &&
+                         rawAfter.right == texts->Raw.right && rawAfter.bottom == texts->Raw.bottom);
 
 end:
-    if (found) IUIAutomationElementArray_Release(found);
+    for (int k = 0; k < TOAST_CARDS_MAX; k++)
+        if (cards[k]) IUIAutomationElement_Release(cards[k]);
+    if (all) IUIAutomationElementArray_Release(all);
     if (condText) IUIAutomationCondition_Release(condText);
-    if (card) IUIAutomationElement_Release(card);
-    if (condCard) IUIAutomationCondition_Release(condCard);
+    if (condAll) IUIAutomationCondition_Release(condAll);
     if (rawView) IUIAutomationCondition_Release(rawView);
     if (cache) IUIAutomationCacheRequest_Release(cache);
     if (root) IUIAutomationElement_Release(root);

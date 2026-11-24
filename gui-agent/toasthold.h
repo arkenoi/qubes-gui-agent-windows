@@ -87,6 +87,12 @@ BOOL ToastHoldTakeRepaintOwed(IN HWND window);
 
 void ToastHoldEvict(IN HWND window);
 
+// The crop of a STACKED banner whose cards are not all shown in this window (main.c GetWindowData, before
+// the decision): the contiguous run of the cards that belong here, from the last identity read's card
+// rects - a card the bridge forwarded, or is still deciding, is kept out (ADR-toasts 13, no doubles).
+// FALSE = no override (one card, every card shown, no fresh read): the crop worker's union stands.
+BOOL ToastHoldCardInsets(IN const WINDOW_DATA* entry, OUT RECT* insets);
+
 // TRUE when the hold already tracks this window (main.c applies its size rule only to a window it does not
 // track yet, so a banner that grows is never released by its own growth).
 BOOL ToastHoldTracks(IN HWND window);

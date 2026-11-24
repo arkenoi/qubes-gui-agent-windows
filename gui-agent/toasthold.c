@@ -47,9 +47,23 @@
 // Outcome of one identity read (worker thread).
 #define TH_READ_NONE     (-1)  // no read has completed yet
 #define TH_READ_OK       0     // a title was found (message/sender may be empty)
-#define TH_READ_NOCARD   1     // no NormalToastView under the window: a card not built yet, or not a banner
+#define TH_READ_NOCARD   1     // no card element (TiIsCardAutomationId) under the window: not built yet, or not a banner
 #define TH_READ_NOTITLE  2     // a card, but no Title/TitleText block (tree still populating)
 #define TH_READ_UIAFAIL  3     // ElementFromHandle/Find failed (a busy or closing shell host)
+
+// One card of a stacked banner (ADR-toasts 13), as the last read that found cards saw it. The bottom card
+// is the entry's own (TH_ENTRY.Core / Ident); each card above it is matched to its OWN bridge record here.
+typedef struct _TH_STACK_CARD
+{
+    TOAST_IDENT Ident;
+    RECT      Rect;           // screen coordinates, from the read
+    LONG      Seq;            // its record (0 = not matched yet)
+    UINT32    NotifId;
+    LONG      Verdict;        // its record's verdict as of the last pass
+    ULONGLONG FirstSeen;      // the read that first showed this content
+    BOOL      Titled;         // the read found its title (an untitled card is re-read within its bound)
+    BOOL      Excluded;       // kept out of this window: the bridge has it, or it is still being decided
+} TH_STACK_CARD;
 
 typedef struct _TH_ENTRY
 {
@@ -106,6 +120,29 @@ typedef struct _TH_ENTRY
     UINT32    QueuedNotif;
     UINT      QueuedSameReads;
     ULONGLONG QueuedLastSameRead;
+    // THE CARD STACK, top to bottom, from the last read that found cards (Stack[StackCount - 1] is the
+    // bottom card, the entry's own). CardSeen is sticky: a window a read once found a card in is a banner,
+    // whatever a later read mid-swap says - "two card-less reads" may never class it a flyout after that.
+    BOOL      CardSeen;
+    int       StackCount;
+    BOOL      StackRectsValid;
+    RECT      StackRaw;               // the window rect the card rects belong to
+    TH_STACK_CARD Stack[TOAST_CARDS_MAX];
+    LONG      PromotedSeq;            // the bottom card left: the card now at the bottom keeps the record it had
+    BOOL      BottomStacks;           // the bottom card is one the shell stacks the next toast onto (PriorityToastView*)
+    UINT      StackMask;              // excluded cards (bit k = Stack[k]) as of the last pass, for the change log
+    int       StackMaskN;
+    // What ToastHoldCardInsets applied on the latest pass, and the bottom-anchored carry it uses while the
+    // window's rect differs from the last read whose rects were valid: cards arrive on TOP and the bottom
+    // card does not move (measured, win11r 26300, 2026-11-24: the reminder is 364x157 with b=13 alone and
+    // with a toast stacked above it).
+    BOOL      AppliedValid;
+    UINT      AppliedMask;
+    RECT      AppliedInsets;
+    BOOL      AppliedCarry;
+    int       AppliedGap;
+    LONG      CarryShownH, CarryBottom, CarryLeft, CarryRight, CarryW, CarryH;
+    BOOL      CarryExcl;
     ULONGLONG LastUse;
 } TH_ENTRY;
 
@@ -337,6 +374,15 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     UINT32 preemptNotif = 0;
     int readStatus = TH_READ_NONE;
     UINT noCardReads = 0;
+    BOOL stackChanged = FALSE, stackOverride = FALSE;
+    int stackN = 0;
+    UINT stackMask = 0;
+    ULONGLONG stackDue = 0;
+    UINT32 stackNotif[TOAST_CARDS_MAX] = { 0 };
+    LONG stackVerdict[TOAST_CARDS_MAX] = { 0 };
+    RECT stackApplied = { 0, 0, 0, 0 };
+    int stackGap = 0;
+    BOOL stackAppliedValid = FALSE, stackAppliedCarry = FALSE;
 
     ZeroMemory(&in, sizeof(in));
     ZeroMemory(&out, sizeof(out));
@@ -386,9 +432,13 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             // new toast and must find its own record or fail open (review N5). Other banners' records never
             // are candidates.
             TI_CANDIDATE cand[TH_IPC_RECORDS];
-            const LONG ownSeq = (e->Core.RecordSeq != 0 &&
-                                 ThCoreReadingExtends(&e->ClaimIdent, e->ClaimMsgNorm, e->ClaimMsgLen,
-                                                      &e->Ident, e->MsgNorm, e->MsgLen)) ? e->Core.RecordSeq : 0;
+            // A card that moved to the bottom (the one below it left) is the same toast it was one card up:
+            // the record it was matched to there is its own, not another banner's.
+            LONG ownSeq = (e->Core.RecordSeq != 0 &&
+                           ThCoreReadingExtends(&e->ClaimIdent, e->ClaimMsgNorm, e->ClaimMsgLen,
+                                                &e->Ident, e->MsgNorm, e->MsgLen)) ? e->Core.RecordSeq : 0;
+            if (ownSeq == 0) ownSeq = e->PromotedSeq;
+            e->PromotedSeq = 0;
             const int n = ThCoreCandidates(recs, nrec, &g_ThCons, ownSeq, now, cand);
             const int pick = TiSelect(cand, n, &e->Ident, &quality);
             if (pick >= 0)
@@ -461,6 +511,88 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         e->QueuedNotif = queuedNow;
         e->QueuedSameReads = 0;
         e->QueuedLastSameRead = 0;
+    }
+
+    // THE CARDS ABOVE THE BOTTOM ONE (ADR-toasts 13: stacking is normal; dom0 shows every card once). The
+    // bottom card is this entry's own and was decided above. Every card above it is matched to its OWN
+    // record and kept out of this window while the bridge has it or is still deciding it: a card the bridge
+    // forwarded is shown by dom0's notification, and showing it here too was the double (run 45353589359
+    // S3iv: a bridged toast stacked onto a shown reminder; the read saw only the first NormalToastView).
+    // Unknown is kept out to the hold's own bound and then shown - the bottom card's own fail-open. The
+    // crop itself is ToastHoldCardInsets', from the flags set here.
+    if (!e->NotBanner && e->StackCount > 1)
+    {
+        UINT mask = 0;
+        BOOL rereadUntitled = FALSE;
+        stackN = e->StackCount;
+        for (int k = 0; k < e->StackCount - 1; k++)
+        {
+            TH_STACK_CARD* sc = &e->Stack[k];
+            TH_IPC_RECORD r;
+            if (sc->Seq == 0 && sc->Ident.Combined != 0)
+            {
+                TI_CANDIDATE cand[TH_IPC_RECORDS];
+                TI_MATCH q = TiMatchNone;
+                const int nc = ThCoreCandidates(recs, nrec, &g_ThCons, 0, now, cand);
+                const int pick = TiSelect(cand, nc, &sc->Ident, &q);
+                if (pick >= 0)
+                {
+                    sc->Seq = recs[pick].Seq;
+                    sc->NotifId = recs[pick].NotifId;
+                    ThConsumedAdd(&g_ThCons, sc->Seq);
+                }
+            }
+            if (sc->Seq != 0 && ThFindBySeq(recs, nrec, sc->Seq, &r))
+                sc->Verdict = ThCoreDeadVerdict(r.Seq, r.Verdict, deadSeq);
+            const BOOL bound = (now - sc->FirstSeen) >= TH_HOLD_BOUND_MS;
+            const BOOL undecided = (sc->Seq == 0 || sc->Verdict == TH_VERDICT_PENDING);
+            if (!in.BridgeUp)
+                sc->Excluded = FALSE;               // no bridge: nothing can be shown by dom0 instead
+            else if (undecided)
+                sc->Excluded = !bound;
+            else
+                sc->Excluded = TiVerdictSuppresses(sc->Verdict);
+            if (in.BridgeUp && undecided && !bound)
+            {
+                stackDue = ThMinTick(ThMinTick(stackDue, now + TH_HOLD_RECHECK_MS), sc->FirstSeen + TH_HOLD_BOUND_MS);
+                if (!sc->Titled) rereadUntitled = TRUE;
+            }
+            if (sc->Excluded) mask |= 1u << k;
+            stackNotif[k] = sc->NotifId;
+            stackVerdict[k] = sc->Verdict;
+        }
+        if (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecSuppress)
+            mask |= 1u << (e->StackCount - 1);      // the bottom card's own toast went to dom0
+        // A stacked card read before its title was built cannot be matched: read it again on the recheck
+        // tick, and ONLY until its bound - a timed re-read keeps a banner on screen (TOASTBANNERLOSTONDIRECTPATH),
+        // so this is at most TH_HOLD_BOUND_MS / TH_HOLD_RECHECK_MS reads per card, never a standing poll.
+        if (rereadUntitled && !e->ReadInFlight && (now - e->LastReadAttempt) >= TH_HOLD_RECHECK_MS)
+            ThRequestReadLocked(e, now);
+        stackMask = mask;
+        stackChanged = (mask != e->StackMask || e->StackCount != e->StackMaskN);
+        stackGap = e->AppliedGap;
+        e->StackMask = mask;
+        e->StackMaskN = e->StackCount;
+        // A suppressed bottom card with a card above it that belongs here: the window shows THAT card, and
+        // only once the crop keeping the bottom card out was applied on this very pass (GetWindowData runs
+        // before this decision; ToastHoldCardInsets records what it applied) - never one pass early.
+        const UINT all = (1u << e->StackCount) - 1;
+        if (out.Decision == ThDecSuppress && e->Core.Phase == ThPhaseDecided && (all & ~mask) != 0 &&
+            e->AppliedValid && e->AppliedMask == mask)
+        {
+            out.Decision = ThDecShow;
+            stackOverride = TRUE;
+        }
+        stackApplied = e->AppliedInsets;
+        stackAppliedValid = e->AppliedValid;
+        stackAppliedCarry = e->AppliedCarry;
+    }
+    else if (e->StackMaskN != e->StackCount)
+    {
+        stackChanged = (e->StackMaskN > 1);         // a stack collapsed to one card: say so once
+        stackN = e->StackCount;
+        e->StackMask = 0;
+        e->StackMaskN = e->StackCount;
     }
 
     if (out.ReleaseSeq)
@@ -596,6 +728,8 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         e->Due = ThMinTick(e->Due, retryAt);
     if (swapGateHold)
         e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
+    if (stackDue)
+        e->Due = ThMinTick(e->Due, stackDue);   // a stacked card still being decided: its verdict, or its bound
     ThRecomputeDueLocked();
     LeaveCriticalSection(&g_ThLock);
 
@@ -747,7 +881,7 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             hw, hc);
         break;
     case ThEvNotBanner:
-        LogInfo("QGATOASTIDENT hwnd=0x%x not a toast banner (no NormalToastView in %u reads, %ux%u) - shown, never held: a "
+        LogInfo("QGATOASTIDENT hwnd=0x%x not a toast banner (no card in %u reads, %ux%u) - shown, never held: a "
             L"ShellExperienceHost flyout that passes the toast classifier",
             hw, noCardReads, entry->Width, entry->Height);
         break;
@@ -801,7 +935,118 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         break;
     }
 
+    // The stack, said when it changes: which cards this window keeps out and why, and the crop that was
+    // applied for it. A changed set also re-drives a pass at once, so the crop the next GetWindowData
+    // applies is this one (it ran before this decision).
+    if (stackChanged)
+    {
+        WCHAR cards[TOAST_CARDS_MAX * 48] = L"";
+        for (int k = 0; k < stackN - 1 && k < TOAST_CARDS_MAX; k++)
+        {
+            WCHAR one[48];
+            if (SUCCEEDED(StringCchPrintfW(one, RTL_NUMBER_OF(one), L" card%d=id%lu/%s/%s", k, (ULONG)stackNotif[k],
+                    ThVerdictName(stackVerdict[k]), (stackMask >> k) & 1 ? L"out" : L"shown")))
+                StringCchCatW(cards, RTL_NUMBER_OF(cards), one);
+        }
+        LogInfo("QGATOASTCARDS hwnd=0x%x n=%d excluded=0x%x bottom=%s%s (top to bottom; a card the bridge has or is still "
+            L"deciding is kept out of this window) applied=%s l=%ld t=%ld r=%ld b=%ld gap=%d%s", hw, stackN, stackMask,
+            stackN > 0 && ((stackMask >> (stackN - 1)) & 1) ? L"out" : L"shown", cards,
+            stackAppliedValid ? (stackAppliedCarry ? L"carry" : L"fresh") : L"none",
+            (long)stackApplied.left, (long)stackApplied.top, (long)stackApplied.right, (long)stackApplied.bottom, stackGap,
+            stackOverride ? L" - the bottom card's toast went to dom0, this window shows the cards above it" : L"");
+        PokeWindowTrackingFor(entry->Handle);
+    }
+
     return out.Decision;
+}
+
+// The crop of a stacked banner whose cards are not all shown here (main.c GetWindowData, every pass of a
+// toast window, before the decision). From the last read's card rects and the last pass's flags: the
+// contiguous run of shown cards (TiCardRun). While the window's rect differs from the last read whose
+// rects were valid, the run is carried anchored at the BOTTOM - cards arrive on top and the bottom card
+// does not move - when that read had cards kept out, or when the window GREW over a shown bottom card the
+// shell stacks onto (PriorityToastView*): the card it grew for is unknown until a read names it, and its
+// record trails the growth - run 45360456502 S3iv, the window grew at 11:22:26.378 and the bridge listed
+// the toast at 11:22:27, so the first frames of a forwarded card would be shown before anything knew it.
+// A plain toast card swaps in place instead of stacking and is never carried. FALSE = no override.
+BOOL ToastHoldCardInsets(IN const WINDOW_DATA* entry, OUT RECT* insets)
+{
+    BOOL have = FALSE, carried = FALSE, logGap = FALSE;
+    int gap = 0;
+    if (!g_ThActive || !entry || !insets) return FALSE;
+    EnterCriticalSection(&g_ThLock);
+    TH_ENTRY* e = ThFindLocked(entry->Handle);
+    if (e && !e->NotBanner && e->StackCount >= 1)
+    {
+        const int n = e->StackCount;
+        const LONG x = (LONG)entry->X, y = (LONG)entry->Y, w = (LONG)entry->Width, h = (LONG)entry->Height;
+        const LONG rw = e->StackRaw.right - e->StackRaw.left, rh = e->StackRaw.bottom - e->StackRaw.top;
+        const BOOL fresh = e->StackRectsValid &&
+                           (x == e->StackRaw.left && y == e->StackRaw.top && w == rw && h == rh);
+        const BOOL shownBottom = (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecShow);
+        UINT mask = 0;
+        for (int k = 0; k < n - 1; k++)
+            if (e->Stack[k].Excluded) mask |= 1u << k;
+        if (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecSuppress)
+            mask |= 1u << (n - 1);
+        if (fresh)
+        {
+            TI_CARD_BOX raw = { e->StackRaw.left, e->StackRaw.top, e->StackRaw.right, e->StackRaw.bottom };
+            TI_CARD_BOX boxes[TOAST_CARDS_MAX], run = { 0, 0, 0, 0 };
+            int excl[TOAST_CARDS_MAX], t = 0, b = 0;
+            for (int k = 0; k < n; k++)
+            {
+                boxes[k].Left = e->Stack[k].Rect.left;   boxes[k].Top = e->Stack[k].Rect.top;
+                boxes[k].Right = e->Stack[k].Rect.right; boxes[k].Bottom = e->Stack[k].Rect.bottom;
+                excl[k] = (int)((mask >> k) & 1);
+            }
+            if (TiCardRun(&raw, boxes, excl, n, &run, &t, &b, &gap))
+            {
+                insets->left = run.Left; insets->top = run.Top; insets->right = run.Right; insets->bottom = run.Bottom;
+                have = TRUE;
+                e->CarryShownH = e->Stack[b].Rect.bottom - e->Stack[t].Rect.top;
+                e->CarryBottom = run.Bottom; e->CarryLeft = run.Left; e->CarryRight = run.Right;
+                e->CarryExcl = TRUE;
+            }
+            else if (mask == 0)
+            {
+                // Every card shown: the crop worker's union stands; kept as the carry for a toast queued behind.
+                e->CarryShownH = e->Stack[n - 1].Rect.bottom - e->Stack[0].Rect.top;
+                e->CarryBottom = e->StackRaw.bottom - e->Stack[n - 1].Rect.bottom;
+                e->CarryLeft = e->Stack[n - 1].Rect.left - e->StackRaw.left;
+                e->CarryRight = e->StackRaw.right - e->Stack[n - 1].Rect.right;
+                e->CarryExcl = FALSE;
+            }
+            else
+                e->CarryShownH = 0;
+            e->CarryW = rw;
+            e->CarryH = rh;
+            logGap = (gap != e->AppliedGap);
+            e->AppliedGap = gap;
+        }
+        else if (e->CarryShownH > 0 && w == e->CarryW &&
+                 (e->CarryExcl || (e->BottomStacks && shownBottom && h > e->CarryH)))
+        {
+            const LONG top = h - e->CarryBottom - e->CarryShownH;
+            if (top >= 0)
+            {
+                insets->left = e->CarryLeft; insets->top = top; insets->right = e->CarryRight; insets->bottom = e->CarryBottom;
+                have = carried = TRUE;
+            }
+        }
+        e->AppliedValid = have;
+        e->AppliedMask = mask;
+        e->AppliedCarry = carried;
+        if (have) e->AppliedInsets = *insets;
+    }
+    LeaveCriticalSection(&g_ThLock);
+    // Cards this window should show but one rectangle cannot: a card kept out sits BETWEEN shown ones. NOT
+    // DECIDED (owner question P7): the run with the bottom-most shown card is shown and these are not.
+    if (logGap)
+        LogInfo("QGATOASTCARDGAP hwnd=0x%x %d shown card(s) outside the shown run: a card kept out sits between "
+            "cards that belong here, and one rectangle shows only the run with the bottom-most of them",
+            (DWORD)(ULONG_PTR)entry->Handle, gap);
+    return have;
 }
 
 // Called on the WinEvent HOOK thread for every EVENT_OBJECT_LOCATIONCHANGE / NAMECHANGE of a top-level
@@ -961,6 +1206,9 @@ void ToastHoldEvict(IN HWND window)
         // stays consumed (its banner was shown or suppressed).
         if (e->Core.Phase == ThPhaseHolding && e->Core.RecordSeq)
             ThConsumedRemove(&g_ThCons, e->Core.RecordSeq);
+        for (int k = 0; k < e->StackCount - 1 && k < TOAST_CARDS_MAX; k++)   // the same for a stacked card still pending
+            if (e->Stack[k].Seq && e->Stack[k].Verdict == TH_VERDICT_PENDING)
+                ThConsumedRemove(&g_ThCons, e->Stack[k].Seq);
         queuedNotif = e->QueuedNotif;
         ownNotif = e->Core.NotifId;
         queuedSameReads = e->QueuedSameReads;
@@ -1085,10 +1333,19 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
     }
     WCHAR msgNorm[TI_NORM_MAX];
     size_t msgLen = 0;
-    if (status == TH_READ_OK && texts)
+    TOAST_IDENT cardIdent[TOAST_CARDS_MAX];
+    int cardCount = 0, oldCount = 0;
+    ZeroMemory(cardIdent, sizeof(cardIdent));
+    if (status == TH_READ_OK && texts && texts->Count > 0 && texts->Count <= TOAST_CARDS_MAX)
     {
-        TiIdentFromTexts(texts->Sender, texts->Title, texts->Message, &ident);   // the same normalization the bridge applies
-        msgLen = TiNormalize(texts->Message, msgNorm, TI_NORM_MAX);             // kept in clear for the re-claim rule only
+        // The entry's own identity is the BOTTOM card's - the oldest, the one this window showed first. Every
+        // card's identity is kept for the stack (ToastHoldDecide matches the ones above it to their records).
+        const TOAST_CARD_ONE* bottom = &texts->Card[texts->Count - 1];
+        cardCount = texts->Count;
+        for (int k = 0; k < cardCount; k++)
+            TiIdentFromTexts(texts->Card[k].Sender, texts->Card[k].Title, texts->Card[k].Message, &cardIdent[k]);
+        ident = cardIdent[cardCount - 1];                                         // the same normalization the bridge applies
+        msgLen = TiNormalize(bottom->Message, msgNorm, TI_NORM_MAX);             // kept in clear for the re-claim rule only
     }
     else if (status == TH_READ_OK)
         status = TH_READ_UIAFAIL;
@@ -1119,6 +1376,40 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
             e->QueuedSameReads++;
             e->QueuedLastSameRead = now;
         }
+        // The stack, keyed by CONTENT: a card that was there before keeps its record, verdict and first-seen
+        // tick wherever it now sits; a new card is kept out until its record says otherwise. A new bottom card
+        // that was a card above it before keeps that card's record as its own (PromotedSeq).
+        {
+            TH_STACK_CARD next[TOAST_CARDS_MAX];
+            ZeroMemory(next, sizeof(next));
+            oldCount = e->StackCount;
+            for (int k = 0; k < cardCount; k++)
+            {
+                next[k].Ident = cardIdent[k];
+                next[k].Rect = texts->Card[k].Rect;
+                next[k].FirstSeen = now;
+                next[k].Titled = texts->Card[k].Titled;
+                next[k].Excluded = TRUE;
+                for (int j = 0; j < oldCount; j++)
+                    if (e->Stack[j].Ident.Combined != 0 && e->Stack[j].Ident.Combined == cardIdent[k].Combined)
+                    {
+                        next[k].Seq = e->Stack[j].Seq;
+                        next[k].NotifId = e->Stack[j].NotifId;
+                        next[k].Verdict = e->Stack[j].Verdict;
+                        next[k].FirstSeen = e->Stack[j].FirstSeen;
+                        next[k].Excluded = e->Stack[j].Excluded;
+                        if (k == cardCount - 1 && j < oldCount - 1 && e->Stack[j].Seq != 0 && changed)
+                            e->PromotedSeq = e->Stack[j].Seq;
+                        break;
+                    }
+            }
+            memcpy(e->Stack, next, sizeof(next));
+            e->StackCount = cardCount;
+            e->StackRaw = texts->Raw;
+            e->StackRectsValid = texts->RectsValid;
+            e->BottomStacks = texts->Card[cardCount - 1].Stacks;
+        }
+        e->CardSeen = TRUE;
         e->Ident = ident;
         e->IdentValid = TRUE;
         e->MsgLen = msgLen;
@@ -1136,6 +1427,8 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
         e->ReadsWithoutTitle++;
         e->ReadFails++;
         withoutTitle = e->ReadsWithoutTitle;
+        if (status == TH_READ_NOTITLE)
+            e->CardSeen = TRUE;   // cards were found; the bottom one is still populating
         if (status == TH_READ_NOCARD)
         {
             // Two card-less reads say "not a banner" ONLY when the second was requested TH_NOCARD_RETRY_MS or
@@ -1183,7 +1476,7 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
                 else
                 {
                     e->NoCardReads = 2;
-                    if (!e->IdentValid)
+                    if (!e->IdentValid && !e->CardSeen)
                     {
                         e->NotBanner = TRUE;   // two paced looks at the SAME size, no card: a flyout - ToastHoldDecide shows it
                         notBanner = TRUE;
@@ -1220,7 +1513,7 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
             (DWORD)(ULONG_PTR)window, (long)e_firstW, (long)e_firstH, (long)e_seenW, (long)e_seenH,
             (unsigned)TH_HOLD_BOUND_MS);
     if (logNoCard)
-        LogInfo("QGATOASTIDENT hwnd=0x%x card not readable yet (%s, read %u): no NormalToastView / no Title|TitleText block - "
+        LogInfo("QGATOASTIDENT hwnd=0x%x card not readable yet (%s, read %u): no card / no Title|TitleText block - "
             L"held until a read succeeds, a second card-less read says not-a-banner, or the %u ms bound opens it",
             (DWORD)(ULONG_PTR)window, ThReadStatusName(status), withoutTitle, (unsigned)TH_HOLD_BOUND_MS);
     else if (status == TH_READ_OK && changed)

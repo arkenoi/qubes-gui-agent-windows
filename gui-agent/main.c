@@ -856,7 +856,7 @@ static const struct
 // the foreground goes to Start's search box (SearchHost) on its own schedule, possibly after the surface's last event of that opening,
 // and the dismissal decides on the foreground (see DismissHiddenStartSurface).
 static HWND volatile g_StartSurfaceOpen = NULL;
-// LOGGING ONLY. Whose refusal has already been written. Never read by a policy: see GUARD:startfg.
+// LOGGING ONLY. Whose refusal has already been written. Never read by a policy: the policy reads g_StartSurfaceOpen, latched where a Start surface is seen.
 // Cleared with the latch when the opening ends, because StartMenuExperienceHost keeps the SAME
 // window across openings - without the clear, every opening after the first would be silent.
 static HWND volatile g_StartRefusalSaid = NULL;
@@ -2349,7 +2349,7 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
     if ((IsShellToastWindow(entry) || IsMenuPopupWindow(entry)) &&
         QgaShellSurfacePolicy(g_SeamlessMode, g_SeamlessStart, (int)ShellSurfaceKind(entry),
             InterlockedCompareExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, NULL, NULL) != NULL)
-            == QGA_SURFACE_PRESENT)   // GUARD:cropgate
+            == QGA_SURFACE_PRESENT)
     {
         // Zero-init: the compiler cannot prove that every path setting have=TRUE also wrote
         // insets once the broker-authority short-circuit is in the condition (C4701, warnings
@@ -2384,6 +2384,13 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
                 have = TRUE;
         }
         else if (ToastCropLookup(entry, &insets))
+            have = TRUE;
+        // A STACKED toast banner whose cards are not all shown here: the hold's crop of the cards that belong
+        // to this window replaces the union, so a card the bridge forwarded is never shown here as well (ADR-
+        // toasts 13: no doubles; run 45353589359 S3iv). It is the hold's own geometry from the read's card
+        // rects, so the 40 % plausibility guard - which is about a walk that latched the wrong element - is
+        // not applied to it. Called here, outside every hold lock, before the decision that reads what it applied.
+        if (IsShellToastWindow(entry) && ToastHoldCardInsets(entry, &insets))
             have = TRUE;
 
         if (have)
@@ -10282,7 +10289,7 @@ static volatile ULONGLONG g_ShellCardlessAt = 0;
 
 BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 {
-    StartDismissMaybeRearm();   // GUARD:startrearm
+    StartDismissMaybeRearm();
     if (!data->IsVisible)
     {
         if (data->Handle == g_StartSurfaceOpen)   // the hidden Start closed: foreground changes stop looking at it
@@ -10607,7 +10614,7 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
             // change to a suppression decision: Jev, asked what that shape costs, answered
             // one-global-two-jobs 0.98 / separate-the-two 1.00. Keep them apart so neither job can
             // be broken for the other's sake.
-            const PVOID prev = InterlockedExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, data->Handle);   // GUARD:startfg - look again when the foreground moves
+            const PVOID prev = InterlockedExchangePointer((PVOID volatile*)&g_StartSurfaceOpen, data->Handle);   // look again when the foreground moves
             if (prev != (PVOID)data->Handle)
             {
                 // BEHAVIOUR, not logging: the latch has just begun tracking THIS surface, so a
@@ -10620,7 +10627,7 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
                 LogDebug("0x%x: Start surface not presented in seamless mode (SeamlessStart=0)",
                     data->Handle);
             }
-            DismissHiddenStartSurface(data->Handle);   // GUARD:startdismiss - hidden must also mean CLOSED
+            DismissHiddenStartSurface(data->Handle);   // hidden must also mean CLOSED
             return FALSE;
         }
         if (policy == QGA_SURFACE_REFUSE_COMPANION)

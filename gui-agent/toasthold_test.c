@@ -206,6 +206,29 @@ static void TestAutomationIds(void)
     Check("aid: PriorityToastView is a card (reminder)", TiIsCardAutomationId(W("PriorityToastView")));
     Check("aid: PriorityToastView3 is a card (third of a stack)", TiIsCardAutomationId(W("PriorityToastView3")));
     Check("aid: PriorityToastViewX is not a card", !TiIsCardAutomationId(W("PriorityToastViewX")));
+
+    /* The shown run of a stack: the measured mixed stack (win11r 26300, 2026-11-24), forwarded card on top. */
+    {
+        const TI_CARD_BOX raw = { 4724, 1071, 5120, 1392 };
+        const TI_CARD_BOX two[2] = { { 4740, 1101, 5104, 1210 }, { 4740, 1222, 5104, 1379 } };
+        const TI_CARD_BOX three[3] = { { 4740, 1101, 5104, 1150 }, { 4740, 1162, 5104, 1210 }, { 4740, 1222, 5104, 1379 } };
+        const TI_CARD_BOX outside[2] = { { 4700, 1101, 5104, 1210 }, { 4740, 1222, 5104, 1379 } };
+        TI_CARD_BOX in = { 0, 0, 0, 0 };
+        int t = -1, b = -1, gap = -1;
+        const int fwdTop[2] = { 1, 0 }, fwdBottom[2] = { 0, 1 }, none[2] = { 0, 0 }, all[2] = { 1, 1 };
+        const int gapped[3] = { 0, 1, 0 };
+        Check("run: forwarded card on top -> the reminder alone, l=16 t=151 r=16 b=13",
+              TiCardRun(&raw, two, fwdTop, 2, &in, &t, &b, &gap) &&
+              in.Left == 16 && in.Top == 151 && in.Right == 16 && in.Bottom == 13 && t == 1 && b == 1 && gap == 0);
+        Check("run: forwarded card at the bottom -> the top card alone, t=30 b=182",
+              TiCardRun(&raw, two, fwdBottom, 2, &in, &t, &b, &gap) &&
+              in.Top == 30 && in.Bottom == 182 && t == 0 && b == 0 && gap == 0);
+        Check("run: every card shown -> no override", !TiCardRun(&raw, two, none, 2, &in, &t, &b, &gap));
+        Check("run: no card shown -> no override", !TiCardRun(&raw, two, all, 2, &in, &t, &b, &gap));
+        Check("run: shown, excluded, shown -> the bottom run, one card outside it",
+              TiCardRun(&raw, three, gapped, 3, &in, &t, &b, &gap) && t == 2 && b == 2 && gap == 1 && in.Top == 151);
+        Check("run: a card outside the window -> no override", !TiCardRun(&raw, outside, fwdTop, 2, &in, &t, &b, &gap));
+    }
     Check("aid: SenderName", TiIsSenderAutomationId(W("SenderName")));
     Check("aid: Title (Win11)", TiIsTitleAutomationId(W("Title")));
     Check("aid: TitleText (Win10)", TiIsTitleAutomationId(W("TitleText")));

@@ -210,16 +210,33 @@ BOOL ToastCropWorkerAvailable(void);
 // includes the UIA headers; it gets the card's three RAW texts (SenderName, Title|TitleText, MessageText
 // blocks joined by ' ') through this contract and normalizes/hashes them itself (toastident.h).
 #define TOAST_CARD_TEXT_UNITS 512   // == TI_NORM_MAX (toastident.h); toasthold.c asserts it at compile time
-typedef struct _TOAST_CARD_TEXTS
+// EVERY CARD of the window (ADR-toasts 13: stacking is normal). A stacked banner is one window holding
+// several card elements, newest on top (win11r 26300, 2026-11-24: three reminders PriorityToastView,
+// PriorityToastView2, PriorityToastView3; a reminder with a bridged toast stacked on it, NormalToastView
+// on top). Card[] is in visual order, top to bottom, so Card[Count - 1] is the bottom card - the oldest.
+#define TOAST_CARDS_MAX 4   // kept per read; 3 measured. Found > Count says more were there.
+typedef struct _TOAST_CARD_ONE
 {
     WCHAR Sender[TOAST_CARD_TEXT_UNITS + 1];
     WCHAR Title[TOAST_CARD_TEXT_UNITS + 1];
     WCHAR Message[TOAST_CARD_TEXT_UNITS + 1];
+    RECT  Rect;               // the card element's bounding rectangle, screen coordinates
+    BOOL  Titled;             // a Title|TitleText block was found
+    BOOL  Stacks;             // PriorityToastView*: a card the shell stacks the next toast ONTO (measured,
+                              // win11r 26300: reminder+reminder and reminder+toast stack; toast+toast swaps in place)
+} TOAST_CARD_ONE;
+typedef struct _TOAST_CARD_TEXTS
+{
+    int   Count;              // cards kept in Card[]
+    int   Found;              // card elements found
+    RECT  Raw;                // the window rect (GetRealWindowRect) the card rects belong to
+    BOOL  RectsValid;         // the window rect was the same before and after the read
+    TOAST_CARD_ONE Card[TOAST_CARDS_MAX];
 } TOAST_CARD_TEXTS;
 typedef enum _TOAST_CARD_STATUS
 {
-    ToastCardOk = 0,         // a title was found (sender/message may be empty)
-    ToastCardNoCard = 1,     // no NormalToastView under the window: a card not built yet, or not a banner
-    ToastCardNoTitle = 2,    // a card, but no Title/TitleText block (tree still populating)
+    ToastCardOk = 0,         // the bottom card has a title (sender/message may be empty)
+    ToastCardNoCard = 1,     // no card element (TiIsCardAutomationId) under the window: not built yet, or not a banner
+    ToastCardNoTitle = 2,    // cards, but the bottom one has no Title/TitleText block (tree still populating)
     ToastCardUiaFailed = 3   // ElementFromHandle/Find failed (a busy or closing shell host)
 } TOAST_CARD_STATUS;
