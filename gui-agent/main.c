@@ -10391,6 +10391,38 @@ static BOOL ErrBoxIsSystemBoxHwnd(IN HWND hwnd)
 #define QGA_SHELL_OPENING_MS 1000
 static volatile ULONGLONG g_ShellCardlessAt = 0;
 
+// For a WinUI popup with no tracked owner: the visible, framed Start or Search window of its own process that it lies
+// over most, or NULL. Only those two kinds - any other app's ownerless popup keeps the path it had (GWeck post 241 C).
+static const WINDOW_DATA* ShellPopupCarrier(IN const WINDOW_DATA* popup)
+{
+    const WINDOW_DATA* best = NULL;
+    LONGLONG bestOver = 0;
+    RECT p, c, o;
+    if (!popup->ProcessId)
+        return NULL;
+    SetRect(&p, (LONG)popup->X, (LONG)popup->Y, (LONG)popup->X + (LONG)popup->Width, (LONG)popup->Y + (LONG)popup->Height);
+    for (LIST_ENTRY* e = g_WatchedWindowsList.Flink; e != &g_WatchedWindowsList; e = e->Flink)
+    {
+        const WINDOW_DATA* cand = CONTAINING_RECORD(e, WINDOW_DATA, ListEntry);
+        SHELL_SURFACE_KIND kind;
+        LONGLONG over;
+        if (cand == popup || cand->ProcessId != popup->ProcessId || !cand->IsVisible || cand->IsOverrideRedirect ||
+            !cand->PwSliceFed)
+            continue;
+        kind = ShellSurfaceKind(cand);
+        if (kind != ShellSurfaceStart && kind != ShellSurfaceSearch)
+            continue;
+        SetRect(&c, (LONG)cand->X, (LONG)cand->Y, (LONG)cand->X + (LONG)cand->Width, (LONG)cand->Y + (LONG)cand->Height);
+        over = IntersectRect(&o, &p, &c) ? (LONGLONG)(o.right - o.left) * (o.bottom - o.top) : 0;
+        if (over > bestOver)
+        {
+            bestOver = over;
+            best = cand;
+        }
+    }
+    return best;
+}
+
 BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 {
     StartDismissMaybeRearm();
@@ -10454,20 +10486,49 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
     // onto the popup (DAEMONMOVE), and from there it sits outside its owner, black, for good. A
     // captioned app frame that is visible but not tracked yet, or being dropped (the first open,
     // restored before dom0 is told), holds such a popup for the pass; the next pass judges it.
+    //
+    // A POPUP OF START OR SEARCH (GWeck post 241 C, 2026-11-25; ADR-capture 37). Start's power flyout on 26300 is a
+    // WinUI popup over Start's card, and Start's capture draws it (seen in dom0, owner 2026-11-25: "popup stays
+    // normally inside"). The strict test below fails it on a few pixels of transparent shadow past the card - he
+    // got it a second time, as its own window beside Start, with its shadow margins black (the crop cannot take them:
+    // the 127 px card is under the 136 px minimum window, below which a popup is dropped). So for a framed Start or
+    // Search the carrier is found also without a tracked GW_OWNER (ShellPopupCarrier: same process), and a popup at
+    // least 90% over its card is carried. Any other owner keeps the strict test.
     BOOL insideOwner = FALSE;
-    if (IsMenuPopupWindow(data) && data->Owner && WgcBrokerActive())
+    const WINDOW_DATA* carrier = NULL;
+    if (IsMenuPopupWindow(data) && WgcBrokerActive())
     {
-        const WINDOW_DATA* ownerData = FindWindowByHandle(data->Owner);
-        insideOwner = ownerData && ownerData->IsVisible &&
-            (LONG)data->X >= (LONG)ownerData->X &&
-            (LONG)data->Y >= (LONG)ownerData->Y &&
-            (LONG)data->X + (LONG)data->Width  <= (LONG)ownerData->X + (LONG)ownerData->Width &&
-            (LONG)data->Y + (LONG)data->Height <= (LONG)ownerData->Y + (LONG)ownerData->Height;
+        carrier = data->Owner ? FindWindowByHandle(data->Owner) : NULL;
+        if (!carrier)
+            carrier = ShellPopupCarrier(data);
+        if (carrier && carrier->IsVisible)
+        {
+            const SHELL_SURFACE_KIND carrierKind = ShellSurfaceKind(carrier);
+            if (carrierKind == ShellSurfaceStart || carrierKind == ShellSurfaceSearch)
+            {
+                RECT popup, card, overlap;
+                SetRect(&popup, (LONG)data->X, (LONG)data->Y,
+                    (LONG)data->X + (LONG)data->Width, (LONG)data->Y + (LONG)data->Height);
+                SetRect(&card, (LONG)carrier->X, (LONG)carrier->Y,
+                    (LONG)carrier->X + (LONG)carrier->Width, (LONG)carrier->Y + (LONG)carrier->Height);
+                const LONGLONG area = (LONGLONG)data->Width * data->Height;
+                const LONGLONG over = IntersectRect(&overlap, &popup, &card) ?
+                    (LONGLONG)(overlap.right - overlap.left) * (overlap.bottom - overlap.top) : 0;
+                insideOwner = area > 0 && over * 10 >= area * 9;
+            }
+            else
+                insideOwner = data->Owner && carrier == FindWindowByHandle(data->Owner) &&
+                    (LONG)data->X >= (LONG)carrier->X &&
+                    (LONG)data->Y >= (LONG)carrier->Y &&
+                    (LONG)data->X + (LONG)data->Width  <= (LONG)carrier->X + (LONG)carrier->Width &&
+                    (LONG)data->Y + (LONG)data->Height <= (LONG)carrier->Y + (LONG)carrier->Height;
+        }
     }
     else if (data->Owner && (data->Style & WS_POPUP) && (data->Style & WS_CAPTION) != WS_CAPTION &&
         WgcBrokerActive())
     {
         const WINDOW_DATA* ownerData = FindWindowByHandle(data->Owner);
+        carrier = ownerData;
         RECT live;
         // An owner not shown yet (Edge creates its first-run overlay before it shows the browser) holds only a popup
         // too large for override-redirect - the one dom0's window manager would take as a frame of its own. A small
@@ -10497,17 +10558,13 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
             }
         }
     }
-    if (insideOwner)
+    if (insideOwner && carrier)
     {
-        const WINDOW_DATA* ownerData = FindWindowByHandle(data->Owner);
-        if (ownerData)
-        {
-            LogDebug("0x%x: owned popup (class %s, %ux%u at %d,%d) is over owner 0x%x "
-                L"(%ux%u at %d,%d) - not announced; the owner's capture carries it",
-                (DWORD)(ULONG_PTR)data->Handle, data->Class, data->Width, data->Height, data->X, data->Y,
-                (DWORD)(ULONG_PTR)data->Owner, ownerData->Width, ownerData->Height, ownerData->X, ownerData->Y);
-            return FALSE;
-        }
+        LogDebug("0x%x: owned popup (class %s, %ux%u at %d,%d) is over owner 0x%x "
+            L"(%ux%u at %d,%d) - not announced; the owner's capture carries it",
+            (DWORD)(ULONG_PTR)data->Handle, data->Class, data->Width, data->Height, data->X, data->Y,
+            (DWORD)(ULONG_PTR)carrier->Handle, carrier->Width, carrier->Height, carrier->X, carrier->Y);
+        return FALSE;
     }
 
     // THE DRAG IMAGE IS SHOWN BY THE WINDOWS BENEATH IT. It is an ownerless WS_POPUP |
