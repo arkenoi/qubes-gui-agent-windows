@@ -143,6 +143,7 @@ typedef struct _TH_ENTRY
     int       AppliedGap;
     LONG      CarryShownH, CarryBottom, CarryLeft, CarryRight, CarryW, CarryH;
     BOOL      CarryExcl;
+    BOOL      StackShown;             // the last pass showed this window for the cards above a suppressed bottom card
     ULONGLONG LastUse;
 } TH_ENTRY;
 
@@ -549,7 +550,11 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             const BOOL bound = (now - sc->FirstSeen) >= TH_HOLD_BOUND_MS;
             const BOOL undecided = (sc->Seq == 0 || sc->Verdict == TH_VERDICT_PENDING);
             if (!in.BridgeUp)
-                sc->Excluded = FALSE;               // no bridge: nothing can be shown by dom0 instead
+                // No bridge: the core's dead-bridge rule for a suppressed banner (ThCoreDecide, "THE BRIDGE DIED"): a
+                // card dom0 acknowledged (`forwarded`) is shown by dom0 and stays out; `bridge` and `pending` are
+                // toasts nobody will forward now, so they are shown here. Forwarded-only on purpose: g_ThDeadSeq can
+                // be 0 (no ceiling captured), and then ThCoreDeadVerdict leaves `bridge` standing.
+                sc->Excluded = (sc->Verdict == TH_VERDICT_FORWARDED);
             else if (undecided)
                 sc->Excluded = !bound;
             else
@@ -599,6 +604,8 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         e->StackMask = 0;
         e->StackMaskN = e->StackCount;
     }
+    // Every pass: ToastHoldNoteChanged gates the swap edge of a window shown for its upper cards as it does a shown banner's.
+    e->StackShown = stackOverride;
 
     if (out.ReleaseSeq)
         ThConsumedRemove(&g_ThCons, out.ReleaseSeq);
@@ -1090,7 +1097,10 @@ void ToastHoldNoteChanged(IN HWND window)
         // NormalToastView in 2 reads)", then each card added to its stack logged "frames gated at the swap
         // edge" and, with no read between, "frames resumed after 2 held, swap gate open 3000 ms" and "after
         // 11 held, ... 3000 ms" - dom0 kept the old stack for 3 s while the new card was on the guest.
-        gateSwap = (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecShow && !e->NotBanner);
+        // A window ToastHoldDecide shows for the cards above its suppressed bottom card (StackShown) is shown too: its
+        // core decision stays Suppress, and without this a bridged toast painted into a shown upper card's place
+        // went out ungated until the read named it (override-shown-upper-swap).
+        gateSwap = (e->Core.Phase == ThPhaseDecided && (e->Core.Decision == ThDecShow || e->StackShown) && !e->NotBanner);
         // EVERY DECIDED BANNER ARMS THE DEADLINE, NOT ONLY A SHOWN ONE. This is the toast loss that
         // kept coming back (findings/issues.md TOASTBANNERLOSTONDIRECTPATH, four times, last on
         // 2026-11-07 02:45:49Z as toast-hold S3i-2=LOST with its pair 838 ms apart - inside the first
@@ -1403,6 +1413,21 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
                         next[k].Verdict = e->Stack[j].Verdict;
                         next[k].FirstSeen = e->Stack[j].FirstSeen;
                         next[k].Excluded = e->Stack[j].Excluded;
+                        // The inverse of PromotedSeq: the entry's own card moved UP (a card was inserted below it and
+                        // is the bottom card now). Its record lives only in e->Core, which the next pass zeroes, and
+                        // it stays consumed, so the card could never match it again: undecided, it was shown 3 s
+                        // later beside the new bottom card although the bridge had forwarded it (DEMOTED-PLAIN). It
+                        // keeps the record and the entry's standing decision as its verdict; ToastHoldDecide re-reads
+                        // the record every pass. Not after a fail-open show: that card stays shown, as decided.
+                        if (changed && j == oldCount - 1 && k < cardCount - 1 && e->Core.Phase == ThPhaseDecided &&
+                            e->Core.RecordSeq != 0 && !e->Core.FailedOpen && e->Core.Ident == cardIdent[k].Combined)
+                        {
+                            next[k].Seq = e->Core.RecordSeq;
+                            next[k].NotifId = e->Core.NotifId;
+                            next[k].Verdict = e->Core.Decision != ThDecSuppress ? TH_VERDICT_WINDOW :
+                                              e->Core.AckSeen ? TH_VERDICT_FORWARDED : TH_VERDICT_BRIDGE;
+                            next[k].Excluded = (e->Core.Decision == ThDecSuppress);
+                        }
                         if (k == cardCount - 1 && j < oldCount - 1 && e->Stack[j].Seq != 0 && changed)
                             e->PromotedSeq = e->Stack[j].Seq;
                         break;
