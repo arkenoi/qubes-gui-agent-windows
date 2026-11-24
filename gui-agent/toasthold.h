@@ -74,6 +74,11 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry);
 // (a banner arriving in place), so re-read the identity (coalesced: one read in flight per window).
 void ToastHoldNoteChanged(IN HWND window);
 
+// A new captured frame was copied into this banner's buffer (main.c, PwConsumeBrokerFrame). While a newer
+// toast is queued behind the decided banner, re-read its identity (coalesced); otherwise nothing. Never a
+// timer: a timed re-read kept the banner on screen (findings/issues.md TOASTBANNERLOSTONDIRECTPATH).
+void ToastHoldNoteFrame(IN HWND window);
+
 // Drop the window's state (RemoveWindow). HWNDs are recycled; a stale hold would hide the next one.
 // A gate release left dom0 holding a frame from before the hold. Returns TRUE ONCE for the window that
 // owes a repaint; the caller must then repaint it from its VISIBLE region, never the whole window (see

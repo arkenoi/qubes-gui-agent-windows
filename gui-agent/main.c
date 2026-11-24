@@ -13777,6 +13777,10 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
         const BOOL brokerCopied = PwBrokerCopyDiff(entry, bsrc, bpitch, &pwRect);
         if (brokerCopied)
             entry->PwSlabUnfed = FALSE;   // a whole frame of the slab's size is in it now
+        // A new frame of a toast banner is the only reliable sign of a toast swapped into it in place; the hold
+        // re-reads it then, and only then, if a newer toast is queued behind it (toasthold.c ToastHoldNoteFrame).
+        if (brokerCopied && ShellSurfaceKind(entry) == ShellSurfaceToast)
+            ToastHoldNoteFrame(entry->Handle);
         // Buffer is complete for this window: square off DWM's black rounded
         // corners before the content check judges it.
         FlattenBufferCorners(entry);

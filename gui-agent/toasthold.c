@@ -410,9 +410,14 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // window in place. A dead bridge's records are nobody's queue (its unconfirmed ones read as window).
     // `successorQueued`: ANY toast newer than this banner's own that is still a match candidate (the core's
     // own rule - unconsumed, younger than TH_RECORD_TTL_MS), whatever its verdict. Windows paints it into
-    // this window in place when the current display ends, and nothing reliably reports that repaint: no
-    // event may come, or its read lands before the new content. So a DECIDED banner re-reads on the
-    // recheck tick while one is queued (below), and a reading that names it takes the content-changed path.
+    // this window in place when the current display ends, and no window event reliably reports that
+    // repaint. Its NEW FRAME does: while one is queued (QueuedNotif below), ToastHoldNoteFrame requests a
+    // read for every new captured frame, and a reading that names it takes the content-changed path.
+    // NEVER ON A TIMER (TOASTBANNERLOSTONDIRECTPATH, 2026-11-24): a 500 ms re-read kept the banner it read
+    // on screen - hold-on lives were their re-reads x 0.5 s ("180 re-read(s)", ~90 s, until the history
+    // was cleared), while with that read removed (one-variable build 167ee3b, 4 runs) no banner outlived
+    // 37 s and every queued toast was painted in place ~6 s in; Jev agent_uia_rereads 0.82. A banner at
+    // rest sends no frames, so it is not read and Windows times it out.
     BOOL successorQueued = FALSE;
     UINT32 successorNotif = 0;
     if (!e->NotBanner && in.BridgeUp)
@@ -482,7 +487,9 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     //     flyout passes the toast classifier too; a banner mid-grow does not, review N2);
     //   * a last read that FAILED (UIA error, no title, no card on a banner already identified), in ANY phase:
     //     once per recheck interval, at most TH_READ_RETRY_MAX times in a row (review #8) - a decided banner
-    //     with a stale reading must not keep it for ever, and must not be polled for ever either.
+    //     with a stale reading must not keep it for ever, and must not be polled for ever either;
+    //   * decided, with a newer toast queued behind it: never here - on its next captured frame
+    //     (ToastHoldNoteFrame), because a timed read kept the banner on screen.
     BOOL armRetry = FALSE;
     ULONGLONG retryAt = 0;
     if (!e->NotBanner && !e->ReadInFlight && e->LastReadAttempt != 0)
@@ -499,8 +506,6 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             ThRequestReadLocked(e, now);
         else if (secondLookDue || failedRetryDue)
             ThRequestReadLocked(e, now);
-        else if (successorQueued && e->Core.Phase == ThPhaseDecided && since >= recheck)
-            ThRequestReadLocked(e, now);   // a newer toast is queued: is it painted in this window yet?
         // Whatever happened above, arm the moment the next attempt becomes due - anchored at the attempt
         // just made (or the refused one), so a refused request waits its back-off instead of spinning.
         if (!e->ReadInFlight && !e->NotBanner)
@@ -585,11 +590,8 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // window event for the next banner arrived - which is why they were never lost and this was.
     if (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecSuppress)
         e->Due = ThMinTick(e->Due, now + TH_HOLD_RECHECK_MS);
-    // ...and ANY decided banner, shown or suppressed, while a newer toast is queued behind it: the tick
-    // is what brings the re-read above. It ends when that toast's record is consumed (some banner was
-    // decided for it) or ages past TH_RECORD_TTL_MS, and the entry is dropped with its window.
-    if (successorQueued && e->Core.Phase == ThPhaseDecided)
-        e->Due = ThMinTick(e->Due, now + TH_HOLD_RECHECK_MS);
+    // A decided banner with a newer toast queued behind it gets NO recheck tick: its re-read comes from
+    // its next captured frame (ToastHoldNoteFrame), never from a timer - see successorQueued above.
     if (armRetry)
         e->Due = ThMinTick(e->Due, retryAt);
     if (swapGateHold)
@@ -887,6 +889,25 @@ void ToastHoldNoteChanged(IN HWND window)
             "its frames are held until a fresh identity read says which toast it now carries",
             (DWORD)(ULONG_PTR)window);
     }
+}
+
+// Called by main.c's broker-frame consumer for every NEW captured frame copied into a toast banner's
+// buffer. While a newer toast is queued behind this decided banner (QueuedNotif, set by the tracking
+// pass), a new frame is how its in-place swap shows itself - measured 2026-11-24 nr4: a suppressed banner
+// got "QGAPROTO,msg=DAMAGE ... ry=18,w=364,h=12" at the swap and no window event, and with no read the
+// queued window-path toast was lost. So one read is requested (coalesced: a frame while a read is in
+// flight marks it dirty and it repeats once when it lands). No frame, no read: a banner at rest is
+// never read, which is what lets Windows time it out. No frame gate here - that is NoteChanged's job on
+// the swap edge, and gating on frames would freeze a shown banner.
+void ToastHoldNoteFrame(IN HWND window)
+{
+    if (!g_ThActive || !window || g_ThEntryCount == 0) return;
+    const ULONGLONG now = GetTickCount64();
+    EnterCriticalSection(&g_ThLock);
+    TH_ENTRY* e = ThFindLocked(window);
+    if (e && e->QueuedNotif != 0 && e->Core.Phase == ThPhaseDecided)
+        ThRequestReadLocked(e, now);
+    LeaveCriticalSection(&g_ThLock);
 }
 
 // Collected by main.c's tracking pass, which owns WINDOW_DATA and the visible-region arithmetic. One
