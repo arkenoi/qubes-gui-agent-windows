@@ -7162,7 +7162,7 @@ static void MapDeferWakeSweep(void)
         WINDOW_DATA* entry = CONTAINING_RECORD(le, WINDOW_DATA, ListEntry);
         if (!entry->MapDeferred || entry->DeletePending)
             continue;
-        // A banner the TOAST HOLD owns (held for its verdict, suppressed, pre-empted) is not this sweep's to
+        // A banner the TOAST HOLD owns (held for its verdict, suppressed, or its frames held) is not this sweep's to
         // re-check: it stays MapDeferred for its whole display (5-25 s, longer for a reminder), and the 32 ms /
         // 100 ms tick here would run a pass for it that long - a timer at rest (owner rule). The hold wakes
         // it through its own events (the verdict, its reads) and its own bounded deadlines; when it says
@@ -10916,6 +10916,7 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
 // Defined next to the occluder walk it needs; called from UpdateWindowData's exit, which both
 // TrackWindows callers reach with g_csWatchedWindows held.
 static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry);
+static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRectIn, OUT const WCHAR** why);
 
 static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
 {
@@ -12949,6 +12950,17 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     // keeps the debt: the consume path damages the window when a frame lands, the next pass pays here, and a debt no
     // frame ever settles reaches owed=overdue - the one line a toast whose re-registration also got no frame would
     // leave. Broker-sourced only, the measured case (src=broker): a composite-fed toast keeps its payment as it was.
+    // THE RELEASE'S OWN COPY (docs/ADR-toasts.md 13, the settle hold). The hold consumed this banner's new frames without
+    // copying them (PwConsumeBrokerFrame), and a banner at rest raises no broker event to bring the newest one, so the
+    // payment takes it itself: both payers (the tracking pass's end and ToastDebtWakeSweep) come here. Guards as
+    // BrokerConsumePass; never into a slab of another size - its frames were cut for the old request, and the rebuild's
+    // first frame is a new frame, held and released as one.
+    if (!g_OnSecureDesktop && !entry->Synthesized && !entry->IsIconic && PwIsAttached(entry) && entry->PwSliceFed &&
+        entry->PwBrokerSourced && entry->PwSliceNeedsFull && entry->PwWidth == entry->Width && entry->PwHeight == entry->Height)
+    {
+        const RECT r = { entry->X, entry->Y, entry->X + (int)entry->Width, entry->Y + (int)entry->Height };
+        (void)PwConsumeBrokerFrame(entry, &r, NULL);
+    }
     if (PwIsAttached(entry) && entry->PwSliceFed && entry->PwBrokerSourced && entry->PwSlabUnfed)
         return ToastPayDeclined(entry, L"slab-unfed");
     // A BUFFER OF ANOTHER SIZE IS NOT THIS WINDOW'S PICTURE. A banner the shell resized under its gate keeps the buffer dom0
@@ -12956,6 +12968,10 @@ static BOOL ToastPayRepaintNow(IN OUT WINDOW_DATA* entry)
     // pixels. Declining keeps the debt for ToastDebtWakeSweep, which queues the pass whose rebuild arm fixes the size.
     if (PwSlabSizeStale(entry))
         return ToastPayDeclined(entry, L"slab-size-stale");
+    // THE RELEASE'S FRAME HAS NOT LANDED (still held, or no frame to take - the settle hold's copy above): a damage now
+    // would make dom0 re-read the frame it already has and log `paid` over it. The debt stands; both payers retry.
+    if (PwIsAttached(entry) && entry->PwSliceFed && entry->PwBrokerSourced && entry->PwSliceNeedsFull)
+        return ToastPayDeclined(entry, L"release-frame-pending");
 
     // THE DAMAGE HOLD IS NOT OURS TO BREAK. While the daemon dictates this window's geometry (a dom0
     // WM drag) or a guest-native drag has latched it, position announces are withheld, so dom0's
@@ -13768,8 +13784,9 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
     {
         // A BLANK FRAME NEVER ENTERS A PAINTED TOAST BANNER'S BUFFER (findings/issues.md TOASTSWAPBLACKINDOM0). The granted
         // buffer below IS the image dom0 maps: dom0 re-reads it on every damage, on the swap gate's release repaint and on
-        // any X expose. The gate withholds damage, configures and rebuilds, never this copy, so the frame gate cannot keep
-        // what dom0 shows - and the hook notice that closes it follows the swap's first frame (ADR-toasts 10). Measured
+        // any X expose. The swap-edge gate of that time withheld damage, configures and rebuilds, never this copy, so it could
+        // not keep what dom0 shows - and the hook notice that closed it followed the swap's first frame (ADR-toasts 10; the
+        // settle hold arm below now withholds the copy itself, ADR-toasts 13). Measured
         // 2026-11-23, toast-hold geo5 on ca80ce2: the only damages dom0 got for banner 0x801a8 were its map, 225503.853,
         // the release repaint at .958 and .971 (send.c logs every forwarded damage; "resumed after 0 held"), the gate
         // closed at .907, and dom0's capture spanning them was black - 0 of 37800 pixels lit inside its frame - between a
@@ -13792,6 +13809,19 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
                 return TRUE;                   // current: the buffer already holds this window's last painted frame
             }
         }
+        // THE SETTLE HOLD (docs/ADR-toasts.md 13, owner-confirmed 2026-11-24): a mapped banner's new frame reaches dom0
+        // only after a read has named the cards it shows. Decided BEFORE the copy, because the granted buffer below IS the
+        // image dom0 maps (the blank-frame arm above). Consumed like a blank frame: not copied, no damage. PwBrokerLastId
+        // advances so the frame is neither counted nor read for twice; PwSliceNeedsFull keeps this branch open, so the
+        // release's payment (ToastPayRepaintNow) copies the newest frame. The blank arm stays first: a blank frame is
+        // never content and requests no read.
+        if (ShellSurfaceKind(entry) == ShellSurfaceToast &&
+            ToastHoldNoteFrame(entry->Handle, bid != entry->PwBrokerLastId, entry->CreateSent && !entry->MapDeferred))
+        {
+            entry->PwBrokerLastId = bid;
+            entry->PwSliceNeedsFull = TRUE;
+            return TRUE;   // fed as far as dom0 may know: not a feed hold (PwHoldRun), dom0 keeps the frame it has
+        }
         BOOL firstBrokerFrame = (entry->PwBrokerLastId == 0);
         entry->PwSliceNeedsFull = FALSE;
         entry->PwBrokerLastId = bid;
@@ -13807,10 +13837,6 @@ static BOOL PwConsumeBrokerFrame(IN OUT WINDOW_DATA* entry, IN const RECT* pwRec
         const BOOL brokerCopied = PwBrokerCopyDiff(entry, bsrc, bpitch, &pwRect);
         if (brokerCopied)
             entry->PwSlabUnfed = FALSE;   // a whole frame of the slab's size is in it now
-        // A new frame of a toast banner is the only reliable sign of a toast swapped into it in place; the hold
-        // re-reads it then, and only then, if a newer toast is queued behind it (toasthold.c ToastHoldNoteFrame).
-        if (brokerCopied && ShellSurfaceKind(entry) == ShellSurfaceToast)
-            ToastHoldNoteFrame(entry->Handle);
         // Buffer is complete for this window: square off DWM's black rounded
         // corners before the content check judges it.
         FlattenBufferCorners(entry);
@@ -15393,7 +15419,7 @@ static ULONG ProcessNewFrame(IN const CAPTURE_FRAME* frame, IN const BYTE* frame
                 // PwDirectSuppressed windows are deliberately kept unmapped (no pixels, no
                 // composite to fall back on) - re-queueing them every frame would be pure churn.
                 // A real frame clears the flag through the same arm that maps them.
-                // A banner the TOAST HOLD owns (suppressed, held, pre-empted) is likewise not this
+                // A banner the TOAST HOLD owns (suppressed, held, or its frames held) is likewise not this
                 // backstop's to re-queue: it stays MapDeferred for its whole display and the hold wakes it
                 // itself (see MapDeferWakeSweep's ToastHoldOwned skip).
                 if (g_SliceMapHold && entry->MapDeferred && !entry->PwDirectSuppressed && !entry->ToastHoldOwned &&

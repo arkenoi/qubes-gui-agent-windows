@@ -81,15 +81,12 @@ static ULONG g_GeomDrops;    // MSG_CREATE / MSG_CONFIGURE / MSG_WINDOW_DUMP
 static ULONG g_GeomClamps;   // values rewritten rather than refused
 static ULONG g_DamageDrops;  // MSG_SHMIMAGE
 
-// --- swap-edge frame gate (ADR-toasts 10; toasthold-core.h sets TH_OUTPUT.GateFrames) -------------
-// While a shell toast banner is pre-empted, its window stays MAPPED and dom0 keeps the frame it
-// already has, but none of that window's NEW frames may go out. Windows toasts reuse one banner
-// window, so the queued toast repaints the very window dom0 was told carries the displayed one;
-// forwarding that repaint would show toast B's pixels inside the window announced as toast A.
-// That reasoning covers one toast REPLACING another. Toasts also STACK as several cards in the window,
-// which is normal and required (owner 2026-11-24, docs/ADR-toasts.md 13): a stack's frames must never be
-// held here - findings/issues.md TOASTSTACKNOTSHOWN.
-// toasthold.c owns the policy and the bound - this file only holds the frames back.
+// --- the settle hold's send-side gate (docs/ADR-toasts.md 13) ---------------------------------------------------------
+// While a shown toast banner's new frames are held (main.c does not copy them into dom0's buffer until a read has named
+// the cards they show), its window stays MAPPED, dom0 keeps the frame it already has, and none of that window's damage,
+// configure or buffer rebuild goes out. A toast is never held because another is on screen or queued (owner-confirmed
+// 2026-11-24): the hold is keyed on the window's own new frames, so a stack of cards settles and is shown, never held.
+// toasthold.c owns the policy and the bound - this file only holds the damage back.
 //
 // WHY HERE. Every frame-forwarding path in the agent passes through SendWindowDamageEvent: the WGC
 // per-window damage callback on the capture thread (perwindow.c) and main.c's repaints. It is the
@@ -103,12 +100,11 @@ static ULONG g_DamageDrops;  // MSG_SHMIMAGE
 // from the capture thread. No lock on the frame path, ever. A read that races a publish sees the
 // handle one pass early or late, which costs at most one frame either way.
 //
-// FOUR SLOTS, and what happens when they are all taken. Every capture on record pre-empts at most
-// one banner window at a time; four is slack, not a design limit. A failed claim is REPORTED to the
-// caller, which falls back to rule 5 and unmaps - a loss, which is bad, rather than a
-// misattribution, which is worse. Failing open to "forward the frames" is the one thing this must
-// never do.
-#define SEND_FRAME_GATES 4
+// EIGHT SLOTS = toasthold.c TH_ENTRIES: every tracked banner can be held at once, so a claim is not refused. A refused
+// claim (a bug, if it ever comes) is REPORTED to the caller, which logs QGATOASTGATELATE: the frames are still held -
+// main.c does not copy them - and only this window's configure and rebuild lose their hold. Failing open to
+// "forward the frames" is the one thing the settle hold (docs/ADR-toasts.md 13) must never do.
+#define SEND_FRAME_GATES 8
 static HWND volatile g_FrameGates[SEND_FRAME_GATES];
 // Frames actually dropped per slot. NOT a log line per frame: a gated window is dropping frames at
 // capture rate, and a per-window INFO line at that rate is exactly what log policy refuses
@@ -135,8 +131,8 @@ int SendWindowFrameGate(IN HWND window)
     if (!window)
         return SEND_GATE_REFUSED;   // whole-desktop damage has no per-window identity (composite path)
 
-    // Idempotent: both callers re-assert the gate - the tracking pass on every pass for as long as
-    // the pre-emption lasts, and the hook thread on every change notice - so a second call must not
+    // Idempotent: both callers re-assert the gate - ToastHoldNoteFrame at a new frame and the hook thread
+    // on every change notice - so a second call must not
     // consume a second slot. SEND_GATE_NEW tells the caller this call is the one that closed it,
     // which is what keeps a log line per swap from becoming a log line per mouse-move.
     if (SendWindowFrameGated(window))
@@ -1101,14 +1097,12 @@ ULONG SendWindowDamageEvent(IN HWND window, IN int x, IN int y, IN int width, IN
         return ERROR_SUCCESS; // dropped on purpose; not an error the caller can act on
     }
 
-    // Swap-edge gating: this window's frames are held while its banner is pre-empted or mid-swap (see
-    // the gate above). Dropped on purpose, the same shape as the refusal above - but COUNTED, NOT
-    // LOGGED: a gated window drops frames at capture rate, and a per-window line at that rate is what
-    // log policy refuses (tools/tests/log-policy-selftest.sh no_routine_per_window_info). The count is
-    // reported once, on the ungate, as `after N held`. Both ends are bounded - the core's pre-emption
-    // window and the glue's own TH_HOLD_BOUND_MS on the swap gate - and the ungate forces a full-window
-    // repaint, so a gated window cannot stay frozen. Placed after the negative check so that a bad rect
-    // is still reported as bad rather than silently absorbed by the gate.
+    // The settle hold (docs/ADR-toasts.md 13): this banner's damage is held while its new frames are (main.c does not
+    // copy them until a read names its cards). Dropped on purpose, the same shape as the refusal above - but COUNTED, NOT
+    // LOGGED: a held window drops rects at capture rate, and a per-window line at that rate is what log policy refuses
+    // (tools/tests/log-policy-selftest.sh no_routine_per_window_info). The count is reported once, on the release.
+    // Bounded by toasthold.c's TH_HOLD_BOUND_MS, and the release repaints in full, so a held window cannot stay frozen.
+    // Placed after the negative check so that a bad rect is still reported as bad rather than absorbed by the hold.
     if (window)
     {
         for (int i = 0; i < SEND_FRAME_GATES; i++)

@@ -33,13 +33,6 @@
  * selftest.sh runs the matrix with gcc; CI runs it with msbuild /p:ToastHoldDefect=<define>):
  *   TOASTHOLD_DEFECT_NOBOUND           a hold never fails open (a lost toast instead of a late one)
  *   TOASTHOLD_DEFECT_FAILCLOSED        doubt suppresses instead of showing
- *   TOASTHOLD_DEFECT_NOPREEMPT         a queued bridge-bound toast no longer pre-empts (the flash)
- *   TOASTHOLD_DEFECT_PREEMPT_UNMAPS    rule 5 restored: a pre-emption UNMAPS the displayed banner instead of
- *                                      gating its frames - the banner is withdrawn seconds before the queued
- *                                      toast's content arrives and never comes back (TOASTPREEMPTLOSESBANNER)
- *   TOASTHOLD_DEFECT_PREEMPT_IDENTGATE pre-emption ends while an identity read is in flight: the in-place
- *                                      swap's own event queues a read, so the swap pass MAPS the window while
- *                                      the bridged toast paints (review blocker #1; TestReviewProbe step 3)
  *   TOASTHOLD_DEFECT_SUPPRESS_FINAL    a suppressed banner never re-reads its record: the bridge's later
  *                                      `window` and its death before `forwarded` are ignored - a LOSS (review
  *                                      blocker #2; TestReviewProbe step 5, TestSuppressReopen)
@@ -420,13 +413,12 @@ static void TestRing(void)
 }
 
 /* ---- the state machine ------------------------------------------------------------------------ */
-static TH_INPUT In(int identKnown, UINT64 ident, int bridgeUp, int match, LONG seq, LONG verdict, int preempt, ULONGLONG preemptDue)
+static TH_INPUT In(int identKnown, UINT64 ident, int bridgeUp, int match, LONG seq, LONG verdict)
 {
     TH_INPUT in;
     memset(&in, 0, sizeof(in));
     in.IdentKnown = identKnown; in.Ident = ident; in.BridgeUp = bridgeUp;
     in.MatchFound = match; in.MatchSeq = seq; in.MatchNotifId = (UINT32)(100 + seq); in.MatchVerdict = verdict;
-    in.PreemptWanted = preempt; in.PreemptDue = preemptDue;
     return in;
 }
 
@@ -440,29 +432,29 @@ static void TestMachine(void)
 
     /* 1. pending -> bridge: never mapped */
     memset(&c, 0, sizeof(c));
-    in = In(0, 0, 1, 0, 0, 0, 0, 0);
+    in = In(0, 0, 1, 0, 0, 0);
     ThCoreDecide(&c, &in, t0, &out);
     Check("machine: a new banner with no identity yet is HELD at once (hold starts before any map)", out.Decision == ThDecHold && out.Event == ThEvHoldStart && out.Reason == ThReasonNoIdentity);
     Check("machine: ...with a recheck deadline inside the bound", out.Due == t0 + TH_HOLD_RECHECK_MS);
-    in = In(1, IA, 1, 1, 7, TH_VERDICT_PENDING, 0, 0);
+    in = In(1, IA, 1, 1, 7, TH_VERDICT_PENDING);
     ThCoreDecide(&c, &in, t0 + 120, &out);
     Check("machine: identity known, record pending -> still HELD, deadline = the bound", out.Decision == ThDecHold && out.Reason == ThReasonVerdictPending && out.Due == t0 + TH_HOLD_BOUND_MS && out.Event == ThEvNone);
-    in = In(1, IA, 1, 1, 7, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, IA, 1, 1, 7, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0 + 900, &out);
     Check("machine: verdict bridge -> SUPPRESS (never mapped), event reported once with held_ms", out.Decision == ThDecSuppress && out.Event == ThEvSuppress && out.HeldMs == 900 && c.NotifId == 107);
     ThCoreDecide(&c, &in, t0 + 2000, &out);
     Check("machine: the standing SUPPRESS is quiet (no repeated event); the forward bound is armed while dom0's ack is awaited",
         out.Decision == ThDecSuppress && out.Event == ThEvNone && out.Due == t0 + 900 + TH_FORWARD_BOUND_MS);
-    in = In(0, 0, 1, 0, 0, 0, 0, 0);   /* a re-read in flight after a LOCATIONCHANGE */
+    in = In(0, 0, 1, 0, 0, 0);   /* a re-read in flight after a LOCATIONCHANGE */
     ThCoreDecide(&c, &in, t0 + 2100, &out);
     Check("machine: a re-read in flight keeps the standing decision", out.Decision == ThDecSuppress && out.Event == ThEvNone);
 
     /* 2. pending -> window: mapped at the verdict */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 8, TH_VERDICT_PENDING, 0, 0);
+    in = In(1, IA, 1, 1, 8, TH_VERDICT_PENDING);
     ThCoreDecide(&c, &in, t0, &out);
     Check("machine: first examination with identity -> HELD (HoldStart)", out.Decision == ThDecHold && out.Event == ThEvHoldStart);
-    in = In(1, IA, 1, 1, 8, TH_VERDICT_WINDOW, 0, 0);
+    in = In(1, IA, 1, 1, 8, TH_VERDICT_WINDOW);
     ThCoreDecide(&c, &in, t0 + 400, &out);
     Check("machine: verdict window -> SHOW at once", out.Decision == ThDecShow && out.Event == ThEvShowVerdict && out.HeldMs == 400);
     ThCoreDecide(&c, &in, t0 + 500, &out);
@@ -470,19 +462,19 @@ static void TestMachine(void)
 
     /* 3. pending -> timeout: FAIL OPEN, reported */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 9, TH_VERDICT_PENDING, 0, 0);
+    in = In(1, IA, 1, 1, 9, TH_VERDICT_PENDING);
     ThCoreDecide(&c, &in, t0, &out);
     ThCoreDecide(&c, &in, t0 + TH_HOLD_BOUND_MS - 1, &out);
     Check("machine: one ms before the bound still HELD", out.Decision == ThDecHold);
     ThCoreDecide(&c, &in, t0 + TH_HOLD_BOUND_MS, &out);
     Check("machine: at the bound with the verdict still pending -> SHOW by FAIL-OPEN (loud)", out.Decision == ThDecShow && out.Event == ThEvFailOpen && out.Reason == ThReasonVerdictPending && c.FailedOpen);
-    in = In(1, IA, 1, 1, 9, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, IA, 1, 1, 9, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0 + TH_HOLD_BOUND_MS + 500, &out);
     Check("machine: a verdict landing after the fail-open does not flip a shown banner", out.Decision == ThDecShow && out.Event == ThEvNone);
 
     /* 4. no record at all: recheck ticks, then fail open at the bound */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 0, 0, 0, 0, 0);
+    in = In(1, IA, 1, 0, 0, 0);
     ThCoreDecide(&c, &in, t0, &out);
     Check("machine: identity but no record -> HELD with a recheck tick", out.Decision == ThDecHold && out.Reason == ThReasonNoRecord && out.Due == t0 + TH_HOLD_RECHECK_MS);
     ThCoreDecide(&c, &in, t0 + 2800, &out);
@@ -492,94 +484,45 @@ static void TestMachine(void)
 
     /* 5. no identity ever: fail open at the bound */
     memset(&c, 0, sizeof(c));
-    in = In(0, 0, 1, 0, 0, 0, 0, 0);
+    in = In(0, 0, 1, 0, 0, 0);
     ThCoreDecide(&c, &in, t0, &out);
     ThCoreDecide(&c, &in, t0 + TH_HOLD_BOUND_MS, &out);
     Check("machine: no identity within the bound -> FAIL-OPEN no-identity (the Win10-structure guard)", out.Decision == ThDecShow && out.Event == ThEvFailOpen && out.Reason == ThReasonNoIdentity);
 
     /* 6. bridge down when the banner appears: shown at once, no 3 s wait */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 0, 0, 0, 0, 0, 0);
+    in = In(1, IA, 0, 0, 0, 0);
     ThCoreDecide(&c, &in, t0, &out);
     Check("machine: bridge down + no record -> SHOW immediately (window path by design)", out.Decision == ThDecShow && out.Event == ThEvShowNoBridge && out.Reason == ThReasonBridgeDown && !c.FailedOpen);
 
     /* 7. bridge dies while a pending record is held: shown at once */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 10, TH_VERDICT_PENDING, 0, 0);
+    in = In(1, IA, 1, 1, 10, TH_VERDICT_PENDING);
     ThCoreDecide(&c, &in, t0, &out);
-    in = In(1, IA, 0, 1, 10, TH_VERDICT_PENDING, 0, 0);
+    in = In(1, IA, 0, 1, 10, TH_VERDICT_PENDING);
     ThCoreDecide(&c, &in, t0 + 700, &out);
     Check("machine: bridge death while held -> SHOW at once, FAIL-OPEN bridge-exited", out.Decision == ThDecShow && out.Event == ThEvFailOpen && out.Reason == ThReasonBridgeExited && out.HeldMs == 700);
 
     /* 8. content changes in place under a decided banner: a fresh hold for the new content */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 11, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, IA, 1, 1, 11, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0, &out);
     Check("machine: (setup) suppressed", out.Decision == ThDecSuppress);
-    in = In(1, IB, 1, 0, 0, 0, 0, 0);
+    in = In(1, IB, 1, 0, 0, 0);
     ThCoreDecide(&c, &in, t0 + 6000, &out);
     Check("machine: new content in the same window -> ContentChanged, HELD again", out.Decision == ThDecHold && out.Event == ThEvContentChanged && c.HoldSince == t0 + 6000 && c.RecordSeq == 0);
-    in = In(1, IB, 1, 1, 12, TH_VERDICT_WINDOW, 0, 0);
+    in = In(1, IB, 1, 1, 12, TH_VERDICT_WINDOW);
     ThCoreDecide(&c, &in, t0 + 6300, &out);
     Check("machine: ...and the new content's own verdict decides it", out.Decision == ThDecShow && out.Event == ThEvShowVerdict && out.HeldMs == 300);
 
     /* 9. a reserved pending record is released when the held content turns out different */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 13, TH_VERDICT_PENDING, 0, 0);
+    in = In(1, IA, 1, 1, 13, TH_VERDICT_PENDING);
     ThCoreDecide(&c, &in, t0, &out);
-    in = In(1, IB, 1, 0, 0, 0, 0, 0);   /* the re-read says: different content, nothing matches it */
+    in = In(1, IB, 1, 0, 0, 0);   /* the re-read says: different content, nothing matches it */
     ThCoreDecide(&c, &in, t0 + 200, &out);
     Check("machine: a pending reservation is released when the content turns out different", out.ReleaseSeq == 13 && c.RecordSeq == 0 && out.Decision == ThDecHold);
 
-    /* 10. pre-emption: a mapped window-path banner is unmapped for a queued bridge-bound toast */
-    memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 14, TH_VERDICT_WINDOW, 0, 0);
-    ThCoreDecide(&c, &in, t0, &out);
-    Check("machine: (setup) shown", out.Decision == ThDecShow);
-    in = In(1, IA, 1, 1, 14, TH_VERDICT_WINDOW, 1, t0 + 5000);
-    ThCoreDecide(&c, &in, t0 + 1000, &out);
-    /* SWAP-EDGE GATING (ADR-toasts 10): the banner STAYS MAPPED and its frames are gated. The old
-     * expectation here was ThDecHold - rule 5's unmap - which is the defect: the pre-emption fires on the
-     * mere existence of a newer record, measured 4.47 s before that toast's content arrived, and the banner
-     * was withdrawn and never came back. TOASTHOLD_DEFECT_PREEMPT_UNMAPS restores it. */
-    Check("machine: a queued bridge-bound toast GATES the mapped banner's frames (it stays mapped)", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvPreemptStart && out.Reason == ThReasonPreempt && out.Due == t0 + 5000);
-    ThCoreDecide(&c, &in, t0 + 1500, &out);
-    Check("machine: the gate is quiet, and still closed, while the pre-emption lasts", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvNone);
-    in = In(1, IA, 1, 1, 14, TH_VERDICT_WINDOW, 0, 0);
-    ThCoreDecide(&c, &in, t0 + 2000, &out);
-    Check("machine: the queued toast resolved to window -> frames resume (PreemptEnd, gate open)", out.Decision == ThDecShow && !out.GateFrames && out.Event == ThEvPreemptEnd && out.HeldMs == 1000);
-
-    /* 11. a suppressed banner is never pre-empted into anything else */
-    memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 15, TH_VERDICT_BRIDGE, 1, t0 + 5000);
-    ThCoreDecide(&c, &in, t0, &out);
-    Check("machine: pre-emption does not touch a suppressed banner", out.Decision == ThDecSuppress && out.Event == ThEvSuppress);
-}
-
-static void TestPreemptPredicate(void)
-{
-    TH_IPC_RECORD r;
-    ULONGLONG due = 0;
-    const ULONGLONG now = 50000;
-    memset(&r, 0, sizeof(r));
-
-    r.Seq = 5; r.Verdict = TH_VERDICT_PENDING; r.ArrivalTick = now - 1000;
-    Check("preempt: a pending record newer than the banner's pre-empts, due = arrival + bound", ThCorePreemptBy(&r, 4, now, &due) && due == now - 1000 + TH_HOLD_BOUND_MS);
-    Check("preempt: ...but not one OLDER than the banner's own record (bannerless by FIFO)", !ThCorePreemptBy(&r, 5, now, &due) && !ThCorePreemptBy(&r, 9, now, &due));
-    r.ArrivalTick = now - TH_HOLD_BOUND_MS;
-    Check("preempt: a pending record past its bound no longer pre-empts", !ThCorePreemptBy(&r, 0, now, &due));
-    r.Verdict = TH_VERDICT_BRIDGE; r.ArrivalTick = now - 4000;
-    Check("preempt: a bridge record pre-empts within its window", ThCorePreemptBy(&r, 0, now, &due) && due == now - 4000 + TH_PREEMPT_WINDOW_MS);
-    r.ArrivalTick = now - TH_PREEMPT_WINDOW_MS;
-    Check("preempt: a bridge record past its window no longer pre-empts (bannerless toast)", !ThCorePreemptBy(&r, 0, now, &due));
-    r.Verdict = TH_VERDICT_WINDOW; r.ArrivalTick = now - 100;
-    Check("preempt: a window-verdict record never pre-empts", !ThCorePreemptBy(&r, 0, now, &due));
-    r.Verdict = TH_VERDICT_FORWARDED; r.ArrivalTick = now - 100;
-    Check("preempt: a forwarded record pre-empts like a bridge one", ThCorePreemptBy(&r, 0, now, &due));
-    r.Verdict = TH_VERDICT_BRIDGE; r.ArrivalTick = now + 99999;
-    Check("preempt: an arrival tick from the future reads as now", ThCorePreemptBy(&r, 0, now, &due) && due == now + TH_PREEMPT_WINDOW_MS);
-    r.Seq = 0;
-    Check("preempt: an empty slot never pre-empts", !ThCorePreemptBy(&r, 0, now, &due));
 }
 
 /* ---- the review's probe (2026-10-06), as a checked scenario -------------------------------------
@@ -597,44 +540,17 @@ static void TestReviewProbe(void)
     ULONGLONG t = 1000;
     memset(&c, 0, sizeof(c));
 
-    in = In(1, 0xA, 1, 1, 1, TH_VERDICT_WINDOW, 0, 0);
+    in = In(1, 0xA, 1, 1, 1, TH_VERDICT_WINDOW);
     ThCoreDecide(&c, &in, t, &out);
     Check("probe 1: banner A, record window -> SHOW", out.Decision == ThDecShow && out.Event == ThEvShowVerdict);
 
-    t += 1000;
-    in = In(1, 0xA, 1, 1, 1, TH_VERDICT_WINDOW, 1, t + 14000);
-    ThCoreDecide(&c, &in, t, &out);
-    Check("probe 2: record B (bridge) queued behind -> pre-empted (SHOWN, frames gated)", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvPreemptStart);
-
-    /* 3a. the glue's new contract: a read in flight does NOT make the identity unknown - and it computes
-     *     PreemptWanted on every pass. */
-    t += 4000;
-    in = In(1, 0xA, 1, 1, 1, TH_VERDICT_WINDOW, 1, t + 10000);
-    ThCoreDecide(&c, &in, t, &out);
-    Check("probe 3a: the swap pass with the last reading standing and pre-emption still wanted -> GATED", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvNone);
-    /* 3b. an identity-less pass (a banner whose card never read, shown by fail-open) with pre-emption WANTED
-     *     holds (the PREEMPT_IDENTGATE defect ignores PreemptWanted without an identity and maps it)... */
-    in = In(0, 0, 1, 0, 0, 0, 1, t + 10000);
-    ThCoreDecide(&c, &in, t + 1, &out);
-    Check("probe 3b: an identity-less pass with pre-emption wanted -> GATED", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvNone && c.Preempting);
-    /* 3c. ...and an identity-less pass with pre-emption NO LONGER wanted ENDS it - the glue computes
-     *     PreemptWanted on every pass, so nothing else may keep a pre-emption alive (review N1: a term that
-     *     did made it permanent for a banner whose card never read). */
-    in = In(0, 0, 1, 0, 0, 0, 0, 0);
-    ThCoreDecide(&c, &in, t + 2, &out);
-    Check("probe 3c: an identity-less pass with pre-emption no longer wanted ENDS it -> SHOW, gate OPEN, PreemptEnd, no deadline", out.Decision == ThDecShow && !out.GateFrames && out.Event == ThEvPreemptEnd && !c.Preempting && out.Due == 0);
-    /* back to the pre-empted state for the rest of the probe */
-    in = In(1, 0xA, 1, 1, 1, TH_VERDICT_WINDOW, 1, t + 10000);
-    ThCoreDecide(&c, &in, t + 3, &out);
-    Check("probe 3d: pre-empted again (setup)", out.Decision == ThDecShow && out.GateFrames && out.Event == ThEvPreemptStart);
-
     t += 150;
-    in = In(1, 0xB, 1, 1, 2, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, 0xB, 1, 1, 2, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t, &out);
     Check("probe 4: the read lands with B (bridge) -> SUPPRESS", out.Decision == ThDecSuppress && out.Event == ThEvSuppress);
 
     t += 6000;
-    in = In(1, 0xB, 1, 1, 2, TH_VERDICT_WINDOW, 0, 0);
+    in = In(1, 0xB, 1, 1, 2, TH_VERDICT_WINDOW);
     ThCoreDecide(&c, &in, t, &out);
     Check("probe 5: B's record turns window (forward failed for good) -> SHOWN after all (corrected)", out.Decision == ThDecShow && out.Event == ThEvShowCorrected && out.Reason == ThReasonCorrected);
     ThCoreDecide(&c, &in, t + 10, &out);
@@ -651,18 +567,18 @@ static void TestSuppressReopen(void)
 
     /* record still `bridge` (forward not acknowledged) when the bridge dies -> shown, loud */
     memset(&c, 0, sizeof(c));
-    in = In(1, 0xC, 1, 1, 3, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, 0xC, 1, 1, 3, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0, &out);
     Check("reopen: (setup) suppressed on bridge", out.Decision == ThDecSuppress);
-    in = In(1, 0xC, 0, 1, 3, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, 0xC, 0, 1, 3, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0 + 800, &out);
     Check("reopen: bridge dies before dom0's ack -> SHOW, FAIL-OPEN bridge-exited", out.Decision == ThDecShow && out.Event == ThEvFailOpen && out.Reason == ThReasonBridgeExited);
 
     /* record `forwarded` (dom0 acknowledged) -> the suppression stands through the bridge's death */
     memset(&c, 0, sizeof(c));
-    in = In(1, 0xD, 1, 1, 4, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, 0xD, 1, 1, 4, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0, &out);
-    in = In(1, 0xD, 1, 1, 4, TH_VERDICT_FORWARDED, 0, 0);
+    in = In(1, 0xD, 1, 1, 4, TH_VERDICT_FORWARDED);
     ThCoreDecide(&c, &in, t0 + 300, &out);
     /* NO LONGER quiet: the ack is reported once, for its TIMING (ThEvAckConfirmed -> QGATOASTACK, INFO).
      * The suppression and the disarmed bound are unchanged - what is added is HeldMs measured from the
@@ -670,31 +586,31 @@ static void TestSuppressReopen(void)
      * the fail-opens and nothing else, so how close a WORKING forward runs to the bound was unmeasurable. */
     Check("reopen: bridge -> forwarded keeps the suppression, reports the ack's wait, and disarms the forward bound",
           out.Decision == ThDecSuppress && out.Event == ThEvAckConfirmed && out.HeldMs == 300 && out.Due == 0);
-    in = In(1, 0xD, 0, 1, 4, TH_VERDICT_FORWARDED, 0, 0);
+    in = In(1, 0xD, 0, 1, 4, TH_VERDICT_FORWARDED);
     ThCoreDecide(&c, &in, t0 + 900, &out);
     Check("reopen: bridge dies AFTER dom0's ack -> stays suppressed (dom0 has it)", out.Decision == ThDecSuppress && out.Event == ThEvNone);
 
     /* record gone from the ring (wrapped) when the bridge dies -> nobody can vouch for the forward -> shown */
     memset(&c, 0, sizeof(c));
-    in = In(1, 0xE, 1, 1, 5, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, 0xE, 1, 1, 5, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0, &out);
-    in = In(1, 0xE, 0, 0, 0, 0, 0, 0);
+    in = In(1, 0xE, 0, 0, 0, 0);
     ThCoreDecide(&c, &in, t0 + 500, &out);
     Check("reopen: record gone + bridge down -> SHOW (unconfirmed)", out.Decision == ThDecShow && out.Event == ThEvFailOpen);
 
     /* a suppressed banner's record turning window with the bridge UP is the correction, not a fail-open */
     memset(&c, 0, sizeof(c));
-    in = In(1, 0xF, 1, 1, 6, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, 0xF, 1, 1, 6, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0, &out);
-    in = In(1, 0xF, 1, 1, 6, TH_VERDICT_WINDOW, 0, 0);
+    in = In(1, 0xF, 1, 1, 6, TH_VERDICT_WINDOW);
     ThCoreDecide(&c, &in, t0 + 2000, &out);
     Check("reopen: record -> window with the bridge up -> SHOW corrected, FailedOpen stays 0", out.Decision == ThDecShow && out.Event == ThEvShowCorrected && !c.FailedOpen);
 
     /* a record that is somebody else's (different seq) turning window is NOT our correction */
     memset(&c, 0, sizeof(c));
-    in = In(1, 0x10, 1, 1, 7, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, 0x10, 1, 1, 7, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0, &out);
-    in = In(1, 0x10, 1, 1, 8, TH_VERDICT_WINDOW, 0, 0);
+    in = In(1, 0x10, 1, 1, 8, TH_VERDICT_WINDOW);
     ThCoreDecide(&c, &in, t0 + 100, &out);
     Check("reopen: another record's window verdict does not reopen this suppression", out.Decision == ThDecSuppress && out.Event == ThEvNone);
 }
@@ -796,16 +712,16 @@ static void TestReclaim(void)
     {
         TH_CORE c; TH_INPUT in; TH_OUTPUT out;
         memset(&c, 0, sizeof(c));
-        in = In(1, firstRead.Combined, 1, 1, 1, TH_VERDICT_PENDING, 0, 0);
+        in = In(1, firstRead.Combined, 1, 1, 1, TH_VERDICT_PENDING);
         ThCoreDecide(&c, &in, now, &out);
-        in = In(1, fullRead.Combined, 1, 1, 1, TH_VERDICT_PENDING, 0, 0);   /* the glue re-claimed seq 1 */
+        in = In(1, fullRead.Combined, 1, 1, 1, TH_VERDICT_PENDING);   /* the glue re-claimed seq 1 */
         ThCoreDecide(&c, &in, now + 200, &out);
         Check("reclaim: core keeps the reservation when the completed reading re-claims the same record", out.ReleaseSeq == 0 && c.RecordSeq == 1 && out.Decision == ThDecHold);
         /* and a decided banner whose reading completes onto the same record is decided again at once, same way */
-        in = In(1, fullRead.Combined, 1, 1, 1, TH_VERDICT_BRIDGE, 0, 0);
+        in = In(1, fullRead.Combined, 1, 1, 1, TH_VERDICT_BRIDGE);
         ThCoreDecide(&c, &in, now + 300, &out);
         Check("reclaim: (setup) suppressed", out.Decision == ThDecSuppress);
-        in = In(1, 0x77, 1, 1, 1, TH_VERDICT_BRIDGE, 0, 0);
+        in = In(1, 0x77, 1, 1, 1, TH_VERDICT_BRIDGE);
         ThCoreDecide(&c, &in, now + 400, &out);
         Check("reclaim: a decided banner re-claiming its record on a changed reading is suppressed again in the same pass", out.Decision == ThDecSuppress && out.Event == ThEvSuppress && c.RecordSeq == 1);
     }
@@ -819,23 +735,13 @@ static void TestReviewProbe3(void)
     TH_OUTPUT out;
     ULONGLONG t = 1000;
     memset(&c, 0, sizeof(c));
-    in = In(0, 0, 1, 0, 0, 0, 0, 0);
+    in = In(0, 0, 1, 0, 0, 0);
     ThCoreDecide(&c, &in, t, &out);
     Check("probe3 1: first sight, no identity -> HOLD", out.Decision == ThDecHold);
     t += 3000;
     ThCoreDecide(&c, &in, t, &out);
     Check("probe3 2: bound passed -> SHOW (fail-open, mapped)", out.Decision == ThDecShow && out.Event == ThEvFailOpen);
     t += 1000;
-    in = In(0, 0, 1, 0, 0, 0, 1, t + 15000);
-    ThCoreDecide(&c, &in, t, &out);
-    Check("probe3 3: a newer bridge record -> pre-empted with the record's deadline, frames gated", out.Decision == ThDecShow && out.GateFrames && out.Due == t + 15000);
-    t += 15001;
-    in = In(0, 0, 1, 0, 0, 0, 0, 0);
-    ThCoreDecide(&c, &in, t, &out);
-    /* THE BOUND LAPSING IS THE UNGATE-AND-REPAINT PATH (Jev 0.81): past TH_PREEMPT_WINDOW_MS the glue stops
-     * wanting the pre-emption, so it arrives here as a plain SHOW with the gate open, and the glue forces a
-     * full-window repaint. No case of its own, and a gate that outlived its bound cannot freeze a window. */
-    Check("probe3 4: the record's window passed -> SHOW again, gate OPEN (pre-emption ENDS; no deadline left)", out.Decision == ThDecShow && !out.GateFrames && out.Event == ThEvPreemptEnd && out.Due == 0);
     t += 600000;
     ThCoreDecide(&c, &in, t, &out);
     Check("probe3 5: ten minutes later still SHOW, nothing armed", out.Decision == ThDecShow && out.Event == ThEvNone && out.Due == 0);
@@ -850,7 +756,7 @@ static void TestForwardBound(void)
     const ULONGLONG t0 = 30000;
 
     memset(&c, 0, sizeof(c));
-    in = In(1, 0x21, 1, 1, 9, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, 0x21, 1, 1, 9, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0, &out);
     Check("fwdbound: suppressed on bridge arms the forward bound on the deciding pass itself", out.Decision == ThDecSuppress && out.Event == ThEvSuppress && out.Due == t0 + TH_FORWARD_BOUND_MS);
     ThCoreDecide(&c, &in, t0 + 100, &out);
@@ -859,15 +765,15 @@ static void TestForwardBound(void)
     Check("fwdbound: one ms before the bound still suppressed", out.Decision == ThDecSuppress && out.Event == ThEvNone);
     ThCoreDecide(&c, &in, t0 + TH_FORWARD_BOUND_MS, &out);
     Check("fwdbound: no ack within the bound -> SHOW, FAIL-OPEN forward-unconfirmed (loud)", out.Decision == ThDecShow && out.Event == ThEvFailOpen && out.Reason == ThReasonForwardUnconfirmed && c.FailedOpen);
-    in = In(1, 0x21, 1, 1, 9, TH_VERDICT_FORWARDED, 0, 0);
+    in = In(1, 0x21, 1, 1, 9, TH_VERDICT_FORWARDED);
     ThCoreDecide(&c, &in, t0 + TH_FORWARD_BOUND_MS + 500, &out);
     Check("fwdbound: a late ack does not flip the shown banner back", out.Decision == ThDecShow && out.Event == ThEvNone);
 
     /* the ack arrives in time: nothing reopens, nothing stays armed */
     memset(&c, 0, sizeof(c));
-    in = In(1, 0x22, 1, 1, 10, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, 0x22, 1, 1, 10, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0, &out);
-    in = In(1, 0x22, 1, 1, 10, TH_VERDICT_FORWARDED, 0, 0);
+    in = In(1, 0x22, 1, 1, 10, TH_VERDICT_FORWARDED);
     ThCoreDecide(&c, &in, t0 + 120, &out);
     Check("fwdbound: ack in time -> suppressed, no deadline", out.Decision == ThDecSuppress && out.Due == 0);
     ThCoreDecide(&c, &in, t0 + 60000, &out);
@@ -875,16 +781,16 @@ static void TestForwardBound(void)
 
     /* suppressed straight onto an already-forwarded record (allowlisted toast acked before its banner): no bound */
     memset(&c, 0, sizeof(c));
-    in = In(1, 0x23, 1, 1, 11, TH_VERDICT_FORWARDED, 0, 0);
+    in = In(1, 0x23, 1, 1, 11, TH_VERDICT_FORWARDED);
     ThCoreDecide(&c, &in, t0, &out);
     ThCoreDecide(&c, &in, t0 + 10000, &out);
     Check("fwdbound: suppressed on an already-forwarded record never reopens", out.Decision == ThDecSuppress && out.Event == ThEvNone && out.Due == 0);
 
     /* the record vanished from the ring while awaited: counts as unconfirmed at the bound */
     memset(&c, 0, sizeof(c));
-    in = In(1, 0x24, 1, 1, 12, TH_VERDICT_BRIDGE, 0, 0);
+    in = In(1, 0x24, 1, 1, 12, TH_VERDICT_BRIDGE);
     ThCoreDecide(&c, &in, t0, &out);
-    in = In(1, 0x24, 1, 0, 0, 0, 0, 0);
+    in = In(1, 0x24, 1, 0, 0, 0);
     ThCoreDecide(&c, &in, t0 + TH_FORWARD_BOUND_MS, &out);
     Check("fwdbound: record gone + no ack within the bound -> SHOW", out.Decision == ThDecShow && out.Event == ThEvFailOpen && out.Reason == ThReasonForwardUnconfirmed);
 }
@@ -914,15 +820,6 @@ static void TestPureRules(void)
     Check("dead: window stands", ThCoreDeadVerdict(5, TH_VERDICT_WINDOW, 7) == TH_VERDICT_WINDOW);
     Check("dead: a NEWER record (the next instance's) is untouched", ThCoreDeadVerdict(8, TH_VERDICT_BRIDGE, 7) == TH_VERDICT_BRIDGE);
     Check("dead: no dead instance (ceiling 0) changes nothing", ThCoreDeadVerdict(5, TH_VERDICT_BRIDGE, 0) == TH_VERDICT_BRIDGE);
-    {
-        TH_CORE c; TH_INPUT in; TH_OUTPUT out;
-        memset(&c, 0, sizeof(c));
-        in = In(1, 0x31, 1, 1, 20, TH_VERDICT_WINDOW, 0, 0);
-        ThCoreDecide(&c, &in, 1000, &out);
-        in = In(1, 0x31, 0, 1, 20, TH_VERDICT_WINDOW, 1, 20000);
-        ThCoreDecide(&c, &in, 1100, &out);
-        Check("dead: no pre-emption while the bridge is down (its records are nobody's queue)", out.Decision == ThDecShow && out.Event == ThEvNone);
-    }
 
     /* N7: refused identity requests back off: 250, 500, 1000, 2000, 2000... */
     Check("backoff: 0 refusals -> 250 ms", ThCoreRetryDelayMs(0) == 250);
@@ -939,13 +836,13 @@ static void TestNoIdentityBridgeDown(void)
     TH_INPUT in;
     TH_OUTPUT out;
     memset(&c, 0, sizeof(c));
-    in = In(0, 0, 0, 0, 0, 0, 0, 0);
+    in = In(0, 0, 0, 0, 0, 0);
     ThCoreDecide(&c, &in, 7000, &out);
     Check("no-identity + bridge down -> SHOW at once (no record can ever name it)", out.Decision == ThDecShow && out.Event == ThEvShowNoBridge && out.Reason == ThReasonBridgeDown && !c.FailedOpen);
     memset(&c, 0, sizeof(c));
-    in = In(0, 0, 1, 0, 0, 0, 0, 0);
+    in = In(0, 0, 1, 0, 0, 0);
     ThCoreDecide(&c, &in, 7000, &out);
-    in = In(0, 0, 0, 0, 0, 0, 0, 0);
+    in = In(0, 0, 0, 0, 0, 0);
     ThCoreDecide(&c, &in, 7400, &out);
     Check("no-identity hold + the bridge dies -> SHOW at once", out.Decision == ThDecShow && out.Event == ThEvShowNoBridge);
 }
@@ -969,21 +866,20 @@ static void TestConsumedAndNotBanner(void)
 
     /* not a banner: shown at once, once-logged, never held, pre-emption irrelevant */
     memset(&c, 0, sizeof(c));
-    in = In(0, 0, 1, 0, 0, 0, 1, 99999);
+    in = In(0, 0, 1, 0, 0, 0);
     ThCoreDecide(&c, &in, 1000, &out);
     Check("not-banner: (setup) first sight is held", out.Decision == ThDecHold);
     in.NotBanner = 1;
     ThCoreDecide(&c, &in, 1300, &out);
     Check("not-banner: two card-less reads -> SHOW with the NotBanner event", out.Decision == ThDecShow && out.Event == ThEvNotBanner && c.NotBanner);
     ThCoreDecide(&c, &in, 1400, &out);
-    Check("not-banner: ...quiet afterwards, pre-emption ignored", out.Decision == ThDecShow && out.Event == ThEvNone && out.Due == 0);
+    Check("not-banner: ...quiet afterwards, nothing armed", out.Decision == ThDecShow && out.Event == ThEvNone && out.Due == 0);
 }
 
 int main(void)
 {
-#if defined(TOASTHOLD_DEFECT_PREEMPT_UNMAPS) || \
-    defined(TOASTHOLD_DEFECT_NOBOUND) || defined(TOASTHOLD_DEFECT_FAILCLOSED) || defined(TOASTHOLD_DEFECT_NOPREEMPT) || \
-    defined(TOASTHOLD_DEFECT_PREEMPT_IDENTGATE) || defined(TOASTHOLD_DEFECT_SUPPRESS_FINAL) || \
+#if defined(TOASTHOLD_DEFECT_NOBOUND) || defined(TOASTHOLD_DEFECT_FAILCLOSED) || \
+    defined(TOASTHOLD_DEFECT_SUPPRESS_FINAL) || \
     defined(TOASTHOLD_DEFECT_NORECLAIM) || defined(TOASTHOLD_DEFECT_NOIDENT_IGNORES_BRIDGE) || \
     defined(TOASTHOLD_DEFECT_NOFORWARDBOUND) || defined(TOASTHOLD_DEFECT_NOCARD_UNPACED) || \
     defined(TOASTHOLD_DEFECT_SIZE60) || defined(TOASTHOLD_DEFECT_DEADRECORDS) || defined(TOASTHOLD_DEFECT_NOBACKOFF) || \
@@ -996,7 +892,6 @@ int main(void)
     TestSelect();
     TestRing();
     TestMachine();
-    TestPreemptPredicate();
     TestReviewProbe();
     TestReviewProbe3();
     TestSuppressReopen();

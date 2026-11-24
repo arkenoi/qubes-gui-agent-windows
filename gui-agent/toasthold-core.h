@@ -7,8 +7,7 @@
  * bridge forwards this toast to dom0 - mapping it too would be the owner's double). The decision is
  * taken from inputs the glue gathers: whether the banner's content identity has been read (UIA),
  * whether a bridge record matched it and what that record's verdict is NOW, whether the bridge is
- * alive, whether a bridge-bound toast is queued behind the displayed banner (pre-emption, below), and
- * whether the window turned out not to be a toast banner at all.
+ * alive, and whether the window turned out not to be a toast banner at all.
  *
  * THE OWNER'S FOUR REQUIREMENTS AND HOW EACH IS CARRIED HERE:
  *   no doubles   a banner is never mapped before its toast's verdict is known; verdict=bridge keeps it
@@ -21,19 +20,11 @@
  *                unreachable) or when the bridge dies before dom0 acknowledged the forward
  *                (`forwarded`). A fail-open is a FAILURE STATE and the glue logs it loudly.
  *   no flash     the hold starts the moment the banner is first examined, before anything of it is
- *                mapped; a banner that arrives IN PLACE (same window, same rect - measured 2026-10-04)
- *                while a window-path toast is mapped is pre-empted: once the bridge has published a
- *                record that is still unconsumed and is `bridge`/`forwarded` or `pending`, and that
- *                record is NEWER than the displayed banner's own (assumed: the shell shows banners FIFO;
- *                it also STACKS them, and a stack must never be held - owner 2026-11-24, ADR-toasts 13,
- *                findings/issues.md TOASTSTACKNOTSHOWN: this rule is a defect on a stack), the
- *                displayed banner is unmapped BEFORE the swap can paint, and re-mapped if the record
- *                turns out `window` without a swap. Pre-emption is evaluated on EVERY pass, whether or
- *                not an identity read is in flight - the swap's own LOCATIONCHANGE queues a read first,
- *                and a pre-emption that lapsed while the read ran would map the window while the
- *                bridged toast paints (the review's blocker #1). Cost: a window-path banner followed
- *                within its display time by a bridged toast loses the tail of its dom0 display (it
- *                stays in the guest's Notification Center). The owner ruled a flash out; this is the price.
+ *                mapped. A SHOWN banner is not this core's: its new frames are held by the glue until a
+ *                read names the cards they show, at most 3 s (ADR-toasts 13, owner-confirmed 2026-11-24:
+ *                "A toast is never held back because another toast is on screen or queued. Pre-emption is
+ *                removed."). Pre-emption - unmapping or gating a shown banner because a newer record
+ *                existed - is gone from here with its input, state, events and reason.
  *   ~3 s max     TH_HOLD_BOUND_MS = 3000 from the banner's first examination.
  *
  * PURE: no Windows calls, no allocation, no I/O - the same header compiles with gcc for the offline
@@ -42,10 +33,6 @@
  * DEFECT RE-INTRODUCTION (CLAUDE.md: a check counts once it has been seen to FAIL):
  *   TOASTHOLD_DEFECT_NOBOUND               a hold never fails open (the deadline is ignored)
  *   TOASTHOLD_DEFECT_FAILCLOSED            doubt resolves to SUPPRESS instead of SHOW
- *   TOASTHOLD_DEFECT_NOPREEMPT             a queued bridge-bound toast does not pre-empt the displayed banner
- *   TOASTHOLD_DEFECT_PREEMPT_IDENTGATE     pre-emption is only honoured while the identity is known: an
- *                                          in-flight read ends it (the blocker: the in-place swap maps the
- *                                          window while the bridged toast paints)
  *   TOASTHOLD_DEFECT_SUPPRESS_FINAL        a suppressed banner never re-reads its record: the bridge's later
  *                                          `window`, and its death before `forwarded`, are ignored (a LOSS)
  *   TOASTHOLD_DEFECT_NORECLAIM             a banner whose identity merely completed cannot re-claim the record
@@ -57,8 +44,8 @@
  *                                          mid-grow is classed not-a-banner within milliseconds (doubles for good)
  *   TOASTHOLD_DEFECT_SIZE60                the old absolute 60 % ceiling: 573 px banners at 768/900 px screens or
  *                                          125 %+ DPI are never held
- *   TOASTHOLD_DEFECT_DEADRECORDS           a dead bridge's `bridge`/`pending` records stay authoritative and keep
- *                                          pre-empting: a toast nobody will forward stays suppressed (a LOSS)
+ *   TOASTHOLD_DEFECT_DEADRECORDS           a dead bridge's `bridge`/`pending` records stay authoritative: a toast
+ *                                          nobody will forward stays suppressed (a LOSS)
  *   TOASTHOLD_DEFECT_NOBACKOFF             a refused identity request is retried without back-off (a spin on a
  *                                          full worker queue)
  *   TOASTHOLD_DEFECT_RECLAIM_ANY           the own consumed record is re-claimable for ANY new content in the
@@ -84,10 +71,6 @@ extern "C" {
  * is built within the collapse-and-grow animation (~300 ms measured), a Quick Settings / volume flyout
  * never has one. Two card-less reads = not a banner: shown at once, never held for the 3 s bound. */
 #define TH_NOCARD_RETRY_MS     250
-/* A `bridge` record newer than the displayed banner pre-empts it for at most this long after the
- * record's arrival: a bridged toast whose banner never comes (do-not-disturb, banners off for that app,
- * an update of an existing toast) must not keep the user's window-path banners hidden for ever. */
-#define TH_PREEMPT_WINDOW_MS 15000
 /* A record older than this can no longer be the toast of a banner appearing now (the shell's queue
  * drains far faster); the glue stops considering it. */
 #define TH_RECORD_TTL_MS    120000
@@ -126,8 +109,6 @@ typedef enum _TH_EVENT   /* what changed in THIS call, for the glue to log (none
     ThEvShowNoBridge,    /* bridge not running: window path at once (by design, ADR-toasts 3) */
     ThEvFailOpen,        /* the hold ended by its bound or by the bridge dying: mapped - a FAILURE STATE */
     ThEvContentChanged,  /* the displayed content changed under a decided banner (in-place swap) */
-    ThEvPreemptStart,    /* a mapped window-path banner was unmapped for a queued bridge-bound toast */
-    ThEvPreemptEnd,      /* ...and re-mapped (the queued toast resolved to window, or its window passed) */
     ThEvShowCorrected,   /* a suppressed banner's record turned `window`: shown after all */
     ThEvNotBanner,       /* the window is not a toast banner (no card after two reads): shown, never held again */
     ThEvAckConfirmed     /* dom0 acknowledged the forward: the suppression stands - reported for its TIMING */
@@ -141,7 +122,6 @@ typedef enum _TH_REASON
     ThReasonVerdictPending, /* a record matched but its verdict never arrived within the bound */
     ThReasonBridgeDown,     /* no bridge running when the banner appeared */
     ThReasonBridgeExited,   /* the bridge died while this banner was held or suppressed-unconfirmed */
-    ThReasonPreempt,        /* held because a bridge-bound toast is queued behind it */
     ThReasonCorrected,      /* the bridge turned a suppressed banner's record to window */
     ThReasonForwardUnconfirmed /* suppressed, but dom0 never acknowledged the forward within TH_FORWARD_BOUND_MS */
 } TH_REASON;
@@ -155,11 +135,9 @@ typedef struct _TH_CORE          /* per banner window; zero-initialised = idle *
     TH_DECISION Decision;        /* valid while Phase == Decided */
     ULONGLONG   HoldSince;       /* tick the current hold started (the banner's first examination) */
     ULONGLONG   Due;             /* fail-open deadline of the current hold; 0 = none */
-    LONG        RecordSeq;       /* the matched record (0 = none) - the pre-emption baseline, re-read every pass */
+    LONG        RecordSeq;       /* the matched record (0 = none), re-read every pass */
     UINT32      NotifId;         /* its notification id (logs) */
     int         FailedOpen;      /* the current SHOW came from a fail-open */
-    int         Preempting;      /* currently unmapped by pre-emption */
-    ULONGLONG   PreemptSince;
     int         NotBanner;       /* not a toast banner: SHOW for good, nothing is ever held again */
     ULONGLONG   SuppressSince;   /* tick the current SUPPRESS was decided: the forward bound counts from here */
     int         AckSeen;         /* dom0's ack has been reported once for THIS suppression (ThEvAckConfirmed) */
@@ -176,8 +154,6 @@ typedef struct _TH_INPUT         /* gathered by the glue for one pass */
     LONG      MatchSeq;
     UINT32    MatchNotifId;
     LONG      MatchVerdict;      /* TH_VERDICT_PENDING / BRIDGE / WINDOW / FORWARDED, as of this pass */
-    int       PreemptWanted;     /* an unconsumed bridge/pending record newer than this banner's exists */
-    ULONGLONG PreemptDue;        /* when that pre-emption lapses by itself */
     int       NotBanner;         /* the glue found no toast card twice: not a banner */
 } TH_INPUT;
 
@@ -190,11 +166,6 @@ typedef struct _TH_OUTPUT
     ULONGLONG   HeldMs;          /* now - HoldSince (0 when not holding) */
     LONG        ReleaseSeq;      /* a PENDING record reserved for content that turned out to be something
                                     else: the glue un-consumes it so that toast's own banner can still match */
-    int         GateFrames;      /* SWAP-EDGE GATING: this window stays MAPPED and dom0 keeps the frame it has,
-                                    but none of this window's new frames may be forwarded until the gate drops.
-                                    Set only alongside Decision == ThDecShow; the glue holds the frames (send.c)
-                                    and MUST force a full-window repaint when it goes back to 0, or "ungated"
-                                    means "frozen". See ADR-toasts 10. */
 } TH_OUTPUT;
 
 /* ---- the consumed set (records already tied to a banner) ------------------------------------ */
@@ -339,8 +310,6 @@ TI_INLINE void ThCoreStartHold(TH_CORE* c, ULONGLONG now, UINT64 ident)
     c->RecordSeq = 0;
     c->NotifId = 0;
     c->FailedOpen = 0;
-    c->Preempting = 0;
-    c->PreemptSince = 0;
     c->SuppressSince = 0;
     c->AckSeen = 0;
 }
@@ -383,9 +352,8 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
     out->Due = 0;
     out->HeldMs = 0;
     out->ReleaseSeq = 0;
-    out->GateFrames = 0;
 
-    /* ---- not a toast banner at all: shown, for good, nothing to hold or pre-empt ---------------- */
+    /* ---- not a toast banner at all: shown, for good, nothing to hold ---------------------------- */
     if (in->NotBanner || c->NotBanner)
     {
         if (!c->NotBanner)
@@ -395,7 +363,6 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
             ThCoreDecideNow(c, ThDecShow, 0);
             c->NotBanner = 1;
             c->RecordSeq = 0;
-            c->Preempting = 0;
             out->Event = ThEvNotBanner;
         }
         out->Decision = ThDecShow;
@@ -406,7 +373,7 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
     if (!in->IdentKnown || in->Ident == 0)
     {
         if (c->Phase == ThPhaseDecided)
-            goto decided;                        /* keep the standing decision (pre-emption is still evaluated there) */
+            goto decided;                        /* keep the standing decision */
         if (c->Phase == ThPhaseIdle)
         {
             ThCoreStartHold(c, now, 0);
@@ -583,14 +550,14 @@ decided:
              * Without it the log holds only the FAILURES (QGATOASTHOLDLATE), so there is no distribution of
              * how close a HEALTHY ack runs to 3000 ms - and a bound can only be moved against that. */
             c->AckSeen = 1;   /* latched even when another event owns this pass: the ack IS in hand */
-            /* Never CLOBBER this pass's event (the file's idiom, as PreemptStart/End use). A banner
+            /* Never CLOBBER this pass's event (the file's idiom). A banner
              * suppressed straight onto an already-forwarded record - an allowlisted toast acked before its
              * banner appeared - reports ThEvSuppress with verdict=forwarded on this very pass, and its wait
              * was zero, so there is nothing for a second line to add. */
             if (out->Event == ThEvNone)
             {
                 out->Event = ThEvAckConfirmed;
-                out->HeldMs = now - c->SuppressSince;   /* suppress-relative, as PreemptStart/End do for theirs */
+                out->HeldMs = now - c->SuppressSince;   /* suppress-relative */
             }
         }
 #endif
@@ -598,89 +565,13 @@ decided:
 
     if (c->Decision == ThDecShow)
     {
-        int wanted;
-#if defined(TOASTHOLD_DEFECT_NOPREEMPT)
-        wanted = 0; (void)in;
-#elif defined(TOASTHOLD_DEFECT_PREEMPT_IDENTGATE)
-        /* DEFECT: pre-emption honoured only while the identity is known. */
-        wanted = in->IdentKnown ? in->PreemptWanted : 0;
-#else
-        /* The glue evaluates PreemptWanted on EVERY pass - identity known or not - and only while the bridge
-         * is up (a dead bridge's records are nobody's queue). Nothing else keeps a pre-emption alive: a term
-         * that held it while the identity was unknown made it PERMANENT for a banner whose card never read
-         * (review N1), and that banner then swallowed every toast swapped into its window. */
-        wanted = in->PreemptWanted && in->BridgeUp;
-#endif
-        if (wanted)
-        {
-            if (!c->Preempting)
-            {
-                c->Preempting = 1;
-                c->PreemptSince = now;
-                if (out->Event == ThEvNone) out->Event = ThEvPreemptStart;
-            }
-            /* SWAP-EDGE GATING, replacing rule 5's unmap (ADR-toasts 10). Windows toasts reuse ONE banner
-             * window, so a newer toast repaints the window dom0 was told carries this one. (Owner 2026-11-24,
-             * ADR-toasts 13: a newer toast may instead STACK beside this one, which is normal and required -
-             * gating a stack holds it, a defect, TOASTSTACKNOTSHOWN.) Rule 5 unmapped it
-             * to avoid showing B's pixels as A - but ThCorePreemptBy fires as soon as an unconsumed newer
-             * record EXISTS, measured 4.47 s before that toast's content arrived (run 40407378739, id=12 shown
-             * for 680 ms and withdrawn for good). So the cure ran far ahead of the disease and the banner was
-             * simply lost. Instead: keep it MAPPED and hold the window's frames. dom0 keeps the last frame it
-             * received - which IS this toast, correctly attributed - while the shared window is repainted
-             * underneath with content dom0 never sees. Nothing is lost and nothing flashes. The fresh identity
-             * read then decides: a window-path toast ungates (and the glue forces a repaint), a bridge-bound
-             * one is suppressed, which is rule 5's behaviour applied where it is actually justified.
-             *
-             * The hold is bounded by ThCorePreemptBy's own TH_HOLD_BOUND_MS / TH_PREEMPT_WINDOW_MS: past the
-             * bound `wanted` is 0, so control falls into the release branch below - ungate and repaint. A frame
-             * hold that outlived its bound would freeze a real window, which is worse than the loss it fixes. */
-#if defined(TOASTHOLD_DEFECT_PREEMPT_UNMAPS)
-            /* DEFECT: rule 5 restored - the displayed banner is withdrawn instead of having its frames held. */
-            out->Decision = ThDecHold;
-#else
-            out->Decision = ThDecShow;
-            out->GateFrames = 1;
-#endif
-            out->Reason = ThReasonPreempt;
-            out->Due = in->PreemptDue;
-            out->HeldMs = now - c->PreemptSince;
-            return;
-        }
-        if (c->Preempting)
-        {
-            c->Preempting = 0;
-            if (out->Event == ThEvNone) out->Event = ThEvPreemptEnd;
-            out->HeldMs = now - c->PreemptSince;
-        }
+        /* A shown banner arms nothing here. Its new frames are held by the glue until a read names the cards they
+         * show (ADR-toasts 13, the settle hold); no toast is held because another is queued, so pre-emption is gone. */
         out->Decision = ThDecShow;
         out->Due = 0;
         return;
     }
     out->Decision = ThDecSuppress;   /* out->Due: the forward bound while the ack is awaited, else 0 */
-}
-
-/* The pre-emption predicate over one record, as the glue evaluates it for every unconsumed record:
- * TRUE (and *dueOut set) when `rec` is a bridge-bound (`bridge`/`forwarded`) or still-pending toast
- * queued behind the banner whose matched record is `bannerSeq` (0 = the banner has no record:
- * everything newer than nothing). */
-TI_INLINE BOOL ThCorePreemptBy(const TH_IPC_RECORD* rec, LONG bannerSeq, ULONGLONG now, ULONGLONG* dueOut)
-{
-    ULONGLONG arrival = rec->ArrivalTick > now ? now : rec->ArrivalTick;   /* a clock from the future reads as now */
-    if (rec->Seq == 0 || rec->Seq <= bannerSeq) return FALSE;              /* older than the displayed banner: bannerless */
-    if (rec->Verdict == TH_VERDICT_PENDING)
-    {
-        if (now - arrival >= TH_HOLD_BOUND_MS) return FALSE;                /* a verdict that never came: window, by the bound */
-        *dueOut = arrival + TH_HOLD_BOUND_MS;
-        return TRUE;
-    }
-    if (TiVerdictSuppresses(rec->Verdict))
-    {
-        if (now - arrival >= TH_PREEMPT_WINDOW_MS) return FALSE;
-        *dueOut = arrival + TH_PREEMPT_WINDOW_MS;
-        return TRUE;
-    }
-    return FALSE;
 }
 
 #ifdef __cplusplus
