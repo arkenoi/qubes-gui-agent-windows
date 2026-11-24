@@ -402,6 +402,12 @@ TI_INLINE int TiSelect(const TI_CANDIDATE* c, int n, const TOAST_IDENT* seen, TI
 #define TH_VERDICT_FORWARDED 4         /* forwarded AND acknowledged by dom0: the suppression stands even if the
                                           bridge dies now (a `bridge` without this is reopened on bridge death) */
 
+/* How long a banner may be held waiting for its verdict (owner: an occasional ~3 s delay of a first toast is fine,
+ * faster is better) - and, for a PENDING record, the bridge's limit too: both run it from the record's ArrivalTick
+ * (ADR-toasts 13). A FAILURE-STATE deadline: armed only while a banner is held. Here, not in toasthold-core.h, because
+ * the bridge includes only this header. */
+#define TH_HOLD_BOUND_MS      3000
+
 TI_INLINE BOOL TiVerdictSuppresses(LONG v) { return v == TH_VERDICT_BRIDGE || v == TH_VERDICT_FORWARDED; }
 
 #define TH_REC_FLAG_ALLOWLISTED 0x1u   /* informational only */
@@ -508,13 +514,22 @@ TI_INLINE int ThIpcFindSeq(const TH_IPC_HEADER* h, LONG seq)
  * onlyIfPending a verdict already decided is kept - the classifier's late answer must never override
  * a route the listing already settled (WindowOnly app, allowlist, forward outcome). TRUE if found;
  * *seqOut (optional) receives the record's sequence, found or not stored, so the caller can read the
- * agent's mark on exactly that record later (ThIpcAgentState). */
-TI_INLINE BOOL ThIpcSetVerdictSeq(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, BOOL onlyIfPending, LONG* seqOut)
+ * agent's mark on exactly that record later (ThIpcAgentState).
+ *
+ * THE RECORD'S 3 s (ADR-toasts 13, owner 2026-11-24: "Any verdict that arrives after a record has been pending for
+ * 3 s goes to the window path and is never forwarded"). The agent stops holding a banner for a pending record at
+ * that record's ArrivalTick + TH_HOLD_BOUND_MS and maps it. With onlyIfPending, an answer written at or after that
+ * tick (`now`, read by the caller at the write) is LATE: `bridge` is stored as `window`, and *lateOut (optional)
+ * says so whatever verdict was asked for, so the caller never forwards it. 2999 ms is in time, 3000 ms is late -
+ * the same >= the agent uses. */
+TI_INLINE BOOL ThIpcSetVerdictSeq(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, BOOL onlyIfPending, LONG* seqOut,
+                                  UINT64 now, BOOL* lateOut)
 {
     int i, best = -1;
     LONG bestSeq = 0;
     TH_IPC_RECORD* recs = ThIpcRecords(h);
     if (seqOut) *seqOut = 0;
+    if (lateOut) *lateOut = FALSE;
     for (i = 0; i < TH_IPC_RECORDS; i++)
     {
         LONG s = TI_LOAD32(&recs[i].Seq);
@@ -526,14 +541,21 @@ TI_INLINE BOOL ThIpcSetVerdictSeq(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict
      * listing's final word (main thread) race on this field, and PENDING -> v must be the ONLY transition the
      * late answer can make. */
     if (onlyIfPending)
-        return TiCas32(&recs[best].Verdict, verdict, TH_VERDICT_PENDING) == TH_VERDICT_PENDING;
+    {
+        const BOOL late = (now >= recs[best].ArrivalTick + TH_HOLD_BOUND_MS);
+        if (late && verdict == TH_VERDICT_BRIDGE) verdict = TH_VERDICT_WINDOW;
+        if (TiCas32(&recs[best].Verdict, verdict, TH_VERDICT_PENDING) != TH_VERDICT_PENDING) return FALSE;
+        if (lateOut) *lateOut = late;
+        return TRUE;
+    }
     TI_STORE32(&recs[best].Verdict, verdict);
     return TRUE;
 }
 
+/* Suites only: no clock (now = 0 is before every ArrivalTick + bound, so nothing is late). */
 TI_INLINE BOOL ThIpcSetVerdict(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, BOOL onlyIfPending)
 {
-    return ThIpcSetVerdictSeq(h, notifId, verdict, onlyIfPending, (LONG*)0);
+    return ThIpcSetVerdictSeq(h, notifId, verdict, onlyIfPending, (LONG*)0, 0, (BOOL*)0);
 }
 
 /* AGENT side, the store itself: "I map a banner for the record with sequence `seq`" into `slot`. This is the

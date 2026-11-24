@@ -422,7 +422,7 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         TH_IPC_RECORD r;
         if (e->Core.RecordSeq != 0 && sameContent && ThFindBySeq(recs, nrec, e->Core.RecordSeq, &r))
         {
-            in.MatchFound = 1; in.MatchSeq = r.Seq; in.MatchNotifId = r.NotifId;
+            in.MatchFound = 1; in.MatchSeq = r.Seq; in.MatchNotifId = r.NotifId; in.MatchArrival = r.ArrivalTick;
             in.MatchVerdict = ThCoreDeadVerdict(r.Seq, r.Verdict, deadSeq);
         }
         else if (in.IdentKnown && (e->Core.RecordSeq == 0 || !sameContent))
@@ -444,7 +444,7 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             const int pick = TiSelect(cand, n, &e->Ident, &quality);
             if (pick >= 0)
             {
-                in.MatchFound = 1; in.MatchSeq = recs[pick].Seq; in.MatchNotifId = recs[pick].NotifId;
+                in.MatchFound = 1; in.MatchSeq = recs[pick].Seq; in.MatchNotifId = recs[pick].NotifId; in.MatchArrival = recs[pick].ArrivalTick;
                 in.MatchVerdict = ThCoreDeadVerdict(recs[pick].Seq, recs[pick].Verdict, deadSeq);
                 ThConsumedAdd(&g_ThCons, recs[pick].Seq);
                 logPartial = (quality == TiMatchPartial);
@@ -471,9 +471,11 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // rest sends no frames, so it is not read and Windows times it out.
     // `dom0Queued`: a newer, unconsumed record the bridge has (`bridge`) or dom0 acknowledged (`forwarded`). Read only at the
     // settle hold's 3 s bound: a change no read has named by then, with such a toast queued, is that toast's - dom0 shows it,
-    // so this window keeps the frame dom0 has (ADR-toasts 13). Never a reason to hold anything else.
+    // so this window keeps the frame dom0 has (ADR-toasts 13). Never a reason to hold anything else. `pendingDue`: such a record still
+    // `pending` inside its own 3 s may yet become `bridge` (ThIpcSetVerdictSeq); the hold waits for it to that tick, unlatched.
     BOOL successorQueued = FALSE, dom0Queued = FALSE;
     UINT32 successorNotif = 0, dom0Notif = 0;
+    ULONGLONG pendingDue = 0;   // earliest ArrivalTick + TH_HOLD_BOUND_MS among those still pending and inside it
     if (!e->NotBanner && in.BridgeUp)
     {
         const LONG baseline = in.MatchFound ? in.MatchSeq : e->Core.RecordSeq;
@@ -485,11 +487,13 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             if (!queued[i].Eligible || recs[i].Seq <= baseline) continue;
             successorQueued = TRUE;
             successorNotif = recs[i].NotifId;
-            if (!dom0Queued && TiVerdictSuppresses(ThCoreDeadVerdict(recs[i].Seq, recs[i].Verdict, deadSeq)))
+            const LONG qv = ThCoreDeadVerdict(recs[i].Seq, recs[i].Verdict, deadSeq);
+            if (TiVerdictSuppresses(qv))
             {
-                dom0Queued = TRUE;
-                dom0Notif = recs[i].NotifId;
+                if (!dom0Queued) { dom0Queued = TRUE; dom0Notif = recs[i].NotifId; }
             }
+            else if (qv == TH_VERDICT_PENDING && now < queued[i].ArrivalTick + TH_HOLD_BOUND_MS)
+                pendingDue = ThMinTick(pendingDue, queued[i].ArrivalTick + TH_HOLD_BOUND_MS);   // ThCoreCandidates' copy: never ahead of now
         }
     }
 
@@ -684,11 +688,15 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // change no read has named is that toast, which dom0 shows: dom0 keeps this window's last frame - the toast it was
     // told this window carries - and the reads go on until one names the cards (SwapGateBound). The window is never
     // unmapped for it: that loses this banner's toast where a frozen frame loses nothing. A stacked window whose crop
-    // is not current is kept too, because releasing it would show a card that may be dom0's. Otherwise released with
-    // a full repaint, and said loudly: a toast still `pending` there could yet be forwarded (findings/issues.md
-    // TOASTHOLDENDSDOUBLE; only a claim on the record closes that end).
+    // is not current is kept too, because releasing it would show a card that may be dom0's. A newer record still
+    // `pending` inside its own 3 s (pendingDue) can still become `bridge`: the hold waits for it to that tick, NOT
+    // latched (the latch clears only when a read lands and arms no deadline, so a record that turns `window` would
+    // leave dom0 on the old frame), and the bound decides again there - `bridge` kept, `window` or too old released.
+    // Capped at SwapGateSince + 2 x the bound, failing toward release: a record present at the first bound always
+    // gets its full 3 s; only a chain listed during the wait, or a bridge-written future tick, is cut. Otherwise
+    // released with a full repaint, and said loudly.
     BOOL settleHold = FALSE, settleReleased = FALSE, settleLate = FALSE, settleKept = FALSE;
-    ULONGLONG settleMs = 0;
+    ULONGLONG settleMs = 0, settlePendDue = 0;
     ULONG settleFrames = 0;
     const UINT readFails = e->ReadFails, queueFails = e->ReadQueueFails;
     if (e->SwapGateBound && !e->SwapGateReadPending)
@@ -710,6 +718,11 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             settleReleased = TRUE;                       // a read named the cards, and the crop for them is applied
         else if (settleMs < TH_HOLD_BOUND_MS)
             settleHold = TRUE;
+        else if (!dom0Queued && !(stackMask != 0 && !cropCurrent) && pendingDue != 0 && settleMs < 2 * TH_HOLD_BOUND_MS)
+        {
+            settleHold = TRUE;                           // a newer record may still become `bridge`: decided at its tick
+            settlePendDue = ThMinTick(pendingDue, e->SwapGateSince + 2 * TH_HOLD_BOUND_MS);
+        }
         else
         {
             settleLate = TRUE;
@@ -758,7 +771,7 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     if (armRetry)
         e->Due = ThMinTick(e->Due, retryAt);
     if (settleHold && !e->SwapGateBound)
-        e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
+        e->Due = ThMinTick(e->Due, settlePendDue ? settlePendDue : e->SwapGateSince + TH_HOLD_BOUND_MS);   // settlePendDue is ahead of now
     if (stackDue)
         e->Due = ThMinTick(e->Due, stackDue);   // a stacked card still being decided: its verdict, or its bound
     ThRecomputeDueLocked();
@@ -1053,7 +1066,7 @@ void ToastHoldNoteChanged(IN HWND window)
                 // Pending until an OK read COMPLETES - set after ThRequestReadLocked above, so it is TRUE even when that
                 // request was refused, and the hold then lasts to its bound instead of opening with the change unnamed.
                 e->SwapGateReadPending = TRUE;
-                if (!e->SwapGateBound)
+                if (!e->SwapGateBound && now < e->SwapGateSince + TH_HOLD_BOUND_MS)   // past it, the deadline ToastHoldDecide armed stands
                     e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
             }
             else
@@ -1114,7 +1127,8 @@ BOOL ToastHoldNoteFrame(IN HWND window, IN BOOL newFrame, IN BOOL mapped)
             if (e->SwapGateFrames < 0xFFFFFFFFu) e->SwapGateFrames++;
             e->SwapGateReadPending = TRUE;   // before the request: it stands when the worker's queue refuses it
             ThRequestReadLocked(e, now);
-            if (!e->SwapGateBound)           // past the bound the stamp is old: arming it again would spin the sweep
+            if (!e->SwapGateBound && now < e->SwapGateSince + TH_HOLD_BOUND_MS)   // past the bound the stamp is old: arming it
+                                             // would spin the sweep; a pending record's wait keeps the deadline ToastHoldDecide armed
             {
                 e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
                 ThRecomputeDueLocked();

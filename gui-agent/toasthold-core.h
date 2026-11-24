@@ -25,7 +25,10 @@
  *                "A toast is never held back because another toast is on screen or queued. Pre-emption is
  *                removed."). Pre-emption - unmapping or gating a shown banner because a newer record
  *                existed - is gone from here with its input, state, events and reason.
- *   ~3 s max     TH_HOLD_BOUND_MS = 3000 from the banner's first examination.
+ *   ~3 s max     TH_HOLD_BOUND_MS = 3000 from the banner's first examination - except a banner held for a
+ *                PENDING record, which is held to that record's ArrivalTick + 3000: the bridge stores `bridge`
+ *                until exactly then and never after (ADR-toasts 13, owner 2026-11-24), and a banner is first
+ *                seen up to 1.9 s before its record is listed (measured), so its own 3 s ended too early.
  *
  * PURE: no Windows calls, no allocation, no I/O - the same header compiles with gcc for the offline
  * suite (toasthold_test.c), which drives every transition.
@@ -61,9 +64,6 @@
 extern "C" {
 #endif
 
-/* How long a banner may be held waiting for its verdict (owner: an occasional ~3 s delay of a first
- * toast is fine, faster is better). A FAILURE-STATE deadline: armed only while a banner is held. */
-#define TH_HOLD_BOUND_MS      3000
 /* While held with NO record (the bridge has not listed the toast yet, or the identity read saw a
  * half-built card), re-read the identity and re-match this often - bounded by TH_HOLD_BOUND_MS. */
 #define TH_HOLD_RECHECK_MS     500
@@ -141,6 +141,8 @@ typedef struct _TH_CORE          /* per banner window; zero-initialised = idle *
     int         NotBanner;       /* not a toast banner: SHOW for good, nothing is ever held again */
     ULONGLONG   SuppressSince;   /* tick the current SUPPRESS was decided: the forward bound counts from here */
     int         AckSeen;         /* dom0's ack has been reported once for THIS suppression (ThEvAckConfirmed) */
+    ULONGLONG   PendDue;         /* the pending-verdict hold's fail-open deadline: the matched record's ArrivalTick +
+                                    TH_HOLD_BOUND_MS, fixed on the pass that takes the record; 0 = none */
 } TH_CORE;
 
 typedef struct _TH_INPUT         /* gathered by the glue for one pass */
@@ -154,6 +156,7 @@ typedef struct _TH_INPUT         /* gathered by the glue for one pass */
     LONG      MatchSeq;
     UINT32    MatchNotifId;
     LONG      MatchVerdict;      /* TH_VERDICT_PENDING / BRIDGE / WINDOW / FORWARDED, as of this pass */
+    ULONGLONG MatchArrival;      /* that record's ArrivalTick (bridge-written, untrusted) */
     int       NotBanner;         /* the glue found no toast card twice: not a banner */
 } TH_INPUT;
 
@@ -312,6 +315,7 @@ TI_INLINE void ThCoreStartHold(TH_CORE* c, ULONGLONG now, UINT64 ident)
     c->FailedOpen = 0;
     c->SuppressSince = 0;
     c->AckSeen = 0;
+    c->PendDue = 0;
 }
 
 TI_INLINE void ThCoreDecideNow(TH_CORE* c, TH_DECISION d, int failedOpen)
@@ -322,13 +326,13 @@ TI_INLINE void ThCoreDecideNow(TH_CORE* c, TH_DECISION d, int failedOpen)
     c->Due = 0;
 }
 
-TI_INLINE int ThCoreBoundPassed(const TH_CORE* c, ULONGLONG now)
+TI_INLINE int ThCoreBoundPassed(ULONGLONG due, ULONGLONG now)
 {
 #ifdef TOASTHOLD_DEFECT_NOBOUND
-    (void)c; (void)now;
+    (void)due; (void)now;
     return 0;   /* DEFECT: the hold never ends by itself */
 #else
-    return c->Due != 0 && now >= c->Due;
+    return due != 0 && now >= due;
 #endif
 }
 
@@ -391,7 +395,7 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
             goto decided;
         }
 #endif
-        if (ThCoreBoundPassed(c, now))
+        if (ThCoreBoundPassed(c->Due, now))
         {
             ThCoreDecideNow(c, ThCoreFailOpenDecision(), 1);
             out->Event = ThEvFailOpen;
@@ -430,6 +434,7 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
             out->ReleaseSeq = c->RecordSeq;
             c->RecordSeq = 0;
             c->NotifId = 0;
+            c->PendDue = 0;
         }
         c->Ident = in->Ident;
     }
@@ -437,6 +442,14 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
 
     if (in->MatchFound)
     {
+        /* THE PENDING HOLD RUNS ON THE RECORD'S CLOCK (ADR-toasts 13, owner 2026-11-24): the bridge may store `bridge`
+         * until the record's ArrivalTick + TH_HOLD_BOUND_MS and never after (ThIpcSetVerdictSeq), so the banner is held
+         * until then - not until its own first sight + 3 s, which starts up to 1.9 s before the record exists
+         * (measured, runs 45438672842 and 45411516056). Fixed ONCE, on the pass that takes the record: the tick is
+         * bridge-written, and one in the future is taken as now (clamping it every pass would move the deadline for
+         * ever). A record already 3 s old is shown on this pass: the bridge can no longer make it `bridge`. */
+        if (c->RecordSeq != in->MatchSeq || c->PendDue == 0)
+            c->PendDue = (in->MatchArrival > now ? now : in->MatchArrival) + TH_HOLD_BOUND_MS;
         c->RecordSeq = in->MatchSeq;
         c->NotifId = in->MatchNotifId;
         if (TiVerdictSuppresses(in->MatchVerdict))
@@ -461,7 +474,7 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
             out->Reason = ThReasonBridgeExited;
             goto decided;
         }
-        if (ThCoreBoundPassed(c, now))
+        if (ThCoreBoundPassed(c->PendDue, now))
         {
             ThCoreDecideNow(c, ThCoreFailOpenDecision(), 1);
             out->Event = ThEvFailOpen;
@@ -470,7 +483,7 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
         }
         out->Decision = ThDecHold;
         out->Reason = ThReasonVerdictPending;
-        out->Due = c->Due;                       /* the verdict event wakes us earlier */
+        out->Due = c->PendDue;                   /* the verdict event wakes us earlier */
         return;
     }
 
@@ -484,7 +497,7 @@ TI_INLINE void ThCoreDecide(TH_CORE* c, const TH_INPUT* in, ULONGLONG now, TH_OU
         out->Reason = ThReasonBridgeDown;
         goto decided;
     }
-    if (ThCoreBoundPassed(c, now))
+    if (ThCoreBoundPassed(c->Due, now))
     {
         ThCoreDecideNow(c, ThCoreFailOpenDecision(), 1);
         out->Event = ThEvFailOpen;

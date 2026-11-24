@@ -397,7 +397,7 @@ static void TestRing(void)
         ThIpcInit(h);
         s4 = ThIpcPublish(h, 300, 0, 0x9, &id1, TH_VERDICT_FORWARDED, 7000);
         Check("agent mark: a fresh record reads none", ThIpcRead(h, 0, &r) && r.AgentShownSeq == 0 && ThIpcAgentState(h, s4) == TH_AGENT_NONE);
-        Check("agent mark: the bridge's unconditional window turn hands back the record's sequence", ThIpcSetVerdictSeq(h, 300, TH_VERDICT_WINDOW, FALSE, &seq) && seq == s4);
+        Check("agent mark: the bridge's unconditional window turn hands back the record's sequence", ThIpcSetVerdictSeq(h, 300, TH_VERDICT_WINDOW, FALSE, &seq, 0, NULL) && seq == s4);
         ThIpcAgentMarkShown(h, s4);
         Check("agent mark: stored as the sequence, read back for that sequence", ThIpcAgentState(h, s4) == TH_AGENT_SHOWN && ThIpcRead(h, 0, &r) && r.AgentShownSeq == s4);
         ThIpcAgentMarkShown(h, s4 + 5);
@@ -436,7 +436,7 @@ static void TestMachine(void)
     ThCoreDecide(&c, &in, t0, &out);
     Check("machine: a new banner with no identity yet is HELD at once (hold starts before any map)", out.Decision == ThDecHold && out.Event == ThEvHoldStart && out.Reason == ThReasonNoIdentity);
     Check("machine: ...with a recheck deadline inside the bound", out.Due == t0 + TH_HOLD_RECHECK_MS);
-    in = In(1, IA, 1, 1, 7, TH_VERDICT_PENDING);
+    in = In(1, IA, 1, 1, 7, TH_VERDICT_PENDING); in.MatchArrival = t0;
     ThCoreDecide(&c, &in, t0 + 120, &out);
     Check("machine: identity known, record pending -> still HELD, deadline = the bound", out.Decision == ThDecHold && out.Reason == ThReasonVerdictPending && out.Due == t0 + TH_HOLD_BOUND_MS && out.Event == ThEvNone);
     in = In(1, IA, 1, 1, 7, TH_VERDICT_BRIDGE);
@@ -451,7 +451,7 @@ static void TestMachine(void)
 
     /* 2. pending -> window: mapped at the verdict */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 8, TH_VERDICT_PENDING);
+    in = In(1, IA, 1, 1, 8, TH_VERDICT_PENDING); in.MatchArrival = t0;
     ThCoreDecide(&c, &in, t0, &out);
     Check("machine: first examination with identity -> HELD (HoldStart)", out.Decision == ThDecHold && out.Event == ThEvHoldStart);
     in = In(1, IA, 1, 1, 8, TH_VERDICT_WINDOW);
@@ -462,7 +462,7 @@ static void TestMachine(void)
 
     /* 3. pending -> timeout: FAIL OPEN, reported */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 9, TH_VERDICT_PENDING);
+    in = In(1, IA, 1, 1, 9, TH_VERDICT_PENDING); in.MatchArrival = t0;
     ThCoreDecide(&c, &in, t0, &out);
     ThCoreDecide(&c, &in, t0 + TH_HOLD_BOUND_MS - 1, &out);
     Check("machine: one ms before the bound still HELD", out.Decision == ThDecHold);
@@ -497,9 +497,9 @@ static void TestMachine(void)
 
     /* 7. bridge dies while a pending record is held: shown at once */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 10, TH_VERDICT_PENDING);
+    in = In(1, IA, 1, 1, 10, TH_VERDICT_PENDING); in.MatchArrival = t0;
     ThCoreDecide(&c, &in, t0, &out);
-    in = In(1, IA, 0, 1, 10, TH_VERDICT_PENDING);
+    in = In(1, IA, 0, 1, 10, TH_VERDICT_PENDING); in.MatchArrival = t0;
     ThCoreDecide(&c, &in, t0 + 700, &out);
     Check("machine: bridge death while held -> SHOW at once, FAIL-OPEN bridge-exited", out.Decision == ThDecShow && out.Event == ThEvFailOpen && out.Reason == ThReasonBridgeExited && out.HeldMs == 700);
 
@@ -517,11 +517,28 @@ static void TestMachine(void)
 
     /* 9. a reserved pending record is released when the held content turns out different */
     memset(&c, 0, sizeof(c));
-    in = In(1, IA, 1, 1, 13, TH_VERDICT_PENDING);
+    in = In(1, IA, 1, 1, 13, TH_VERDICT_PENDING); in.MatchArrival = t0;
     ThCoreDecide(&c, &in, t0, &out);
     in = In(1, IB, 1, 0, 0, 0);   /* the re-read says: different content, nothing matches it */
     ThCoreDecide(&c, &in, t0 + 200, &out);
     Check("machine: a pending reservation is released when the content turns out different", out.ReleaseSeq == 13 && c.RecordSeq == 0 && out.Decision == ThDecHold);
+
+    /* 10. the pending hold ends on the RECORD's clock (ADR-toasts 13): the bridge may store `bridge` until the record's
+     * ArrivalTick + 3 s, and a banner is first seen up to 1.9 s before its record is listed (measured) */
+    memset(&c, 0, sizeof(c));
+    in = In(1, IA, 1, 0, 0, 0);
+    ThCoreDecide(&c, &in, t0, &out);                                   /* first sight: no record yet */
+    in = In(1, IA, 1, 1, 14, TH_VERDICT_PENDING); in.MatchArrival = t0 + 1900;
+    ThCoreDecide(&c, &in, t0 + 1900, &out);                            /* its record is listed 1.9 s later */
+    ThCoreDecide(&c, &in, t0 + TH_HOLD_BOUND_MS, &out);                /* the banner's own 3 s */
+    {
+        int held = (out.Decision == ThDecHold && out.Due == t0 + 1900 + TH_HOLD_BOUND_MS);
+        ThCoreDecide(&c, &in, t0 + 1900 + TH_HOLD_BOUND_MS - 1, &out);
+        held = held && out.Decision == ThDecHold;
+        ThCoreDecide(&c, &in, t0 + 1900 + TH_HOLD_BOUND_MS, &out);
+        Check("machine: a pending record holds its banner to the record's arrival + 3 s, not to the banner's first sight + 3 s",
+              held && out.Decision == ThDecShow && out.Event == ThEvFailOpen && out.Reason == ThReasonVerdictPending);
+    }
 
 }
 
@@ -712,9 +729,9 @@ static void TestReclaim(void)
     {
         TH_CORE c; TH_INPUT in; TH_OUTPUT out;
         memset(&c, 0, sizeof(c));
-        in = In(1, firstRead.Combined, 1, 1, 1, TH_VERDICT_PENDING);
+        in = In(1, firstRead.Combined, 1, 1, 1, TH_VERDICT_PENDING); in.MatchArrival = now;
         ThCoreDecide(&c, &in, now, &out);
-        in = In(1, fullRead.Combined, 1, 1, 1, TH_VERDICT_PENDING);   /* the glue re-claimed seq 1 */
+        in = In(1, fullRead.Combined, 1, 1, 1, TH_VERDICT_PENDING); in.MatchArrival = now;   /* the glue re-claimed seq 1 */
         ThCoreDecide(&c, &in, now + 200, &out);
         Check("reclaim: core keeps the reservation when the completed reading re-claims the same record", out.ReleaseSeq == 0 && c.RecordSeq == 1 && out.Decision == ThDecHold);
         /* and a decided banner whose reading completes onto the same record is decided again at once, same way */

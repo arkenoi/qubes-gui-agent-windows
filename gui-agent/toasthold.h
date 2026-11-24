@@ -17,7 +17,8 @@
  *     worker thread (bounded by the same 500 ms UIA timeouts; never inline on the tracking thread)
  *     and matches it against the records (toastident.h: content first, FIFO only to break ties);
  *   * verdict=bridge: the banner is never mapped (it times out unseen in the guest); verdict=window:
- *     mapped at once; no verdict / no record / no identity within TH_HOLD_BOUND_MS (3 s): mapped and
+ *     mapped at once; no record / no identity within TH_HOLD_BOUND_MS (3 s) of first sight, or a record
+ *     still pending at its ArrivalTick + 3 s (the bridge never stores `bridge` after that): mapped and
  *     the fall-back REPORTED (QGATOASTHOLDLATE) - a double is better than a loss, and neither is the
  *     target; bridge not running or dying mid-hold: mapped at once. A suppressed banner is re-examined
  *     on every pass: it is shown after all when the bridge turns its record to `window` (the forward
