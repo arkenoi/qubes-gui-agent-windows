@@ -2596,8 +2596,8 @@ static void MenuFillNearBlack(IN OUT WINDOW_DATA* entry)
 // TRANSPARENT in the source, and WGC hands us premultiplied pixels with no usable alpha, so
 // transparent captures as opaque black. Same root cause as the menu shadow margin that
 // MenuFillNearBlack already removes; the Qubes protocol has no per-pixel alpha for us to pass the
-// transparency through, so the choice is a black bar or a continuous card. The owner calls them
-// "merged toasts", and merged is what a filled gap looks like.
+// transparency through, so the gap is drawn: the cards meet with a black separator
+// TOAST_GAP_BAND_ROWS high at its middle, the rest of the gap in the card's own background.
 //
 // WHY PER FRAME AND NOT ONCE. MenuFillNearBlack is one-shot at map because a menu's buffer is
 // painted once. A toast stack is re-captured while it animates, and the band came back in every
@@ -2625,6 +2625,8 @@ static int RowInteriorMax(IN const BYTE* buf, IN int W, IN int m, IN int y)
 }
 
 #define TOAST_GAP_MAX_ROWS 64
+#define TOAST_GAP_BAND_ROWS 2              // height of the black separator kept between two stacked cards
+#define TOAST_GAP_BAND_PIXEL 0xFF000000u   // opaque black, BGRA
 static void ToastFillGapRows(IN OUT WINDOW_DATA* entry)
 {
     if (!entry->PwBuffer || !entry->PwSliceFed || !IsShellToastWindow(entry))
@@ -2701,19 +2703,40 @@ static void ToastFillGapRows(IN OUT WINDOW_DATA* entry)
             if (bestDark < 0 || darkCols < bestDark) { bestDark = darkCols; srcY = cy; }
             if (darkCols == 0) break;           // cannot do better than an edge-to-edge row
         }
+        // The cards stay visibly separate: TOAST_GAP_BAND_ROWS black rows are kept at the middle of
+        // the gap and the rest of it takes the card's body. A pass over a buffer it already treated
+        // finds the band alone and changes nothing, so it sends no damage.
+        const int bandRows = rows < TOAST_GAP_BAND_ROWS ? rows : TOAST_GAP_BAND_ROWS;
+        const int bandTop = y + (rows - bandRows) / 2;
         const BYTE* above = buf + ((size_t)srcY * W) * 4;
+        BOOL changed = FALSE;
         for (int yy = y; yy <= end; yy++)
         {
             BYTE* q = buf + ((size_t)yy * W) * 4;
-            memcpy(q, above, (size_t)W * 4);
+            if (yy >= bandTop && yy < bandTop + bandRows)
+            {
+                DWORD* px = (DWORD*)q;
+                for (int x = 0; x < W; x++)
+                    if (px[x] != TOAST_GAP_BAND_PIXEL) { px[x] = TOAST_GAP_BAND_PIXEL; changed = TRUE; }
+            }
+            else if (memcmp(q, above, (size_t)W * 4) != 0)
+            {
+                memcpy(q, above, (size_t)W * 4);
+                changed = TRUE;
+            }
+        }
+        if (!changed)
+        {
+            y = end;
+            continue;
         }
         (void)SendWindowDamageEvent(entry->Handle, 0, y, W, rows);
         if (!entry->ToastGapLogged)
         {
             entry->ToastGapLogged = TRUE;
-            LogInfo("QGATOASTGAP hwnd 0x%x filled %d black row(s) at y=%d from the card above "
-                L"(transparent inter-card gap; logged once per window)",
-                (DWORD)(ULONG_PTR)entry->Handle, rows, y);
+            LogInfo("QGATOASTGAP hwnd 0x%x gap of %d row(s) at y=%d: %d black row(s) kept at y=%d, the rest "
+                L"filled from the card above (transparent inter-card gap; logged once per window)",
+                (DWORD)(ULONG_PTR)entry->Handle, rows, y, bandRows, bandTop);
         }
         y = end;
     }
