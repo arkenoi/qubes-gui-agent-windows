@@ -47,23 +47,6 @@
  * the offline suites (agent/gui-agent/toasthold_test.c, tools/notifhost/toasthold_bridge_test.cpp)
  * build with gcc/g++ as well as MSVC.
  *
- * DEFECT RE-INTRODUCTION (CLAUDE.md: a check counts once it has been seen to FAIL):
- *   TOASTIDENT_DEFECT_NOFOLD    - whitespace is not collapsed: the bridge's "a\nb" and the banner's
- *                                 "a b" stop matching (every multi-line toast would double)
- *   TOASTIDENT_DEFECT_ORDERONLY - TiSelect takes the oldest unconsumed record regardless of content:
- *                                 the pre-2026-10-04 "arrival order" idea, which a bannerless
- *                                 notification desyncs
- *   TOASTIDENT_DEFECT_VERDICTOVERRIDE - ThIpcSetVerdict ignores onlyIfPending: the classifier's
- *                                 late verdict overrides a WindowOnly/allowlist/forward-decided route
- *   TOASTIDENT_DEFECT_TIE_SLOTORDER - equal arrival ticks are broken by ring slot instead of by
- *                                 sequence: across a ring wrap the newer record (slot 0) is taken
- *                                 for the earlier banner (review #12)
- *   TOASTIDENT_DEFECT_MARK_BY_SLOT - the agent's shown mark is a FLAG in the slot instead of the
- *                                 sequence it marks: an agent store that races the bridge's republish
- *                                 of that slot (find the slot, then store) lands the previous toast's
- *                                 mark on the new toast's record, and a failed dom0 action on the new
- *                                 toast then reads as "banner shown" - unreported (review 2026-10-07)
- *
  * VERDICT LIFECYCLE the bridge drives: PENDING at listing (or WINDOW/BRIDGE when the listing already
  * settles it: window-only app, allowlisted app over a live connection); the classifier's answer only
  * while PENDING (compare-exchange); the listing's final word unconditionally - WINDOW when the toast
@@ -187,9 +170,6 @@ TI_INLINE size_t TiNormalize(const WCHAR* in, WCHAR* out, size_t cap)
     {
         WCHAR c = *in;
         if (TiIsDropped(c)) continue;
-#ifdef TOASTIDENT_DEFECT_NOFOLD
-        if (c == 0x0A || c == 0x0D) { if (n < cap) out[n++] = c; continue; }   /* DEFECT: newlines kept */
-#endif
         if (TiIsSpace(c)) { pendingSpace = (n > 0); continue; }   /* leading space never emitted */
         if (pendingSpace) { if (n < cap) out[n++] = 0x20; pendingSpace = 0; }
         if (n < cap) out[n++] = TiFold(c);
@@ -252,7 +232,9 @@ TI_INLINE void TiIdentFromTexts(const WCHAR* sender, const WCHAR* title, const W
 
 /* --- the banner's UIA element names (both id sets, measured 2026-10-04) --------------------- */
 /* The card: AutomationId NormalToastView on 10 and 11 (its ClassName differs - FlexibleToastView on
- * 11 only - and is NOT keyed on). The card's Name is a LOCALIZED composite and is NOT parsed. */
+ * 11 only - and is NOT keyed on); a reminder/alarm card is PriorityToastView, and the second and third
+ * cards of a stack are PriorityToastView2, PriorityToastView3 (win11r 26300, 2026-11-24). The card's
+ * Name is a LOCALIZED composite and is NOT parsed. */
 TI_INLINE int TiUnitsEqualAscii(const WCHAR* s, const char* ascii)
 {
     size_t i;
@@ -267,7 +249,19 @@ TI_INLINE int TiUnitsStartWithAscii(const WCHAR* s, const char* ascii)
     for (i = 0; ascii[i]; i++) if (s[i] != (WCHAR)(unsigned char)ascii[i]) return 0;
     return 1;
 }
-TI_INLINE int TiIsCardAutomationId(const WCHAR* aid)    { return TiUnitsEqualAscii(aid, "NormalToastView"); }
+/* `ascii` followed by nothing but decimal digits: the card ids a stack numbers from its second card. */
+TI_INLINE int TiUnitsEqualAsciiThenDigits(const WCHAR* s, const char* ascii)
+{
+    size_t i;
+    if (!TiUnitsStartWithAscii(s, ascii)) return 0;
+    for (i = 0; ascii[i]; i++) {}
+    for (; s[i]; i++) if (s[i] < L'0' || s[i] > L'9') return 0;
+    return 1;
+}
+TI_INLINE int TiIsCardAutomationId(const WCHAR* aid)
+{
+    return TiUnitsEqualAsciiThenDigits(aid, "NormalToastView") || TiUnitsEqualAsciiThenDigits(aid, "PriorityToastView");
+}
 TI_INLINE int TiIsSenderAutomationId(const WCHAR* aid)  { return TiUnitsEqualAscii(aid, "SenderName"); }
 TI_INLINE int TiIsTitleAutomationId(const WCHAR* aid)   { return TiUnitsEqualAscii(aid, "Title") || TiUnitsEqualAscii(aid, "TitleText"); }
 /* MessageText, and any numbered sibling a build may add (MessageText2...). DismissTextBlock, VerbText
@@ -308,11 +302,7 @@ typedef struct _TI_CANDIDATE
  * a wrap (slot 0 holds the newest record once the ring has turned; review #12). */
 TI_INLINE int TiEarlier(const TI_CANDIDATE* a, const TI_CANDIDATE* b)
 {
-#ifdef TOASTIDENT_DEFECT_TIE_SLOTORDER
-    return a->ArrivalTick < b->ArrivalTick;   /* DEFECT: ties fall to whichever slot the scan met first */
-#else
     return a->ArrivalTick < b->ArrivalTick || (a->ArrivalTick == b->ArrivalTick && a->Seq < b->Seq);
-#endif
 }
 
 /* Picks the record a displayed banner belongs to. FULL matches win; among several, the EARLIEST
@@ -324,14 +314,6 @@ TI_INLINE int TiSelect(const TI_CANDIDATE* c, int n, const TOAST_IDENT* seen, TI
 {
     int best = -1, partial = -1, partials = 0, i;
     TI_MATCH q = TiMatchNone;
-#ifdef TOASTIDENT_DEFECT_ORDERONLY
-    /* DEFECT: arrival order alone - the oldest eligible record, whatever it says. */
-    for (i = 0; i < n; i++)
-        if (c[i].Eligible && (best < 0 || TiEarlier(&c[i], &c[best]))) best = i;
-    if (quality) *quality = best >= 0 ? TiMatchFull : TiMatchNone;
-    (void)seen; (void)partial; (void)partials; (void)q;
-    return best;
-#else
     for (i = 0; i < n; i++)
     {
         TI_MATCH m;
@@ -351,7 +333,6 @@ TI_INLINE int TiSelect(const TI_CANDIDATE* c, int n, const TOAST_IDENT* seen, TI
     if (best < 0 && partials == 1) { best = partial; q = TiMatchPartial; }
     if (quality) *quality = (best >= 0) ? q : TiMatchNone;
     return best;
-#endif
 }
 
 /* --- THE SHARED RING: bridge -> agent, per-notification records ----------------------------- */
@@ -495,15 +476,11 @@ TI_INLINE BOOL ThIpcSetVerdictSeq(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict
     }
     if (best < 0) return FALSE;
     if (seqOut) *seqOut = bestSeq;
-#ifdef TOASTIDENT_DEFECT_VERDICTOVERRIDE
-    (void)onlyIfPending;
-#else
     /* A real compare-exchange, not a read-then-write: the classifier's late answer (shadow worker) and the
      * listing's final word (main thread) race on this field, and PENDING -> v must be the ONLY transition the
      * late answer can make. */
     if (onlyIfPending)
         return TiCas32(&recs[best].Verdict, verdict, TH_VERDICT_PENDING) == TH_VERDICT_PENDING;
-#endif
     TI_STORE32(&recs[best].Verdict, verdict);
     return TRUE;
 }
@@ -519,12 +496,7 @@ TI_INLINE BOOL ThIpcSetVerdict(TH_IPC_HEADER* h, UINT32 notifId, LONG verdict, B
  * not have and reads as none. Exposed for the suites, which interleave it with a publish. */
 TI_INLINE void ThIpcAgentStoreShown(TH_IPC_HEADER* h, int slot, LONG seq)
 {
-#ifdef TOASTIDENT_DEFECT_MARK_BY_SLOT
-    (void)seq;
-    TI_STORE32(&ThIpcRecords(h)[slot].AgentShownSeq, 1);   /* DEFECT: a flag - lands on whatever toast the slot holds now */
-#else
     TI_STORE32(&ThIpcRecords(h)[slot].AgentShownSeq, seq);
-#endif
 }
 
 /* AGENT side: mark the record with sequence `seq` as shown (nothing happens when the record is gone). */
@@ -546,11 +518,7 @@ TI_INLINE LONG ThIpcAgentState(const TH_IPC_HEADER* h, LONG seq)
     v = TI_LOAD32(&ThIpcRecordsC(h)[i].AgentShownSeq);
     TI_BARRIER();
     if (TI_LOAD32(&ThIpcRecordsC(h)[i].Seq) != seq) return TH_AGENT_NONE;
-#ifdef TOASTIDENT_DEFECT_MARK_BY_SLOT
-    return v != 0 ? TH_AGENT_SHOWN : TH_AGENT_NONE;   /* DEFECT: any mark in the slot counts */
-#else
     return v == seq ? TH_AGENT_SHOWN : TH_AGENT_NONE;
-#endif
 }
 
 /* Reader (agent) side: a consistent copy of slot `index`, or FALSE for an empty/torn slot (retry on

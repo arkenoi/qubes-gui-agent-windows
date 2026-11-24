@@ -552,8 +552,14 @@ static void TcValidateInsets(IN HWND window, IN LONG rawWidth, IN LONG rawHeight
 // Depth is capped because this walks a live XAML tree over cross-process RPC: the toast tree is
 // 4 levels deep, Start's is deeper but its card is near the root, and an unbounded walk on a
 // pathological tree would cost exactly the per-frame stall the timeouts exist to prevent.
+// `cardsOnly` (the toast rule): only an element whose AutomationId is a card id (TiIsCardAutomationId:
+// NormalToastView*, PriorityToastView*) is accumulated, and every other qualifying element is counted
+// in *others. Without it a walk that reached the card's children before the card itself qualified -
+// 49 ms after the window was created, run 45353589359 10:32:27.515 - returned their union
+// (32/33/23/29, the card being 16/30/16/13): a rect the plausibility guard passes, mapped overcropped
+// until the confirmation re-measure grew it 3.4 s later (TOASTUNIONOFCHILDREN).
 static BOOL TcFindCardRect(IN IUIAutomationTreeWalker* walker, IN IUIAutomationElement* element,
-    IN RECT raw, IN int depth, IN ULONGLONG deadline, IN OUT TC_CARD_ACC* acc)
+    IN RECT raw, IN int depth, IN ULONGLONG deadline, IN BOOL cardsOnly, IN OUT int* others, IN OUT TC_CARD_ACC* acc)
 {
     IUIAutomationElement* child = NULL;
     BOOL found = FALSE;
@@ -585,11 +591,29 @@ static BOOL TcFindCardRect(IN IUIAutomationTreeWalker* walker, IN IUIAutomationE
             // Qualification and both accumulations live in toastcrop-pick.h so the rule is
             // unit-tested offline; this loop only supplies rects in walk order (a node
             // before its children, which is what makes the largest-on-tie the container).
-            if (TcCardAccumulate(raw, r, acc))
-                found = TRUE;
+            if (!cardsOnly)
+            {
+                if (TcCardAccumulate(raw, r, acc))
+                    found = TRUE;
+            }
+            else if (TcCardQualifies(raw, r))
+            {
+                BSTR aid = NULL;
+                if (SUCCEEDED(IUIAutomationElement_get_CurrentAutomationId(child, &aid)) && TiIsCardAutomationId(aid))
+                {
+                    if (TcCardAccumulate(raw, r, acc))
+                        found = TRUE;
+                }
+                else if (others)
+                {
+                    (*others)++;
+                }
+                if (aid)
+                    SysFreeString(aid);
+            }
         }
 
-        if (TcFindCardRect(walker, child, raw, depth + 1, deadline, acc))
+        if (TcFindCardRect(walker, child, raw, depth + 1, deadline, cardsOnly, others, acc))
             found = TRUE;
 
         if (FAILED(IUIAutomationTreeWalker_GetNextSiblingElement(walker, child, &next)))
@@ -657,6 +681,9 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
     // measured 2026-08-11; on 24H2 the same menu had no margin at all). The qualifier ("fully
     // inside the window, strictly smaller in both dimensions") and the two selection rules are
     // in toastcrop-pick.h, where they are unit-tested offline (toastcrop_pick_test.c).
+    // The TOAST rule adds one key that is not a class name: the element's AutomationId must be a card id
+    // (TiIsCardAutomationId) - the non-localized id the identity read keys on as well (ADR-toasts 10,
+    // measured on 10 and 11), so a walk that sees the card's children but not yet the card measures nothing.
     // Rule and view, decided once so the stability re-walk below mirrors the first walk exactly.
     BOOL useMenuRule = (rule == TcRuleMenu);
     BOOL usedControlView = FALSE;   // which view the accepted first walk came from
@@ -670,6 +697,7 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
         ULONGLONG deadline = GetTickCount64() + 2000;
         IUIAutomationTreeWalker* walker = NULL;
         BOOL found = FALSE;
+        int others = 0;   // toast rule: qualifying elements that are not a card
 
         TcCardAccInit(&acc);
 
@@ -680,7 +708,7 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
             // nothing can regress below what it cropped to then).
             if (SUCCEEDED(IUIAutomation_get_ControlViewWalker(uia, &walker)) && walker)
             {
-                found = TcFindCardRect(walker, windowElement, raw, 0, deadline, &acc);
+                found = TcFindCardRect(walker, windowElement, raw, 0, deadline, FALSE, NULL, &acc);
                 IUIAutomationTreeWalker_Release(walker);
                 walker = NULL;
                 view = L"control";
@@ -694,7 +722,7 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
                 usedControlView = FALSE;
                 if (SUCCEEDED(IUIAutomation_get_RawViewWalker(uia, &walker)) && walker)
                 {
-                    found = TcFindCardRect(walker, windowElement, raw, 0, deadline, &acc);
+                    found = TcFindCardRect(walker, windowElement, raw, 0, deadline, FALSE, NULL, &acc);
                     IUIAutomationTreeWalker_Release(walker);
                     walker = NULL;
                 }
@@ -702,10 +730,11 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
         }
         else
         {
-            // TOAST and START RULES: the raw view and the union; the rule name is the log's.
+            // TOAST and START RULES: the raw view and the union; the rule name is the log's. The
+            // toast rule unions CARD elements only (see TcFindCardRect).
             if (SUCCEEDED(IUIAutomation_get_RawViewWalker(uia, &walker)) && walker)
             {
-                found = TcFindCardRect(walker, windowElement, raw, 0, deadline, &acc);
+                found = TcFindCardRect(walker, windowElement, raw, 0, deadline, rule == TcRuleToast, &others, &acc);
                 IUIAutomationTreeWalker_Release(walker);
                 walker = NULL;
             }
@@ -715,7 +744,11 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
         {
             // Expected while the XAML tree is still being built; the caller retries a bounded
             // number of times and then leaves the window uncropped.
-            LogDebug("0x%x: no card element yet (rule=%s view=%s)", window, ruleName, view);
+            if (others > 0)
+                LogInfo("QGATOASTNOCARD 0x%x: %d element(s) inside the %dx%d window, no card (NormalToastView*/PriorityToastView*) yet - not measured, retried",
+                    window, others, raw.right - raw.left, raw.bottom - raw.top);
+            else
+                LogDebug("0x%x: no card element yet (rule=%s view=%s)", window, ruleName, view);
             status = ERROR_NOT_FOUND;
             goto end;
         }
@@ -843,7 +876,7 @@ static ULONG TcQueryCore(IN IUIAutomation* uia, IN HWND window, IN RECT raw, IN 
                                           : IUIAutomation_get_RawViewWalker(uia, &walker);
             if (SUCCEEDED(hrw) && walker)
             {
-                foundAgain = TcFindCardRect(walker, windowElement, raw, 0, GetTickCount64() + 2000, &again);
+                foundAgain = TcFindCardRect(walker, windowElement, raw, 0, GetTickCount64() + 2000, rule == TcRuleToast, NULL, &again);
                 IUIAutomationTreeWalker_Release(walker);
                 walker = NULL;
             }

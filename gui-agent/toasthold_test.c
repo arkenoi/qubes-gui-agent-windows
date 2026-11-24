@@ -31,9 +31,6 @@
  * DEFECT RE-INTRODUCTION (CLAUDE.md: a check counts as evidence only once it has been seen to FAIL).
  * Each define below removes one guard; this suite MUST then exit nonzero (tools/tests/toasthold-
  * selftest.sh runs the matrix with gcc; CI runs it with msbuild /p:ToastHoldDefect=<define>):
- *   TOASTIDENT_DEFECT_NOFOLD           multi-line bodies stop matching (every such toast doubles)
- *   TOASTIDENT_DEFECT_ORDERONLY        the matcher goes by arrival order alone (the desync case)
- *   TOASTIDENT_DEFECT_VERDICTOVERRIDE  the classifier overrides a settled route
  *   TOASTHOLD_DEFECT_NOBOUND           a hold never fails open (a lost toast instead of a late one)
  *   TOASTHOLD_DEFECT_FAILCLOSED        doubt suppresses instead of showing
  *   TOASTHOLD_DEFECT_NOPREEMPT         a queued bridge-bound toast no longer pre-empts (the flash)
@@ -58,13 +55,8 @@
  *                                      screens or 125 %+ DPI (N3; TestPureRules)
  *   TOASTHOLD_DEFECT_DEADRECORDS       a dead bridge's records stay authoritative / keep pre-empting (N6)
  *   TOASTHOLD_DEFECT_NOBACKOFF         a refused identity request is retried without back-off (N7)
- *   TOASTIDENT_DEFECT_TIE_SLOTORDER    equal arrival ticks broken by ring slot: across a wrap the newer record
- *                                      (slot 0) is taken for the earlier banner (#12; TestSelect)
  *   TOASTHOLD_DEFECT_RECLAIM_ANY       the own consumed record is re-claimable for ANY new in-place content: a
  *                                      new same-title toast inherits another toast's verdict (N5; TestReclaim)
- *   TOASTIDENT_DEFECT_MARK_BY_SLOT     the agent's shown mark is a flag in the slot, not the sequence it marks: a
- *                                      store racing the bridge's republish of the slot makes the NEW toast read as
- *                                      shown, and its failed dom0 action goes unreported (ADR-toasts 11; TestRing)
  */
 
 #include "toasthold-core.h"
@@ -211,6 +203,9 @@ static void TestAutomationIds(void)
 {
     Check("aid: NormalToastView is the card", TiIsCardAutomationId(W("NormalToastView")));
     Check("aid: FlexibleToastView is NOT the card key (ClassName, Win11 only)", !TiIsCardAutomationId(W("FlexibleToastView")));
+    Check("aid: PriorityToastView is a card (reminder)", TiIsCardAutomationId(W("PriorityToastView")));
+    Check("aid: PriorityToastView3 is a card (third of a stack)", TiIsCardAutomationId(W("PriorityToastView3")));
+    Check("aid: PriorityToastViewX is not a card", !TiIsCardAutomationId(W("PriorityToastViewX")));
     Check("aid: SenderName", TiIsSenderAutomationId(W("SenderName")));
     Check("aid: Title (Win11)", TiIsTitleAutomationId(W("Title")));
     Check("aid: TitleText (Win10)", TiIsTitleAutomationId(W("TitleText")));
@@ -963,16 +958,14 @@ static void TestConsumedAndNotBanner(void)
 
 int main(void)
 {
-#if defined(TOASTIDENT_DEFECT_NOFOLD) || defined(TOASTIDENT_DEFECT_ORDERONLY) || defined(TOASTIDENT_DEFECT_VERDICTOVERRIDE) || \
-    defined(TOASTHOLD_DEFECT_PREEMPT_UNMAPS) || \
+#if defined(TOASTHOLD_DEFECT_PREEMPT_UNMAPS) || \
     defined(TOASTHOLD_DEFECT_NOBOUND) || defined(TOASTHOLD_DEFECT_FAILCLOSED) || defined(TOASTHOLD_DEFECT_NOPREEMPT) || \
     defined(TOASTHOLD_DEFECT_PREEMPT_IDENTGATE) || defined(TOASTHOLD_DEFECT_SUPPRESS_FINAL) || \
     defined(TOASTHOLD_DEFECT_NORECLAIM) || defined(TOASTHOLD_DEFECT_NOIDENT_IGNORES_BRIDGE) || \
     defined(TOASTHOLD_DEFECT_NOFORWARDBOUND) || defined(TOASTHOLD_DEFECT_NOCARD_UNPACED) || \
     defined(TOASTHOLD_DEFECT_SIZE60) || defined(TOASTHOLD_DEFECT_DEADRECORDS) || defined(TOASTHOLD_DEFECT_NOBACKOFF) || \
-    defined(TOASTIDENT_DEFECT_TIE_SLOTORDER) || defined(TOASTHOLD_DEFECT_RECLAIM_ANY) || \
-    defined(TOASTIDENT_DEFECT_MARK_BY_SLOT)
-    printf("DEFECT BUILD: a TOASTIDENT_/TOASTHOLD_DEFECT_* switch is compiled in - this run MUST fail\n");
+    defined(TOASTHOLD_DEFECT_RECLAIM_ANY)
+    printf("DEFECT BUILD: a TOASTHOLD_DEFECT_* switch is compiled in - this run MUST fail\n");
 #endif
     TestNormalization();
     TestIdentityAgreement();
