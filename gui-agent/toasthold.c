@@ -165,6 +165,64 @@ static TH_ENTRY g_Th[TH_ENTRIES];
 static volatile LONG g_ThEntryCount = 0;   // live entries, for the hook thread's lock-free early-out
 static volatile LONG g_ThIncarnations = 0;
 static TH_CONSUMED g_ThCons;
+
+// CONTENT THAT ENDED UNSHOWN WITH NO RECORD (ADR-toasts 13: never dropped). Module-global: it must outlive its entry
+// (ToastHoldEvict and the LRU victim zero it). Read only on the bridge's verdict event - no timer.
+#define TH_ENDED_SLOTS 8
+typedef struct _TH_ENDED { TOAST_IDENT Ident; ULONGLONG At; } TH_ENDED;
+static TH_ENDED g_ThEnded[TH_ENDED_SLOTS];
+static int g_ThEndedNext = 0;
+typedef struct _TH_END_ITEM { LONG Seq; UINT32 NotifId; LONG Held; BOOL Won; UINT64 Ident; } TH_END_ITEM;
+typedef struct _TH_END_REPORT
+{
+    int Claims;
+    TH_END_ITEM Claim[TOAST_CARDS_MAX + 1];
+    int Remembered;
+    UINT64 RememberedIdent[TOAST_CARDS_MAX + 1];
+} TH_END_REPORT;
+
+// g_ThLock held.
+static void ThRememberEndedLocked(IN const TOAST_IDENT* ident, IN ULONGLONG now, IN OUT TH_END_REPORT* rep)
+{
+    if (!ident || ident->Title == 0) return;   // TiMatch keys on the title: nothing could ever match it
+    g_ThEnded[g_ThEndedNext].Ident = *ident;
+    g_ThEnded[g_ThEndedNext].At = now;
+    g_ThEndedNext = (g_ThEndedNext + 1) % TH_ENDED_SLOTS;
+    if (rep->Remembered < TOAST_CARDS_MAX + 1) rep->RememberedIdent[rep->Remembered++] = ident->Combined;
+}
+
+// g_ThLock held. One record whose banner ended unshown: claimed for the bridge (the ring's interlocked ops need no lock).
+static void ThEndClaimLocked(IN LONG seq, IN UINT32 notifId, IN UINT64 ident, IN OUT TH_END_REPORT* rep)
+{
+    BOOL won = FALSE;
+    LONG held;
+    if (!seq) return;
+    if (!g_ThIpc || !g_ThBridgeUp) { ThConsumedRemove(&g_ThCons, seq); return; }   // no bridge: as before (a lesser problem)
+    held = ThIpcClaimSeq(g_ThIpc, seq, TH_VERDICT_PENDING, TH_VERDICT_BRIDGE, &won);
+    if (rep->Claims < TOAST_CARDS_MAX + 1)
+    {
+        TH_END_ITEM* it = &rep->Claim[rep->Claims++];
+        it->Seq = seq; it->NotifId = notifId; it->Held = held; it->Won = won; it->Ident = ident;
+    }
+}
+
+// g_ThLock held. THE ENTRY'S BANNER ENDS UNSHOWN (destroyed, or its slot is reused): its pending records are claimed for
+// the bridge, an identity with no record is remembered.
+static void ThEndUnshownLocked(IN TH_ENTRY* e, IN ULONGLONG now, OUT TH_END_REPORT* rep)
+{
+    if (e->NotBanner) return;
+    if (e->Core.Phase == ThPhaseHolding && e->Core.RecordSeq)
+        ThEndClaimLocked(e->Core.RecordSeq, e->Core.NotifId, e->Core.Ident, rep);
+    else if (e->Core.RecordSeq == 0 && e->IdentValid &&
+             (e->Core.Phase == ThPhaseHolding || (e->Core.Phase == ThPhaseDecided && e->Core.Ended)))
+        ThRememberEndedLocked(&e->Ident, now, rep);
+    for (int k = 0; k < e->StackCount - 1 && k < TOAST_CARDS_MAX; k++)
+    {
+        const TH_STACK_CARD* sc = &e->Stack[k];
+        if (sc->Seq && sc->Verdict == TH_VERDICT_PENDING) ThEndClaimLocked(sc->Seq, sc->NotifId, sc->Ident.Combined, rep);
+        else if (!sc->Seq && sc->Excluded) ThRememberEndedLocked(&sc->Ident, now, rep);
+    }
+}
 static ULONGLONG g_ThClock = 0;
 static ULONGLONG g_ThNextDue = 0;    // earliest armed deadline over all entries; 0 = nothing armed
 
@@ -213,10 +271,11 @@ void ToastHoldInit(IN BOOL bridgeGate)
     // each line used to explain is in the comment beside it.
     if (g_ThActive)
         // ACTIVE: a banner is mapped only after its verdict - a bridge verdict never maps it, a window verdict maps it
-        // at once, and no verdict within TH_HOLD_BOUND_MS maps it and reports the fail-open (QGATOASTHOLDLATE).
+        // at once, and with no verdict by the banner's end (TH_BANNER_END_MS) it is never mapped: its record is claimed for
+        // the bridge, which forwards it (QGATOASTCLAIM, ADR-toasts 13).
         LogInfo("QGATOASTHOLD gate: ACTIVE (bridge gate on, ToastHoldDisable=0, UIA worker up, IPC up): banners held "
-            L"for their verdict, bound %u ms",
-            (unsigned)TH_HOLD_BOUND_MS);
+            L"for their verdict until the banner's end, %u ms",
+            (unsigned)TH_BANNER_END_MS);
     else if (!g_ThGate)
         LogInfo("QGATOASTHOLD gate: inactive (bridge gate off), banners map as before");
     else if (g_ThKnobOff)
@@ -249,7 +308,7 @@ static TH_ENTRY* ThFindLocked(IN HWND window)
 
 // g_ThLock held. Find or create (LRU victim). A new entry gets a fresh incarnation, so a read still
 // in flight for the window's previous life cannot land in it.
-static TH_ENTRY* ThGetLocked(IN HWND window)
+static TH_ENTRY* ThGetLocked(IN HWND window, OUT TH_END_REPORT* victimRep, OUT HWND* victimWnd)
 {
     TH_ENTRY* e = ThFindLocked(window);
     int victim = 0;
@@ -261,6 +320,7 @@ static TH_ENTRY* ThGetLocked(IN HWND window)
     }
     e = &g_Th[victim];
     if (e->Window == NULL) InterlockedIncrement(&g_ThEntryCount);   // a reused victim keeps the count
+    else { *victimWnd = e->Window; ThEndUnshownLocked(e, GetTickCount64(), victimRep); }   // its banner ends unshown here
     ZeroMemory(e, sizeof(*e));
     e->Window = window;
     e->Incarnation = InterlockedIncrement(&g_ThIncarnations);
@@ -357,6 +417,43 @@ static const WCHAR* ThVerdictName(IN LONG v)
     }
 }
 
+// Outside g_ThLock. One ERROR per end claim and per remembered identity (ADR-toasts 13: fail loudly).
+static void ThLogEndReport(IN HWND window, IN const WCHAR* how, IN const TH_END_REPORT* rep)
+{
+    for (int i = 0; i < rep->Claims; i++)
+        LogError("QGATOASTCLAIM hwnd=0x%x id=%lu seq=%ld ident=%016llx banner %s unshown with no verdict: claim pending->bridge %s, record "
+            L"now %s - %s", (DWORD)(ULONG_PTR)window, (ULONG)rep->Claim[i].NotifId, rep->Claim[i].Seq, (unsigned long long)rep->Claim[i].Ident,
+            how, rep->Claim[i].Won ? L"WON by the agent" : L"LOST", ThVerdictName(rep->Claim[i].Held),
+            TiVerdictSuppresses(rep->Claim[i].Held) ? L"NOT mapped; the bridge forwards this toast to dom0" :
+            rep->Claim[i].Held == TH_VERDICT_WINDOW ? L"the bridge said window and the banner is gone: shown NOWHERE" :
+            L"the record left the ring: shown NOWHERE");
+    for (int i = 0; i < rep->Remembered; i++)
+        LogError("QGATOASTUNSHOWN hwnd=0x%x ident=%016llx banner %s unshown with NO record: its identity is remembered, a record that "
+            L"matches it within %u ms is claimed for the bridge", (DWORD)(ULONG_PTR)window, (unsigned long long)rep->RememberedIdent[i],
+            how, (unsigned)TH_RECORD_TTL_MS);
+}
+
+// g_ThLock held. The bridge's verdict event: a record listed AFTER its banner ended unshown is claimed for the bridge.
+static void ThClaimEndedLocked(IN ULONGLONG now, IN OUT TH_END_REPORT* rep)
+{
+    TH_IPC_RECORD recs[TH_IPC_RECORDS];
+    TI_CANDIDATE cand[TH_IPC_RECORDS];
+    int nrec = -1;
+    for (int i = 0; i < TH_ENDED_SLOTS; i++)
+    {
+        TI_MATCH q = TiMatchNone;
+        if (g_ThEnded[i].At == 0) continue;
+        if (now - g_ThEnded[i].At >= TH_RECORD_TTL_MS) { g_ThEnded[i].At = 0; continue; }
+        if (nrec < 0) nrec = ThSnapshotRecords(recs, TH_IPC_RECORDS);
+        const int n = ThCoreCandidates(recs, nrec, &g_ThCons, 0, now, cand);
+        const int pick = TiSelect(cand, n, &g_ThEnded[i].Ident, &q);
+        if (pick < 0) continue;
+        ThConsumedAdd(&g_ThCons, recs[pick].Seq);
+        ThEndClaimLocked(recs[pick].Seq, recs[pick].NotifId, g_ThEnded[i].Ident.Combined, rep);
+        g_ThEnded[i].At = 0;
+    }
+}
+
 // ---- the decision -----------------------------------------------------------------------------
 
 TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
@@ -384,19 +481,30 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     RECT stackApplied = { 0, 0, 0, 0 };
     int stackGap = 0;
     BOOL stackAppliedValid = FALSE, stackAppliedCarry = FALSE;
+    // The ring's own verdict of the matched record (in.MatchVerdict has been through ThCoreDeadVerdict), and the claim
+    // this pass makes on it (ADR-toasts 13).
+    LONG matchRaw = TH_VERDICT_NONE, claimWant = TH_VERDICT_NONE, claimHeld = TH_VERDICT_NONE, claimSeq = 0;
+    BOOL claimWon = FALSE;
+    TH_END_REPORT endRep, victimRep;
+    HWND victimWnd = NULL;
+    ZeroMemory(&endRep, sizeof(endRep));
+    ZeroMemory(&victimRep, sizeof(victimRep));
 
     ZeroMemory(&in, sizeof(in));
     ZeroMemory(&out, sizeof(out));
     ZeroMemory(&identForLog, sizeof(identForLog));
 
     EnterCriticalSection(&g_ThLock);
-    TH_ENTRY* e = ThGetLocked(entry->Handle);
+    TH_ENTRY* e = ThGetLocked(entry->Handle, &victimRep, &victimWnd);
     // The geometry this pass sees, kept for the card-less guard in ToastHoldApplyIdentity (the worker
     // thread has the HWND but not WINDOW_DATA, and must not call into the window code to get it).
     e->SeenW = (LONG)entry->Width;
     e->SeenH = (LONG)entry->Height;
 
-    in.BridgeUp = (g_ThBridgeUp != 0);
+    // Up = the bridge process is up AND its records section is one this agent can read. A section of another ABI (a mixed
+    // install) yields no records at all, and with the claim design a banner whose record never comes is never mapped - so
+    // that state must read as "no bridge" (shown at once), not as a bridge that never lists anything.
+    in.BridgeUp = (g_ThBridgeUp != 0) && g_ThIpc && ThIpcValid(g_ThIpc);
     // The LAST completed reading stands while a new read is in flight: an unknown identity on the pass
     // the swap's event triggers would end a pre-emption and map the window while the bridged toast paints
     // (review #1). The new reading, when it lands, re-drives this pass through ContentChanged.
@@ -422,8 +530,9 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
         TH_IPC_RECORD r;
         if (e->Core.RecordSeq != 0 && sameContent && ThFindBySeq(recs, nrec, e->Core.RecordSeq, &r))
         {
-            in.MatchFound = 1; in.MatchSeq = r.Seq; in.MatchNotifId = r.NotifId; in.MatchArrival = r.ArrivalTick;
+            in.MatchFound = 1; in.MatchSeq = r.Seq; in.MatchNotifId = r.NotifId;
             in.MatchVerdict = ThCoreDeadVerdict(r.Seq, r.Verdict, deadSeq);
+            matchRaw = r.Verdict;
         }
         else if (in.IdentKnown && (e->Core.RecordSeq == 0 || !sameContent))
         {
@@ -444,8 +553,9 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             const int pick = TiSelect(cand, n, &e->Ident, &quality);
             if (pick >= 0)
             {
-                in.MatchFound = 1; in.MatchSeq = recs[pick].Seq; in.MatchNotifId = recs[pick].NotifId; in.MatchArrival = recs[pick].ArrivalTick;
+                in.MatchFound = 1; in.MatchSeq = recs[pick].Seq; in.MatchNotifId = recs[pick].NotifId;
                 in.MatchVerdict = ThCoreDeadVerdict(recs[pick].Seq, recs[pick].Verdict, deadSeq);
+                matchRaw = recs[pick].Verdict;
                 ThConsumedAdd(&g_ThCons, recs[pick].Seq);
                 logPartial = (quality == TiMatchPartial);
                 // The reading this record is claimed on: the yardstick for a later re-claim.
@@ -471,11 +581,10 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // rest sends no frames, so it is not read and Windows times it out.
     // `dom0Queued`: a newer, unconsumed record the bridge has (`bridge`) or dom0 acknowledged (`forwarded`). Read only at the
     // settle hold's 3 s bound: a change no read has named by then, with such a toast queued, is that toast's - dom0 shows it,
-    // so this window keeps the frame dom0 has (ADR-toasts 13). Never a reason to hold anything else. `pendingDue`: such a record still
-    // `pending` inside its own 3 s may yet become `bridge` (ThIpcSetVerdictSeq); the hold waits for it to that tick, unlatched.
-    BOOL successorQueued = FALSE, dom0Queued = FALSE;
-    UINT32 successorNotif = 0, dom0Notif = 0;
-    ULONGLONG pendingDue = 0;   // earliest ArrivalTick + TH_HOLD_BOUND_MS among those still pending and inside it
+    // so this window keeps the frame dom0 has (ADR-toasts 13). Never a reason to hold anything else. `pendingQueued`: such a
+    // record still `pending` can become `bridge` at any time until it is claimed (no clock), so it keeps the frame too.
+    BOOL successorQueued = FALSE, dom0Queued = FALSE, pendingQueued = FALSE;
+    UINT32 successorNotif = 0, dom0Notif = 0, pendingNotif = 0;
     if (!e->NotBanner && in.BridgeUp)
     {
         const LONG baseline = in.MatchFound ? in.MatchSeq : e->Core.RecordSeq;
@@ -492,8 +601,10 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             {
                 if (!dom0Queued) { dom0Queued = TRUE; dom0Notif = recs[i].NotifId; }
             }
-            else if (qv == TH_VERDICT_PENDING && now < queued[i].ArrivalTick + TH_HOLD_BOUND_MS)
-                pendingDue = ThMinTick(pendingDue, queued[i].ArrivalTick + TH_HOLD_BOUND_MS);   // ThCoreCandidates' copy: never ahead of now
+            else if (qv == TH_VERDICT_PENDING)
+            {
+                if (!pendingQueued) { pendingQueued = TRUE; pendingNotif = recs[i].NotifId; }
+            }
         }
     }
 
@@ -503,6 +614,26 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // repaint debt). The show below then owes one itself.
     const BOOL shownBefore = (e->Core.Phase == ThPhaseDecided && e->Core.Decision == ThDecShow);
     const UINT64 identBefore = e->Core.Ident;
+    const UINT32 notifBeforeRelease = e->Core.NotifId;
+
+    // THE CLAIM (ADR-toasts 13, "Claim, no timer"), made here because the core is pure. A pending record is turned by ONE
+    // compare-exchange before anything is decided on it: pending -> window when this pass would map without a window
+    // verdict (the bridge is down; a dead instance's record reads window), pending -> bridge at the banner's end. The
+    // core then decides on what the record HOLDS, so a lost claim follows the winner.
+    const ULONGLONG claimAfterMs = e->Core.HoldSince ? now - e->Core.HoldSince : 0;
+    if (in.MatchFound && matchRaw == TH_VERDICT_PENDING && g_ThIpc)
+    {
+        TH_INPUT probe = in;
+        probe.MatchVerdict = TH_VERDICT_PENDING;
+        claimWant = (in.MatchVerdict == TH_VERDICT_WINDOW) ? TH_VERDICT_WINDOW : ThCoreClaimWanted(&e->Core, &probe, now);
+        if (claimWant != TH_VERDICT_NONE)
+        {
+            claimSeq = in.MatchSeq;
+            claimHeld = ThIpcClaimSeq(g_ThIpc, in.MatchSeq, TH_VERDICT_PENDING, claimWant, &claimWon);
+            if (claimHeld == TH_VERDICT_NONE) { in.MatchFound = 0; in.MatchSeq = 0; in.MatchNotifId = 0; }   // the record left the ring
+            else in.MatchVerdict = claimHeld;
+        }
+    }
 
     ThCoreDecide(&e->Core, &in, now, &out);
 
@@ -520,7 +651,7 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // record and kept out of this window while the bridge has it or is still deciding it: a card the bridge
     // forwarded is shown by dom0's notification, and showing it here too was the double (run 45353589359
     // S3iv: a bridged toast stacked onto a shown reminder; the read saw only the first NormalToastView).
-    // Unknown is kept out to the hold's own bound and then shown - the bottom card's own fail-open. The
+    // Unknown is kept out to its end and then claimed for the bridge (ADR-toasts 13) - never shown undecided. The
     // crop itself is ToastHoldCardInsets', from the flags set here.
     if (!e->NotBanner && e->StackCount > 1)
     {
@@ -546,9 +677,27 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
                     ThConsumedAdd(&g_ThCons, sc->Seq);
                 }
             }
+            LONG cardRaw = TH_VERDICT_NONE;
             if (sc->Seq != 0 && ThFindBySeq(recs, nrec, sc->Seq, &r))
+            {
+                cardRaw = r.Verdict;
                 sc->Verdict = ThCoreDeadVerdict(r.Seq, r.Verdict, deadSeq);
-            const BOOL bound = (now - sc->FirstSeen) >= TH_HOLD_BOUND_MS;
+            }
+            const BOOL ended = (now - sc->FirstSeen) >= TH_BANNER_END_MS;
+            // THE SAME CLAIM PER CARD (ADR-toasts 13): pending at the card's end -> claimed for the bridge, never shown here;
+            // pending with the bridge down -> shown only on a won window claim.
+            if (cardRaw == TH_VERDICT_PENDING && g_ThIpc && (!in.BridgeUp || ended))
+            {
+                BOOL won = FALSE;
+                const LONG want = in.BridgeUp ? TH_VERDICT_BRIDGE : TH_VERDICT_WINDOW;
+                const LONG held = ThIpcClaimSeq(g_ThIpc, sc->Seq, TH_VERDICT_PENDING, want, &won);
+                if (held != TH_VERDICT_NONE) sc->Verdict = held;
+                if (in.BridgeUp && endRep.Claims < TOAST_CARDS_MAX + 1)
+                {
+                    TH_END_ITEM* it = &endRep.Claim[endRep.Claims++];
+                    it->Seq = sc->Seq; it->NotifId = sc->NotifId; it->Held = held; it->Won = won; it->Ident = sc->Ident.Combined;
+                }
+            }
             const BOOL undecided = (sc->Seq == 0 || sc->Verdict == TH_VERDICT_PENDING);
             if (!in.BridgeUp)
                 // No bridge: the core's dead-bridge rule for a suppressed banner (ThCoreDecide, "THE BRIDGE DIED"): a
@@ -557,12 +706,12 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
                 // be 0 (no ceiling captured), and then ThCoreDeadVerdict leaves `bridge` standing.
                 sc->Excluded = (sc->Verdict == TH_VERDICT_FORWARDED);
             else if (undecided)
-                sc->Excluded = !bound;
+                sc->Excluded = TRUE;                                     // never shown undecided, however long
             else
                 sc->Excluded = TiVerdictSuppresses(sc->Verdict);
-            if (in.BridgeUp && undecided && !bound)
+            if (in.BridgeUp && undecided && !ended)
             {
-                stackDue = ThMinTick(ThMinTick(stackDue, now + TH_HOLD_RECHECK_MS), sc->FirstSeen + TH_HOLD_BOUND_MS);
+                stackDue = ThMinTick(ThMinTick(stackDue, now + TH_HOLD_RECHECK_MS), sc->FirstSeen + TH_BANNER_END_MS);
                 if (!sc->Titled) rereadUntitled = TRUE;
             }
             if (sc->Excluded) mask |= 1u << k;
@@ -576,7 +725,7 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             mask |= 1u << (e->StackCount - 1);      // the bottom card's own toast went to dom0
         // A stacked card read before its title was built cannot be matched: read it again on the recheck
         // tick, and ONLY until its bound - a timed re-read keeps a banner on screen (TOASTBANNERLOSTONDIRECTPATH),
-        // so this is at most TH_HOLD_BOUND_MS / TH_HOLD_RECHECK_MS reads per card, never a standing poll.
+        // so this is at most TH_BANNER_END_MS / TH_HOLD_RECHECK_MS reads per card, never a standing poll.
         if (rereadUntitled && !e->ReadInFlight && (now - e->LastReadAttempt) >= TH_HOLD_RECHECK_MS)
             ThRequestReadLocked(e, now);
         stackMask = mask;
@@ -609,7 +758,16 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     e->StackShown = stackOverride;
 
     if (out.ReleaseSeq)
-        ThConsumedRemove(&g_ThCons, out.ReleaseSeq);
+    {
+        // The record this banner had reserved. Its content is still DISPLAYED when it only moved up the stack (a card was
+        // inserted below it): then it is released and the card re-matches it. Otherwise that content left the window
+        // while held - its banner ended unshown: claimed for the bridge (ADR-toasts 13).
+        BOOL stillShown = FALSE;
+        for (int k = 0; k < e->StackCount - 1 && k < TOAST_CARDS_MAX; k++)
+            if (identBefore != 0 && e->Stack[k].Ident.Combined == identBefore) stillShown = TRUE;
+        if (stillShown) ThConsumedRemove(&g_ThCons, out.ReleaseSeq);
+        else ThEndClaimLocked(out.ReleaseSeq, notifBeforeRelease, identBefore, &endRep);
+    }
     if (in.MatchFound) notifForLog = in.MatchNotifId;
     if (e->Core.NotifId) notifForLog = e->Core.NotifId;
     // The agent's one word back into a record (toastident.h AgentShownSeq, ADR-toasts 11): this banner shows the
@@ -688,15 +846,12 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     // change no read has named is that toast, which dom0 shows: dom0 keeps this window's last frame - the toast it was
     // told this window carries - and the reads go on until one names the cards (SwapGateBound). The window is never
     // unmapped for it: that loses this banner's toast where a frozen frame loses nothing. A stacked window whose crop
-    // is not current is kept too, because releasing it would show a card that may be dom0's. A newer record still
-    // `pending` inside its own 3 s (pendingDue) can still become `bridge`: the hold waits for it to that tick, NOT
-    // latched (the latch clears only when a read lands and arms no deadline, so a record that turns `window` would
-    // leave dom0 on the old frame), and the bound decides again there - `bridge` kept, `window` or too old released.
-    // Capped at SwapGateSince + 2 x the bound, failing toward release: a record present at the first bound always
-    // gets its full 3 s; only a chain listed during the wait, or a bridge-written future tick, is cut. Otherwise
-    // released with a full repaint, and said loudly.
+    // is not current is kept too, because releasing it would show a card that may be dom0's. So is a newer record still
+    // `pending` (pendingQueued): with no clock on either side it can become `bridge` at any moment until it is claimed
+    // (ADR-toasts 13), and the frame no read has named may be that toast - said as an ERROR. Otherwise released with a
+    // full repaint, and said loudly.
     BOOL settleHold = FALSE, settleReleased = FALSE, settleLate = FALSE, settleKept = FALSE;
-    ULONGLONG settleMs = 0, settlePendDue = 0;
+    ULONGLONG settleMs = 0;
     ULONG settleFrames = 0;
     const UINT readFails = e->ReadFails, queueFails = e->ReadQueueFails;
     if (e->SwapGateBound && !e->SwapGateReadPending)
@@ -718,15 +873,10 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             settleReleased = TRUE;                       // a read named the cards, and the crop for them is applied
         else if (settleMs < TH_HOLD_BOUND_MS)
             settleHold = TRUE;
-        else if (!dom0Queued && !(stackMask != 0 && !cropCurrent) && pendingDue != 0 && settleMs < 2 * TH_HOLD_BOUND_MS)
-        {
-            settleHold = TRUE;                           // a newer record may still become `bridge`: decided at its tick
-            settlePendDue = ThMinTick(pendingDue, e->SwapGateSince + 2 * TH_HOLD_BOUND_MS);
-        }
         else
         {
             settleLate = TRUE;
-            if (dom0Queued || (stackMask != 0 && !cropCurrent))
+            if (dom0Queued || pendingQueued || (stackMask != 0 && !cropCurrent))
             {
                 e->SwapGateBound = 1;
                 settleKept = TRUE;
@@ -771,7 +921,7 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     if (armRetry)
         e->Due = ThMinTick(e->Due, retryAt);
     if (settleHold && !e->SwapGateBound)
-        e->Due = ThMinTick(e->Due, settlePendDue ? settlePendDue : e->SwapGateSince + TH_HOLD_BOUND_MS);   // settlePendDue is ahead of now
+        e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
     if (stackDue)
         e->Due = ThMinTick(e->Due, stackDue);   // a stacked card still being decided: its verdict, or its bound
     ThRecomputeDueLocked();
@@ -796,7 +946,12 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     const BOOL ungated = (!settleHold && out.Decision == ThDecShow && SendWindowFrameUngate(entry->Handle, &damageHeld));
     // The in-place swap no hold saw: the same debt, paid by the same release.
     const BOOL swapOwed = (!ungated && !settleReleased && swappedInPlace && !settleHold && out.Decision == ThDecShow);
-    if (settleLate)
+    if (settleLate && settleKept && pendingQueued && !dom0Queued)
+        LogError("QGATOASTGATELATE hwnd=0x%x no read named this banner's cards within %llu ms of its first held frame (%lu held, "
+            L"lastRead=%s readFails=%u queueFails=%u) and a newer record id=%lu is still PENDING: dom0 keeps its last frame until a "
+            L"read names the cards", hw, (unsigned long long)settleMs, (ULONG)settleFrames, ThReadStatusName(readStatus), readFails,
+            queueFails, (ULONG)pendingNotif);
+    else if (settleLate)
         LogWarning("QGATOASTGATELATE hwnd=0x%x no read named this banner's cards within %llu ms of its first held frame "
             L"(%lu held, lastRead=%s readFails=%u queueFails=%u, queued bridge id=%lu): %s", hw,
             (unsigned long long)settleMs, (ULONG)settleFrames, ThReadStatusName(readStatus), readFails, queueFails,
@@ -824,6 +979,20 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
     if (logPartial)
         LogWarning("QGATOASTIDENT hwnd=0x%x PARTIAL match taken (same sender+title, message differs); "
             L"ident=%016llx s=%016llx t=%016llx m=%016llx id=%lu", hw, hc, hs, ht, hm, (ULONG)notifForLog);
+
+    // ADR-toasts 13: every claim the agent makes is said - the banner-end claim as an ERROR (fail loudly).
+    if (claimWant == TH_VERDICT_BRIDGE)
+        LogError("QGATOASTCLAIM hwnd=0x%x id=%lu seq=%ld ident=%016llx banner end after %llu ms with no verdict: claim pending->bridge "
+            L"%s, record now %s - %s", hw, (ULONG)notifForLog, (LONG)claimSeq, hc, claimAfterMs,
+            claimWon ? L"WON by the agent" : L"LOST", ThVerdictName(claimHeld),
+            TiVerdictSuppresses(claimHeld) ? L"NOT mapped; the bridge forwards this toast to dom0" :
+            claimHeld == TH_VERDICT_WINDOW ? L"the bridge said window first: the banner is mapped" :
+            L"the record left the ring: NOT mapped and NOT forwarded");
+    else if (claimWant == TH_VERDICT_WINDOW)
+        LogWarning("QGATOASTCLAIM hwnd=0x%x id=%lu seq=%ld ident=%016llx bridge down with the record pending: claim pending->window %s, "
+            L"record now %s", hw, (ULONG)notifForLog, (LONG)claimSeq, hc, claimWon ? L"WON by the agent" : L"LOST", ThVerdictName(claimHeld));
+    ThLogEndReport(entry->Handle, L"replaced in place or left the stack", &endRep);
+    ThLogEndReport(victimWnd, L"evicted", &victimRep);
 
     switch (out.Event)
     {
@@ -870,15 +1039,26 @@ TH_DECISION ToastHoldDecide(IN const WINDOW_DATA* entry)
             L"ShellExperienceHost flyout that passes the toast classifier",
             hw, noCardReads, entry->Width, entry->Height);
         break;
+    case ThEvBannerEnd:
+        if (out.Reason == ThReasonNoRecord)
+            LogError("QGATOASTUNSHOWN hwnd=0x%x banner end after %llu ms with NO record: NOT mapped; ident=%016llx s=%016llx t=%016llx "
+                L"m=%016llx lastRead=%s records=%d - a record listed later that matches it is claimed for the bridge",
+                hw, out.HeldMs, hc, hs, ht, hm, ThReadStatusName(readStatus), nrec);
+        else
+            LogWarning("QGATOASTUNSHOWN hwnd=0x%x banner end after %llu ms with NO identity (lastRead=%s): NOT mapped, nothing to remember",
+                hw, out.HeldMs, ThReadStatusName(readStatus));
+        break;
+    case ThEvForwardLate:
+        LogError("QGATOASTFWDLATE hwnd=0x%x ident=%016llx id=%lu suppressed %llu ms with no dom0 acknowledgement (bound %u ms): NOT "
+            L"mapped - the record is the bridge's; shown only if the bridge turns it window", hw, hc, (ULONG)notifForLog,
+            out.HeldMs, (UINT)TH_FORWARD_BOUND_MS);
+        break;
     case ThEvFailOpen:
-        // The anomaly this module exists to make visible: a hold that ended by its bound or by the bridge
-        // dying is mapped without a verdict - possibly as the second copy of a forwarded toast (the owner's double).
-        // reason= decoder (ThReason, toasthold-core.h; the grader keys on 'QGATOASTHOLDLATE hwnd=' and 'after N ms'):
-        //   no-identity = the card's Title/TitleText block never read within the bound (a banner tree this build
-        //   does not know); no-record = the bridge listed no matching notification in time (compare s/t/m with its
-        //   HOLD lines); verdict-pending = a record matched, the classifier gave no answer in time; bridge-exited =
-        //   the bridge died mid-hold or before dom0 acknowledged the forward; forward-unconfirmed = suppressed, but
-        //   no dom0 acknowledgement within the forward bound (the bridge's own failure paths outlast a banner's life).
+        // The bridge died with this banner held, or suppressed before dom0 acknowledged the forward: mapped without a
+        // verdict (a lesser problem, owner 2026-11-24). Every other end of a hold is NOT mapped (ADR-toasts 13): the
+        // banner's end claims the record for the bridge (QGATOASTCLAIM), a banner with no record or no identity is
+        // QGATOASTUNSHOWN. reason= decoder (ThReason, toasthold-core.h; the grader keys on 'QGATOASTHOLDLATE hwnd='):
+        // bridge-exited only.
         LogWarning("QGATOASTHOLDLATE hwnd=0x%x mapped FAIL-OPEN after %llu ms: reason=%s ident=%016llx s=%016llx t=%016llx "
             L"m=%016llx id=%lu lastRead=%s bridgeUp=%d records=%d; shown TWICE if the bridge forwarded it",
             hw, out.HeldMs, ThReasonName(out.Reason), hc, hs, ht, hm, (ULONG)notifForLog,
@@ -1066,7 +1246,7 @@ void ToastHoldNoteChanged(IN HWND window)
                 // Pending until an OK read COMPLETES - set after ThRequestReadLocked above, so it is TRUE even when that
                 // request was refused, and the hold then lasts to its bound instead of opening with the change unnamed.
                 e->SwapGateReadPending = TRUE;
-                if (!e->SwapGateBound && now < e->SwapGateSince + TH_HOLD_BOUND_MS)   // past it, the deadline ToastHoldDecide armed stands
+                if (!e->SwapGateBound)
                     e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
             }
             else
@@ -1127,8 +1307,7 @@ BOOL ToastHoldNoteFrame(IN HWND window, IN BOOL newFrame, IN BOOL mapped)
             if (e->SwapGateFrames < 0xFFFFFFFFu) e->SwapGateFrames++;
             e->SwapGateReadPending = TRUE;   // before the request: it stands when the worker's queue refuses it
             ThRequestReadLocked(e, now);
-            if (!e->SwapGateBound && now < e->SwapGateSince + TH_HOLD_BOUND_MS)   // past the bound the stamp is old: arming it
-                                             // would spin the sweep; a pending record's wait keeps the deadline ToastHoldDecide armed
+            if (!e->SwapGateBound)           // past the bound the stamp is old: arming it again would spin the sweep
             {
                 e->Due = ThMinTick(e->Due, e->SwapGateSince + TH_HOLD_BOUND_MS);
                 ThRecomputeDueLocked();
@@ -1191,15 +1370,14 @@ void ToastHoldEvict(IN HWND window)
     UINT32 queuedNotif = 0, ownNotif = 0;
     UINT queuedSameReads = 0;
     ULONGLONG sinceSameRead = 0;
+    TH_END_REPORT endRep;
+    ZeroMemory(&endRep, sizeof(endRep));
     if (e)
     {
-        // A record reserved for a hold that never resolved belongs to nobody now; a decided record
-        // stays consumed (its banner was shown or suppressed).
-        if (e->Core.Phase == ThPhaseHolding && e->Core.RecordSeq)
-            ThConsumedRemove(&g_ThCons, e->Core.RecordSeq);
-        for (int k = 0; k < e->StackCount - 1 && k < TOAST_CARDS_MAX; k++)   // the same for a stacked card still pending
-            if (e->Stack[k].Seq && e->Stack[k].Verdict == TH_VERDICT_PENDING)
-                ThConsumedRemove(&g_ThCons, e->Stack[k].Seq);
+        // THE BANNER ENDS UNSHOWN (ADR-toasts 13): a record it was still waiting on is claimed for the bridge, which
+        // forwards the toast - mapped nowhere is not an end; content that ended with no record is remembered and the
+        // record listed later is claimed. A decided record stays consumed (its banner was shown or suppressed).
+        ThEndUnshownLocked(e, GetTickCount64(), &endRep);
         queuedNotif = e->QueuedNotif;
         ownNotif = e->Core.NotifId;
         queuedSameReads = e->QueuedSameReads;
@@ -1209,6 +1387,7 @@ void ToastHoldEvict(IN HWND window)
     }
     ThRecomputeDueLocked();
     LeaveCriticalSection(&g_ThLock);
+    ThLogEndReport(window, L"destroyed", &endRep);
     // Whether Windows ever painted the queued toast here is otherwise unrecorded: a re-read that finds the
     // same content logs nothing. One line per banner that ends with a newer toast still queued behind it.
     if (queuedNotif)
@@ -1253,12 +1432,17 @@ void ToastHoldOnSignal(void)
 {
     HWND wake[TH_ENTRIES];
     int n = 0;
+    TH_END_REPORT endRep;
     if (!g_ThActive) return;
+    ZeroMemory(&endRep, sizeof(endRep));
     EnterCriticalSection(&g_ThLock);
+    // The bridge's verdict event: a record listed AFTER its banner ended unshown with no record is claimed for the bridge.
+    ThClaimEndedLocked(GetTickCount64(), &endRep);
     for (int i = 0; i < TH_ENTRIES; i++)
         if (g_Th[i].Window && !g_Th[i].NotBanner)
             wake[n++] = g_Th[i].Window;
     LeaveCriticalSection(&g_ThLock);
+    ThLogEndReport(NULL, L"ended earlier", &endRep);
     for (int i = 0; i < n; i++)
         PokeWindowTrackingFor(wake[i]);
 }
@@ -1345,6 +1529,8 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
     UINT64 before = 0, after = 0;
     UINT withoutTitle = 0;
     LONG e_firstW = 0, e_firstH = 0, e_seenW = 0, e_seenH = 0;   // copied under the lock, for the log below
+    TH_END_REPORT endRep;   // cards that left the stack still undecided (ADR-toasts 13), said after the lock
+    ZeroMemory(&endRep, sizeof(endRep));
 
     EnterCriticalSection(&g_ThLock);
     TH_ENTRY* e = ThFindLocked(window);
@@ -1408,6 +1594,19 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
                             e->PromotedSeq = e->Stack[j].Seq;
                         break;
                     }
+            }
+            // A card above the bottom one that this read no longer shows ended unshown if it was still kept out undecided:
+            // its pending record is claimed for the bridge, a title with no record is remembered (ADR-toasts 13).
+            for (int j = 0; j < oldCount - 1 && j < TOAST_CARDS_MAX; j++)
+            {
+                BOOL still = FALSE;
+                for (int k = 0; k < cardCount; k++)
+                    if (e->Stack[j].Ident.Combined != 0 && e->Stack[j].Ident.Combined == cardIdent[k].Combined) still = TRUE;
+                if (still) continue;
+                if (e->Stack[j].Seq && e->Stack[j].Verdict == TH_VERDICT_PENDING)
+                    ThEndClaimLocked(e->Stack[j].Seq, e->Stack[j].NotifId, e->Stack[j].Ident.Combined, &endRep);
+                else if (!e->Stack[j].Seq && e->Stack[j].Excluded)
+                    ThRememberEndedLocked(&e->Stack[j].Ident, now, &endRep);
             }
             memcpy(e->Stack, next, sizeof(next));
             e->StackCount = cardCount;
@@ -1510,6 +1709,7 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
     if (status == TH_READ_OK && !again)
         e->SwapGateReadPending = FALSE;
     LeaveCriticalSection(&g_ThLock);
+    ThLogEndReport(window, L"left the stack", &endRep);
 
     // The guard above, said out loud: a card-less look that did NOT count because the window is still
     // building. toast-hold-grade.py keys on QGATOASTIDENT, and this is the line that explains a hold
@@ -1517,13 +1717,13 @@ void ToastHoldApplyIdentity(IN HWND window, IN LONG incarnation, IN TOAST_CARD_S
     if (stillGrowing)
         LogInfo("QGATOASTIDENT hwnd=0x%x card-less look does NOT count: the window changed size since the "
             "first one (%ldx%ld -> %ldx%ld), so it is a banner still building, not a flyout - this look "
-            "becomes the first of a new pair and the hold continues to its %u ms bound",
+            "becomes the first of a new pair and the hold continues to the banner's end (%u ms)",
             (DWORD)(ULONG_PTR)window, (long)e_firstW, (long)e_firstH, (long)e_seenW, (long)e_seenH,
-            (unsigned)TH_HOLD_BOUND_MS);
+            (unsigned)TH_BANNER_END_MS);
     if (logNoCard)
         LogInfo("QGATOASTIDENT hwnd=0x%x card not readable yet (%s, read %u): no card / no Title|TitleText block - "
-            L"held until a read succeeds, a second card-less read says not-a-banner, or the %u ms bound opens it",
-            (DWORD)(ULONG_PTR)window, ThReadStatusName(status), withoutTitle, (unsigned)TH_HOLD_BOUND_MS);
+            L"held until a read succeeds, a second card-less read says not-a-banner, or the banner's end (%u ms, NOT mapped) ends it",
+            (DWORD)(ULONG_PTR)window, ThReadStatusName(status), withoutTitle, (unsigned)TH_BANNER_END_MS);
     else if (status == TH_READ_OK && changed)
         LogDebug("QGATOASTIDENT hwnd=0x%x identity %016llx -> %016llx (s=%016llx t=%016llx m=%016llx)", (DWORD)(ULONG_PTR)window,
             (unsigned long long)before, (unsigned long long)after, (unsigned long long)ident.Sender,
