@@ -1838,9 +1838,12 @@ ULONG GetRealWindowRect(IN HWND window, OUT RECT* rect)
             // operator or a field report can still see it happening without 119 separate lines
             // (Jev: split the cases 0.93, but hides_degradation 0.56 - high enough not to make
             // the routine case disappear entirely).
-            const BOOL allZero = (dwmRect.left == 0 && dwmRect.top == 0 &&
-                                  dwmRect.right == 0 && dwmRect.bottom == 0);
-            if (allZero)
+            // A POINT IS EMPTY, NOT INVERTED. Measured 2026-11-25 (26300): 7 of that log's 14 warnings were one window
+            // collapsed to a point at successive positions - (12,71)-(12,71), (2363,573)-(2363,573), (2143,605)-(2143,605) -
+            // which shows nothing, exactly as (0,0)-(0,0) does. Only right < left or bottom < top is the garbage case.
+            const BOOL zeroArea = (dwmRect.right == dwmRect.left || dwmRect.bottom == dwmRect.top) &&
+                                  dwmRect.right >= dwmRect.left && dwmRect.bottom >= dwmRect.top;
+            if (zeroArea)
             {
                 static volatile LONG s_zeroRectCount = 0;
                 static ULONGLONG s_zeroRectLastReport = 0;
@@ -6913,7 +6916,13 @@ static BOOL BrokerFreshFrame(IN WINDOW_DATA* e, OUT const BYTE** base, OUT int* 
     // an inset is the pre-ABI-25 behaviour and is correct for a window nobody can place - but it is
     // not the same event, and a warning that cannot be told apart from a real mis-crop is how the
     // real one would get declared away.
-    if (!e->PwCropFallbackLogged && s->ReqCardValid)
+    // ONLY A FRAME OF THE CURRENT GEOMETRY. ReqCard is the request NOW; CropUsed/CropWin belong to the frame the broker last
+    // published, which may answer the previous request. Measured 2026-11-25 (26300, search view 0x1017a): the agent rebuilt
+    // the slab 858x890 -> 833x864 for the card and, in the same millisecond, warned "cropped 0,0 not 12,13" off a frame the
+    // same pass rejected as "frame 858x890 != slab 833x864" - the old request's frame, no card asked of it; no "feed LOST"
+    // followed, so the next frame was the new geometry. A frame's size equals the slab only once it answers this geometry.
+    if (!e->PwCropFallbackLogged && s->ReqCardValid &&
+        s->FrameWidth == (LONG)e->PwWidth && s->FrameHeight == (LONG)e->PwHeight)
     {
         if (!s->CropWinValid)
         {
