@@ -2199,6 +2199,19 @@ static BOOL g_ConsentHostWarned = FALSE;
 
 static BOOL CapStripTaken(IN HWND hwnd);   // the stripped set, defined with it (RestyleGuestCaption)
 
+// Is Windows 10's SearchApp window cut by its window region to a box smaller than its window rect - the taskbar search box
+// it collapses to while Start is shown (a 784x680 window cut to 344x40 at (0,640))? Read live; the frame gate below and
+// ShouldAcceptWindow's search-behind-Start rule both ask it, so they cannot disagree about the same window.
+static BOOL SearchAppCollapsedToBox(IN HWND window)
+{
+    RECT regionBox, windowRect;
+    const int regionType = GetWindowRgnBox(window, &regionBox);
+    return (regionType == SIMPLEREGION || regionType == COMPLEXREGION) &&
+        GetWindowRect(window, &windowRect) &&
+        (regionBox.right - regionBox.left < windowRect.right - windowRect.left ||
+         regionBox.bottom - regionBox.top < windowRect.bottom - windowRect.top);
+}
+
 ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
 {
     WINDOW_DATA* entry = NULL;
@@ -2496,16 +2509,8 @@ ULONG GetWindowData(IN HWND window, IN OUT WINDOW_DATA** windowData)
         // the flip below frames the search view with a fresh MAP after Start has gone. Keyed on the
         // host image because SearchHost's window, on Windows 11, is region-cut too while it
         // composes. Silent: this is re-read on every pass.
-        BOOL collapsedSearchBox = FALSE;
-        if (kind == ShellSurfaceSearch && ShellSurfaceHostedBySearchApp(entry))
-        {
-            RECT regionBox, windowRect;
-            const int regionType = GetWindowRgnBox(entry->Handle, &regionBox);
-            collapsedSearchBox = (regionType == SIMPLEREGION || regionType == COMPLEXREGION) &&
-                GetWindowRect(entry->Handle, &windowRect) &&
-                (regionBox.right - regionBox.left < windowRect.right - windowRect.left ||
-                 regionBox.bottom - regionBox.top < windowRect.bottom - windowRect.top);
-        }
+        const BOOL collapsedSearchBox = kind == ShellSurfaceSearch && ShellSurfaceHostedBySearchApp(entry) &&
+            SearchAppCollapsedToBox(entry->Handle);
         if (!collapsedSearchBox && settled &&
             QgaShellFrameAllowed(g_ShellManaged, (int)kind,
                                  entry->Width, entry->Height, g_ScreenWidth, g_ScreenHeight))
@@ -10142,6 +10147,22 @@ static BOOL StartSurfaceStillVisible(IN HWND start)
     return TRUE;
 }
 
+// Is a Start host window visible and uncloaked in the GUEST now? Read live from Windows, not from dom0's map
+// (StartMappedOnScreen): measured 2026-11-25 on Windows 10, SearchApp's window was announced at 014116.051 and Start's
+// at 014116.292, so a test on what dom0 has mapped is false exactly when the search window is first examined.
+static BOOL StartVisibleInGuest(void)
+{
+    HWND w = NULL;
+    while ((w = FindWindowEx(NULL, w, L"Windows.UI.Core.CoreWindow", NULL)) != NULL)
+    {
+        DWORD pid = 0;
+        (void)GetWindowThreadProcessId(w, &pid);
+        if (ShellHostKindOfProcess(pid) == ShellSurfaceStart && StartSurfaceStillVisible(w))
+            return TRUE;
+    }
+    return FALSE;
+}
+
 // ONE EXAMINATION of a hidden-Start opening: gather the six facts, take the verdict, act, and say
 // what happened once. Three call sites ask the same question - the hidden-Start branch when a
 // surface appears or is looked at again, the re-arm on every window event while a dismissal is
@@ -10812,6 +10833,34 @@ BOOL ShouldAcceptWindow(IN const WINDOW_DATA *data)
             LogDebug("0x%x: Search surface of a hidden Start opening - not presented", data->Handle);
             return FALSE;
         }
+    }
+
+    // WINDOWS 10'S SEARCH WINDOW BEHIND A SHOWN START IS NOT A WINDOW. GWeck post 241 A: two dom0 windows on opening
+    // Start, "Start" and "Suche", the second menu-sized and showing "part of some other window". Reproduced 2026-11-25 on
+    // win10 (19045) with the taskbar search box hidden (SearchboxTaskbarMode 0): SearchApp's window 0x1018c went visible
+    // at (48,760) 784x640 with NO region and was created ovr=0 and mapped; its per-window capture is the slice under it
+    // (Start's app list, black, wallpaper). With the box shown, Windows cuts the same window to the 344x40 box and the
+    // frame gate keeps that a popup (SearchAppCollapsedToBox) - unchanged here - but the uncut 784x680 state was still
+    // created for 17 ms before the cut (win10-ab2 011844.481). This is the stock "hide search while start is shown" rule
+    // deleted below for its caption lookup, restored by kind and by Start's live visibility. Typing hides Start and
+    // paints the search view; the next pass accepts it and the frame gate frames it (row 29's search view).
+    if (ShellSurfaceKind(data) == ShellSurfaceSearch && ShellSurfaceHostedBySearchApp(data))
+    {
+        // One line per opening: SearchApp keeps the same window across openings, so the marker is cleared whenever the
+        // window is examined outside this state (Start gone, or cut to its box).
+        static HWND s_searchBehindStartSaid;
+        if (!SearchAppCollapsedToBox(data->Handle) && StartVisibleInGuest())
+        {
+            if (s_searchBehindStartSaid != data->Handle)
+            {
+                s_searchBehindStartSaid = data->Handle;
+                LogInfo("QGASEARCHBEHINDSTART 0x%x: Windows 10 search window (%ux%u, no box region) while Start is shown - "
+                    "not announced", data->Handle, data->Width, data->Height);
+            }
+            return FALSE;
+        }
+        if (s_searchBehindStartSaid == data->Handle)
+            s_searchBehindStartSaid = NULL;
     }
 
     // GENUINE-OPEN GATE. A shell host (StartMenuExperienceHost / ShellExperienceHost /
