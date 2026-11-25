@@ -11938,7 +11938,20 @@ static ULONG UpdateWindowData(IN OUT WINDOW_DATA *windowData)
             // "it violated crop-before-map", and until 2026-09-09 there was NO line naming it -
             // only held_ms in QGASLICEMAP encoded it, implicitly. A fallback that fires silently is
             // the anomaly this project's own rule forbids, so grep QGACROPLATE for it.
-            if (timedOut && !cropReady)
+            // NOT READY IS TWO DIFFERENT THINGS, and until 2026-11-25 this line called both "uncropped". Windows 10's
+            // Start waited the whole timeout with its crop LANDED (TcApplyResult and CREATE at its 636x636 card) and no
+            // slice content (QGASLICEMAP content=0 painted=0 held_ms=734), while the line said "shadow strip visible
+            // until cropped" (WIN10STARTMAPSAFTERCROPTIMEOUT). The content form carries this window's own frame-loop
+            // counts, which tell its three causes apart: seen=0 - the loop never reached it (hidden, iconic, or
+            // every frame dropped redundant); seen>0 copies=0 - no dirty rect crossed its rect; refused>0 - the copy.
+            if (timedOut && !cropReady && !SliceChromeContentReady(windowData))
+                LogWarning("QGACROPLATE hwnd 0x%x (class %s) mapped after %lu ms with NO slice content (crop %s): no frame "
+                    "showed this window's pixels - visible=%d iconic=%d seen=%llu copies=%llu refused=%llu",
+                    (DWORD)(ULONG_PTR)windowData->Handle, windowData->Class, (ULONG)CROP_BEFORE_SHOW_TIMEOUT_MS,
+                    CropPending(windowData) ? L"still pending" : L"resolved",
+                    windowData->IsVisible ? 1 : 0, windowData->IsIconic ? 1 : 0, windowData->PwLedgerFramesSeen,
+                    windowData->PwLedgerCopies, windowData->PwLedgerRefused);
+            else if (timedOut && !cropReady)
                 // The shadow-crop did not resolve within the timeout, so the window is shown at its full rect and
                 // will snap when the measurement lands. This is the line to quote for a toast/menu that appears with
                 // its shadow strip.
