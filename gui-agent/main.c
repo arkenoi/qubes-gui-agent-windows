@@ -4693,7 +4693,13 @@ static void BrokerSupervise(void)
         //     one-shot W names the blocked guard, which is the fact the log could not supply before.
         //   * launched - anchored at the launch, in the branch below.
         const BOOL shellUp = ShellWindowNow() != NULL;
-        const BOOL pendingTooLong = shellUp && g_ShellSeenTick && (now - g_ShellSeenTick) >= DESLICE_LAUNCH_PENDING_MS;
+        // `now` was read at the top of this pass, and ShellWindowNow() stamps g_ShellSeenTick the first
+        // time it sees the shell - which can be the call just above, AFTER `now`. Unsigned, now minus a
+        // later tick wraps to ~2^64, so the very pass that first saw the shell declared the launch
+        // overdue ("shell up 18446744073709551 s", rel-45591941978 win11-upgrade). A shell first seen
+        // after `now` has been up for no time at all.
+        const ULONGLONG shellUpMs = (g_ShellSeenTick && now > g_ShellSeenTick) ? now - g_ShellSeenTick : 0;
+        const BOOL pendingTooLong = shellUp && g_ShellSeenTick && shellUpMs >= DESLICE_LAUNCH_PENDING_MS;
         if (!pendingTooLong)
         {
             if (g_BrokerDownSince)
@@ -4711,7 +4717,7 @@ static void BrokerSupervise(void)
                 g_WgcLaunchStallSaid = TRUE;
                 LogWarning("QGABROKERLAUNCHNOTISSUED shell up %I64u s and the de-slice broker launch has not been "
                     "issued (session=0x%x disarmed=%d) - reporting it as a de-slice outage, which is what the user sees",
-                    (now - g_ShellSeenTick) / 1000, sid, HelpersDisarmed() ? 1 : 0);
+                    shellUpMs / 1000, sid, HelpersDisarmed() ? 1 : 0);
             }
             if (!g_BrokerDownSince)
             {
