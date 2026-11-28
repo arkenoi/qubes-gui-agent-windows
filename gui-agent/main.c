@@ -5094,7 +5094,8 @@ static void BrokerShutdown(void)
 #define DIRECT_DARK_FRAMES 2u
 #define DIRECT_NOTIFY_REPEAT_MS (5u * 60u * 1000u)
 static ULONGLONG g_DirectNotifyNext = 0;
-static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL resident);   // defined below
+static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL resident, DWORD sid,
+                              volatile LONG64* createFrom);   // defined below
 static void DirectSuppressNotifyUser(IN DWORD count, IN const WCHAR* fault)
 {
     // NOT AT BOOT. The broker's one launch waits for a shell, so EVERY cold boot has a window -
@@ -5357,20 +5358,23 @@ static BOOL g_NotifRestorePending = FALSE;
 // launch that failed); FALSE for a one-shot (a notify, the banner restore), which the scheduler must never retry.
 // There is no child handle AT LAUNCH; callers watch their own signals (the bridge: its heartbeat file, then the
 // validated process handle taken from the pid it publishes there; the restore one-shot: its marker deletion).
-static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL resident)
+// sid: the console session THE CALLER read on the main loop, where it also saw the shell.
+// createFrom (NULL for a one-shot): set to the tick between the old task's delete and the new one's create - nothing
+// this launch starts can have run before it, and a predecessor's instance is ended by that delete.
+static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL resident, DWORD sid,
+                              volatile LONG64* createFrom)
 {
-    DWORD sid = WTSGetActiveConsoleSessionId();
-    if (sid == 0xFFFFFFFF) return FALSE;
-
     // A SESSION EXISTING IS NOT A SESSION THAT CAN HOST A UI HELPER. Between logon and the shell
     // coming up, WTSGetActiveConsoleSessionId and WTSUserName are both already satisfied while
     // there is no shell for notifhost to present into - so the launch would half-succeed into a
     // session that is itself still starting. WgcLaunch's caller has always required GetShellWindow()
     // for exactly this reason; this path did not, and it is the one that fired at 08:22:49 on
     // 2026-09-08, during the first logon of a guest that was still installing.
-    // Returning FALSE here is a DEFINED outcome the callers already handle (they log "no
-    // interactive session?" and keep the failure in the log), not a silent drop.
-    if (!ShellWindowNow()) return FALSE;
+    // BOTH ARE THE CALLER'S, read once on the main loop (bridge-death census P3, 2026-11-28). This runs on the bridge's
+    // launch thread as well, which asked again after the latch: a thread that cannot see the shell window (it is
+    // per desktop, and the main loop moves between desktops while this thread does not) or a session read in the
+    // middle of a console attach failed the agent's one launch for good, where the loop's own reading had passed.
+    if (sid == 0xFFFFFFFF) return FALSE;
 
     WCHAR userId[256];
     if (!TaskUserId(sid, userId, RTL_NUMBER_OF(userId))) return FALSE;
@@ -5387,6 +5391,8 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL 
     WCHAR args[2048];
     StringCchPrintf(args, RTL_NUMBER_OF(args), L"/delete /tn %s /f", taskName);
     WgcRunSchtasks(args, NULL, NULL, 0);
+    if (createFrom)
+        (void)InterlockedExchange64(createFrom, (LONG64)GetTickCount64());
     if (!HelperTaskRegister(taskName, longExe, exeArgs, userId, resident,
             resident ? L"QWT: the GUI agent's notification bridge (re-created by the GUI agent at each of its starts; "
                        L"Task Scheduler retries only a launch that failed; never relaunched by the agent)"
@@ -5445,10 +5451,21 @@ static void NotifBridgeRetireLeftovers(void)
     }
 }
 
-static BOOL NotifBridgeLaunch(void)
+// THE EARLIEST TICK A HEARTBEAT OF THE AWAITED BRIDGE CAN CARRY (bridge-death census P1, 2026-11-28). The launch
+// thread writes it between the old task's delete and the new one's create; the exit path writes the exit's tick when
+// it re-arms the wait; 0 while a launch has not reached its create, and nothing is accepted then. It replaced the
+// reap's DONE tick as the accept anchor: a bridge started by the registration trigger publishes while schtasks is
+// still held (measured margins down to 47 ms after the DONE tick, 11-16..11-28), and an earlier tick was refused for
+// the agent's whole life because the bridge publishes once. The heartbeat's tick and this one are the same clock.
+static volatile LONG64 g_NotifCreateFromTick = 0;
+
+// sid: the console session the main loop read when it issued the launch (NotifRunInSession).
+// The IPC objects are NOT created here: the liveness mutex must be owned by the main-loop thread for the agent's life,
+// and this runs on the launch thread, which exits (census P14). The main loop refuses the launch without them.
+static BOOL NotifBridgeLaunch(DWORD sid)
 {
     WCHAR args[768];
-    if (!NotifIpcEnsure()) return FALSE;
+    if (!g_NotifAlive || !g_NotifReadyEvt) return FALSE;
     // --notify-errors: the resolved secondary-error-route gate, so the bridge can report its own
     // ACTION faults (listener access denied) without reading the gate itself (notifyerr.h).
     // --alive / --ready: the liveness mutex it waits on and the event it sets once its pid is published (S4c).
@@ -5462,7 +5479,7 @@ static BOOL NotifBridgeLaunch(void)
     // schtasks answered "Value for '/tr' option cannot be more than 261 character(s)" at 262 and took 261; this form is 198).
     if (g_NotifHoldBase && g_NotifVerdictEvt)
         StringCchCat(args, RTL_NUMBER_OF(args), L" --hold");
-    return NotifRunInSession(NOTIF_TASK_NAME, args, TRUE);
+    return NotifRunInSession(NOTIF_TASK_NAME, args, TRUE, sid, &g_NotifCreateFromTick);
 }
 
 // THE BRIDGE'S OWN OFF-LOOP LAUNCH SET, mirroring the broker's rather than sharing one mechanism with it
@@ -5479,11 +5496,11 @@ static volatile ULONGLONG g_NotifLaunchDoneTick = 0;   // when the launch FINISH
 static HANDLE g_NotifLaunchThread = NULL;
 static DWORD WINAPI NotifLaunchThreadProc(IN void* param)
 {
-    UNREFERENCED_PARAMETER(param);
+    const DWORD sid = (DWORD)(ULONG_PTR)param;   // the main loop's reading, at the issue
     LogInfo("QGATHREAD role=notiflaunch tid=%lu", GetCurrentThreadId());   // M1: short-lived, never joined
     const ULONGLONG t0 = GetTickCount64();
     const LONG64 loopBefore = InterlockedCompareExchange64(&g_MainLoopTick, 0, 0);
-    const BOOL ok = NotifBridgeLaunch();
+    const BOOL ok = NotifBridgeLaunch(sid);
     g_NotifLaunchDoneTick = GetTickCount64();
     const LONG64 loopAfter = InterlockedCompareExchange64(&g_MainLoopTick, 0, 0);
     const ULONGLONG wake = g_MainLoopWakeTick;
@@ -5557,8 +5574,9 @@ static void NotifBridgeRestoreSweep(void)
     ULONGLONG now = GetTickCount64();
     if (now < g_NotifNextPoll) return;
     g_NotifNextPoll = now + 5000;
-    if (WTSGetActiveConsoleSessionId() == 0xFFFFFFFF || !ShellWindowNow()) return;
-    if (NotifRunInSession(NOTIF_RESTORE_TASK_NAME, L"--restore-banners", FALSE))
+    const DWORD sid = WTSGetActiveConsoleSessionId();
+    if (sid == 0xFFFFFFFF || !ShellWindowNow()) return;
+    if (NotifRunInSession(NOTIF_RESTORE_TASK_NAME, L"--restore-banners", FALSE, sid, NULL))
     {
         // Gate-off restore: the bridge is off this run and a crash may have left banner markers behind.
         LogInfo("NOTIFBRIDGE restore sweep launched, leftover banner markers cleared");
@@ -5760,13 +5778,16 @@ static void NotifBridgeSupervise(void)
         // direction. NOT CLAIMED: which of the three his 20-second exit took - that is in his
         // bridge.log, which we do not hold (Jev, on it being the sign-in session change:
         // insufficient-evidence 0.61).
-        if (exitCode == 0)
+        // EXIT 2 WITH A RECORDED DENY IS A STAND-DOWN (bridge-death census P5, docs/ADR-toasts.md 12): an explicit user or
+        // device Deny read while the bridge runs ends it as the start's does - that setting's notice, the reason
+        // recorded, exit 2 - and it is accepted from the bridge that just exited, never another reason at that code.
+        if (exitCode == 0 || exitCode == 2)
         {
             WCHAR reasonPath[MAX_PATH] = { 0 }, reason[64] = { 0 };
             DWORD reasonPid = 0;
             ULONGLONG reasonTick = 0;
             (void)NotifReadExitReason(reasonPath, reason, RTL_NUMBER_OF(reason), &reasonPid, &reasonTick);
-            if (reason[0] && reasonPid == g_NotifBridgePid)
+            if (reason[0] && reasonPid == g_NotifBridgePid && (exitCode == 0 || 0 == wcsncmp(reason, L"listener-denied-", 16)))
             {
                 // A SESSION CHANGE IS NOT ACCOMMODATED - IT IS REPORTED. Owner, 2026-10-08:
                 // "normally we dont do this at all: our session is single builtin user. if we EVER
@@ -5841,6 +5862,7 @@ static void NotifBridgeSupervise(void)
         g_NotifLaunchPending = TRUE;
         g_NotifLastLaunch = now;
         g_NotifAwaitedSince = now;
+        (void)InterlockedExchange64(&g_NotifCreateFromTick, (LONG64)now);
         g_NotifNotReadyLogged = FALSE;
     }
     // REAP AN OFF-LOOP LAUNCH, ON THE LOOP, before any early return below can strand it and before the
@@ -5852,27 +5874,48 @@ static void NotifBridgeSupervise(void)
     {
         const BOOL _ok = (g_NotifLaunchState == 2);
         _InterlockedExchange(&g_NotifLaunchState, 4);
-        g_NotifLastLaunch = g_NotifLaunchDoneTick;   // the DONE tick: the 60 s grace starts when the task exists
-        g_NotifLaunchPending = _ok;
-        g_NotifNotReadyLogged = FALSE;
         if (g_NotifLaunchThread)
         {
             CloseHandle(g_NotifLaunchThread);
             g_NotifLaunchThread = NULL;
         }
-        // The one launch per agent life is not retried - no relaunch loop (owner 2026-10-07). Not retried:
-        // the notification bridge is down and guest toasts take the window path until the next agent start.
-        if (!_ok)
-            LogError("QGANOTIFLAUNCHFAIL bridge launch failed, toasts show as guest windows");
+        // THE READY PATH IS ARMED FROM THE ISSUE (census P2), so a bridge the registration trigger started can already
+        // be adopted - or adopted and gone - when the registration returns. The reap then changes nothing it decided.
+        if (!g_NotifLaunchPending)
+        {
+            // Adopted while schtasks was still held: that bridge runs and its exit is waited on. A failure schtasks
+            // reports for a registration whose bridge is running is said, and it is not a failed launch.
+            if (!_ok && g_NotifBridgeProc)
+                LogWarning("NOTIFBRIDGE schtasks reported the registration failed, but bridge pid %lu has published "
+                    L"and is waited on - not a failed launch", g_NotifBridgePid);
+        }
+        else if (g_NotifBridgeExitedAt == 0)
+        {
+            g_NotifLastLaunch = g_NotifLaunchDoneTick;   // the DONE tick: the 60 s grace starts when the task exists
+            g_NotifNotReadyLogged = FALSE;
+            // The one launch per agent life is not retried - no relaunch loop (owner 2026-10-07). Not retried:
+            // the notification bridge is down and guest toasts take the window path until the next agent start.
+            // The READY path stays armed: a bridge that publishes after all is adopted rather than left running
+            // unwatched, with no hold that knows it is up. Said once, here - not again as QGANOTIFNOTREADY.
+            if (!_ok)
+            {
+                g_NotifNotReadyLogged = TRUE;
+                LogError("QGANOTIFLAUNCHFAIL bridge launch failed, toasts show as guest windows");
+            }
+        }
+        // else: an instance of this launch was adopted and has exited already; the wait its exit re-armed stands.
     }
     if (g_NotifBridgeProc) return;            // running: nothing to do and nothing armed
     DWORD sid = WTSGetActiveConsoleSessionId();
-    // No session or no shell yet: the shell's own window events wake this loop when it comes up.
-    if (sid == 0xFFFFFFFF || !ShellWindowNow()) return;
+    // No console session (attached to none, between sessions): nothing can be validated or launched; read again on the
+    // next wake.
+    if (sid == 0xFFFFFFFF) return;
 
     // READY? A launch (or a scheduler restart after an exit) is in flight: take the pid its instance published - only
-    // from a file written AFTER that launch or exit (a dead instance's file can still be there, and a reused pid could
-    // then validate as another notifhost.exe).
+    // from a file written AFTER that launch's create or that exit (a dead instance's file can still be there, and a
+    // reused pid could then validate as another notifhost.exe). NOT GATED ON THE SHELL WINDOW: that is the launch's
+    // precondition, and this thread cannot see it while it sits on the Winlogon desktop - a bridge that published then
+    // ran unadopted until the next wake that found the shell. OpenHelperProcess validates the image and the session.
     if (g_NotifLaunchPending)
     {
         WCHAR hb[MAX_PATH];
@@ -5895,7 +5938,8 @@ static void NotifBridgeSupervise(void)
                 CloseHandle(hf);
             }
         }
-        if (parsed && hbTick >= g_NotifLastLaunch && hbTick <= now)
+        const ULONGLONG acceptFrom = (ULONGLONG)InterlockedCompareExchange64(&g_NotifCreateFromTick, 0, 0);
+        if (parsed && acceptFrom != 0 && hbTick >= acceptFrom && hbTick <= now)
         {
             if (hbPid != 0 && hbPid != g_NotifBridgePidRejected)
             {
@@ -5904,8 +5948,9 @@ static void NotifBridgeSupervise(void)
                 {
                     g_NotifBridgePid = hbPid;
                     g_NotifLaunchPending = FALSE;
+                    // The ms are counted from the launch's create (or the exit), no longer from schtasks' return.
                     LogInfo("NOTIFBRIDGE ready (pid %lu published %I64u ms after the %s) - its exit is now waited on",
-                            hbPid, hbTick - g_NotifLastLaunch,
+                            hbPid, hbTick - acceptFrom,
                             g_NotifBridgeExitedAt != 0 ? L"exit it replaces (Task Scheduler restarted it)" : L"launch");
                     g_NotifBridgeExitedAt = 0;
                     ToastHoldSetBridgeUp(TRUE);
@@ -5982,8 +6027,9 @@ static void NotifBridgeSupervise(void)
         }
         // Not published yet: its ready event wakes this loop. Past 60 s (BridgeNextDue arms that one deadline) it is
         // said ONCE, at ERROR, and NOT relaunched: this agent launches each helper once; what runs without publishing
-        // is Task Scheduler's to restart only if it exits with a failure.
-        if (now - g_NotifLastLaunch >= 60000 && !g_NotifNotReadyLogged)
+        // is Task Scheduler's to restart only if it exits with a failure. The 60 s count from the DONE tick, so not while
+        // the registration is still in flight (g_NotifLastLaunch is 0 until the reap anchors it).
+        if (g_NotifLastLaunch != 0 && now - g_NotifLastLaunch >= 60000 && !g_NotifNotReadyLogged)
         {
             g_NotifNotReadyLogged = TRUE;
             // A BRIDGE THAT STOOD DOWN BEFORE IT HAD A PID TO PUBLISH (docs/ADR-toasts.md 12): on an explicit Deny of
@@ -6015,8 +6061,22 @@ static void NotifBridgeSupervise(void)
     }
     // THE ONE LAUNCH PER AGENT LIFE: never into a session that is ending; a failed launch is said at ERROR and not retried.
     if (g_NotifLaunched || HelpersDisarmed()) return;
+    // No shell yet: the shell's own window events wake this loop when it comes up. Read HERE, once, with the session
+    // above, and handed to the launch thread - which asks neither again (census P3).
+    if (!ShellWindowNow()) return;
+    // THE IPC IS INIT'S, ON THIS THREAD (census P14): the liveness mutex is owned by its creator, and Init on the
+    // main-loop thread is the one creator that lives as long as the agent. When it failed there (QGANOTIFIPC, an
+    // ERROR already), the launch is refused instead of creating the mutex on the launch thread - that thread exits,
+    // the mutex is abandoned, and the bridge reads it at its first pass as this agent's death.
+    if (!g_NotifAlive || !g_NotifReadyEvt)
+    {
+        g_NotifLaunched = TRUE;   // refused once; no task exists, so the exit path has none to disarm
+        LogInfo("NOTIFBRIDGE not launched: its liveness mutex and ready event were not created at Init (QGANOTIFIPC "
+            L"above) - guest toasts take the window path");
+        return;
+    }
     g_NotifLaunched = TRUE;
-    g_NotifLaunchedSession = WTSGetActiveConsoleSessionId();   // which session this one serves
+    g_NotifLaunchedSession = sid;   // which session this one serves: the reading the shell was seen under
     g_NotifBridgeExitedAt = 0;
     g_NotifAwaitedSince = now;   // before the thread exists, so before any bridge it starts
     // OFF THE LOOP, like the broker's (NOTIFLAUNCHBLOCKSTHELOOP): NotifBridgeLaunch reaches schtasks
@@ -6024,16 +6084,20 @@ static void NotifBridgeSupervise(void)
     // deadline, and this function runs on EVERY wake. The state is claimed BEFORE the thread exists, so a
     // thread that finishes instantly cannot have its result clobbered by this assignment.
     //
-    // WHAT IS DELIBERATELY *NOT* SET HERE, both left to the reap:
-    //   g_NotifLastLaunch - the anchor for the 60 s not-ready ERROR. Taking the issue tick would spend the
-    //     registration out of that grace; this is the stale-anchor class of QGADESLICEGRACESTALEANCHOR.
-    //   g_NotifLaunchPending - REQUIRED, not tidiness (Jev must_stay_false 0.83). The READY path's
-    //     staleness test is `hbTick >= g_NotifLastLaunch`, and that anchor is still 0 on a first launch,
-    //     so the guard is vacuous until the reap writes it: a leftover heartbeat from an earlier instance
-    //     in this boot would pass it, and a REUSED pid could then validate as another notifhost.exe -
-    //     exactly the case the comment on that test names.
+    // THE READY PATH IS ARMED NOW, NOT AT THE REAP (census P1/P2, 2026-11-28). It used to wait for the reap
+    // (Jev must_stay_false 0.83) because its staleness test was `hbTick >= g_NotifLastLaunch`, an anchor still 0
+    // here. Its anchor is g_NotifCreateFromTick now: 0 until the launch thread has deleted the old task and is
+    // about to create the new one, and nothing is accepted while it is 0 - so a leftover heartbeat or a
+    // predecessor's instance cannot pass, and the bridge the registration trigger starts is adopted on its ready
+    // event even while schtasks is held (which this tree waits for without a bound).
+    // g_NotifLastLaunch is still left to the reap: the anchor for the 60 s not-ready ERROR. Taking the issue
+    // tick would spend the registration out of that grace; this is the stale-anchor class of
+    // QGADESLICEGRACESTALEANCHOR.
+    (void)InterlockedExchange64(&g_NotifCreateFromTick, 0);
+    g_NotifLaunchPending = TRUE;
+    g_NotifNotReadyLogged = FALSE;
     _InterlockedExchange(&g_NotifLaunchState, 1);
-    g_NotifLaunchThread = CreateThread(NULL, 0, NotifLaunchThreadProc, NULL, 0, NULL);
+    g_NotifLaunchThread = CreateThread(NULL, 0, NotifLaunchThreadProc, (LPVOID)(ULONG_PTR)sid, 0, NULL);
     if (!g_NotifLaunchThread)
     {
         // No thread: run it right here rather than skip the bridge. The state goes back to 0 first so the
@@ -6041,7 +6105,7 @@ static void NotifBridgeSupervise(void)
         _InterlockedExchange(&g_NotifLaunchState, 0);
         LogError("QGANOTIFLAUNCHTHREAD CreateThread for the bridge launch failed (%lu) - launching on the "
             L"main loop instead, which blocks it for the registration", GetLastError());
-        (void)NotifLaunchThreadProc(NULL);
+        (void)NotifLaunchThreadProc((LPVOID)(ULONG_PTR)sid);
     }
 }
 
@@ -6061,7 +6125,8 @@ static ULONGLONG BridgeNextDue(void)
     }
     if (!g_NotifBridge)
         return (g_NotifRestorePending && g_NotifNextPoll > now) ? g_NotifNextPoll : 0;
-    if (g_NotifBridgeProc || !g_NotifLaunchPending || g_NotifNotReadyLogged)
+    // Not while the registration is in flight: the grace is anchored at its reap (the in-flight wake covers the reap).
+    if (g_NotifBridgeProc || !g_NotifLaunchPending || g_NotifNotReadyLogged || g_NotifLastLaunch == 0)
         return 0;
     const ULONGLONG at = g_NotifLastLaunch + 60000;
     return (at > now) ? at : 0;
@@ -6091,7 +6156,7 @@ static void NotifBridgeShutdown(void)
             CloseHandle(g_NotifLaunchThread);
             g_NotifLaunchThread = NULL;
         }
-        if (g_NotifLaunched)
+        if (g_NotifLaunchState != 0)   // a launch was issued (a refused one registered no task to disarm)
             HelperTaskDisarm(NOTIF_TASK_NAME, L"the agent's exit");
         NotifBridgeRequestStop();
         // BOUNDED: a failure detector, graded by QgaHelperStopOutcome (qga-lifecycle.h holds the arms, the offline
