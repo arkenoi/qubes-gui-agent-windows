@@ -5277,7 +5277,15 @@ static BOOL NotifIpcEnsure(void)
         L"D:P(A;;GA;;;SY)(A;;0x100000;;;IU)S:(ML;;NW;;;ME)", SDDL_REVISION_1, &sdM, NULL);
     ConvertStringSecurityDescriptorToSecurityDescriptor(
         L"D:P(A;;GA;;;SY)(A;;0x100002;;;IU)S:(ML;;NW;;;ME)", SDDL_REVISION_1, &sdE, NULL);
-    if (!sdM || !sdE) { if (sdM) LocalFree(sdM); if (sdE) LocalFree(sdE); return FALSE; }
+    if (!sdM || !sdE)
+    {
+        // Said, like the creation failure below (Opus audit, item E): the launch's refusal points at this ERROR.
+        LogError("QGANOTIFIPC bridge setup failed: the liveness mutex's or ready event's security descriptor was not "
+            L"built (%lu), toasts show as guest windows", GetLastError());
+        if (sdM) LocalFree(sdM);
+        if (sdE) LocalFree(sdE);
+        return FALSE;
+    }
     SECURITY_ATTRIBUTES saM = { sizeof(saM), sdM, FALSE }, saE = { sizeof(saE), sdE, FALSE };
     HANDLE m = CreateMutex(&saM, TRUE, g_NotifAliveName);   // OWNED by this, the main-loop thread
     DWORD gle = GetLastError();
@@ -5390,7 +5398,21 @@ static BOOL NotifRunInSession(const WCHAR* taskName, const WCHAR* exeArgs, BOOL 
     // has no 261-character /tr limit (the 2026-10-06 "schtasks /create failed" was that limit).
     WCHAR args[2048];
     StringCchPrintf(args, RTL_NUMBER_OF(args), L"/delete /tn %s /f", taskName);
-    WgcRunSchtasks(args, NULL, NULL, 0);
+    DWORD delRc = 0;
+    WgcRunSchtasks(args, &delRc, NULL, 0);
+    // THE /delete IS READ (Opus audit of the census fixes, item C). It fails on a first start, where the task does not
+    // exist yet - harmless - so the task is queried (exit code only, no text: the answer does not depend on the
+    // locale). Still there means an instance this /delete did not end may keep running; it is said, and only a
+    // heartbeat written after the anchor below is accepted, as for any launch.
+    if (delRc != 0)
+    {
+        DWORD qRc = 0;
+        StringCchPrintf(args, RTL_NUMBER_OF(args), L"/query /tn %s", taskName);
+        WgcRunSchtasks(args, &qRc, NULL, 0);
+        if (qRc == 0)
+            LogWarning("NOTIFBRIDGE schtasks /delete /tn %s exited %lu and the task still exists - an instance it did "
+                L"not end may keep running; the create below replaces the definition", taskName, delRc);
+    }
     if (createFrom)
         (void)InterlockedExchange64(createFrom, (LONG64)GetTickCount64());
     if (!HelperTaskRegister(taskName, longExe, exeArgs, userId, resident,
@@ -5810,6 +5832,24 @@ static void NotifBridgeSupervise(void)
                 // agent-gone and stop-requested stay INFO: one is this agent leaving, the other is
                 // somebody having asked it to stop.
                 const DWORD curSession = WTSGetActiveConsoleSessionId();
+                // "AGENT GONE" FROM A BRIDGE THIS LIVE AGENT IS WATCHING IS A CONTRADICTION (Opus audit, item C): this code
+                // runs on the agent's main loop, so the agent the bridge says is gone is here. It is said at ERROR,
+                // once, and the READY path is re-armed as for a death, so an instance that publishes after this exit
+                // (the task's real one, if this was another) is adopted. Nothing is launched.
+                if (0 == wcscmp(reason, L"agent-gone"))
+                {
+                    LogError("QGANOTIFAGENTGONE the bridge pid %lu left saying its agent was gone, and this agent (pid %lu) "
+                        L"is running - not relaunched; an instance that publishes from now on is adopted, guest toasts take "
+                        L"the window path until then", g_NotifBridgePid, GetCurrentProcessId());
+                    DeleteFile(reasonPath);
+                    g_NotifBridgePid = 0;
+                    g_NotifLaunchPending = TRUE;
+                    g_NotifLastLaunch = now;
+                    g_NotifAwaitedSince = now;
+                    (void)InterlockedExchange64(&g_NotifCreateFromTick, (LONG64)now);
+                    g_NotifNotReadyLogged = TRUE;   // this end's one ERROR is the line above
+                    return;
+                }
                 if (0 == wcscmp(reason, L"session-changed"))
                 {
                     // The premise "one built-in user, autologon, the session is not expected to change at all" is
@@ -5820,6 +5860,19 @@ static void NotifBridgeSupervise(void)
                         g_NotifBridgePid, g_NotifLaunchedSession, curSession);
                     QerrReportText(QerrTextFind("session-changed"), NULL, NULL);
                 }
+                // A BRIDGE THAT CANNOT FORWARD SAYS SO AND SHUTS DOWN; THE GUEST'S OWN TOASTS TAKE OVER. Owner 2026-11-28:
+                // «if bridge cannot forward, it shold emit an error and shut down, then we go for normal guest toasts
+                // indeed.» Each such end is ONE ERROR here and nothing from the death reporter: a stand-down on an
+                // explicit Deny (the bridge sent that setting's notice itself) or a lost dom0 connection (no row of
+                // notifytexts.h names it, so dom0 is told nothing). The hold sees the bridge down: toasts are shown.
+                else if (0 == wcsncmp(reason, L"listener-denied-", 16))
+                    LogError("QGANOTIFSTANDDOWN the bridge pid %lu stood down: %s - it cannot forward without notification "
+                        L"access, not relaunched, guest toasts take the window path; its own notice names the setting",
+                        g_NotifBridgePid, reason);
+                else if (0 == wcscmp(reason, L"cannot-forward"))
+                    LogError("QGANOTIFCANNOTFORWARD the bridge pid %lu shut down: it cannot forward (bridge.log names why) - "
+                        L"not relaunched, guest toasts take the window path until the next agent start",
+                        g_NotifBridgePid);
                 else
                     // It said so in its exit-reason file: not a death. Nothing is relaunched and nothing is reported
                     // to dom0.
@@ -5863,7 +5916,10 @@ static void NotifBridgeSupervise(void)
         g_NotifLastLaunch = now;
         g_NotifAwaitedSince = now;
         (void)InterlockedExchange64(&g_NotifCreateFromTick, (LONG64)now);
-        g_NotifNotReadyLogged = FALSE;
+        // ONE ERROR PER END: this exit said QGANOTIFBRIDGEEXIT. The 60 s QGANOTIFNOTREADY used to follow it about the
+        // same end ("the exit it should have replaced"), and Task Scheduler restarts nothing that ran. An instance that
+        // publishes is still adopted, and its adoption answers this ERROR.
+        g_NotifNotReadyLogged = TRUE;
     }
     // REAP AN OFF-LOOP LAUNCH, ON THE LOOP, before any early return below can strand it and before the
     // READY path reads the flag this sets. The thread publishes exactly two things - a result and the tick
@@ -5952,6 +6008,11 @@ static void NotifBridgeSupervise(void)
                     LogInfo("NOTIFBRIDGE ready (pid %lu published %I64u ms after the %s) - its exit is now waited on",
                             hbPid, hbTick - acceptFrom,
                             g_NotifBridgeExitedAt != 0 ? L"exit it replaces (Task Scheduler restarted it)" : L"launch");
+                    // AN ERROR SAID EARLIER IS ANSWERED (Opus audit, item D): QGANOTIFLAUNCHFAIL or QGANOTIFNOTREADY
+                    // above said there is no bridge, and there is one now - the line a reader of that ERROR needs.
+                    if (g_NotifNotReadyLogged)
+                        LogInfo("NOTIFBRIDGE pid %lu adopted after all - the QGANOTIFLAUNCHFAIL / QGANOTIFNOTREADY above "
+                            L"no longer stands; toasts are forwarded from now on", hbPid);
                     g_NotifBridgeExitedAt = 0;
                     ToastHoldSetBridgeUp(TRUE);
                     return;
@@ -6044,7 +6105,9 @@ static void NotifBridgeSupervise(void)
                 if (NotifReadExitReason(sdPath, sdReason, RTL_NUMBER_OF(sdReason), &sdPid, &sdTick) &&
                     sdTick >= g_NotifAwaitedSince && sdTick <= now && 0 == wcsncmp(sdReason, L"listener-denied-", 16))
                 {
-                    LogInfo("NOTIFBRIDGE the bridge (pid %lu) stood down at its start: %s - not armed and not "
+                    // An ERROR, once, in place of QGANOTIFNOTREADY: it cannot forward (owner 2026-11-28, quoted at the
+                    // exit path). Its own notice is the one dom0 shows.
+                    LogError("QGANOTIFSTANDDOWN the bridge (pid %lu) stood down at its start: %s - not armed and not "
                         L"relaunched, guest toasts take the window path; its own notice names the setting",
                         sdPid, sdReason);
                     DeleteFile(sdPath);   // consumed: it may not excuse a later launch
@@ -6068,11 +6131,16 @@ static void NotifBridgeSupervise(void)
     // main-loop thread is the one creator that lives as long as the agent. When it failed there (QGANOTIFIPC, an
     // ERROR already), the launch is refused instead of creating the mutex on the launch thread - that thread exits,
     // the mutex is abandoned, and the bridge reads it at its first pass as this agent's death.
-    if (!g_NotifAlive || !g_NotifReadyEvt)
+    // THE HOLD TOO: a bridge that forwards with no hold section has every forwarded toast shown twice (QGANOTIFIPC says
+    // so at Init). It could not forward without a double, so it is not launched (owner 2026-11-28, quoted at the exit
+    // path: "cannot forward" is an ERROR and guest toasts).
+    if (!g_NotifAlive || !g_NotifReadyEvt || !g_NotifHoldBase || !g_NotifVerdictEvt)
     {
         g_NotifLaunched = TRUE;   // refused once; no task exists, so the exit path has none to disarm
-        LogInfo("NOTIFBRIDGE not launched: its liveness mutex and ready event were not created at Init (QGANOTIFIPC "
-            L"above) - guest toasts take the window path");
+        LogError("QGANOTIFNOTLAUNCHED the notification bridge is not launched: its %s not created at Init "
+            L"(QGANOTIFIPC above) - it could not forward without losing or doubling toasts; guest toasts take the "
+            L"window path until the next agent start",
+            (!g_NotifAlive || !g_NotifReadyEvt) ? L"liveness mutex and ready event were" : L"toast-hold section and verdict event were");
         return;
     }
     g_NotifLaunched = TRUE;
