@@ -16922,8 +16922,10 @@ static BOOL DrainVchanInput(IN OUT struct _CAPTURE_CONTEXT* capture, OUT BOOL* e
 
     if (!libvchan_is_open(g_Vchan))
     {
-        // KEEP-FATAL, same rule as the vchan case: the daemon is gone (case (a)).
-        LogError("vchan disconnected");
+        // KEEP-FATAL, same rule as the vchan case: the daemon is gone (case (a)). Same level rule too
+        // (ADR-supervision 7): dom0 closing the vchan IS the going-down, so this twin of the vchan case's
+        // line says it at INFO while one holds. Jev 0.84.
+        LogErrorUnlessGoingDown(FALSE, "vchan disconnected");
         LifecycleLatchExit(QGA_EXIT_RECONNECT);
         *exitLoop = TRUE;
         LeaveCriticalSection(&g_VchanCriticalSection);
